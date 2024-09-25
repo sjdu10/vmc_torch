@@ -1,4 +1,4 @@
-# VMC_torch
+# vmc_torch
 
-A VMC framework for pyTorch models. Can be used for tensor network VMC (bosonic and fermionic) once the TNS is wrapped as a torch model.
+A variational Monte Carlo (VMC) framework for pyTorch models. Can be used for tensor network VMC (bosonic and fermionic) once the TNS is wrapped as a torch model.
 
