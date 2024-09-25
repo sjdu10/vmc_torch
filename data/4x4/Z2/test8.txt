@@ -1,0 +1,2 @@
+Variational step 0
+Energy: 10.522867450024933, Err: 1.758168387317758
