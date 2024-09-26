@@ -23,6 +23,7 @@ class Variational_State:
         self.Ns = sampler.Ns if sampler is not None else self.hi.n_states
         self.nsites = self.hi.size
         self.logamp_grad_matrix = None
+        self.mean_logamp_grad = None
         assert self.hi is not None, "Hilbert space must be provided for sampling!"
 
     
@@ -80,7 +81,7 @@ class Variational_State:
                 raise ValueError("Sampler must be provided for sampling!")
         else:
             # should be computed during sampling
-            return self.logamp_grad_matrix
+            return self.logamp_grad_matrix, self.mean_logamp_grad
     
 
     def full_hi_expect_and_grad(self, op):
@@ -173,14 +174,17 @@ class Variational_State:
 
         # reset sampler
         self.sampler.reset()
-    
+
         if RANK == 0:
             print('RANK{}, sample size: {}, chain length per rank: {}'.format(RANK, self.Ns, chain_length))
 
             # Join all samples list from all ranks into a single list
             # each sample is a tuple of (config, E_loc, amp, logamp_grad)
             logamp_grad_matrix = np.concatenate(logamp_grad_matrix_list, axis=1)
+            del logamp_grad_matrix_list
             self.logamp_grad_matrix = logamp_grad_matrix
+            self.mean_logamp_grad = mean_logamp_grad
+            del logamp_grad_matrix
 
             if DEBUG:
                 print('logamp_grad_matrix shape: {}'.format(self.logamp_grad_matrix.shape))

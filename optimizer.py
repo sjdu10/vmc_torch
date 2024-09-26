@@ -1,6 +1,8 @@
 import numpy as np
 from mpi4py import MPI
+# scipy
 import scipy
+from scipy.sparse import csr_matrix
 
 # torch
 import torch
@@ -24,7 +26,7 @@ class TrivialPreconditioner(Preconditioner):
     """Trivial preconditioner that does nothing."""
     def __call__(self, state, grad):
         return grad
-
+    
 class SR(Preconditioner):
     """
     Math: S*dp = g, where S is the QGT and g is the energy gradient. dp is the preconditioned gradient.
@@ -39,7 +41,7 @@ class SR(Preconditioner):
     In practice, one does not need to compute the dense S matrix to solve for dp.
     One can solve the linear equation S*dp = g iteratively using scipy.sparse.linalg.
     """
-    def __init__(self, dense=False, iter_step=None, exact=False):
+    def __init__(self, dense=False, exact=False, iter_step=1e3):
         self.dense = dense
         self.iter_step = iter_step
         self.exact = exact
@@ -57,16 +59,40 @@ class SR(Preconditioner):
             dp = scipy.linalg.solve(R, energy_grad.detach().numpy())
             return torch.tensor(dp, dtype=torch.float32)
 
-        logamp_grad_matrix = state.get_logamp_grad_matrix()
-        if type(logamp_grad_matrix) is torch.Tensor:
-            logamp_grad_matrix = logamp_grad_matrix.detach().numpy()
         if self.dense:
+            logamp_grad_matrix, mean_logamp_grad = state.get_logamp_grad_matrix()
+            if type(logamp_grad_matrix) is torch.Tensor:
+                logamp_grad_matrix = logamp_grad_matrix.detach().numpy()
             # form the dense S matrix
             S = np.mean([np.outer(logamp_grad, logamp_grad.conj()) for logamp_grad in logamp_grad_matrix.T], axis=0)
-            S -= logamp_grad_matrix.mean(axis=1)@logamp_grad_matrix.mean(axis=1).T
+            S -= np.outer(mean_logamp_grad, mean_logamp_grad.conj())
             R = S + eta*np.eye(S.shape[0])
-            dp = scipy.linalg.solve(R, energy_grad)
+            R = csr_matrix(R)
+            # dp = scipy.linalg.solve(R, energy_grad)
+            dp = scipy.sparse.linalg.cg(R, energy_grad)[0]
+
             return torch.tensor(dp, dtype=torch.float32)
+        else:
+            logamp_grad_matrix, mean_logamp_grad = state.get_logamp_grad_matrix()
+            # define function of (S+eta*I) dot x
+            def R_dot_x(x, logamp_grad_matrix, mean_logamp_grad, eta=1e-6):
+                x_out = np.zeros_like(x)
+                for i in range(logamp_grad_matrix.shape[1]):
+                    x_out += np.dot(logamp_grad_matrix[:, i], x)*logamp_grad_matrix[:, i]
+                x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
+                return x_out + eta*x 
+            
+            # define the linear operator
+            n = logamp_grad_matrix.shape[0]
+            matvec = lambda x: R_dot_x(x, logamp_grad_matrix, mean_logamp_grad, eta)
+            A = scipy.sparse.linalg.LinearOperator((n, n), matvec=matvec)
+            # Right-hand side vector
+            b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
+            # Solve the linear equation
+            dp, _ = scipy.sparse.linalg.cg(A, b)
+            return torch.tensor(dp, dtype=torch.float32)
+
+
 
 
 
