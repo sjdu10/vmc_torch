@@ -1,1 +1,5 @@
 data/
+
+
+# Jupyter notebook files
+*.ipynb
