@@ -57,3 +57,4 @@ variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler)
 preconditioner = TrivialPreconditioner()
 vmc = VMC(H, variational_state, optimizer, preconditioner)
 vmc.run(0, 30, tmpdir=f'./data/{Lx}x{Ly}/{symmetry}/test{N_samples}.txt')
+
