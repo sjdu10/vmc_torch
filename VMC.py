@@ -110,11 +110,12 @@ class VMC:
             # Use MPI for the sampling
             state_MC_energy, state_MC_energy_grad = self._state.expect_and_grad(self._hamiltonian)
             # Only rank 0 collects the energy statistics
+            
+            Energy_stats_list.append(state_MC_energy)
+            # Precondition the gradient through SR
+            preconditioned_grad = self.preconditioner(self._state, state_MC_energy_grad)
             if RANK == 0:
                 print('Variational step {}'.format(step))
-                Energy_stats_list.append(state_MC_energy)
-                # Precondition the gradient through SR
-                preconditioned_grad = self.preconditioner(self._state, state_MC_energy_grad)
                 # Compute the new parameter vector
                 new_param_vec = self._optimizer.compute_update_params(self._state.params_vec, preconditioned_grad) # Subroutine: rank 0 computes new parameter vector based on the gradient
                 # Broadcast the new parameter vector to all ranks

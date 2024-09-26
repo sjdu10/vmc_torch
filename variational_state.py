@@ -149,42 +149,37 @@ class Variational_State:
         # clean the memory
         del local_samples
         
-        # Compute the expectation value and gradient in rank 0
-
+        # Compute the op expectation value on all ranks
         op_expect = COMM.allreduce(local_op_loc, op=MPI.SUM)/self.Ns # op_expect is seen by all ranks
+        mean_logamp_grad = COMM.allreduce(local_logamp_grad, op=MPI.SUM)/self.Ns
 
-        mean_logamp_grad = COMM.reduce(local_logamp_grad, op=MPI.SUM, root=0)
+        # Collect the op_logamp_grad_product on rank 0
         op_logamp_grad_product = COMM.reduce(local_op_logamp_grad_product, op=MPI.SUM, root=0)
-        
-        if RANK == 0:
-            mean_logamp_grad = mean_logamp_grad/self.Ns
-            op_logamp_grad_product = op_logamp_grad_product/self.Ns
 
-        # Total sample variance calculation 
+        # Total sample variance calculation is collected on rank 0
         local_op_loc_mean = local_op_loc/chain_length
         # (n_i - 1)* s^2_i
         local_op_loc_sqrd_sum = (chain_length-1)*local_op_var + chain_length*(local_op_loc_mean - op_expect)**2
         op_var = COMM.reduce(local_op_loc_sqrd_sum, op=MPI.SUM, root=0)
 
-        if RANK == 0:
-            op_var = op_var/self.Ns
-        
-        # Gather all logamp_grad_matrix to rank 0
-        logamp_grad_matrix_list = COMM.gather(local_logamp_grad_matrix, root=0)
+        # set the logamp_grad_matrix and mean_logamp_grad for all ranks
+        # each rank has their local batch of logamp_grad_matrix, but shares the same mean_logamp_grad
+        self.logamp_grad_matrix = local_logamp_grad_matrix
+        self.mean_logamp_grad = mean_logamp_grad
 
         # reset sampler
         self.sampler.reset()
 
         if RANK == 0:
-            print('RANK{}, sample size: {}, chain length per rank: {}'.format(RANK, self.Ns, chain_length))
 
+            print('RANK{}, sample size: {}, chain length per rank: {}'.format(RANK, self.Ns, chain_length))
+            op_logamp_grad_product = op_logamp_grad_product/self.Ns
+            op_var = op_var/self.Ns
             # Join all samples list from all ranks into a single list
             # each sample is a tuple of (config, E_loc, amp, logamp_grad)
-            logamp_grad_matrix = np.concatenate(logamp_grad_matrix_list, axis=1)
-            del logamp_grad_matrix_list
-            self.logamp_grad_matrix = logamp_grad_matrix
-            self.mean_logamp_grad = mean_logamp_grad
-            del logamp_grad_matrix
+            # logamp_grad_matrix = np.concatenate(logamp_grad_matrix_list, axis=1)
+            # del logamp_grad_matrix_list
+            # self.logamp_grad_matrix = logamp_grad_matrix # Only rank 0 has the full logamp_grad_matrix
 
             if DEBUG:
                 print('logamp_grad_matrix shape: {}'.format(self.logamp_grad_matrix.shape))

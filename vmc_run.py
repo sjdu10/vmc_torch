@@ -49,12 +49,12 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 
 N_samples = 512
 N_samples = N_samples - N_samples % SIZE
-# model = fTNModel(peps)
-model = fTN_NNiso_Model(peps, max_bond=8, nn_hidden_dim=16, nn_eta=1e-3)
+model = fTNModel(peps)
+# model = fTN_NNiso_Model(peps, max_bond=8, nn_hidden_dim=2, nn_eta=1e-3)
 optimizer = SignedSGD(learning_rate=1e-3)
-sampler = MetropolisExchangeSampler(hi, graph, N_samples=N_samples, burn_in_steps=10)
+sampler = MetropolisExchangeSampler(hi, graph, N_samples=N_samples, burn_in_steps=1)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler)
-preconditioner = SR(dense=False, exact=True if sampler is None else False)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True)
 # preconditioner = TrivialPreconditioner()
 vmc = VMC(H, variational_state, optimizer, preconditioner)
 vmc.run(0, 20, tmpdir=f'./data/{Lx}x{Ly}/{symmetry}/test{N_samples}.txt')
