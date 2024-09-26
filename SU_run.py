@@ -78,7 +78,7 @@ su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True,D=D, compute_en
 
 # cluster energies may not be accuracte yet
 su.evolve(50, tau=0.3)
-# su.evolve(50, tau=0.1)
+su.evolve(50, tau=0.1)
 # su.evolve(100, tau=0.03)
 # su.evolve(100, tau=0.01)
 # su.evolve(100, tau=0.003)

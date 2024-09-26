@@ -1,6 +1,8 @@
 import numpy as np
 from mpi4py import MPI
 from global_var import DEBUG, set_debug
+import torch
+import json
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -103,7 +105,7 @@ class VMC:
     def run(self, start, stop, tmpdir=None): # Now naive implementation
         """Run the VMC optimization loop."""
         self.Einit = 0.
-        Energy_stats_list = []
+        MC_energy_stats = {'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
         for step in range(start, stop):
             self.step_count += 1
             # Compute the average energy and estimated energy gradient, meanwhile also record the amplitude_grad matrix
@@ -111,29 +113,50 @@ class VMC:
             state_MC_energy, state_MC_energy_grad = self._state.expect_and_grad(self._hamiltonian)
             # Only rank 0 collects the energy statistics
             
-            Energy_stats_list.append(state_MC_energy)
+            MC_energy_stats['mean'].append(state_MC_energy['mean'])
+            MC_energy_stats['error'].append(state_MC_energy['error'])
+            MC_energy_stats['variance'].append(state_MC_energy['variance'])
+
             # Precondition the gradient through SR
             preconditioned_grad = self.preconditioner(self._state, state_MC_energy_grad)
             if RANK == 0:
                 print('Variational step {}'.format(step))
                 # Compute the new parameter vector
                 new_param_vec = self._optimizer.compute_update_params(self._state.params_vec, preconditioned_grad) # Subroutine: rank 0 computes new parameter vector based on the gradient
-                # Broadcast the new parameter vector to all ranks
+                new_param_vec = new_param_vec.detach().numpy()
+                
                 self._state.reset() # Clear out the gradient of the state parameters
                 print('Energy: {}, Err: {}'.format(state_MC_energy['mean'], state_MC_energy['error']))
-                # print to .txt file
+            
                 if tmpdir is not None:
-                    with open(tmpdir, 'a') as f:
-                        f.write('Variational step {}\n'.format(step))
-                        f.write('Energy: {}, Err: {}\n'.format(state_MC_energy['mean'], state_MC_energy['error']))
-                new_param_vec = new_param_vec.detach().numpy()
+                    # with open(tmpdir, 'a') as f:
+                        # f.write('Variational step {}\n'.format(step))
+                        # f.write('Energy: {}, Err: {}\n'.format(state_MC_energy['mean'], state_MC_energy['error']))
+                    # save the energy statistics and model parameters to local directory
+                    path = tmpdir
+                    params_path = path + f'/model_params_step{step}.pth'
+
+                    combined_data = {
+                    'model_structure': self._state.model_structure,  # model structure as a dict
+                    'model_params_vec': self._state.params_vec.detach().numpy(),  # NumPy array
+                    'model_state_dict': self._state.state_dict,  # PyTorch state_dict
+                    'MC_energy_stats': state_MC_energy
+                    }
+                    torch.save(combined_data, params_path)
+
+                    # update the MC_energy_stats.json
+                    with open(path + '/energy_stats.json', 'w') as f:
+                        json.dump(MC_energy_stats, f)
+                
+                
             else:
                 new_param_vec = np.empty(self._state.Np, dtype=np.float32)
 
+            # Broadcast the new parameter vector to all ranks
             new_param_vec = np.ascontiguousarray(new_param_vec)
             COMM.Bcast(new_param_vec,root=0)
             # Update the quantum state with the new parameter vector
             self._state.update_state(new_param_vec) # Reload the new parameter vector into the quantum state
             
-        return Energy_stats_list
+        return MC_energy_stats
     

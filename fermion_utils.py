@@ -256,8 +256,8 @@ def insert_compressor(tn, ltags, rtags, new_ltags=None, new_rtags=None, max_bond
     Pr.reindex_(dict(zip(bix, new_bix_right)))
     Pl.drop_tags()
     Pr.drop_tags()
-    new_ltags = tags_to_oset(new_ltags) | tags_to_oset('proj') | tags_to_oset(ltags)
-    new_rtags = tags_to_oset(new_rtags) | tags_to_oset('proj') | tags_to_oset(rtags)
+    new_ltags = tags_to_oset(new_ltags) | tags_to_oset('proj')# | tags_to_oset(ltags)
+    new_rtags = tags_to_oset(new_rtags) | tags_to_oset('proj')# | tags_to_oset(rtags)
     Pl.add_tag(new_ltags)
     Pr.add_tag(new_rtags)
 
@@ -286,6 +286,8 @@ def insert_proj_peps(amp, max_bond, yrange, xrange=None, from_which='ymin'):
             if jnext is not None:
                 ltags = tuple([r.site_tag(ip, j) for ip in i_passed])+(r.site_tag(i, j), r.site_tag(inext, j))
                 rtags = tuple([r.site_tag(ip, jnext) for ip in i_passed])+(r.site_tag(i, jnext), r.site_tag(inext, jnext))
+                new_ltags = (r.site_tag(inext, j),)
+                new_rtags = (r.site_tag(inext, jnext),)
                 #      │         │
                 #    ──O─┐ chi ┌─O──  j+1
                 #      │ └─▷═◁─┘│
@@ -296,8 +298,8 @@ def insert_proj_peps(amp, max_bond, yrange, xrange=None, from_which='ymin'):
                     tn_calc,
                     ltags,
                     rtags,
-                    new_ltags=ltags,
-                    new_rtags=rtags,
+                    new_ltags=new_ltags,
+                    new_rtags=new_rtags,
                     max_bond=max_bond,
                 )
 

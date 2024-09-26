@@ -2,6 +2,7 @@ import numpy as np
 from mpi4py import MPI
 import random
 from tqdm import tqdm
+import time
 
 # torch
 import torch
@@ -93,8 +94,15 @@ class MetropolisExchangeSampler(Sampler):
 
         if RANK == 0:
             pbar = tqdm(total=chain_length, desc='Sampling starts on rank 0...')
+            
         for chain_step in range(chain_length):
+            if RANK == 0:
+                time0 = time.time()
             sigma = self._sample_next(vstate)
+            n += 1
+            if RANK == 0:
+                time1 = time.time()
+                pbar.set_postfix({'Time per sample': (time1 - time0)})
 
             # compute local energy and amplitude gradient
             eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
@@ -118,11 +126,10 @@ class MetropolisExchangeSampler(Sampler):
             logpsi_sigma_grad_mat[:, chain_step] = logpsi_sigma_grad
 
             # update the sample variance of op_loc
-            n += 1
             op_loc_mean_prev = op_loc_mean
             op_loc_mean += (op_loc - op_loc_mean) / n
             op_loc_M2 += (op_loc - op_loc_mean_prev) * (op_loc - op_loc_mean)
-            
+
             # update the sample variance
             if n > 1:
                 op_loc_var = op_loc_M2 / (n - 1)

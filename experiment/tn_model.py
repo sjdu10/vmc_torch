@@ -21,6 +21,7 @@ class fTNModel(torch.nn.Module):
 
     def __init__(self, ftn):
         super().__init__()
+        
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
 
@@ -35,6 +36,10 @@ class fTNModel(torch.nn.Module):
 
         # Get symmetry
         self.symmetry = ftn.arrays[0].symmetry
+
+        self.model_structure = {
+            'fPEPS (exact contraction)':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+        }
 
     def product_bra_state(self, config, peps, symmetry='Z2'):
         """Spinless fermion product bra state."""
@@ -197,11 +202,17 @@ class fTN_NNiso_Model(torch.nn.Module):
 
         # Get symmetry
         self.symmetry = ftn.arrays[0].symmetry
+        assert self.symmetry == 'Z2', "Only Z2 symmetry fPEPS is supported for NN insertion now."
         if self.symmetry == 'Z2':
             assert self.N_fermion %2 == sum(self.parity_config) % 2, "The number of fermions must match the parity of the Z2-TNS."
 
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS (proj inserted)':{'D': ftn.max_bond(), 'chi': self.max_bond, 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry, 'proj_yrange': [0, ftn.Ly-2]},
+            '2LayerMLP':{'hidden_dim': nn_hidden_dim, 'nn_eta': nn_eta, 'activation': 'ReLU'}
+        }
 
     def product_bra_state(self, config, peps, symmetry='Z2'):
         """Spinless fermion product bra state."""
@@ -310,6 +321,8 @@ class fTN_NNiso_Model(torch.nn.Module):
             new_proj_tn = qtn.unpack(new_proj_params, proj_skeleton)
             new_amp_w_proj = amp_tn | new_proj_tn
 
+            # contract column by column
+            
             # batch_amps.append(torch.tensor(new_amp_w_proj.contract(), dtype=torch.float32, requires_grad=True))
             batch_amps.append(new_amp_w_proj.contract())
 

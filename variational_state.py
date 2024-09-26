@@ -27,6 +27,27 @@ class Variational_State:
         assert self.hi is not None, "Hilbert space must be provided for sampling!"
 
     
+    @property
+    def params_vec(self):
+        return self.vstate_func.from_params_to_vec()
+    
+    @property
+    def params_grad_vec(self):
+        return self.vstate_func.params_grad_to_vec()
+    
+    @property
+    def model_structure(self):
+        try:
+            return self.vstate_func.model_structure
+        except AttributeError:
+            return None
+    
+    @property
+    def state_dict(self):
+        return self.vstate_func.state_dict()
+    
+    # state methods
+    
     def reset(self):
         """Clear the gradient of the variational state."""
         self.vstate_func.clear_grad()
@@ -37,14 +58,6 @@ class Variational_State:
             new_param_vec = torch.tensor(new_param_vec, dtype=torch.float32)
         self.vstate_func.load_params(new_param_vec)
 
-    @property
-    def params_vec(self):
-        return self.vstate_func.from_params_to_vec()
-    
-    @property
-    def params_grad_vec(self):
-        return self.vstate_func.params_grad_to_vec()
-    
     def amplitude(self, x):
         return self.vstate_func(x)
     
