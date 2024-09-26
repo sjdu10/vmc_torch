@@ -15,7 +15,7 @@ import symmray as sr
 import autoray as ar
 from autoray import do
 
-from model import fTNModel, fTN_NNiso_Model
+from experiment.tn_model import fTNModel, fTN_NNiso_Model
 from sampler import MetropolisExchangeSampler
 from variational_state import Variational_State
 from optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
