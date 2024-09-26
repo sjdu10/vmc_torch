@@ -1,7 +1,4 @@
 from fermion_utils import *
-# import flax.linen as nn
-# from flax.core import FrozenDict
-# from flax import traverse_util
 import netket as nk
 import netket.experimental as nkx
 import netket.nn as nknn
@@ -12,6 +9,7 @@ from netket.experimental.operator.fermion import destroy as c
 from netket.experimental.operator.fermion import create as cdag
 from netket.experimental.operator.fermion import number as nc
 
+# Currently we borrow the Hamiltonian objects from the netket library.
 
 def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc=False):
     graph = nk.graph.Grid([Lx,Ly], pbc=pbc)
