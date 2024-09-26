@@ -22,7 +22,7 @@ N = graph.n_nodes
 
 
 # Define the fermion filling and the Hilbert space
-N_f = int(Lx*Ly/2)
+N_f = int(Lx*Ly/2)-2
 hi = nkx.hilbert.SpinOrbitalFermions(N, s=None, n_fermions=N_f)
 
 

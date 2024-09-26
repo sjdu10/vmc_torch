@@ -57,13 +57,13 @@ class SR(Preconditioner):
             dp = scipy.linalg.solve(R, energy_grad.detach().numpy())
             return torch.tensor(dp, dtype=torch.float32)
 
-        amp_grad_matrix_normalized = state.get_amp_grad_matrix()
-        if type(amp_grad_matrix_normalized) is torch.Tensor:
-            amp_grad_matrix_normalized = amp_grad_matrix_normalized.detach().numpy()
+        logamp_grad_matrix = state.get_logamp_grad_matrix()
+        if type(logamp_grad_matrix) is torch.Tensor:
+            logamp_grad_matrix = logamp_grad_matrix.detach().numpy()
         if self.dense:
             # form the dense S matrix
-            S = np.mean([np.outer(amp_grad, amp_grad.conj()) for amp_grad in amp_grad_matrix_normalized.T], axis=0)
-            S -= amp_grad_matrix_normalized.mean(axis=1)@amp_grad_matrix_normalized.mean(axis=1).T
+            S = np.mean([np.outer(logamp_grad, logamp_grad.conj()) for logamp_grad in logamp_grad_matrix.T], axis=0)
+            S -= logamp_grad_matrix.mean(axis=1)@logamp_grad_matrix.mean(axis=1).T
             R = S + eta*np.eye(S.shape[0])
             dp = scipy.linalg.solve(R, energy_grad)
             return torch.tensor(dp, dtype=torch.float32)

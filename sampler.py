@@ -78,27 +78,61 @@ class MetropolisExchangeSampler(Sampler):
     def sample(self, op, vstate, chain_length=1):
         """Sample the local energy and amplitude gradient for each configuration."""
         self.burn_in(vstate)
-        samples = []
+
+        op_loc_sum = 0
+        logpsi_sigma_grad_sum = np.zeros(vstate.Np)
+        op_logpsi_sigma_grad_product_sum = np.zeros(vstate.Np)
+
+        logpsi_sigma_grad_mat = np.zeros((vstate.Np, chain_length))
+
+        # We use Welford's Algorithm to compute the sample variance of op_loc in a single pass.
+        n = 0
+        op_loc_mean = 0
+        op_loc_M2 = 0
+        op_loc_var = 0
+
         if RANK == 0:
             pbar = tqdm(total=chain_length, desc='Sampling starts on rank 0...')
-        for _ in range(chain_length):
+        for chain_step in range(chain_length):
             sigma = self._sample_next(vstate)
+
             # compute local energy and amplitude gradient
             eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
-            psi_sigma, log_psi_sigma_grad = vstate.amplitude_grad(sigma)
+            psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
             psi_eta = vstate.amplitude(eta)
 
+            # convert torch tensors to numpy arrays
             psi_sigma = psi_sigma.detach().numpy()
             psi_eta = psi_eta.detach().numpy()
-            log_psi_sigma_grad = log_psi_sigma_grad.detach().numpy()
+            logpsi_sigma_grad = logpsi_sigma_grad.detach().numpy()
 
-            O_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
-            samples.append((sigma.detach().numpy(), O_loc, psi_sigma, log_psi_sigma_grad))
+            # compute the local operator
+            op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+
+            # accumulate the local energy and amplitude gradient
+            op_loc_sum += op_loc
+            logpsi_sigma_grad_sum += logpsi_sigma_grad
+            op_logpsi_sigma_grad_product_sum += op_loc * logpsi_sigma_grad
+
+            # collect the log-amplitude gradient
+            logpsi_sigma_grad_mat[:, chain_step] = logpsi_sigma_grad
+
+            # update the sample variance of op_loc
+            n += 1
+            op_loc_mean_prev = op_loc_mean
+            op_loc_mean += (op_loc - op_loc_mean) / n
+            op_loc_M2 += (op_loc - op_loc_mean_prev) * (op_loc - op_loc_mean)
+            
+            # update the sample variance
+            if n > 1:
+                op_loc_var = op_loc_M2 / (n - 1)
+
             # add a progress bar if rank == 0
             if RANK == 0:
                 pbar.update(1)
+
         if RANK == 0:
             pbar.close()
 
-
+        samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
         return samples

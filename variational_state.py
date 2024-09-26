@@ -22,7 +22,7 @@ class Variational_State:
         self.hi = sampler.hi if sampler is not None else hi
         self.Ns = sampler.Ns if sampler is not None else self.hi.n_states
         self.nsites = self.hi.size
-        self.amp_grad_matrix = None
+        self.logamp_grad_matrix = None
         assert self.hi is not None, "Hilbert space must be provided for sampling!"
 
     
@@ -57,30 +57,30 @@ class Variational_State:
         self.reset()
         return amp, vec_log_grad
 
-    def full_hi_amp_grad_matrix(self):
+    def full_hi_logamp_grad_matrix(self):
         """Construct the full Np x Ns matrix of amplitude gradients."""
-        parameter_amp_grad = torch.zeros((self.Np, self.hi.n_states), dtype=torch.float32)
+        parameter_logamp_grad = torch.zeros((self.Np, self.hi.n_states), dtype=torch.float32)
         all_config = self.hi.all_states()
         ampx_arr = torch.zeros((self.hi.n_states,), dtype=torch.float32)
 
         for i, config in enumerate(all_config):
             ampx, ampx_dp = self.amplitude_grad(config)
-            parameter_amp_grad[:, i] = ampx_dp
+            parameter_logamp_grad[:, i] = ampx_dp
             ampx_arr[i] = ampx
 
-        return parameter_amp_grad, ampx_arr
+        return parameter_logamp_grad, ampx_arr
     
 
-    def get_amp_grad_matrix(self):
+    def get_logamp_grad_matrix(self):
         """Return the amplitude gradient matrix."""
-        if self.amp_grad_matrix is None:
+        if self.logamp_grad_matrix is None:
             if self.sampler is None and self.hi is not None:
-                return self.full_hi_amp_grad_matrix()
+                return self.full_hi_logamp_grad_matrix()
             else:
                 raise ValueError("Sampler must be provided for sampling!")
         else:
             # should be computed during sampling
-            return self.amp_grad_matrix
+            return self.logamp_grad_matrix
     
 
     def full_hi_expect_and_grad(self, op):
@@ -121,10 +121,10 @@ class Variational_State:
         # use MPI for sampling
         chain_length = self.Ns//SIZE # Number of samples per rank
 
-        op_expect, op_grad, op_var, op_error, config_list, amp_list = self.collect_samples(op, chain_length=chain_length)
+        op_expect, op_grad, op_var, op_err = self.collect_samples(op, chain_length=chain_length)
         
         # return statistics of the MC sampling
-        stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_error}
+        stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_err}
 
 
         return stats_dict, op_grad
@@ -135,46 +135,68 @@ class Variational_State:
         vstate = self
         
         # Sample on each rank
-        # this should be a list of samples, where each sample is a tuple of (config, E_loc, amp, amp_grad)
+        # this should be a list of local samples statistics:
+        # a tuple of (op_loc_sum, logamp_grad_sum, op_loc_logamp_grad_product_sum, op_loc_var, logamp_grad_matrix)
         local_samples = self.sampler.sample(op, vstate, chain_length=chain_length)
 
-        # Gather all samples to rank 0
-        all_samples = COMM.gather(local_samples, root=0)
-        # # reset sampler
-        self.sampler.reset()
-        self.amp_grad_matrix = None
+        local_op_loc = local_samples[0]
+        local_logamp_grad = local_samples[1]
+        local_op_logamp_grad_product = local_samples[2]
+        local_op_var = local_samples[3]
+        local_logamp_grad_matrix = local_samples[4]
+        
+        # clean the memory
+        del local_samples
+        
+        # Compute the expectation value and gradient in rank 0
+
+        op_expect = COMM.allreduce(local_op_loc, op=MPI.SUM)/self.Ns # op_expect is seen by all ranks
+
+        mean_logamp_grad = COMM.reduce(local_logamp_grad, op=MPI.SUM, root=0)
+        op_logamp_grad_product = COMM.reduce(local_op_logamp_grad_product, op=MPI.SUM, root=0)
+        
+        if RANK == 0:
+            mean_logamp_grad = mean_logamp_grad/self.Ns
+            op_logamp_grad_product = op_logamp_grad_product/self.Ns
+
+        # Total sample variance calculation 
+        local_op_loc_mean = local_op_loc/chain_length
+        # (n_i - 1)* s^2_i
+        local_op_loc_sqrd_sum = (chain_length-1)*local_op_var + chain_length*(local_op_loc_mean - op_expect)**2
+        op_var = COMM.reduce(local_op_loc_sqrd_sum, op=MPI.SUM, root=0)
 
         if RANK == 0:
+            op_var = op_var/self.Ns
+        
+        # Gather all logamp_grad_matrix to rank 0
+        logamp_grad_matrix_list = COMM.gather(local_logamp_grad_matrix, root=0)
+
+        # reset sampler
+        self.sampler.reset()
+    
+        if RANK == 0:
             print('RANK{}, sample size: {}, chain length per rank: {}'.format(RANK, self.Ns, chain_length))
+
             # Join all samples list from all ranks into a single list
-            # each sample is a tuple of (config, E_loc, amp, amp_grad)
-            all_samples = [sample for sublist in all_samples for sample in sublist]
+            # each sample is a tuple of (config, E_loc, amp, logamp_grad)
+            logamp_grad_matrix = np.concatenate(logamp_grad_matrix_list, axis=1)
+            self.logamp_grad_matrix = logamp_grad_matrix
 
-            op_loc = [sample[1] for sample in all_samples]
-            amp_grad = [sample[3] for sample in all_samples]
-
-            self.amp_grad_matrix = np.asarray(amp_grad).T
             if DEBUG:
-                print('amp_grad_matrix shape: {}'.format(self.amp_grad_matrix.shape))
-                # each amp_grad is a long vector as (10000,)
+                print('logamp_grad_matrix shape: {}'.format(self.logamp_grad_matrix.shape))
+                # each logamp_grad is a long vector as (10000,)
                 # thus the matrix can be as large as (10000, 10000)
 
-            # Compute the expectation value and gradient
-            op_expect = np.mean(op_loc)
-            mean_amp_grad = np.mean(amp_grad, axis=0)
-
-            op_grad = np.mean([sample[1]*sample[3] for sample in all_samples], axis=0) - op_expect*mean_amp_grad
+            # Compute the op gradient
+            op_grad = op_logamp_grad_product - op_expect*mean_logamp_grad
             # is forming the whole list too memory consuming?
 
-            config_list = [sample[0] for sample in all_samples]
-            amp_list = [sample[2] for sample in all_samples]
-            op_var = np.var(op_loc)
-            op_error = np.sqrt(op_var/len(all_samples))
+            op_err = np.sqrt(op_var/self.Ns)
 
-            return op_expect, op_grad, op_var, op_error, config_list, amp_list
+            return op_expect, op_grad, op_var, op_err
         
         else:
-            return None, None, None, None, None, None
+            return None, None, None, None
         
 
             
