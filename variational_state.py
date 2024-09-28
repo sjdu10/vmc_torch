@@ -57,6 +57,9 @@ class Variational_State:
         if not type(new_param_vec) == torch.Tensor:
             new_param_vec = torch.tensor(new_param_vec, dtype=torch.float32)
         self.vstate_func.load_params(new_param_vec)
+    
+    def load_state_dict(self, state_dict):
+        self.vstate_func.load_state_dict(state_dict)
 
     def amplitude(self, x):
         return self.vstate_func(x)

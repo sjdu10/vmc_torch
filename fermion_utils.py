@@ -5,9 +5,9 @@ import autoray as ar
 from quimb.tensor.tensor_core import  *
 from quimb.tensor.tensor_core import bonds, tags_to_oset, rand_uuid
 from quimb.tensor.tensor_2d import Rotator2D, pairwise
-from flax.core import FrozenDict
-from jax import lax
-import jax.numpy as jnp
+# from flax.core import FrozenDict
+# from jax import lax
+# import jax.numpy as jnp
 
 
 class fPEPS(qtn.PEPS):
@@ -387,9 +387,9 @@ def decompose_permutation_into_transpositions(perm):
 
 
 
-def argsort_jax(seq, reversed=False):
-    """Return the indices that would sort an array."""
-    return jnp.argsort(jnp.array(seq), descending=reversed)
+# def argsort_jax(seq, reversed=False):
+#     """Return the indices that would sort an array."""
+#     return jnp.argsort(jnp.array(seq), descending=reversed)
 
 def argsort(seq, reversed=False):
     """Return the indices that would sort an array."""

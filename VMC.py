@@ -102,7 +102,7 @@ class VMC:
         )
     
     
-    def run(self, start, stop, tmpdir=None): # Now naive implementation
+    def run(self, start, stop, tmpdir=None, save=True): # Now naive implementation
         """Run the VMC optimization loop."""
         self.Einit = 0.
         MC_energy_stats = {'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
@@ -128,7 +128,7 @@ class VMC:
                 self._state.reset() # Clear out the gradient of the state parameters
                 print('Energy: {}, Err: {}'.format(state_MC_energy['mean'], state_MC_energy['error']))
             
-                if tmpdir is not None:
+                if tmpdir is not None and save:
                     # with open(tmpdir, 'a') as f:
                         # f.write('Variational step {}\n'.format(step))
                         # f.write('Energy: {}, Err: {}\n'.format(state_MC_energy['mean'], state_MC_energy['error']))
@@ -137,15 +137,15 @@ class VMC:
                     params_path = path + f'/model_params_step{step}.pth'
 
                     combined_data = {
-                    'model_structure': self._state.model_structure,  # model structure as a dict
-                    'model_params_vec': self._state.params_vec.detach().numpy(),  # NumPy array
-                    'model_state_dict': self._state.state_dict,  # PyTorch state_dict
-                    'MC_energy_stats': state_MC_energy
+                        'model_structure': self._state.model_structure,  # model structure as a dict
+                        'model_params_vec': self._state.params_vec.detach().numpy(),  # NumPy array
+                        'model_state_dict': self._state.state_dict,  # PyTorch state_dict
+                        'MC_energy_stats': state_MC_energy
                     }
                     torch.save(combined_data, params_path)
 
                     # update the MC_energy_stats.json
-                    with open(path + '/energy_stats.json', 'w') as f:
+                    with open(path + f'/energy_stats_start_{start}.json', 'w') as f:
                         json.dump(MC_energy_stats, f)
                 
                 

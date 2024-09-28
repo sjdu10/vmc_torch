@@ -3,3 +3,6 @@ data/
 
 # Jupyter notebook files
 *.ipynb
+
+# Experiment
+experiment/experiment.md
