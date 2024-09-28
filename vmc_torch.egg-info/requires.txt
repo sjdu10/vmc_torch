@@ -1,0 +1,5 @@
+autoray
+numpy
+torch
+quimb
+symmray@ git+https://github.com/jcmgray/symmray.git
