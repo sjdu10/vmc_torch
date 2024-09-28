@@ -2,6 +2,7 @@ data/*
 symmray/
 local/
 __pycache__/
+vmc_torch.egg-info/
 
 # Jupyter notebook files
 *.ipynb
