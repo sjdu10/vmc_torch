@@ -1,6 +1,7 @@
 data/*
 symmray/
 local/
+__pycache__/
 
 # Jupyter notebook files
 *.ipynb
