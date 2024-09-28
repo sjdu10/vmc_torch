@@ -1,5 +1,6 @@
-data/
-
+data/*
+symmray/
+local/
 
 # Jupyter notebook files
 *.ipynb

@@ -5,9 +5,6 @@ import autoray as ar
 from quimb.tensor.tensor_core import  *
 from quimb.tensor.tensor_core import bonds, tags_to_oset, rand_uuid
 from quimb.tensor.tensor_2d import Rotator2D, pairwise
-# from flax.core import FrozenDict
-# from jax import lax
-# import jax.numpy as jnp
 
 
 class fPEPS(qtn.PEPS):

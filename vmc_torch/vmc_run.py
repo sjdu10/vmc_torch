@@ -49,12 +49,12 @@ peps_params = pickle.load(open(f"./data/{Lx}x{Ly}/{symmetry}/peps_su_params.pkl"
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 
-N_samples = 512
+N_samples = 1024
 N_samples = N_samples - N_samples % SIZE + SIZE
 
 # model = fTNModel(peps)
 model = fTN_NNiso_Model(peps, max_bond=4, nn_hidden_dim=8, nn_eta=1e-3)
-init_step = 99
+init_step = 131
 total_steps = 50
 saved_model_params = torch.load(f'./data/{Lx}x{Ly}/{symmetry}/model_params_step{init_step}.pth')
 saved_model_state_dict = saved_model_params['model_state_dict']
