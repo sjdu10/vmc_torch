@@ -10,7 +10,7 @@ import torch
 # quimb
 from autoray import do
 
-from global_var import DEBUG, set_debug
+from .global_var import DEBUG, set_debug
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()

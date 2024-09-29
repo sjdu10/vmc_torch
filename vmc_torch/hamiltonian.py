@@ -1,4 +1,3 @@
-from fermion_utils import *
 import netket as nk
 import netket.experimental as nkx
 import netket.nn as nknn

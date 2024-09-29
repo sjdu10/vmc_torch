@@ -5,7 +5,7 @@ import torch
 # quimb
 from autoray import do
 
-from global_var import DEBUG, set_debug
+from .global_var import DEBUG, set_debug
 
 
 COMM = MPI.COMM_WORLD
@@ -111,13 +111,14 @@ class Variational_State:
         psi = psi/do('linalg.norm', psi)
         
         op_dense = torch.tensor(op.to_dense(), dtype=torch.float32)
-        expect_op_per_site = psi.conj().T@(op_dense@psi)/N
+        expect_op = psi.conj().T@(op_dense@psi)
 
-        expect_op_per_site.backward()
-        vec_grad = self.vstate_func.params_grad_to_vec()
+        expect_op.backward()
+        op_grad = self.vstate_func.params_grad_to_vec()
+        stats_dict = {'mean': float(expect_op.detach().numpy()), 'variance': 0., 'error': 0.}
         # Clear the gradient
         self.reset()
-        return expect_op_per_site, vec_grad
+        return stats_dict, op_grad
         
     
     def expect_and_grad(self, op, full_hi=False):

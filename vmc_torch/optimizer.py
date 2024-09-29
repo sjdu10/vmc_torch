@@ -53,7 +53,7 @@ class SR(Preconditioner):
         if self.exact:
             if energy_grad is None:
                 return torch.zeros(state.Np, dtype=torch.float32)
-            parameter_amp_grad, amp_arr = state.get_amp_grad_matrix()
+            parameter_amp_grad, amp_arr = state.get_logamp_grad_matrix()
             parameter_amp_grad = parameter_amp_grad.detach().numpy()
             amp_arr = amp_arr.detach().numpy()
             norm_sqr = np.linalg.norm(amp_arr)**2

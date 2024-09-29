@@ -1,7 +1,6 @@
-from fermion_utils import *
-# import flax.linen as nn
-# from flax.core import FrozenDict
-# from flax import traverse_util
+import os
+os.environ["NUMBA_NUM_THREADS"] = "20"
+
 import netket as nk
 import netket.experimental as nkx
 import netket.nn as nknn
@@ -12,10 +11,15 @@ from netket.experimental.operator.fermion import destroy as c
 from netket.experimental.operator.fermion import create as cdag
 from netket.experimental.operator.fermion import number as nc
 
+from vmc_torch.fermion_utils import generate_random_fpeps
+import quimb.tensor as qtn
+import symmray as sr
+import pickle
+
 # Define the lattice shape
 L = 4  # Side of the square
 Lx = int(L)
-Ly = int(L)
+Ly = int(L/2)
 # graph = nk.graph.Square(L)
 graph = nk.graph.Grid([Lx,Ly], pbc=False)
 N = graph.n_nodes
@@ -88,10 +92,10 @@ peps.equalize_norms_(value=1)
 
 # save the state
 params, skeleton = qtn.pack(peps)
-import pickle
-with open(f'./data/{Lx}x{Ly}/{symmetry}/peps_skeleton.pkl', 'wb') as f:
+
+with open(f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
     pickle.dump(skeleton, f)
-with open(f'./data/{Lx}x{Ly}/{symmetry}/peps_su_params.pkl', 'wb') as f:
+with open(f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
     pickle.dump(params, f)
     
 
