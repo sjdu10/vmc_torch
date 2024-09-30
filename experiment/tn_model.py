@@ -25,17 +25,20 @@ class fTNModel(torch.nn.Module):
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
 
-        # Flatten the dictionary structure and assign each parameter
-        self.torch_params = {
-            tid: nn.ParameterDict({
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
                 str(sector): nn.Parameter(data)
                 for sector, data in blk_array.items()
             })
             for tid, blk_array in params.items()
-        }
+        })
 
         # Get symmetry
         self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
             'fPEPS (exact contraction)':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
@@ -89,11 +92,6 @@ class fTNModel(torch.nn.Module):
         )
         return amp
         
-    def parameters(self):
-        # Manually yield all parameters from the nested structure
-        for tid_dict in self.torch_params.values():
-            for param in tid_dict.values():
-                yield param
     
     def from_params_to_vec(self):
         return torch.cat([param.data.flatten() for param in self.parameters()])
@@ -127,23 +125,23 @@ class fTNModel(torch.nn.Module):
         return params
     
     def load_params(self, new_params):
-        if isinstance(new_params, torch.Tensor):
-            new_params = self.from_vec_to_params(new_params)
-        # Update the parameters manually
-        with torch.no_grad():
-            for tid, blk_array in new_params.items():
-                for sector, data in blk_array.items():
-                    self.torch_params[tid][sector].data = data
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
 
     
     def amplitude(self, x):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
-            tid: {
+            int(tid): {
                 ast.literal_eval(sector): data
                 for sector, data in blk_array.items()
             }
-            for tid, blk_array in self.torch_params.items()
+            for tid, blk_array in self.torch_tn_params.items()
         }
         # Reconstruct the TN with the new parameters
         psi = qtn.unpack(params, self.skeleton)

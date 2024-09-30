@@ -51,21 +51,25 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 
 # VMC parameters
-N_samples = 1048
+N_samples = 2000
 N_samples = N_samples - N_samples % SIZE + SIZE
 
 model = fTNModel(peps)
 # model = fTN_NNiso_Model(peps, max_bond=4, nn_hidden_dim=8, nn_eta=1e-3)
 model_name = 'fTN' if isinstance(model, fTNModel) else 'fTN_NNi'
-init_step = 14
-total_steps = 86
+init_step = 98
+total_steps = 51
 if init_step != 0:
+    # try:
+    saved_model_params = torch.load(f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/{model_name}/model_params_step{init_step}.pth')
+    saved_model_state_dict = saved_model_params['model_state_dict']
+    saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
-        saved_model_params = torch.load(f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/{model_name}/model_params_step{init_step}.pth')
-        saved_model_state_dict = saved_model_params['model_state_dict']
         model.load_state_dict(saved_model_state_dict)
     except:
-        print('Use SU TNS parameters as initial parameters')
+        model.load_params(saved_model_params_vec)
+    # except:
+    #     print('Use SU TNS parameters as initial parameters')
 
 optimizer = SignedSGD(learning_rate=1e-3)
 # optimizer = SGD(learning_rate=1e-3)
