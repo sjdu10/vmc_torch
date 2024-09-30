@@ -10,6 +10,10 @@ import torch
 # quimb
 from autoray import do
 
+#jax
+import jax
+import random
+
 from .global_var import DEBUG, set_debug
 
 COMM = MPI.COMM_WORLD
@@ -22,11 +26,13 @@ class Sampler:
         self.Ns = N_samples
         self.graph = graph
         self.burn_in_steps = burn_in_steps
-        self.initial_config = torch.tensor(np.asarray(random.choice(hi.all_states())), dtype=torch.float32)
+        rand_int = random.randint(0, 2**32-1)
+        self.initial_config = torch.tensor(np.asarray(hi.random_state(jax.random.PRNGKey(rand_int))), dtype=torch.float32)
         self.current_config = self.initial_config.clone()
     
     def reset(self):
-        self.initial_config = torch.tensor(np.asarray(random.choice(self.hi.all_states())), dtype=torch.float32)
+        rand_int = random.randint(0, 2**32-1)
+        self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=torch.float32)
         self.current_config = self.initial_config.clone()
 
     def _sample_next(self, vstate_func):

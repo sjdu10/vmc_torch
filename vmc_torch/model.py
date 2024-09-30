@@ -10,8 +10,8 @@ import symmray as sr
 import autoray as ar
 from autoray import do
 
-from fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params
-from global_var import DEBUG, set_debug
+from .fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params
+from .global_var import DEBUG, set_debug
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()

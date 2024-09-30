@@ -43,6 +43,7 @@ H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f)
 
 # TN parameters
 D = 4
+chi = 4
 
 # Load PEPS
 skeleton = pickle.load(open(f"../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
@@ -51,17 +52,17 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 
 # VMC parameters
-N_samples = 2000
+N_samples = 1000
 N_samples = N_samples - N_samples % SIZE + SIZE
 
-model = fTNModel(peps)
+model = fTNModel(peps, max_bond=chi)
 # model = fTN_NNiso_Model(peps, max_bond=4, nn_hidden_dim=8, nn_eta=1e-3)
 model_name = 'fTN' if isinstance(model, fTNModel) else 'fTN_NNi'
-init_step = 98
-total_steps = 51
+init_step = 0
+total_steps = 50
 if init_step != 0:
     # try:
-    saved_model_params = torch.load(f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/{model_name}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -81,5 +82,6 @@ preconditioner = SR(dense=False, exact=True if sampler is None else False, use_M
 vmc = VMC(H, variational_state, optimizer, preconditioner)
 
 if __name__ == "__main__":
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/{model_name}/')
+    torch.autograd.set_detect_anomaly(True)
+    vmc.run(init_step, init_step+total_steps, tmpdir=f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/{model_name}/chi={chi}/')
 

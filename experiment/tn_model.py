@@ -19,7 +19,7 @@ RANK = COMM.Get_rank()
 
 class fTNModel(torch.nn.Module):
 
-    def __init__(self, ftn):
+    def __init__(self, ftn, max_bond=None):
         super().__init__()
         
         # extract the raw arrays and a skeleton of the TN
@@ -43,6 +43,7 @@ class fTNModel(torch.nn.Module):
         self.model_structure = {
             'fPEPS (exact contraction)':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
         }
+        self.max_bond = max_bond
 
     def product_bra_state(self, config, peps, symmetry='Z2'):
         """Spinless fermion product bra state."""
@@ -145,12 +146,16 @@ class fTNModel(torch.nn.Module):
         }
         # Reconstruct the TN with the new parameters
         psi = qtn.unpack(params, self.skeleton)
-       # `x` is expected to be batched as (batch_size, input_dim)
+        # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
         for x_i in x:
             amp = self.get_amp(psi, x_i, symmetry=self.symmetry, conj=True)
-            batch_amps.append(amp.contract())
+            if self.max_bond is None:
+                batch_amps.append(amp.contract())
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-2])
+                batch_amps.append(amp.contract())
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)

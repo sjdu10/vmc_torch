@@ -17,9 +17,9 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-L = 4  # Side of the square
+L = 6  # Side of the square
 Lx = int(L)
-Ly = int(L/2)
+Ly = int(L)
 # graph = nk.graph.Square(L)
 graph = nk.graph.Grid([Lx,Ly], pbc=False)
 N = graph.n_nodes
@@ -39,16 +39,16 @@ for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
     H += V * nc(hi,i) * nc(hi,j)
 
 
-# Exact diagonalization of the Hamiltonian for benchmark
-sp_h = H.to_sparse() # Convert the Hamiltonian to a sparse matrix
-from scipy.sparse.linalg import eigsh
-eig_vals, eig_vecs = eigsh(sp_h, k=2, which="SA")
-E_gs = eig_vals[0]
-print("Exact ground state energy per site:", E_gs/N)
+# # Exact diagonalization of the Hamiltonian for benchmark
+# sp_h = H.to_sparse() # Convert the Hamiltonian to a sparse matrix
+# from scipy.sparse.linalg import eigsh
+# eig_vals, eig_vecs = eigsh(sp_h, k=2, which="SA")
+# E_gs = eig_vals[0]
+# print("Exact ground state energy per site:", E_gs/N)
 
 
 # SU in quimb
-D = 4
+D = 8
 seed = 2
 symmetry = 'Z2'
 peps, parity_config = generate_random_fpeps(Lx, Ly, D, seed, symmetry, Nf=N_f)
@@ -78,11 +78,11 @@ terms = {
     for (sitea, siteb) in peps.gen_bond_coos()
 }
 ham = qtn.LocalHam2D(Lx, Ly, terms)
-su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True,D=D, compute_energy_opts={"max_distance":2}, gate_opts={'cutoff':1e-12})
+su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True,D=D, compute_energy_opts={"max_distance":1}, gate_opts={'cutoff':1e-12})
 
 # cluster energies may not be accuracte yet
-su.evolve(50, tau=0.3)
-su.evolve(50, tau=0.1)
+su.evolve(5, tau=0.3)
+su.evolve(5, tau=0.1)
 # su.evolve(100, tau=0.03)
 # su.evolve(100, tau=0.01)
 # su.evolve(100, tau=0.003)
