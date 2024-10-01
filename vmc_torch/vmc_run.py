@@ -10,6 +10,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 from torch.nn.parameter import Parameter
 import torch
 import torch.nn as nn
+torch.autograd.set_detect_anomaly(False)
 
 # quimb
 import quimb as qu

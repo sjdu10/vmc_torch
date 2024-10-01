@@ -304,7 +304,7 @@ def insert_proj_peps(amp, max_bond, yrange, xrange=None, from_which='ymin'):
 
 
 def flatten_proj_params(params):
-    """Flatten the projector tensor parameters.
+    """Flatten the tensor parameters into a vector.
     
     Parameters
     ----------
@@ -324,8 +324,8 @@ def flatten_proj_params(params):
     return do('stack', vec_proj)
 
 
-def reconstruct_proj_params(vec_proj, params):
-    """Reconstruct the projector tensor parameters from a flattened vector.
+def reconstruct_proj_params(vec_params, params):
+    """Reconstruct the tensor parameters from a flattened vector.
     
     Parameters
     ----------
@@ -344,7 +344,7 @@ def reconstruct_proj_params(vec_proj, params):
     for tid, ts_values in params.items():
         new_ts_values = {}
         for blk, data in ts_values.items():
-            new_ts_values[blk] = vec_proj[idx:idx+len(data.flatten())].reshape(data.shape)
+            new_ts_values[blk] = vec_params[idx:idx+len(data.flatten())].reshape(data.shape)
             idx += len(data.flatten())
         new_proj_params[tid] = new_ts_values
     return new_proj_params
