@@ -42,12 +42,13 @@ class SR(Preconditioner):
     In practice, one does not need to compute the dense S matrix to solve for dp.
     One can solve the linear equation S*dp = g iteratively using scipy.sparse.linalg.
     """
-    def __init__(self, dense=False, exact=False, iter_step=1e3, use_MPI4Solver=False):
+    def __init__(self, dense=False, exact=False, iter_step=1e3, use_MPI4Solver=False, diag_eta=1e-2):
         super().__init__(use_MPI4Solver)
         self.dense = dense
         self.iter_step = iter_step
         self.exact = exact
-    def __call__(self, state, energy_grad, eta=1e-3):
+        self.diag_eta = diag_eta
+    def __call__(self, state, energy_grad):
         """iter_step is for iterative solvers."""
         
         if self.exact:
@@ -60,7 +61,7 @@ class SR(Preconditioner):
             S = np.sum([np.outer(amp_grad, amp_grad.conj()) for amp_grad in parameter_amp_grad.T], axis=0)/norm_sqr
             weighted_amp_grad = np.sum([amp_arr[i]*parameter_amp_grad[:, i] for i in range(amp_arr.shape[0])], axis=0)/norm_sqr
             S -= np.outer(weighted_amp_grad, weighted_amp_grad.conj())
-            R = S + eta*np.eye(S.shape[0])
+            R = S + self.diag_eta*np.eye(S.shape[0])
             dp = scipy.linalg.solve(R, energy_grad.detach().numpy())
             return torch.tensor(dp, dtype=torch.float32)
 
@@ -75,7 +76,7 @@ class SR(Preconditioner):
             # form the dense S matrix
             S = np.mean([np.outer(logamp_grad, logamp_grad.conj()) for logamp_grad in logamp_grad_matrix.T], axis=0)
             S -= np.outer(mean_logamp_grad, mean_logamp_grad.conj())
-            R = S + eta*np.eye(S.shape[0])
+            R = S + self.diag_eta*np.eye(S.shape[0])
             R = csr_matrix(R)
             # dp = scipy.linalg.solve(R, energy_grad)
             dp = scipy.sparse.linalg.cg(R, energy_grad)[0]
@@ -98,7 +99,7 @@ class SR(Preconditioner):
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
                     return x_out + eta*x
                 n = state.Np
-                matvec = lambda x: R_dot_x(x, eta)
+                matvec = lambda x: R_dot_x(x, self.diag_eta)
                 A = scipy.sparse.linalg.LinearOperator((n, n), matvec=matvec)
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 dp, _ = scipy.sparse.linalg.cg(A, b)
@@ -123,7 +124,7 @@ class SR(Preconditioner):
                 
                 # define the linear operator
                 n = state.Np
-                matvec = lambda x: R_dot_x(x, logamp_grad_matrix, mean_logamp_grad, eta)
+                matvec = lambda x: R_dot_x(x, logamp_grad_matrix, mean_logamp_grad, self.diag_eta)
                 A = scipy.sparse.linalg.LinearOperator((n, n), matvec=matvec)
                 # Right-hand side vector
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
