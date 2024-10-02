@@ -48,7 +48,7 @@ for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
 
 
 # SU in quimb
-D = 8
+D = 4
 seed = 2
 symmetry = 'Z2'
 peps, parity_config = generate_random_fpeps(Lx, Ly, D, seed, symmetry, Nf=N_f)
@@ -93,9 +93,12 @@ peps.equalize_norms_(value=1)
 # save the state
 params, skeleton = qtn.pack(peps)
 
-with open(f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
+import os
+os.makedirs(f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
+
+with open(f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
     pickle.dump(skeleton, f)
-with open(f'../data/{Lx}x{Ly}/t={t}_V={V}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
+with open(f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
     pickle.dump(params, f)
     
 

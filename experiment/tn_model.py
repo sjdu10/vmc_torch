@@ -17,6 +17,31 @@ COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
+def init_weights_xavier(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding)):
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.xavier_uniform_(m.weight)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+
+# Define the custom Kaiming initialization function
+def init_weights_kaiming(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        # Initialize weights using Kaiming uniform
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+
+# Define the custom zero-initialization function
+def init_weights_to_zero(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding, nn.LayerNorm)):
+        # Set weights and biases to zero
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.constant_(m.weight, 0.0)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+
 class fTNModel(torch.nn.Module):
 
     def __init__(self, ftn, max_bond=None):
@@ -393,7 +418,7 @@ class fTN_NN_Model(torch.nn.Module):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'fPEPS (proj inserted)':{'D': ftn.max_bond(), 'chi': self.max_bond, 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+            'fPEPS (2-row)':{'D': ftn.max_bond(), 'chi': self.max_bond, 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
             '2LayerMLP':{'hidden_dim': nn_hidden_dim, 'nn_eta': nn_eta, 'activation': 'ReLU'}
         }
         
@@ -462,6 +487,194 @@ class fTN_NN_Model(torch.nn.Module):
             # Load the new parameters
             new_amp_2row = qtn.unpack(new_2row_params, amp_2row_skeleton)
 
+            batch_amps.append(new_amp_2row.contract())
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+    
+    def forward(self, x):
+        if x.ndim == 1:
+            # If input is not batched, add a batch dimension
+            x = x.unsqueeze(0)
+        return self.amplitude(x)
+    
+# Transformer model
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
+
+class TransformerModel(nn.Module):
+    def __init__(self, input_size, output_size, d_model=128, nhead=8, num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=512, dropout=0.1):
+        super(TransformerModel, self).__init__()
+        
+        # Embedding layer for integer input sequence
+        self.embedding = nn.Embedding(input_size, d_model)
+        
+        # Positional encoding for fixed-length sequences
+        self.pos_encoder = PositionalEncoding(d_model)
+        
+        # Transformer layers
+        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout)
+        
+        # Linear layer for output generation (predicting floating-point values)
+        self.fc_out = nn.Linear(d_model, output_size)
+        
+    def forward(self, src, tgt, src_mask=None, tgt_mask=None):
+        
+        src = src.transpose(0, 1)
+        tgt = tgt.transpose(0, 1)
+
+        # Encode source (input) sequence
+        src = self.embedding(src) * torch.sqrt(torch.tensor(self.embedding.embedding_dim, dtype=torch.float32))
+        src = self.pos_encoder(src)
+        
+        # Positional encoding for target (output) sequence
+        tgt = self.pos_encoder(tgt)
+        
+        # Apply transformer
+        output = self.transformer(src, tgt, src_mask=src_mask, tgt_mask=tgt_mask)
+        
+        # Predict floating-point values for each output token
+        output = self.fc_out(output)
+
+        # Transpose output to match the shape [batch_size, seq_len, output_size]
+        output = output.transpose(0, 1)
+        
+        return output
+    
+
+class fTN_Transformer_Model(torch.nn.Module):
+    
+    def __init__(self, ftn, max_bond, nn_eta=1e-3, d_model=128, nhead=8, num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=512, dropout=0.1):
+        super().__init__()
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+        
+        self.parity_config = [array.parity for array in ftn.arrays]
+        self.N_fermion = sum(self.parity_config)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+        assert self.symmetry == 'Z2', "Only Z2 symmetry fPEPS is supported for NN insertion now."
+        if self.symmetry == 'Z2':
+            assert self.N_fermion %2 == sum(self.parity_config) % 2, "The number of fermions must match the parity of the Z2-TNS."
+        
+        # Transformer model
+        self.d_model = d_model
+        self.transformer = TransformerModel(
+            input_size=ftn.nsites, 
+            output_size=1, 
+            d_model=self.d_model, 
+            nhead=nhead, 
+            num_encoder_layers=num_encoder_layers, 
+            num_decoder_layers=num_decoder_layers, 
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout
+        )
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS (transformer-two-row)':{'D': ftn.max_bond(), 'chi': self.max_bond, 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+            'transformer':{'input_size': ftn.nsites, 'output_size': 1}
+        }
+
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    @property
+    def num_tn_params(self):
+        num=0
+        for tid, blk_array in self.torch_tn_params.items():
+            for sector, data in blk_array.items():
+                num += data.numel()
+        return num
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            param.grad = None
+    
+    def load_params(self, new_params):
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(params, self.skeleton)
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            amp = psi.get_amp(x_i, conj=True)
+            # Contract to 2 rows
+            amp_2row = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+            amp_2row = amp_2row.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+            amp_2row_params, amp_2row_skeleton = qtn.pack(amp_2row)
+            amp_2row_params_vec = flatten_proj_params(amp_2row_params)
+            vec_len = len(amp_2row_params_vec)
+            
+            # Check x_i type
+            if not type(x_i) == torch.Tensor or x_i.dtype != torch.int32:
+                x_i = torch.tensor(x_i, dtype=torch.int32)
+
+            # Input of the transformer
+            src = x_i.unsqueeze(0) # Shape: [batch_size==1, seq_len]
+            # Target output of the transformer
+            tgt = torch.zeros((1, vec_len, self.d_model))
+            # Forward pass
+            nn_output = self.transformer(src, tgt)
+            # concatenate the output to get the final vector of length vec_len
+            nn_output = nn_output.view(-1)
+            # Add NN output
+            amp_2row_params_vec = amp_2row_params_vec + self.nn_eta*nn_output
+            # Reconstruct the proj parameters
+            new_2row_params = reconstruct_proj_params(amp_2row_params_vec, amp_2row_params)
+            # Load the new parameters
+            new_amp_2row = qtn.unpack(new_2row_params, amp_2row_skeleton)
+            # Add to batch
             batch_amps.append(new_amp_2row.contract())
 
         # Return the batch of amplitudes stacked as a tensor

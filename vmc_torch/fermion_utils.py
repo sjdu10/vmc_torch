@@ -87,8 +87,8 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0):
     rng = np.random.default_rng(seed)
     parity_config = np.zeros(Lx*Ly, dtype=int)
 
+    # generate a random binary string with Nf ones in it
     if symmetry == 'U1':
-        # generate a random binary string with Nf ones in it
         parity_config = np.zeros(Lx*Ly, dtype=int)
         parity_config[:Nf] = 1
         rng.shuffle(parity_config)
@@ -109,8 +109,9 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0):
         if symmetry == 'Z2':
             data = sr.Z2FermionicArray.random(
                 block_indices,
-                charge=0,
+                charge=1 if parity_config[tid] else 0,
                 seed=rng,
+                oddpos=2*tid,
             )
         elif symmetry == 'U1':
             data = sr.U1FermionicArray.random(
