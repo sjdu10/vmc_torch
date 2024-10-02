@@ -576,7 +576,7 @@ class fTN_Transformer_Model(torch.nn.Module):
 
         # Get symmetry
         self.symmetry = ftn.arrays[0].symmetry
-        assert self.symmetry == 'Z2', "Only Z2 symmetry fPEPS is supported for NN insertion now."
+        assert self.symmetry == 'Z2' or self.symmetry == 'U1', "Only Z2 or U1 symmetry fPEPS is supported for Transformer insertion now."
         if self.symmetry == 'Z2':
             assert self.N_fermion %2 == sum(self.parity_config) % 2, "The number of fermions must match the parity of the Z2-TNS."
         

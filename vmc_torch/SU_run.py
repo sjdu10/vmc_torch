@@ -17,7 +17,7 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-L = 6  # Side of the square
+L = 4  # Side of the square
 Lx = int(L)
 Ly = int(L)
 # graph = nk.graph.Square(L)
@@ -50,7 +50,7 @@ for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
 # SU in quimb
 D = 4
 seed = 2
-symmetry = 'Z2'
+symmetry = 'U1'
 peps, parity_config = generate_random_fpeps(Lx, Ly, D, seed, symmetry, Nf=N_f)
 
 edges = qtn.edges_2d_square(Lx, Ly)
@@ -63,7 +63,7 @@ site_info = sr.utils.parse_edges_to_site_info(
 )
 
 t = 1.0
-V = 4.0
+V = 1.0
 mu = 0.0
 
 terms = {
@@ -81,8 +81,8 @@ ham = qtn.LocalHam2D(Lx, Ly, terms)
 su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True,D=D, compute_energy_opts={"max_distance":1}, gate_opts={'cutoff':1e-12})
 
 # cluster energies may not be accuracte yet
-su.evolve(5, tau=0.3)
-su.evolve(5, tau=0.1)
+su.evolve(50, tau=0.3)
+su.evolve(50, tau=0.1)
 # su.evolve(100, tau=0.03)
 # su.evolve(100, tau=0.01)
 # su.evolve(100, tau=0.003)

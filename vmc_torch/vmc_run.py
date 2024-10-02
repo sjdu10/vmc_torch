@@ -37,9 +37,9 @@ RANK = COMM.Get_rank()
 # Hamiltonian parameters
 Lx = int(4)
 Ly = int(4)
-symmetry = 'Z2'
+symmetry = 'U1'
 t = 1.0
-V = 4.0
+V = 1.0
 N_f = int(Lx*Ly/2)-2
 H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f)
 
@@ -57,9 +57,9 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 N_samples = 128
 N_samples = N_samples - N_samples % SIZE + SIZE
 
-# model = fTNModel(peps, max_bond=chi)
+model = fTNModel(peps, max_bond=chi)
 # model = fTN_NNiso_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
-model = fTN_NN_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
+# model = fTN_NN_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -87,8 +87,8 @@ if init_step != 0:
     except:
         model.load_params(saved_model_params_vec)
 
-optimizer = SignedSGD(learning_rate=0.05)
-# optimizer = SGD(learning_rate=1e-3)
+# optimizer = SignedSGD(learning_rate=0.05)
+optimizer = SGD(learning_rate=0.05)
 sampler = MetropolisExchangeSampler(hi, graph, N_samples=N_samples, burn_in_steps=1)
 # sampler = None
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler)
