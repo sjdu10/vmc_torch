@@ -26,6 +26,11 @@ from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
 from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian import square_lattice_spinless_Fermi_Hubbard
+from vmc_torch.torch_utils import SVD,QR
+
+# Register safe SVD and QR functions to torch
+ar.register_function('torch','linalg.svd',SVD.apply)
+ar.register_function('torch','linalg.qr',QR.apply)
 
 from vmc_torch.global_var import DEBUG
 
@@ -45,7 +50,7 @@ H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f)
 
 # TN parameters
 D = 4
-chi = 4
+chi = 8
 
 # Load PEPS
 skeleton = pickle.load(open(f"../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
@@ -54,7 +59,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 
 # VMC parameters
-N_samples = 128
+N_samples = 16
 N_samples = N_samples - N_samples % SIZE + SIZE
 
 model = fTNModel(peps, max_bond=chi)
@@ -88,11 +93,11 @@ if init_step != 0:
         model.load_params(saved_model_params_vec)
 
 # optimizer = SignedSGD(learning_rate=0.05)
-optimizer = SGD(learning_rate=0.05)
+optimizer = SGD(learning_rate=0.01)
 sampler = MetropolisExchangeSampler(hi, graph, N_samples=N_samples, burn_in_steps=1)
 # sampler = None
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler)
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.05)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.01)
 # preconditioner = TrivialPreconditioner()
 vmc = VMC(H, variational_state, optimizer, preconditioner)
 

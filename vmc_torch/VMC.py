@@ -127,7 +127,7 @@ class VMC:
                 
                 self._state.reset() # Clear out the gradient of the state parameters
                 print('Energy: {}, Err: {}'.format(state_MC_energy['mean'], state_MC_energy['error']))
-            
+                
                 if tmpdir is not None and save:
                     # with open(tmpdir, 'a') as f:
                         # f.write('Variational step {}\n'.format(step))

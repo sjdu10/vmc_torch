@@ -1,5 +1,6 @@
 import numpy as np
 from mpi4py import MPI
+import time
 # scipy
 import scipy
 from scipy.sparse import csr_matrix
@@ -42,10 +43,10 @@ class SR(Preconditioner):
     In practice, one does not need to compute the dense S matrix to solve for dp.
     One can solve the linear equation S*dp = g iteratively using scipy.sparse.linalg.
     """
-    def __init__(self, dense=False, exact=False, iter_step=1e3, use_MPI4Solver=False, diag_eta=1e-2):
+    def __init__(self, dense=False, exact=False, iter_step=1e5, use_MPI4Solver=False, diag_eta=1e-2):
         super().__init__(use_MPI4Solver)
         self.dense = dense
-        self.iter_step = iter_step
+        self.iter_step = int(iter_step)
         self.exact = exact
         self.diag_eta = diag_eta
     def __call__(self, state, energy_grad):
@@ -102,7 +103,11 @@ class SR(Preconditioner):
                 matvec = lambda x: R_dot_x(x, self.diag_eta)
                 A = scipy.sparse.linalg.LinearOperator((n, n), matvec=matvec)
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
+                t0 = time.time()
                 dp, _ = scipy.sparse.linalg.cg(A, b)
+                t1 = time.time()
+                if RANK == 0:
+                    print("Time for solving the linear equation: ", t1-t0)
                 return torch.tensor(dp, dtype=torch.float32)
 
 
