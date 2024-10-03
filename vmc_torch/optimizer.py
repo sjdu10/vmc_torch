@@ -27,7 +27,7 @@ class Preconditioner:
 class TrivialPreconditioner(Preconditioner):
     """Trivial preconditioner that does nothing."""
     def __call__(self, state, grad):
-        return grad
+        return torch.tensor(grad, dtype=torch.float32)
     
 class SR(Preconditioner):
     """
@@ -67,15 +67,23 @@ class SR(Preconditioner):
             return torch.tensor(dp, dtype=torch.float32)
 
         if self.dense:
-            logamp_grad_matrix, mean_logamp_grad = state.get_logamp_grad_matrix()
+            # Send the logamp_grad_matrix to rank 0 to form the dense S matrix
+            local_logamp_grad_matrix, mean_logamp_grad = state.get_logamp_grad_matrix()
             logamp_grad_matrix_list = COMM.gather(local_logamp_grad_matrix, root=0)
-            if energy_grad is None:
+
+            if energy_grad is None or RANK != 0:
                 return torch.zeros(state.Np, dtype=torch.float32)
-            logamp_grad_matrix = np.concatenate(logamp_grad_matrix_list, axis=1)
+            
+            # Convert to list of numpy arrays
+            logamp_grad_matrix_list = [logamp_grad_vec for logamp_grad_matrix in logamp_grad_matrix_list for logamp_grad_vec in logamp_grad_matrix.T ]
+            
+            # Convert the list of vectors to a single matrix
+            logamp_grad_matrix = np.array(logamp_grad_matrix_list)
+
             if type(logamp_grad_matrix) is torch.Tensor:
                 logamp_grad_matrix = logamp_grad_matrix.detach().numpy()
             # form the dense S matrix
-            S = np.mean([np.outer(logamp_grad, logamp_grad.conj()) for logamp_grad in logamp_grad_matrix.T], axis=0)
+            S = np.mean([np.outer(logamp_grad, logamp_grad.conj()) for logamp_grad in logamp_grad_matrix], axis=0)
             S -= np.outer(mean_logamp_grad, mean_logamp_grad.conj())
             R = S + self.diag_eta*np.eye(S.shape[0])
             R = csr_matrix(R)
@@ -91,14 +99,15 @@ class SR(Preconditioner):
                 This is at the cost of having to broadcast the energy_grad to all ranks
                 and solve the linear equation locally in every rank."""
                 local_logamp_grad_matrix, mean_logamp_grad = state.get_logamp_grad_matrix()
-                energy_grad = COMM.bcast(energy_grad, root=0)
+                if energy_grad is None:
+                    energy_grad = COMM.bcast(energy_grad, root=0)
                 def R_dot_x(x, eta=1e-6):
                     x_out_local = np.zeros_like(x)
-                    # for i in range(local_logamp_grad_matrix.shape[1]):
-                    #     x_out_local += np.dot(local_logamp_grad_matrix[:, i], x)*local_logamp_grad_matrix[:, i]
+                    for i in range(local_logamp_grad_matrix.shape[1]):
+                        x_out_local += np.dot(local_logamp_grad_matrix[:, i], x)*local_logamp_grad_matrix[:, i]
                     # use matrix multiplication for speedup
-                    x_out_local = np.dot(local_logamp_grad_matrix, np.dot(local_logamp_grad_matrix.T, x))
-                    x_out = COMM.allreduce(x_out_local, op=MPI.SUM)
+                    # x_out_local = np.dot(local_logamp_grad_matrix, np.dot(local_logamp_grad_matrix.T, x))
+                    x_out = COMM.allreduce(x_out_local, op=MPI.SUM)/state.Ns
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
                     return x_out + eta*x
                 n = state.Np

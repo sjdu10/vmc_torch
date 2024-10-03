@@ -109,9 +109,11 @@ class VMC:
         for step in range(start, stop):
             self.step_count += 1
             # Compute the average energy and estimated energy gradient, meanwhile also record the amplitude_grad matrix
+
             # Use MPI for the sampling
+            # Only rank 0 collects the energy statistics, but all ranks must have the energy gradient
             state_MC_energy, state_MC_energy_grad = self._state.expect_and_grad(self._hamiltonian)
-            # Only rank 0 collects the energy statistics
+            state_MC_energy_grad = COMM.bcast(state_MC_energy_grad, root=0)
             
             MC_energy_stats['mean'].append(state_MC_energy['mean'])
             MC_energy_stats['error'].append(state_MC_energy['error'])
@@ -121,12 +123,19 @@ class VMC:
             preconditioned_grad = self.preconditioner(self._state, state_MC_energy_grad)
             if RANK == 0:
                 print('Variational step {}'.format(step))
+                print('Energy: {}, Err: {}, MAX gi: {}, Max SR gi: {}, Max param: {}'.format(
+                    state_MC_energy['mean'], 
+                    state_MC_energy['error'], 
+                    np.max(np.abs(state_MC_energy_grad)), 
+                    np.max(np.abs(preconditioned_grad.detach().numpy())), 
+                    np.max(np.abs(self._state.params_vec.detach().numpy())))
+                )
                 # Compute the new parameter vector
                 new_param_vec = self._optimizer.compute_update_params(self._state.params_vec, preconditioned_grad) # Subroutine: rank 0 computes new parameter vector based on the gradient
                 new_param_vec = new_param_vec.detach().numpy()
                 
                 self._state.reset() # Clear out the gradient of the state parameters
-                print('Energy: {}, Err: {}'.format(state_MC_energy['mean'], state_MC_energy['error']))
+                
                 
                 if tmpdir is not None and save:
                     # with open(tmpdir, 'a') as f:

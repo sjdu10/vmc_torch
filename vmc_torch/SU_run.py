@@ -50,7 +50,7 @@ for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
 # SU in quimb
 D = 4
 seed = 2
-symmetry = 'U1'
+symmetry = 'Z2'
 peps, parity_config = generate_random_fpeps(Lx, Ly, D, seed, symmetry, Nf=N_f)
 
 edges = qtn.edges_2d_square(Lx, Ly)
@@ -81,8 +81,8 @@ ham = qtn.LocalHam2D(Lx, Ly, terms)
 su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True,D=D, compute_energy_opts={"max_distance":1}, gate_opts={'cutoff':1e-12})
 
 # cluster energies may not be accuracte yet
-su.evolve(50, tau=0.3)
-su.evolve(50, tau=0.1)
+su.evolve(5, tau=0.3)
+# su.evolve(50, tau=0.1)
 # su.evolve(100, tau=0.03)
 # su.evolve(100, tau=0.01)
 # su.evolve(100, tau=0.003)

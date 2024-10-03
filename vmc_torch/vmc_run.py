@@ -42,7 +42,7 @@ RANK = COMM.Get_rank()
 # Hamiltonian parameters
 Lx = int(4)
 Ly = int(4)
-symmetry = 'U1'
+symmetry = 'Z2'
 t = 1.0
 V = 1.0
 N_f = int(Lx*Ly/2)-2
@@ -50,7 +50,7 @@ H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f)
 
 # TN parameters
 D = 4
-chi = 4
+chi = 32
 
 # Load PEPS
 skeleton = pickle.load(open(f"../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
@@ -59,8 +59,8 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 
 # VMC parameters
-N_samples = 128
-N_samples = N_samples - N_samples % SIZE + SIZE
+N_samples = 32
+N_samples = N_samples - N_samples % SIZE + SIZE - 1
 
 model = fTNModel(peps, max_bond=chi)
 # model = fTN_NNiso_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
@@ -68,7 +68,7 @@ model = fTNModel(peps, max_bond=chi)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
-#     nn_eta=0.0, 
+#     nn_eta=1e-1, 
 #     d_model=8, 
 #     nhead=2, 
 #     num_encoder_layers=2, 
@@ -92,12 +92,12 @@ if init_step != 0:
     except:
         model.load_params(saved_model_params_vec)
 
-# optimizer = SignedSGD(learning_rate=0.05)
-optimizer = SGD(learning_rate=0.05)
+optimizer = SignedSGD(learning_rate=1e-3)
+# optimizer = SGD(learning_rate=0.05)
 sampler = MetropolisExchangeSampler(hi, graph, N_samples=N_samples, burn_in_steps=1)
 # sampler = None
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler)
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.01, iter_step=1e2)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-3, iter_step=1e4)
 # preconditioner = TrivialPreconditioner()
 vmc = VMC(H, variational_state, optimizer, preconditioner)
 
