@@ -50,7 +50,7 @@ H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f)
 
 # TN parameters
 D = 4
-chi = 32
+chi = 4
 
 # Load PEPS
 skeleton = pickle.load(open(f"../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
@@ -62,22 +62,23 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 N_samples = 256
 N_samples = N_samples - N_samples % SIZE + SIZE - 1
 
-model = fTNModel(peps, max_bond=chi)
+# model = fTNModel(peps, max_bond=chi)
 # model = fTN_NNiso_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
 # model = fTN_NN_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
-# model = fTN_Transformer_Model(
-#     peps, 
-#     max_bond=chi, 
-#     nn_eta=1e-1, 
-#     d_model=8, 
-#     nhead=2, 
-#     num_encoder_layers=2, 
-#     num_decoder_layers=2,
-#     dim_feedforward=32,
-#     dropout=0.0,
-# )
+model = fTN_Transformer_Model(
+    peps, 
+    max_bond=chi, 
+    nn_eta=1e-3, 
+    d_model=8, 
+    nhead=2, 
+    num_encoder_layers=2, 
+    num_decoder_layers=2,
+    dim_feedforward=32,
+    dropout=0.0,
+)
 
-model.apply(init_weights_to_zero)
+# model.apply(init_weights_to_zero)
+model.apply(init_weights_xavier)
 
 
 model_name = 'fTN' if isinstance(model, fTNModel) else 'fTN_NNiso' if isinstance(model, fTN_NNiso_Model) else 'fTN_NN' if isinstance(model, fTN_NN_Model) else 'fTN_Transformer'
@@ -92,7 +93,7 @@ if init_step != 0:
     except:
         model.load_params(saved_model_params_vec)
 
-optimizer = SignedSGD(learning_rate=1e-3)
+optimizer = SignedSGD(learning_rate=0.05)
 # optimizer = SGD(learning_rate=0.05)
 sampler = MetropolisExchangeSampler(hi, graph, N_samples=N_samples, burn_in_steps=1)
 # sampler = None

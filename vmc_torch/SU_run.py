@@ -32,7 +32,9 @@ hi = nkx.hilbert.SpinOrbitalFermions(N, s=None, n_fermions=N_f)
 
 # Define the Hubbard Hamiltonian
 t = 1.0
-V = 4.0
+V = 1.0
+mu = 0.0
+
 H = 0.0
 for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
     H -= t * (cdag(hi,i) * c(hi,j) + cdag(hi,j) * c(hi,i))
@@ -61,10 +63,6 @@ site_info = sr.utils.parse_edges_to_site_info(
     site_ind_id="k{},{}",
     site_tag_id="I{},{}",
 )
-
-t = 1.0
-V = 1.0
-mu = 0.0
 
 terms = {
     (sitea, siteb): sr.fermi_hubbard_spinless_local_array(
