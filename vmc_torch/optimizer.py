@@ -135,6 +135,7 @@ class SR(Preconditioner):
                     x_out = np.zeros_like(x)
                     for i in range(logamp_grad_matrix.shape[1]):
                         x_out += np.dot(logamp_grad_matrix[:, i], x)*logamp_grad_matrix[:, i]
+                    x_out = x_out/state.Ns
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
                     return x_out + eta*x 
                 

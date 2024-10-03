@@ -59,7 +59,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float32))
 
 # VMC parameters
-N_samples = 32
+N_samples = 256
 N_samples = N_samples - N_samples % SIZE + SIZE - 1
 
 model = fTNModel(peps, max_bond=chi)
