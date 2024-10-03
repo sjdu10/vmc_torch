@@ -29,7 +29,7 @@ class fPEPS(qtn.PEPS):
         return product_tn
     
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
-    def get_amp(self, config, inplace=False, no_odd=False, conj=False, reverse=False):
+    def get_amp(self, config, inplace=False, no_odd=False, conj=True, reverse=False):
         """Get the amplitude of a configuration in a PEPS."""
         peps = self if inplace else self.copy()
 
