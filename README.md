@@ -29,7 +29,9 @@ mpirun -np 10 python vmc_run_example.py
 ```
 Feel free to substitute the number `10` with any number of MPI ranks you want to use.
 
-One can generate VMC results like this (we also compare our neural backflow model updates with the Netket updates):
+One can generate VMC results like this ($N_s$ is the VMC sample size): 
+
+(we also compare our neural backflow model updates with the Netket updates)
 ![VMC_energy](./docs/pics/VMC_energy.png)
 
 
