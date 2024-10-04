@@ -21,7 +21,7 @@ pip install --no-deps -U -e vmc_torch/
 
 **Neural network state example:**
 
-In `/examples`, there's an example script for running VMC on a `4x4` spinless Hubbard model with OBC using various neural network quantum states.
+In `/examples`, there's an example script for running VMC of a spinless Hubbard model on a `4x4` square lattice with OBC using various neural network quantum states.
 To run the code: 
 ```bash
 cd ./examples
