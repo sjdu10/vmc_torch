@@ -30,7 +30,7 @@ mpirun -np 10 python vmc_run_example.py
 Feel free to substitute the number `10` with any number of MPI ranks you want to use.
 
 One can generate VMC results like this:
-![VMC_energy](docs/pics/VMC_energy.png)
+![VMC_energy](./docs/pics/VMC_energy.png)
 
 
 ## References
