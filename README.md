@@ -29,6 +29,9 @@ mpirun -np 10 python vmc_run_example.py
 ```
 Feel free to substitute the number `10` with any number of MPI ranks you want to use.
 
+One can generate VMC results like this:
+![VMC_energy](docs/pics/VMC_energy.png)
+
 
 ## References
 - "NetKet 3: Machine Learning Toolbox for Many-Body Quantum Systems" - *Filippo Vicentini and Damian Hofmann and Attila Szabó and Dian Wu and Christopher Roth and Clemens Giuliani and Gabriel Pescia and Jannes Nys and Vladimir Vargas-Calderón and Nikita Astrakhantsev and Giuseppe Carleo* - https://scipost.org/10.21468/SciPostPhysCodeb.7

@@ -59,9 +59,11 @@ peps_params = pickle.load(open(f"../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
-# VMC parameters
-N_samples = 2**10
+# VMC sample size
+N_samples = 2**12
 N_samples = N_samples - N_samples % SIZE + SIZE - 1
+if (N_samples/SIZE)%2 != 0:
+    N_samples += SIZE
 
 # model = fTNModel(peps, max_bond=chi)
 # model = fTN_NNiso_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
@@ -79,8 +81,8 @@ N_samples = N_samples - N_samples % SIZE + SIZE - 1
 # )
 # model = SlaterDeterminant(hi)
 # model=NeuralBackflow(hi, param_dtype=dtype, hidden_dim=hi.size)
-# model = NeuralJastrow(hi, param_dtype=dtype, hidden_dim=hi.size)
-model = FFNN(hi, hidden_dim=2*hi.size)
+model = NeuralJastrow(hi, param_dtype=dtype, hidden_dim=hi.size)
+# model = FFNN(hi, hidden_dim=2*hi.size)
 
 # model.apply(init_weights_to_zero)
 model.apply(init_weights_xavier)
