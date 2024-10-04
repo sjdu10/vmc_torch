@@ -97,7 +97,7 @@ vmc = VMC(H, variational_state, optimizer, preconditioner)
 
 if __name__ == "__main__":
 
-    """Run the code by command: `mpirun -np 10 python vmc_run.py`
+    """Run the code by command: `mpirun -np 10 python vmc_run_example.py`
     you can change the number 10 to the number of MPI processes you want to use"""
     
     os.makedirs(f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/{model_name}/', exist_ok=True)
