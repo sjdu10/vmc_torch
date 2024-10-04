@@ -17,78 +17,53 @@ COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
-class fTNModel(torch.nn.Module):
+def init_weights_xavier(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding)):
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.xavier_uniform_(m.weight)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
 
-    def __init__(self, ftn):
-        super().__init__()
-        # extract the raw arrays and a skeleton of the TN
-        params, self.skeleton = qtn.pack(ftn)
+# Define the custom Kaiming initialization function
+def init_weights_kaiming(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        # Initialize weights using Kaiming uniform
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
 
-        # Flatten the dictionary structure and assign each parameter
-        self.torch_params = {
-            tid: nn.ParameterDict({
-                str(sector): nn.Parameter(data)
-                for sector, data in blk_array.items()
-            })
-            for tid, blk_array in params.items()
-        }
+# Define the custom zero-initialization function
+def init_weights_to_zero(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding, nn.LayerNorm)):
+        # Set weights and biases to zero
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.constant_(m.weight, 0.0)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
 
-        # Get symmetry
-        self.symmetry = ftn.arrays[0].symmetry
 
-    def product_bra_state(self, config, peps, symmetry='Z2'):
-        """Spinless fermion product bra state."""
-        product_tn = qtn.TensorNetwork()
-        backend = peps.tensors[0].data.backend
-        iterable_oddpos = iter(range(2*peps.nsites+1))
-        for n, site in zip(config, peps.sites):
-            p_ind = peps.site_ind_id.format(*site)
-            p_tag = peps.site_tag_id.format(*site)
-            tid = peps.sites.index(site)
-            nsites = peps.nsites
-            # use autoray to ensure the correct backend is used
-            with ar.backend_like(backend):
-                if symmetry == 'Z2':
-                    data = [sr.Z2FermionicArray.from_blocks(blocks={(0,):do('array', [1.0,], like=backend)}, duals=(True,),symmetry='Z2', charge=0, oddpos=2*tid+1), # It doesn't matter if oddpos is None for even parity tensor.
-                            sr.Z2FermionicArray.from_blocks(blocks={(1,):do('array', [1.0,], like=backend)}, duals=(True,),symmetry='Z2',charge=1, oddpos=2*tid+1)
-                        ]
-                elif symmetry == 'U1':
-                    data = [sr.U1FermionicArray.from_blocks(blocks={(0,):do('array', [1.0,], like=backend)}, duals=(True,),symmetry='U1', charge=0, oddpos=2*tid+1),
-                            sr.U1FermionicArray.from_blocks(blocks={(1,):do('array', [1.0,], like=backend)}, duals=(True,),symmetry='U1', charge=1, oddpos=2*tid+1)
-                        ]
-            tsr_data = data[int(n)] # BUG: does not fit in jax compilation, a concrete value is needed for traced arrays
-            tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
-            product_tn |= tsr
-        return product_tn
 
-    def get_amp(self, peps, config, inplace=False, symmetry='Z2', conj=True):
-        """Get the amplitude of a configuration in a PEPS."""
-        if not inplace:
-            peps = peps.copy()
-        if conj:
-            amp = peps|self.product_bra_state(config, peps, symmetry).conj()
-        else:
-            amp = peps|self.product_bra_state(config, peps, symmetry)
-        for site in peps.sites:
-            site_tag = peps.site_tag_id.format(*site)
-            amp.contract_(tags=site_tag)
-
-        amp.view_as_(
-            qtn.PEPS,
-            site_ind_id="k{},{}",
-            site_tag_id="I{},{}",
-            x_tag_id="X{}",
-            y_tag_id="Y{}",
-            Lx=peps.Lx,
-            Ly=peps.Ly,
-        )
-        return amp
+class SlaterDeterminant(nn.Module):
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32):
+        super(SlaterDeterminant, self).__init__()
         
-    def parameters(self):
-        # Manually yield all parameters from the nested structure
-        for tid_dict in self.torch_params.values():
-            for param in tid_dict.values():
-                yield param
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        
+        # Initialize the parameter M (N x Nf matrix)
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'SlaterDeterminant':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
+        }
     
     def from_params_to_vec(self):
         return torch.cat([param.data.flatten() for param in self.parameters()])
@@ -96,6 +71,7 @@ class fTNModel(torch.nn.Module):
     @property
     def num_params(self):
         return len(self.from_params_to_vec())
+    
     
     def params_grad_to_vec(self):
         param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
@@ -105,55 +81,266 @@ class fTNModel(torch.nn.Module):
         for param in self.parameters():
             param.grad = None
     
-    def from_vec_to_params(self, vec, quimb_format=False):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        params = {}
-        idx = 0
-        for tid, blk_array in self.torch_params.items():
-            params[tid] = {}
-            for sector, data in blk_array.items():
-                shape = data.shape
-                size = data.numel()
-                if quimb_format:
-                    params[tid][ast.literal_eval(sector)] = vec[idx:idx+size].view(shape)
-                else:
-                    params[tid][sector] = vec[idx:idx+size].view(shape)
-                idx += size
-        return params
+    def load_params(self, new_params):
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+    
+    def _determinant(self, A):
+        # Compute the determinant of matrix A
+        det = torch.linalg.det(A)
+        return det
+
+    def forward(self, n):
+        if not type(n) == torch.Tensor:
+            n = torch.tensor(n, dtype=torch.int32)
+        # Define the slater determinant function manually to loop over inputs
+        def slater_det(n):
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = self.M[R]
+
+            return self._determinant(A)
+        if n.ndim == 1:
+            # If input is not batched, add a batch dimension
+            n = n.unsqueeze(0)
+        # Apply slater_det to each element in the batch
+        batch_size = n.shape[0]
+        return torch.stack([slater_det(n[i]) for i in range(batch_size)])
+
+class NeuralJastrow(nn.Module):
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
+        super(NeuralJastrow, self).__init__()
+        
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        self.hidden_dim = hidden_dim
+        
+        # Initialize the parameter M (N x Nf matrix)
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
+
+        self.nn = nn.Sequential(
+            nn.Linear(self.hilbert.n_orbitals, self.hidden_dim, dtype=self.param_dtype),
+            nn.Tanh(),
+            nn.Linear(self.hidden_dim, 1, dtype=self.param_dtype)
+        )
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'NeuralJastrow':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
+        }
+    
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            param.grad = None
     
     def load_params(self, new_params):
-        if isinstance(new_params, torch.Tensor):
-            new_params = self.from_vec_to_params(new_params)
-        # Update the parameters manually
-        with torch.no_grad():
-            for tid, blk_array in new_params.items():
-                for sector, data in blk_array.items():
-                    self.torch_params[tid][sector].data = data
-
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
     
-    def amplitude(self, x):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        params = {
-            tid: {
-                ast.literal_eval(sector): data
-                for sector, data in blk_array.items()
-            }
-            for tid, blk_array in self.torch_params.items()
-        }
-        # Reconstruct the TN with the new parameters
-        psi = qtn.unpack(params, self.skeleton)
-       # `x` is expected to be batched as (batch_size, input_dim)
-        # Loop through the batch and compute amplitude for each sample
-        batch_amps = []
-        for x_i in x:
-            amp = self.get_amp(psi, x_i, symmetry=self.symmetry, conj=True)
-            batch_amps.append(amp.contract())
+    def _determinant(self, A):
+        # Compute the determinant of matrix A
+        det = torch.linalg.det(A)
+        return det
 
-        # Return the batch of amplitudes stacked as a tensor
-        return torch.stack(batch_amps)
-    
-    def forward(self, x):
-        if x.ndim == 1:
+    def forward(self, n):
+        if not type(n) == torch.Tensor:
+            n = torch.tensor(n, dtype=torch.int32)
+        n = n.to(self.param_dtype)
+        # Define the slater determinant function manually to loop over inputs
+        def slater_det_Jastrow(n):
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = self.M[R]
+
+            # Jastrow factor
+            J = torch.sum(self.nn(n))
+
+            return self._determinant(A)*torch.exp(J)
+        
+        if n.ndim == 1:
             # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x)
+            n = n.unsqueeze(0)
+        # Apply slater_det to each element in the batch
+        batch_size = n.shape[0]
+        return torch.stack([slater_det_Jastrow(n[i]) for i in range(batch_size)])
+
+class NeuralBackflow(nn.Module):
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
+        super(NeuralBackflow, self).__init__()
+        
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        
+        # Initialize the parameter M (N x Nf matrix)
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
+
+        # Initialize the neural network layer, input is n and output a matrix with the same shape as M
+        self.nn = nn.Sequential(
+            nn.Linear(self.hilbert.n_orbitals, hidden_dim, dtype=self.param_dtype),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, self.hilbert.n_orbitals*self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'Neuralbackflow':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
+        }
+    
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            param.grad = None
+    
+    def load_params(self, new_params):
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+    
+
+    def forward(self, n):
+        if not type(n) == torch.Tensor:
+            n = torch.tensor(n, dtype=self.param_dtype)
+        n = n.to(self.param_dtype)
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(n):
+            # Compute the backflow matrix F using the neural network
+            F = self.nn(n)
+            M  = self.M + F.reshape(self.M.shape)
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = M[R]
+
+            det = torch.linalg.det(A)
+            return det
+
+        if n.ndim == 1:
+            # If input is not batched, add a batch dimension
+            n = n.unsqueeze(0)
+        # Apply slater_det to each element in the batch
+        batch_size = n.shape[0]
+        return torch.stack([backflow_det(n[i]) for i in range(batch_size)])
+
+
+
+class FFNN(nn.Module):
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
+        super(FFNN, self).__init__()
+        
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        
+        # Initialize the parameter M (N x Nf matrix)
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
+
+        # Initialize the neural network layer, input is n and output a matrix with the same shape as M
+        self.nn = nn.Sequential(
+            nn.Linear(self.hilbert.n_orbitals, hidden_dim, dtype=self.param_dtype),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1, dtype=self.param_dtype)
+        )
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'FFNN':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
+        }
+    
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            param.grad = None
+    
+    def load_params(self, new_params):
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+
+    def forward(self, n):
+        if not type(n) == torch.Tensor:
+            n = torch.tensor(n, dtype=self.param_dtype)
+        # Define the slater determinant function manually to loop over inputs
+        def ffnn(n):
+            # Compute the backflow matrix F using the neural network
+            F = sum(self.nn(n))
+            return F
+        if n.ndim == 1:
+            # If input is not batched, add a batch dimension
+            n = n.unsqueeze(0)
+        # Apply slater_det to each element in the batch
+        batch_size = n.shape[0]
+        return torch.stack([ffnn(n[i]) for i in range(batch_size)])
