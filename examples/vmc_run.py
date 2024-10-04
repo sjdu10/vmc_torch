@@ -1,23 +1,15 @@
-import numpy as np
-from quimb.utils import progbar as Progbar
 from mpi4py import MPI
-import pickle
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
 # torch
-from torch.nn.parameter import Parameter
 import torch
-import torch.nn as nn
 torch.autograd.set_detect_anomaly(False)
+dtype=torch.float64
 
-# quimb
-import quimb as qu
-import quimb.tensor as qtn
-import symmray as sr
+# autoray
 import autoray as ar
-from autoray import do
 
 from vmc_torch.model import SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
 from vmc_torch.model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
@@ -27,13 +19,11 @@ from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
 from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian import square_lattice_spinless_Fermi_Hubbard
 from vmc_torch.torch_utils import SVD,QR
+from vmc_torch.global_var import DEBUG
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)
 ar.register_function('torch','linalg.qr',QR.apply)
-from vmc_torch.global_var import DEBUG
-
-dtype=torch.float64
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -49,10 +39,10 @@ N_f = int(Lx*Ly/2)-2
 H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f)
 
 """Choose the torch model (you can create your own model of course)"""
-# model = SlaterDeterminant(hi)
-# model=NeuralBackflow(hi, param_dtype=dtype, hidden_dim=hi.size)
+model = SlaterDeterminant(hi)
+# model = NeuralBackflow(hi, param_dtype=dtype, hidden_dim=hi.size)
 # model = NeuralJastrow(hi, param_dtype=dtype, hidden_dim=hi.size)
-model = FFNN(hi, hidden_dim=2*hi.size)
+# model = FFNN(hi, hidden_dim=2*hi.size)
 model_names = {
     SlaterDeterminant: 'SlaterDeterminant',
     NeuralBackflow: 'NeuralBackflow',
@@ -106,11 +96,10 @@ vmc = VMC(H, variational_state, optimizer, preconditioner)
 
 
 if __name__ == "__main__":
-    
+
     """Run the code by command: `mpirun -np 10 python vmc_run.py`
     you can change the number 10 to the number of MPI processes you want to use"""
     
-    torch.autograd.set_detect_anomaly(False)
     os.makedirs(f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/{model_name}/', exist_ok=True)
     vmc.run(init_step, init_step+total_steps, tmpdir=f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/{model_name}/')
 
