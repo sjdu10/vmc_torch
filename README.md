@@ -29,6 +29,8 @@ mpirun -np 10 python vmc_run_example.py
 ```
 Feel free to substitute the number `10` with any number of MPI ranks you want to use.
 
+**IMPORTANT:** *When runing MCMC sampling using multiple chains, one should either use only a few long chains, or a large number of short chains, so that the total samples are fully converged to the target distribution. It may cause problems and unreliable results if one use an intermediate number of short chains, as each chain does not have enough time to tour over the target distribution, plus the number of chains is not large enough to distribute these chains dispersively enough over the target distribution.*
+
 One can generate VMC results like this ($N_s$ is the VMC sample size): 
 
 (we also compare our neural backflow model updates with the Netket updates)
