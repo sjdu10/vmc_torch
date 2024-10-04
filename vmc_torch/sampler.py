@@ -21,18 +21,20 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 class Sampler:
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, dtype=torch.float32):
         self.hi = hi
         self.Ns = N_samples
         self.graph = graph
         self.burn_in_steps = burn_in_steps
+        self.reset_chain = reset_chain
+        self.dtype = dtype
         rand_int = random.randint(0, 2**32-1)
-        self.initial_config = torch.tensor(np.asarray(hi.random_state(jax.random.PRNGKey(rand_int))), dtype=torch.float32)
+        self.initial_config = torch.tensor(np.asarray(hi.random_state(jax.random.PRNGKey(rand_int))), dtype=self.dtype)
         self.current_config = self.initial_config.clone()
     
     def reset(self):
         rand_int = random.randint(0, 2**32-1)
-        self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=torch.float32)
+        self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=self.dtype)
         self.current_config = self.initial_config.clone()
 
     def _sample_next(self, vstate_func):
@@ -44,8 +46,10 @@ class Sampler:
         raise NotImplementedError
     
 class MetropolisExchangeSampler(Sampler):
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100):
-        super().__init__(hi, graph, N_samples, burn_in_steps)
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, dtype=torch.float32):
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain)
+        self.random_edge = random_edge
+        self.subchain_length = hi.size if subchain_length is None else subchain_length
     
     def burn_in(self, vstate):
         """Discard the initial samples. (Burn-in)"""
@@ -58,27 +62,52 @@ class MetropolisExchangeSampler(Sampler):
         proposed_config = self.current_config.clone()
         attempts = 0
         accepts = 0
-        for (i, j) in self.graph.edges(): # We always loop over all edges.
-            if self.current_config[i] == self.current_config[j]:
-                continue
-            attempts += 1
-            proposed_config = self.current_config.clone()
-            # swap the configuration on site i and j
-            temp = proposed_config[i].item()
-            proposed_config[i] = proposed_config[j]
-            proposed_config[j] = temp
-            proposed_prob = abs(vstate.amplitude(proposed_config))**2
+        if not self.random_edge: # We always loop over all edges.
+            for (i, j) in self.graph.edges(): 
+                if self.current_config[i] == self.current_config[j]:
+                    continue
+                attempts += 1
+                proposed_config = self.current_config.clone()
+                # swap the configuration on site i and j
+                temp = proposed_config[i].item()
+                proposed_config[i] = proposed_config[j]
+                proposed_config[j] = temp
+                proposed_prob = abs(vstate.amplitude(proposed_config))**2
 
-            try:
-                acceptance_ratio = proposed_prob/current_prob
-            except ZeroDivisionError:
-                acceptance_ratio = 1 if proposed_prob > 0 else 0
+                try:
+                    acceptance_ratio = proposed_prob/current_prob
+                except ZeroDivisionError:
+                    acceptance_ratio = 1 if proposed_prob > 0 else 0
 
-            if random.random() < acceptance_ratio:
-                self.current_config = proposed_config
-                current_prob = proposed_prob
-                accepts += 1
-        # print('Acceptance rate: {}'.format(accepts/attempts))
+                if random.random() < acceptance_ratio:
+                    self.current_config = proposed_config
+                    current_prob = proposed_prob
+                    accepts += 1
+
+        else:
+            # Randomly select an edge to exchange, until the subchain_length is reached.
+            for _ in range(self.subchain_length):
+                i, j = random.choice(list(self.graph.edges()))
+                if self.current_config[i] == self.current_config[j]:
+                    continue
+                proposed_config = self.current_config.clone()
+                # swap the configuration on site i and j
+                temp = proposed_config[i].item()
+                proposed_config[i] = proposed_config[j]
+                proposed_config[j] = temp
+                proposed_prob = abs(vstate.amplitude(proposed_config))**2
+
+                try:
+                    acceptance_ratio = proposed_prob/current_prob
+                except ZeroDivisionError:
+                    acceptance_ratio = 1 if proposed_prob > 0 else 0
+
+                if random.random() < acceptance_ratio:
+                    self.current_config = proposed_config
+                    current_prob = proposed_prob
+        
+        # if RANK == 0:
+        #     print('Acceptance rate: {}'.format(accepts/attempts))
             
         return self.current_config
     
@@ -97,6 +126,7 @@ class MetropolisExchangeSampler(Sampler):
         op_loc_mean = 0
         op_loc_M2 = 0
         op_loc_var = 0
+        op_loc_vec = np.zeros(chain_length)
 
         if RANK == 0:
             pbar = tqdm(total=chain_length, desc='Sampling starts on rank 0...')
@@ -104,7 +134,10 @@ class MetropolisExchangeSampler(Sampler):
         for chain_step in range(chain_length):
             if RANK == 0:
                 time0 = time.time()
+
+            # sample the next configuration
             sigma = self._sample_next(vstate)
+
             n += 1
             if RANK == 0:
                 time1 = time.time()
@@ -122,6 +155,7 @@ class MetropolisExchangeSampler(Sampler):
 
             # compute the local operator
             op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+            op_loc_vec[chain_step] = op_loc
 
             # accumulate the local energy and amplitude gradient
             op_loc_sum += op_loc
@@ -143,9 +177,21 @@ class MetropolisExchangeSampler(Sampler):
             # add a progress bar if rank == 0
             if RANK == 0:
                 pbar.update(1)
+        
+        if self.reset_chain:
+            self.reset()
 
         if RANK == 0:
             pbar.close()
+        
+        # The following is for computing the Rhat diagnostic using the Gelman-Rubin formula
+        # Step 1：split the chain in half and compute the within chain variance
+        split_chains = np.split(op_loc_vec, 2)
+        # Step 2: compute the within chain variance
+        W_loc = np.mean([np.var(split_chain) for split_chain in split_chains])
+        chain_means_loc = [np.mean(split_chain) for split_chain in split_chains]
 
-        samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
+
+        samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
+
         return samples

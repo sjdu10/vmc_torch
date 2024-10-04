@@ -9,3 +9,4 @@ vmc_torch.egg-info/
 
 # Experiment
 experiment/experiment.md
+experiment/tn_model.py

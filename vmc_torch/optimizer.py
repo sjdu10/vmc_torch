@@ -18,16 +18,19 @@ RANK = COMM.Get_rank()
 
 
 class Preconditioner:
-    def __init__(self, use_MPI4Solver=False):
+    def __init__(self, use_MPI4Solver=False, dtype=torch.float32):
         self.use_MPI4Solver = use_MPI4Solver
+        self.dtype = dtype
     def __call__(self, state, grad):
         """Abstract method for preconditioning the gradient."""
         raise NotImplementedError
 
 class TrivialPreconditioner(Preconditioner):
     """Trivial preconditioner that does nothing."""
+    def __init__(self, dtype=torch.float32):
+        super().__init__(dtype=dtype)
     def __call__(self, state, grad):
-        return torch.tensor(grad, dtype=torch.float32)
+        return torch.tensor(grad, dtype=self.dtype)
     
 class SR(Preconditioner):
     """
@@ -43,8 +46,8 @@ class SR(Preconditioner):
     In practice, one does not need to compute the dense S matrix to solve for dp.
     One can solve the linear equation S*dp = g iteratively using scipy.sparse.linalg.
     """
-    def __init__(self, dense=False, exact=False, iter_step=1e5, use_MPI4Solver=False, diag_eta=1e-2):
-        super().__init__(use_MPI4Solver)
+    def __init__(self, dense=False, exact=False, iter_step=1e5, use_MPI4Solver=False, diag_eta=1e-2, dtype=torch.float32):
+        super().__init__(use_MPI4Solver, dtype=dtype)
         self.dense = dense
         self.iter_step = int(iter_step)
         self.exact = exact
@@ -54,7 +57,7 @@ class SR(Preconditioner):
         
         if self.exact:
             if energy_grad is None:
-                return torch.zeros(state.Np, dtype=torch.float32)
+                return torch.zeros(state.Np, dtype=self.dtype)
             parameter_amp_grad, amp_arr = state.get_logamp_grad_matrix()
             parameter_amp_grad = parameter_amp_grad.detach().numpy()
             amp_arr = amp_arr.detach().numpy()
@@ -64,7 +67,7 @@ class SR(Preconditioner):
             S -= np.outer(weighted_amp_grad, weighted_amp_grad.conj())
             R = S + self.diag_eta*np.eye(S.shape[0])
             dp = scipy.linalg.solve(R, energy_grad.detach().numpy())
-            return torch.tensor(dp, dtype=torch.float32)
+            return torch.tensor(dp, dtype=self.dtype)
 
         if self.dense:
             # Send the logamp_grad_matrix to rank 0 to form the dense S matrix
@@ -72,7 +75,7 @@ class SR(Preconditioner):
             logamp_grad_matrix_list = COMM.gather(local_logamp_grad_matrix, root=0)
 
             if energy_grad is None or RANK != 0:
-                return torch.zeros(state.Np, dtype=torch.float32)
+                return torch.zeros(state.Np, dtype=self.dtype)
             
             # Convert to list of numpy arrays
             logamp_grad_matrix_list = [logamp_grad_vec for logamp_grad_matrix in logamp_grad_matrix_list for logamp_grad_vec in logamp_grad_matrix.T ]
@@ -90,7 +93,7 @@ class SR(Preconditioner):
             # dp = scipy.linalg.solve(R, energy_grad)
             dp = scipy.sparse.linalg.cg(R, energy_grad)[0]
 
-            return torch.tensor(dp, dtype=torch.float32)
+            return torch.tensor(dp, dtype=self.dtype)
         
         else:
             if self.use_MPI4Solver:
@@ -119,7 +122,7 @@ class SR(Preconditioner):
                 t1 = time.time()
                 if RANK == 0:
                     print("Time for solving the linear equation: ", t1-t0)
-                return torch.tensor(dp, dtype=torch.float32)
+                return torch.tensor(dp, dtype=self.dtype)
 
 
             else:
@@ -128,7 +131,7 @@ class SR(Preconditioner):
                 logamp_grad_matrix_list = COMM.gather(local_logamp_grad_matrix, root=0)
                 if energy_grad is None:
                     # All ranks but rank 0 return zeros
-                    return torch.zeros(state.Np, dtype=torch.float32)
+                    return torch.zeros(state.Np, dtype=self.dtype)
                 logamp_grad_matrix = np.concatenate(logamp_grad_matrix_list, axis=1)
                 # define function of (S+eta*I) dot x
                 def R_dot_x(x, logamp_grad_matrix, mean_logamp_grad, eta=1e-6):
@@ -147,7 +150,7 @@ class SR(Preconditioner):
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 # Solve the linear equation
                 dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step)
-                return torch.tensor(dp, dtype=torch.float32)
+                return torch.tensor(dp, dtype=self.dtype)
 
 
 

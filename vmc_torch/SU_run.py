@@ -79,7 +79,7 @@ ham = qtn.LocalHam2D(Lx, Ly, terms)
 su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True,D=D, compute_energy_opts={"max_distance":1}, gate_opts={'cutoff':1e-12})
 
 # cluster energies may not be accuracte yet
-su.evolve(5, tau=0.3)
+su.evolve(50, tau=0.3)
 # su.evolve(50, tau=0.1)
 # su.evolve(100, tau=0.03)
 # su.evolve(100, tau=0.01)

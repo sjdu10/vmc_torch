@@ -107,6 +107,8 @@ class VMC:
         self.Einit = 0.
         MC_energy_stats = {'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
         for step in range(start, stop):
+            if RANK == 0:
+                print('Variational step {}'.format(step))
             self.step_count += 1
             # Compute the average energy and estimated energy gradient, meanwhile also record the amplitude_grad matrix
 
@@ -121,9 +123,9 @@ class VMC:
 
             # Precondition the gradient through SR
             preconditioned_grad = self.preconditioner(self._state, state_MC_energy_grad)
+
             if RANK == 0:
-                print('Variational step {}'.format(step))
-                print('Energy: {}, Err: {}, MAX gi: {}, Max SR gi: {}, Max param: {}'.format(
+                print('Energy: {}, Err: {}, \nMAX gi: {}, Max SR gi: {}, Max param: {}\n'.format(
                     state_MC_energy['mean'], 
                     state_MC_energy['error'], 
                     np.max(np.abs(state_MC_energy_grad)), 
@@ -157,9 +159,8 @@ class VMC:
                     with open(path + f'/energy_stats_start_{start}.json', 'w') as f:
                         json.dump(MC_energy_stats, f)
                 
-                
             else:
-                new_param_vec = np.empty(self._state.Np, dtype=np.float32)
+                new_param_vec = np.empty(self._state.Np, dtype=float)
 
             # Broadcast the new parameter vector to all ranks
             new_param_vec = np.ascontiguousarray(new_param_vec)
