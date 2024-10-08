@@ -61,7 +61,7 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
 N_samples = 2**12
-N_samples = N_samples - N_samples % SIZE + SIZE - 1
+N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 

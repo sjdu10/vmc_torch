@@ -7,51 +7,201 @@ from quimb.tensor.tensor_core import bonds, tags_to_oset, rand_uuid
 from quimb.tensor.tensor_2d import Rotator2D, pairwise
 
 
+# class fPEPS(qtn.PEPS):
+#     def __init__(self, arrays, *, shape="urdlp", tags=None, site_ind_id="k{},{}", site_tag_id="I{},{}", x_tag_id="X{}", y_tag_id="Y{}", **tn_opts):
+#         super().__init__(arrays, shape=shape, tags=tags, site_ind_id=site_ind_id, site_tag_id=site_tag_id, x_tag_id=x_tag_id, y_tag_id=y_tag_id, **tn_opts)
+#         self.symmetry = self.arrays[0].symmetry
+    
+#     def product_bra_state(self, config, no_odd=False):
+#         """Spinless fermion product bra state."""
+#         product_tn = qtn.TensorNetwork()
+#         backend = self.tensors[0].data.backend
+#         for n, site in zip(config, self.sites):
+#             p_ind = self.site_ind_id.format(*site)
+#             p_tag = self.site_tag_id.format(*site)
+#             tid = self.sites.index(site)
+#             if no_odd:
+#                 tsr_data = sr.FermionicArray.from_blocks(blocks={(int(n),):do('array', [1.0,], like=backend)}, duals=(True,), symmetry=self.symmetry, charge=0)
+#             else:
+#                 tsr_data = sr.FermionicArray.from_blocks(blocks={(int(n),):do('array', [1.0,], like=backend)}, duals=(True,),symmetry=self.symmetry, charge=int(n), oddpos=2*tid+1 if int(n)%2 else None)
+#             tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
+#             product_tn |= tsr
+#         return product_tn
+    
+#     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
+#     def get_amp(self, config, inplace=False, no_odd=False, conj=True, reverse=False):
+#         """Get the amplitude of a configuration in a PEPS."""
+#         peps = self if inplace else self.copy()
+
+#         if no_odd:
+#             # WARNING: if use oddpos is False, then the phase correction is not activated, so A*B might not be equal to B*A
+#             # if parity(A) == parity(B) == 1, then A*B = -B*A
+#             # However if one use oddpos to record the relative position of A and B, then A*B = B*A, the on-site contraction will be automatically phase corrected
+#             for t in peps:
+#                 t.modify(data = t.data.copy_with(charge=0, oddpos=()))
+
+#         if conj:
+#             if reverse:
+#                 # not recommended
+#                 amp = self.product_bra_state(config, no_odd).conj()|peps # <n|--->---T---, generate a local parity phase (which is just a global -1 for odd-parity n as |n> either has 0 or 1 parity)
+#             else:
+#                 amp = peps|self.product_bra_state(config, no_odd).conj()
+#         else:
+#             if reverse:
+#                 # not recommended
+#                 amp = self.product_bra_state(config, no_odd)|peps
+#             else:
+#                 amp = peps|self.product_bra_state(config, no_odd)
+        
+#         for site in peps.sites:
+#             site_tag = peps.site_tag_id.format(*site)
+#             amp.contract_(tags=site_tag)
+
+#         amp.view_as_(
+#             qtn.PEPS,
+#             site_ind_id="k{},{}",
+#             site_tag_id="I{},{}",
+#             x_tag_id="X{}",
+#             y_tag_id="Y{}",
+#             Lx=peps.Lx,
+#             Ly=peps.Ly,
+#         )
+#         return amp
+
+
+# def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0):
+#     """Generate a random spinless fermionic square PEPS of shape (Lx, Ly)."""
+
+#     assert symmetry == 'Z2' or symmetry == 'U1', "Only Z2 and U1 symmetries are supported."
+    
+#     edges = qtn.edges_2d_square(Lx, Ly)
+#     site_info = sr.utils.parse_edges_to_site_info(
+#         edges,
+#         D,
+#         phys_dim=2,
+#         site_ind_id="k{},{}",
+#         site_tag_id="I{},{}",
+#     )
+
+#     peps = qtn.TensorNetwork()
+#     rng = np.random.default_rng(seed)
+#     parity_config = np.zeros(Lx*Ly, dtype=int)
+
+#     # generate a random binary string with Nf ones in it
+#     if symmetry == 'U1':
+#         parity_config = np.zeros(Lx*Ly, dtype=int)
+#         parity_config[:Nf] = 1
+#         rng.shuffle(parity_config)
+
+#     for site, info in sorted(site_info.items()):
+#         tid = site[0] * Ly + site[1]
+#         # bond index charge distribution
+#         block_indices = [
+#             sr.BlockIndex({0: d // 2, 1: d // 2}, dual=dual)
+#             for d, dual in zip(info["shape"][:-1], info["duals"][:-1])
+#         ]
+#         # physical index
+#         p = info['shape'][-1]
+#         block_indices.append(
+#             sr.BlockIndex({0: p // 2, 1: p // 2}, dual=info["duals"][-1])
+#         )
+
+#         if symmetry == 'Z2':
+#             data = sr.Z2FermionicArray.random(
+#                 block_indices,
+#                 charge=1 if parity_config[tid] else 0,
+#                 seed=rng,
+#                 oddpos=2*tid,
+#             )
+#         elif symmetry == 'U1':
+#             data = sr.U1FermionicArray.random(
+#                 block_indices,
+#                 charge=1 if parity_config[tid] else 0,
+#                 seed=rng,
+#                 oddpos=2*tid,
+#             )
+
+#         peps |= qtn.Tensor(
+#             data=data,
+#             inds=info["inds"],
+#             tags=info["tags"],
+#         )
+
+#     # required to view general TN as an actual PEPS
+#     for i, j in site_info:
+#         peps[f"I{i},{j}"].add_tag([f"X{i}", f"Y{j}"])
+
+#     peps.view_as_(
+#         fPEPS,
+#         site_ind_id="k{},{}",
+#         site_tag_id="I{},{}",
+#         x_tag_id="X{}",
+#         y_tag_id="Y{}",
+#         Lx=Lx,
+#         Ly=Ly,
+#     )
+#     peps = peps.copy() # set symmetry during initialization
+
+#     return peps, parity_config
+
 class fPEPS(qtn.PEPS):
     def __init__(self, arrays, *, shape="urdlp", tags=None, site_ind_id="k{},{}", site_tag_id="I{},{}", x_tag_id="X{}", y_tag_id="Y{}", **tn_opts):
         super().__init__(arrays, shape=shape, tags=tags, site_ind_id=site_ind_id, site_tag_id=site_tag_id, x_tag_id=x_tag_id, y_tag_id=y_tag_id, **tn_opts)
         self.symmetry = self.arrays[0].symmetry
+        self.spinless = True if self.phys_dim() == 2 else False
     
-    def product_bra_state(self, config, no_odd=False):
-        """Spinless fermion product bra state."""
+    def product_bra_state(self, config):
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
+
+        if self.spinless:
+            index_map = {0: 0, 1: 1}
+            array_map = {
+                0: do('array',[1.0],like=backend), 
+                1: do('array',[1.0],like=backend)
+            }
+        else:
+            if self.symmetry == 'Z2':
+                index_map = {0:0, 1:1, 2:1, 3:0}
+                array_map = {
+                    0: do('array',[1.0, 0.0],like=backend), 
+                    1: do('array',[1.0, 0.0],like=backend), 
+                    2: do('array',[0.0, 1.0],like=backend), 
+                    3: do('array',[0.0, 1.0],like=backend)
+                }
+            elif self.symmetry == 'U1':
+                index_map = {0:0, 1:1, 2:1, 3:2}
+                array_map = {
+                    0: do('array',[1.0],like=backend), 
+                    1: do('array',[0.0, 1.0],like=backend), 
+                    2: do('array',[1.0, 0.0],like=backend), 
+                    3: do('array',[1.0],like=backend)
+                }
+
         for n, site in zip(config, self.sites):
             p_ind = self.site_ind_id.format(*site)
             p_tag = self.site_tag_id.format(*site)
             tid = self.sites.index(site)
-            if no_odd:
-                tsr_data = sr.FermionicArray.from_blocks(blocks={(int(n),):do('array', [1.0,], like=backend)}, duals=(True,), symmetry=self.symmetry, charge=0)
-            else:
-                tsr_data = sr.FermionicArray.from_blocks(blocks={(int(n),):do('array', [1.0,], like=backend)}, duals=(True,),symmetry=self.symmetry, charge=int(n), oddpos=2*tid+1 if int(n)%2 else None)
+
+            n_charge = index_map[int(n)]
+            n_array = array_map[int(n)]
+
+            tsr_data = sr.FermionicArray.from_blocks(blocks={(n_charge,):n_array}, duals=(True,),symmetry=self.symmetry, charge=n_charge, oddpos=2*tid+1 if n_charge%2 else None)
             tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
             product_tn |= tsr
         return product_tn
     
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
-    def get_amp(self, config, inplace=False, no_odd=False, conj=True, reverse=False):
+    def get_amp(self, config, inplace=False, conj=True, reverse=False):
         """Get the amplitude of a configuration in a PEPS."""
         peps = self if inplace else self.copy()
+        product_state = self.product_bra_state(config).conj() if conj else self.product_bra_state(config)
 
-        if no_odd:
-            # WARNING: if use oddpos is False, then the phase correction is not activated, so A*B might not be equal to B*A
-            # if parity(A) == parity(B) == 1, then A*B = -B*A
-            # However if one use oddpos to record the relative position of A and B, then A*B = B*A, the on-site contraction will be automatically phase corrected
-            for t in peps:
-                t.modify(data = t.data.copy_with(charge=0, oddpos=()))
-
-        if conj:
-            if reverse:
-                # not recommended
-                amp = self.product_bra_state(config, no_odd).conj()|peps # <n|--->---T---, generate a local parity phase (which is just a global -1 for odd-parity n as |n> either has 0 or 1 parity)
-            else:
-                amp = peps|self.product_bra_state(config, no_odd).conj()
+        if reverse:
+            # not recommended
+            amp = product_state|peps # <n|--->---T---, generate a local parity phase (which is just a global -1 for odd-parity n as |n> either has 0 or 1 parity)
         else:
-            if reverse:
-                # not recommended
-                amp = self.product_bra_state(config, no_odd)|peps
-            else:
-                amp = peps|self.product_bra_state(config, no_odd)
+            amp = peps|product_state # ---T---<---|n>
         
         for site in peps.sites:
             site_tag = peps.site_tag_id.format(*site)
@@ -68,17 +218,16 @@ class fPEPS(qtn.PEPS):
         )
         return amp
 
-
-def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0):
+def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=True):
     """Generate a random spinless fermionic square PEPS of shape (Lx, Ly)."""
 
     assert symmetry == 'Z2' or symmetry == 'U1', "Only Z2 and U1 symmetries are supported."
     
-    edges = qtn.edges_2d_square(Lx, Ly)
+    edges = qtn.edges_2d_square(Lx, Ly, cyclic=cyclic)
     site_info = sr.utils.parse_edges_to_site_info(
         edges,
         D,
-        phys_dim=2,
+        phys_dim=2 if spinless else 4,
         site_ind_id="k{},{}",
         site_tag_id="I{},{}",
     )
@@ -102,10 +251,21 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0):
         ]
         # physical index
         p = info['shape'][-1]
-        block_indices.append(
-            sr.BlockIndex({0: p // 2, 1: p // 2}, dual=info["duals"][-1])
-        )
-
+        if symmetry == 'Z2':
+            block_indices.append(
+                sr.BlockIndex({0: p // 2, 1: p // 2}, dual=info["duals"][-1])
+            )
+        elif symmetry == 'U1':
+            if spinless:
+                block_indices.append(
+                sr.BlockIndex({0: p // 2, 1: p // 2}, dual=info["duals"][-1])
+            )
+            else:
+                block_indices.append(
+                    sr.BlockIndex({0: p // 4, 1: p // 2, 2: p // 4}, dual=info["duals"][-1])
+                )
+        
+        # random fermionic array
         if symmetry == 'Z2':
             data = sr.Z2FermionicArray.random(
                 block_indices,
@@ -141,6 +301,7 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0):
         Ly=Ly,
     )
     peps = peps.copy() # set symmetry during initialization
+    assert peps.spinless == spinless
 
     return peps, parity_config
 
