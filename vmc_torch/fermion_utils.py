@@ -173,8 +173,8 @@ class fPEPS(qtn.PEPS):
                 index_map = {0:0, 1:1, 2:1, 3:2}
                 array_map = {
                     0: do('array',[1.0],like=backend), 
-                    1: do('array',[0.0, 1.0],like=backend), 
-                    2: do('array',[1.0, 0.0],like=backend), 
+                    1: do('array',[1.0, 0.0],like=backend), 
+                    2: do('array',[0.0, 1.0],like=backend), 
                     3: do('array',[1.0],like=backend)
                 }
 
@@ -186,22 +186,37 @@ class fPEPS(qtn.PEPS):
             n_charge = index_map[int(n)]
             n_array = array_map[int(n)]
 
-            tsr_data = sr.FermionicArray.from_blocks(blocks={(n_charge,):n_array}, duals=(True,),symmetry=self.symmetry, charge=n_charge, oddpos=2*tid+1 if n_charge%2 else None)
+            oddpos = None
+            if not self.spinless:
+                assert self.symmetry == 'U1', "Only U1 symmetry is supported for spinful fermions for now."
+                if int(n) == 1:
+                    oddpos = 2*self.nsites + 2*tid+1 # make sure the spin down oddpos is always larger than the spin up oddpos
+                elif int(n) == 2:
+                    oddpos = 2*tid+1
+                elif int(n) == 3:
+                    oddpos = (2*self.nsites + 2*tid+1, 2*tid+1)
+            else:
+                oddpos = 2*tid+1
+
+            tsr_data = sr.FermionicArray.from_blocks(
+                blocks={(n_charge,):n_array}, 
+                duals=(True,),
+                symmetry=self.symmetry, 
+                charge=n_charge, 
+                oddpos=oddpos
+            )
             tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
             product_tn |= tsr
+
         return product_tn
     
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
-    def get_amp(self, config, inplace=False, conj=True, reverse=False):
+    def get_amp(self, config, inplace=False, conj=True):
         """Get the amplitude of a configuration in a PEPS."""
         peps = self if inplace else self.copy()
         product_state = self.product_bra_state(config).conj() if conj else self.product_bra_state(config)
-
-        if reverse:
-            # not recommended
-            amp = product_state|peps # <n|--->---T---, generate a local parity phase (which is just a global -1 for odd-parity n as |n> either has 0 or 1 parity)
-        else:
-            amp = peps|product_state # ---T---<---|n>
+        
+        amp = peps|product_state # ---T---<---|n>
         
         for site in peps.sites:
             site_tag = peps.site_tag_id.format(*site)
@@ -306,27 +321,68 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
     return peps, parity_config
 
 
-def product_bra_state(config, peps, symmetry='Z2'):
-    """Spinless fermion product bra state."""
+def product_bra_state(psi, config, check=False):
     product_tn = qtn.TensorNetwork()
-    backend = peps.tensors[0].data.backend
-    iterable_oddpos = iter(range(2*peps.nsites+1))
-    for n, site in zip(config, peps.sites):
-        p_ind = peps.site_ind_id.format(*site)
-        p_tag = peps.site_tag_id.format(*site)
-        tid = peps.sites.index(site)
-        nsites = peps.nsites
-        # use autoray to ensure the correct backend is used
-        with ar.backend_like(backend):
-            if symmetry == 'Z2':
-                data = [sr.Z2FermionicArray.from_blocks(blocks={(0,):do('array', [1.0,], like=backend)}, duals=(True,),symmetry='Z2', charge=0, oddpos=2*tid+1), # It doesn't matter if oddpos is None for even parity tensor.
-                        sr.Z2FermionicArray.from_blocks(blocks={(1,):do('array', [1.0,], like=backend)}, duals=(True,),symmetry='Z2',charge=1, oddpos=2*tid+1)
-                    ]
-            elif symmetry == 'U1':
-                data = [sr.U1FermionicArray.from_blocks(blocks={(0,):do('array', [1.0,], like=backend)}, duals=(True,),symmetry='U1', charge=0, oddpos=2*tid+1),
-                        sr.U1FermionicArray.from_blocks(blocks={(1,):do('array', [1.0,], like=backend)}, duals=(True,),symmetry='U1', charge=1, oddpos=2*tid+1)
-                    ]
-        tsr_data = data[int(n)] # BUG: does not fit in jax compilation, a concrete value is needed for traced arrays
+    backend = psi.tensors[0].data.backend
+
+    if psi.spinless:
+        index_map = {0: 0, 1: 1}
+        array_map = {
+            0: do('array',[1.0],like=backend), 
+            1: do('array',[1.0],like=backend)
+        }
+    else:
+        if psi.symmetry == 'Z2':
+            index_map = {0:0, 1:1, 2:1, 3:0}
+            array_map = {
+                0: do('array',[1.0, 0.0],like=backend), 
+                1: do('array',[1.0, 0.0],like=backend), 
+                2: do('array',[0.0, 1.0],like=backend), 
+                3: do('array',[0.0, 1.0],like=backend)
+            }
+        elif psi.symmetry == 'U1':
+            index_map = {0:0, 1:1, 2:1, 3:2}
+            if check:
+                array_map = {
+                    0: do('array',[1.0],like=backend), 
+                    1: do('array',[0.0, 1.0],like=backend), 
+                    2: do('array',[1.0, 0.0],like=backend), 
+                    3: do('array',[1.0],like=backend)
+                }
+            else:
+                array_map = {
+                    0: do('array',[1.0],like=backend), 
+                    1: do('array',[1.0, 0.0],like=backend), 
+                    2: do('array',[0.0, 1.0],like=backend), 
+                    3: do('array',[1.0],like=backend)
+                }
+
+    for n, site in zip(config, psi.sites):
+        p_ind = psi.site_ind_id.format(*site)
+        p_tag = psi.site_tag_id.format(*site)
+        tid = psi.sites.index(site)
+
+        n_charge = index_map[int(n)]
+        n_array = array_map[int(n)]
+
+        oddpos = None
+        if not psi.spinless:
+            if int(n) == 1:
+                oddpos = psi.nsites*2 + 2*tid+1
+            elif int(n) == 2:
+                oddpos = 2*tid+1
+            elif int(n) == 3:
+                oddpos = (psi.nsites*2 + 2*tid+1, 2*tid+1)
+        else:
+            oddpos = 2*tid+1
+
+        tsr_data = sr.FermionicArray.from_blocks(
+            blocks={(n_charge,):n_array}, 
+            duals=(True,),
+            symmetry=psi.symmetry, 
+            charge=n_charge, 
+            oddpos=oddpos
+        )
         tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
         product_tn |= tsr
     return product_tn
