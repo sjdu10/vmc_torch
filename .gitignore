@@ -10,3 +10,5 @@ vmc_torch.egg-info/
 # Experiment
 experiment/experiment.md
 experiment/tn_model.py
+vmc_torch/fermion_utils.py
+vmc_torch/SU_run.py
