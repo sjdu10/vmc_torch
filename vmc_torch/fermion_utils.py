@@ -326,7 +326,7 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
 def product_bra_state(psi, config, check=False):
     product_tn = qtn.TensorNetwork()
     backend = psi.tensors[0].data.backend
-
+    dtype = eval(backend+'.'+psi.tensors[0].data.dtype)
     if psi.spinless:
         index_map = {0: 0, 1: 1}
         array_map = {
