@@ -1,6 +1,7 @@
 from autoray import numpy as np
 import symmray as sr
 import torch
+import numpy
 import quimb.tensor as qtn
 import autoray as ar
 from quimb.tensor.tensor_core import  *
@@ -145,6 +146,8 @@ from quimb.tensor.tensor_2d import Rotator2D, pairwise
 
 #     return peps, parity_config
 
+#------Amplitude Calculation------
+
 class fPEPS(qtn.PEPS):
     def __init__(self, arrays, *, shape="urdlp", tags=None, site_ind_id="k{},{}", site_tag_id="I{},{}", x_tag_id="X{}", y_tag_id="Y{}", **tn_opts):
         super().__init__(arrays, shape=shape, tags=tags, site_ind_id=site_ind_id, site_tag_id=site_tag_id, x_tag_id=x_tag_id, y_tag_id=y_tag_id, **tn_opts)
@@ -288,14 +291,14 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
                 block_indices,
                 charge=1 if parity_config[tid] else 0,
                 seed=rng,
-                oddpos=2*tid,
+                oddpos=3*tid,
             )
         elif symmetry == 'U1':
             data = sr.U1FermionicArray.random(
                 block_indices,
                 charge=1 if parity_config[tid] else 0,
                 seed=rng,
-                oddpos=2*tid,
+                oddpos=3*tid,
             )
 
         peps |= qtn.Tensor(
@@ -323,7 +326,7 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
     return peps, parity_config
 
 
-def product_bra_state(psi, config, check=False):
+def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
     product_tn = qtn.TensorNetwork()
     backend = psi.tensors[0].data.backend
     dtype = eval(backend+'.'+psi.tensors[0].data.dtype)
@@ -344,22 +347,16 @@ def product_bra_state(psi, config, check=False):
             }
         elif psi.symmetry == 'U1':
             index_map = {0:0, 1:1, 2:1, 3:2}
-            if check:
-                array_map = {
-                    0: do('array',[1.0],like=backend,dtype=dtype), 
-                    1: do('array',[0.0, 1.0],like=backend,dtype=dtype), 
-                    2: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
-                    3: do('array',[1.0],like=backend,dtype=dtype)
-                }
-            else:
-                array_map = {
-                    0: do('array',[1.0],like=backend,dtype=dtype), 
-                    1: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
-                    2: do('array',[0.0, 1.0],like=backend,dtype=dtype), 
-                    3: do('array',[1.0],like=backend,dtype=dtype)
-                }
+            array_map = {
+                0: do('array',[1.0],like=backend,dtype=dtype), 
+                1: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
+                2: do('array',[0.0, 1.0],like=backend,dtype=dtype), 
+                3: do('array',[1.0],like=backend,dtype=dtype)
+            }
 
-    for n, site in zip(config, psi.sites):
+    iter = zip(config, psi.sites) if not reverse else zip(config[::-1], psi.sites[::-1])
+
+    for n, site in iter:
         p_ind = psi.site_ind_id.format(*site)
         p_tag = psi.site_tag_id.format(*site)
         tid = psi.sites.index(site)
@@ -370,33 +367,61 @@ def product_bra_state(psi, config, check=False):
         oddpos = None
         if not psi.spinless:
             if int(n) == 1:
-                oddpos = psi.nsites*2 + 2*tid+1
+                oddpos = (3*tid+1)*(-1)**reverse
             elif int(n) == 2:
-                oddpos = 2*tid+1
+                oddpos = (3*tid+2)*(-1)**reverse
             elif int(n) == 3:
-                oddpos = (psi.nsites*2 + 2*tid+1, 2*tid+1)
+                # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
+                oddpos = None
         else:
-            oddpos = 2*tid+1
-
+            oddpos = (3*tid+1)*(-1)**reverse
+        
         tsr_data = sr.FermionicArray.from_blocks(
             blocks={(n_charge,):n_array}, 
-            duals=(True,),
+            duals=(dualness,),
             symmetry=psi.symmetry, 
             charge=n_charge, 
             oddpos=oddpos
         )
-        tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
+        if check:
+            if int(n)==0:
+                blocks = {(0,): do('array',[1.0],like=backend,dtype=dtype), (1,): do('array',[0.0, 0.0],like=backend,dtype=dtype), (2,):do('array',[0.0],like=backend,dtype=dtype)}
+            elif int(n)==1:
+                blocks = {(0,): do('array',[0.0],like=backend,dtype=dtype), (1,): do('array',[1.0, 0.0],like=backend,dtype=dtype), (2,):do('array',[0.0],like=backend,dtype=dtype)}
+            elif int(n)==2:
+                blocks = {(0,): do('array',[0.0],like=backend,dtype=dtype), (1,): do('array',[0.0, 1.0],like=backend,dtype=dtype), (2,):do('array',[0.0],like=backend,dtype=dtype)}
+            elif int(n)==3:
+                blocks = {(0,): do('array',[0.0],like=backend,dtype=dtype), (1,): do('array',[0.0, 0.0],like=backend,dtype=dtype), (2,):do('array',[1.0],like=backend,dtype=dtype)}
+            tsr_data = sr.FermionicArray.from_blocks(
+                blocks=blocks, 
+                duals=(dualness,),
+                symmetry=psi.symmetry, 
+                charge=n_charge, 
+                oddpos=oddpos
+            )
+        tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra', f'X{site[0]}', f'Y{site[1]}'))
         product_tn |= tsr
+
+    product_tn.view_as_(
+        qtn.PEPS,
+        site_ind_id="k{},{}",
+        site_tag_id="I{},{}",
+        x_tag_id="X{}",
+        y_tag_id="Y{}",
+        Lx=psi.Lx,
+        Ly=psi.Ly,
+    )
+
     return product_tn
 
-def get_amp(peps, config, inplace=False, symmetry='Z2', conj=False):
+def get_amp(peps, config, inplace=False, symmetry='Z2', conj=True):
     """Get the amplitude of a configuration in a PEPS."""
     if not inplace:
         peps = peps.copy()
-    if conj:
-        amp = peps|product_bra_state(config, peps, symmetry).conj()
-    else:
-        amp = peps|product_bra_state(config, peps, symmetry)
+    bra = product_bra_state(peps, config, reverse=True, dualness=True) if conj else product_bra_state(peps, config, reverse=False, dualness=False)
+
+    amp = bra|peps
+    
     for site in peps.sites:
         site_tag = peps.site_tag_id.format(*site)
         amp.contract_(tags=site_tag)
@@ -412,24 +437,103 @@ def get_amp(peps, config, inplace=False, symmetry='Z2', conj=False):
     )
     return amp
 
-def from_netket_config_to_quimb_config(netket_config):
-    """Translate netket spin-1/2 config to tensor network product state config"""
-    total_sites = len(netket_config)//2
-    spin_up = netket_config[:total_sites]
-    spin_down = netket_config[total_sites:]
-    sum_spin = spin_up + spin_down
-    quimb_config = np.zeros(total_sites, dtype=int)
+# --- Utils for calculating global phase on product states ---
+def get_spinful_parity_map():
+    return {0:0, 1:1, 2:1, 3:0}
+
+def from_netket_config_to_quimb_config(netket_configs):
+    def func(netket_config):
+        """Translate netket spin-1/2 config to tensor network product state config"""
+        total_sites = len(netket_config)//2
+        spin_up = netket_config[:total_sites]
+        spin_down = netket_config[total_sites:]
+        sum_spin = spin_up + spin_down
+        quimb_config = np.zeros(total_sites, dtype=int)
+        for i in range(total_sites):
+            if sum_spin[i] == 0:
+                quimb_config[i] = 0
+            if sum_spin[i] == 2:
+                quimb_config[i] = 3
+            if sum_spin[i] == 1:
+                if spin_down[i] == 1:
+                    quimb_config[i] = 1
+                else:
+                    quimb_config[i] = 2
+        return quimb_config
+    if len(netket_configs.shape) == 1:
+        return func(netket_configs)
+    else:
+        # batched
+        return np.array([func(netket_config) for netket_config in netket_configs])
+
+def from_quimb_config_to_netket_config(quimb_config):
+    """Translate tensor network product state config to netket spin-1/2 config"""
+    total_sites = len(quimb_config)
+    spin_up = np.zeros(total_sites, dtype=int)
+    spin_down = np.zeros(total_sites, dtype=int)
     for i in range(total_sites):
-        if sum_spin[i] == 0:
-            quimb_config[i] = 0
-        if sum_spin[i] == 2:
-            quimb_config[i] = 3
-        if sum_spin[i] == 1:
-            if spin_down[i] == 1:
-                quimb_config[i] = 1
-            else:
-                quimb_config[i] = 2
-    return quimb_config
+        if quimb_config[i] == 0:
+            spin_up[i] = 0
+            spin_down[i] = 0
+        if quimb_config[i] == 1:
+            spin_up[i] = 0
+            spin_down[i] = 1
+        if quimb_config[i] == 2:
+            spin_up[i] = 1
+            spin_down[i] = 0
+        if quimb_config[i] == 3:
+            spin_up[i] = 1
+            spin_down[i] = 1
+    return np.concatenate((spin_up, spin_down))
+
+def detect_hopping(configi, configj):
+    site_ls =  (configi-configj).nonzero()[0]
+    if len(site_ls) == 2:
+        return site_ls
+    else:
+        return None
+
+def calc_phase_netket(configi, configj):
+    """Calculate the phase factor for the matrix element in the netket basis, where all spin-up spins are placed before all spin-down spins"""
+    hopping = detect_hopping(configi, configj)
+    if hopping is not None:
+        netket_config_i = from_quimb_config_to_netket_config(configi)
+        netket_config_j = from_quimb_config_to_netket_config(configj)
+        netket_site_i, netket_site_j = (netket_config_i - netket_config_j).nonzero()[0]
+        phase = (-1)**(sum(netket_config_i[netket_site_i+1:netket_site_j])%2)
+        return phase
+    else:
+        return 1
+
+def calc_phase_symmray(configi, configj):
+    """Calculate the operator matrix element phase in symmray, assuming local basis convention for spinful fermion is (|up, down>).
+    Globally, this convention gives a staggered spin configuration (|+-+-+-+->) when the configuration is flattened to 1D."""
+    hopping = detect_hopping(configi, configj)
+    if hopping is not None:
+        netket_config_i = from_quimb_config_to_netket_config(configi)
+        netket_config_j = from_quimb_config_to_netket_config(configj)
+        config_i_spin_up =netket_config_i[:len(netket_config_i)//2]
+        config_i_spin_down =netket_config_i[len(netket_config_i)//2:]
+        config_j_spin_up =netket_config_j[:len(netket_config_j)//2]
+        config_j_spin_down =netket_config_j[len(netket_config_j)//2:]
+        symmray_config_i = tuple()
+        symmray_config_j = tuple()
+        for i in range(len(config_i_spin_up)):
+            symmray_config_i += (config_i_spin_up[i], config_i_spin_down[i])
+            symmray_config_j += (config_j_spin_up[i], config_j_spin_down[i])
+        symmray_site_i, symmray_site_j = (np.asarray(symmray_config_i) - np.asarray(symmray_config_j)).nonzero()[0]
+        phase = (-1)**(sum(symmray_config_i[symmray_site_i+1:symmray_site_j])%2)
+        return phase
+    else:
+        return 1
+
+def calc_phase_correction_netket_symmray(configi, configj):
+    phase_netket = calc_phase_netket(configi, configj)
+    phase_symmray = calc_phase_symmray(configi, configj)
+    return phase_netket/phase_symmray
+
+
+#------projector insertion------
 
 def _dual_reverse_array(array, inplace=False):
     """Reverse the dualness of all the indices of an AbelianArray. 

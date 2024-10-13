@@ -44,7 +44,7 @@ Ly = int(4)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
-N_f = int(Lx*Ly/2)
+N_f = int(Lx*Ly)
 H, hi, graph = square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f)
 
 # TN parameters
@@ -64,20 +64,20 @@ N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fTNModel(peps, max_bond=chi)
+# model = fTNModel(peps, max_bond=chi)
 # model = fTN_NNiso_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
 # model = fTN_NN_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
-# model = fTN_Transformer_Model(
-#     peps, 
-#     max_bond=chi, 
-#     nn_eta=1e-3, 
-#     d_model=8, 
-#     nhead=2, 
-#     num_encoder_layers=2, 
-#     num_decoder_layers=2,
-#     dim_feedforward=32,
-#     dropout=0.0,
-# )
+model = fTN_Transformer_Model(
+    peps, 
+    max_bond=chi, 
+    nn_eta=1e-3, 
+    d_model=8, 
+    nhead=2, 
+    num_encoder_layers=2, 
+    num_decoder_layers=2,
+    dim_feedforward=32,
+    dropout=0.0,
+)
 # model = SlaterDeterminant(hi)
 # model=NeuralBackflow(hi, param_dtype=dtype, hidden_dim=hi.size)
 # model = NeuralJastrow(hi, param_dtype=dtype, hidden_dim=hi.size)
