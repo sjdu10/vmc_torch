@@ -239,7 +239,7 @@ class fPEPS(qtn.PEPS):
         return amp
 
 def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=True):
-    """Generate a random spinless fermionic square PEPS of shape (Lx, Ly)."""
+    """Generate a random spinless/spinful fermionic square PEPS of shape (Lx, Ly)."""
 
     assert symmetry == 'Z2' or symmetry == 'U1', "Only Z2 and U1 symmetries are supported."
     
@@ -254,13 +254,21 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
 
     peps = qtn.TensorNetwork()
     rng = np.random.default_rng(seed)
-    parity_config = np.zeros(Lx*Ly, dtype=int)
+    charge_config = np.zeros(Lx*Ly, dtype=int)
 
     # generate a random binary string with Nf ones in it
     if symmetry == 'U1':
-        parity_config = np.zeros(Lx*Ly, dtype=int)
-        parity_config[:Nf] = 1
-        rng.shuffle(parity_config)
+        if spinless:
+            charge_config[:Nf] = 1
+            rng.shuffle(charge_config)
+        else:
+            charge_config_netket = from_quimb_config_to_netket_config(charge_config)
+            charge_config_netket[:Nf] = 1
+            rng.shuffle(charge_config_netket)
+            charge_config = from_spinful_ind_to_charge(from_netket_config_to_quimb_config(charge_config_netket))
+
+    elif symmetry == 'Z2':
+        parity_config = charge_config
 
     for site, info in sorted(site_info.items()):
         tid = site[0] * Ly + site[1]
@@ -296,7 +304,7 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
         elif symmetry == 'U1':
             data = sr.U1FermionicArray.random(
                 block_indices,
-                charge=1 if parity_config[tid] else 0,
+                charge=charge_config[tid],
                 seed=rng,
                 oddpos=3*tid,
             )
@@ -323,7 +331,7 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
     peps = peps.copy() # set symmetry during initialization
     assert peps.spinless == spinless
 
-    return peps, parity_config
+    return peps, charge_config
 
 
 def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
@@ -438,8 +446,16 @@ def get_amp(peps, config, inplace=False, symmetry='Z2', conj=True):
     return amp
 
 # --- Utils for calculating global phase on product states ---
+
 def get_spinful_parity_map():
     return {0:0, 1:1, 2:1, 3:0}
+
+def get_spinful_charge_map():
+    return {0:0, 1:1, 2:1, 3:2}
+
+def from_spinful_ind_to_charge(config):
+    charge_map = get_spinful_charge_map()
+    return np.array([charge_map[n] for n in config])
 
 def from_netket_config_to_quimb_config(netket_configs):
     def func(netket_config):
@@ -507,7 +523,7 @@ def calc_phase_netket(configi, configj):
 
 def calc_phase_symmray(configi, configj):
     """Calculate the operator matrix element phase in symmray, assuming local basis convention for spinful fermion is (|up, down>).
-    Globally, this convention gives a staggered spin configuration (|+-+-+-+->) when the configuration is flattened to 1D."""
+    Globally, this convention gives a staggered spin configuration (|dududu...>) when the configuration is flattened to 1D."""
     hopping = detect_hopping(configi, configj)
     if hopping is not None:
         netket_config_i = from_quimb_config_to_netket_config(configi)
@@ -519,8 +535,8 @@ def calc_phase_symmray(configi, configj):
         symmray_config_i = tuple()
         symmray_config_j = tuple()
         for i in range(len(config_i_spin_up)):
-            symmray_config_i += (config_i_spin_up[i], config_i_spin_down[i])
-            symmray_config_j += (config_j_spin_up[i], config_j_spin_down[i])
+            symmray_config_i += (config_i_spin_down[i], config_i_spin_up[i])
+            symmray_config_j += (config_j_spin_down[i], config_j_spin_up[i])
         symmray_site_i, symmray_site_j = (np.asarray(symmray_config_i) - np.asarray(symmray_config_j)).nonzero()[0]
         phase = (-1)**(sum(symmray_config_i[symmray_site_i+1:symmray_site_j])%2)
         return phase

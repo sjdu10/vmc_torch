@@ -8,6 +8,7 @@ from netket.experimental.operator.fermion import destroy as c
 from netket.experimental.operator.fermion import create as cdag
 from netket.experimental.operator.fermion import number as nc
 
+
 # Currently we borrow the Hamiltonian objects from the netket library.
 
 def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc=False):
