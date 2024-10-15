@@ -195,13 +195,14 @@ class fPEPS(qtn.PEPS):
             if not self.spinless:
                 assert self.symmetry == 'U1', "Only U1 symmetry is supported for spinful fermions for now."
                 if int(n) == 1:
-                    oddpos = 2*self.nsites + 2*tid+1 # make sure the spin down oddpos is always larger than the spin up oddpos
+                    oddpos = (3*tid+1)*(-1)#**reverse
                 elif int(n) == 2:
-                    oddpos = 2*tid+1
+                    oddpos = (3*tid+2)*(-1)#**reverse
                 elif int(n) == 3:
-                    oddpos = (2*self.nsites + 2*tid+1, 2*tid+1)
+                    # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
+                    oddpos = None
             else:
-                oddpos = 2*tid+1
+                oddpos = (3*tid+1)*(-1)
 
             tsr_data = sr.FermionicArray.from_blocks(
                 blocks={(n_charge,):n_array}, 
@@ -304,7 +305,7 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
         elif symmetry == 'U1':
             data = sr.U1FermionicArray.random(
                 block_indices,
-                charge=charge_config[tid],
+                charge=int(charge_config[tid]),
                 seed=rng,
                 oddpos=3*tid,
             )
@@ -375,14 +376,14 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
         oddpos = None
         if not psi.spinless:
             if int(n) == 1:
-                oddpos = (3*tid+1)*(-1)**reverse
+                oddpos = (3*tid+1)*(-1)
             elif int(n) == 2:
-                oddpos = (3*tid+2)*(-1)**reverse
+                oddpos = (3*tid+2)*(-1)
             elif int(n) == 3:
                 # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
                 oddpos = None
         else:
-            oddpos = (3*tid+1)*(-1)**reverse
+            oddpos = (3*tid+1)*(-1)
         
         tsr_data = sr.FermionicArray.from_blocks(
             blocks={(n_charge,):n_array}, 
@@ -391,6 +392,7 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
             charge=n_charge, 
             oddpos=oddpos
         )
+        
         if check:
             if int(n)==0:
                 blocks = {(0,): do('array',[1.0],like=backend,dtype=dtype), (1,): do('array',[0.0, 0.0],like=backend,dtype=dtype), (2,):do('array',[0.0],like=backend,dtype=dtype)}
@@ -407,6 +409,7 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
                 charge=n_charge, 
                 oddpos=oddpos
             )
+        
         tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra', f'X{site[0]}', f'Y{site[1]}'))
         product_tn |= tsr
 
@@ -426,7 +429,7 @@ def get_amp(peps, config, inplace=False, symmetry='Z2', conj=True):
     """Get the amplitude of a configuration in a PEPS."""
     if not inplace:
         peps = peps.copy()
-    bra = product_bra_state(peps, config, reverse=True, dualness=True) if conj else product_bra_state(peps, config, reverse=False, dualness=False)
+    bra = product_bra_state(peps, config, dualness=False).conj() if conj else product_bra_state(peps, config, dualness=False)
 
     amp = bra|peps
     
@@ -503,7 +506,8 @@ def from_quimb_config_to_netket_config(quimb_config):
     return np.concatenate((spin_up, spin_down))
 
 def detect_hopping(configi, configj):
-    site_ls =  (configi-configj).nonzero()[0]
+    """Detect the hopping between two configurations"""
+    site_ls = np.asarray(configi-configj).nonzero()[0]
     if len(site_ls) == 2:
         return site_ls
     else:

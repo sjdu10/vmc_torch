@@ -24,7 +24,7 @@ from vmc_torch.sampler import MetropolisExchangeSamplerSpinless
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import square_lattice_spinless_Fermi_Hubbard
+from vmc_torch.hamiltonian import square_lattice_spinless_Fermi_Hubbard, spinful_Fermi_Hubbard_square_lattice, spinless_Fermi_Hubbard_square_lattice
 from vmc_torch.torch_utils import SVD,QR
 
 # Register safe SVD and QR functions to torch
@@ -45,7 +45,8 @@ symmetry = 'Z2'
 t = 1.0
 V = 1.0
 N_f = int(Lx*Ly/2)-2
-H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f)
+# H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f)
+H = spinless_Fermi_Hubbard_square_lattice(Lx, Ly, t, V, N_f)
 
 # TN parameters
 D = 4
@@ -111,9 +112,9 @@ if init_step != 0:
 
 # optimizer = SignedSGD(learning_rate=0.05)
 optimizer = SGD(learning_rate=0.05)
-sampler = MetropolisExchangeSamplerSpinless(hi, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=True, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinless(H.hi, H.graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=True, dtype=dtype)
 # sampler = None
-variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
+variational_state = Variational_State(model, hi=H.hi, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.05, iter_step=1e5, dtype=dtype)
 # preconditioner = TrivialPreconditioner()
 vmc = VMC(H, variational_state, optimizer, preconditioner)

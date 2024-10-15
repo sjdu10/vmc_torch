@@ -11,7 +11,7 @@ np.set_printoptions(suppress=True,precision=6,linewidth=100)
 
 class VMC:
     """
-    NOTE: At current stage, we consider only a 2D hamiltonianiltonian defined on a square lattice as the object function.
+    NOTE: At current stage, we consider only a 2D hamiltoniann defined on a square lattice as the object function.
     1. Perform MC sampling from a parameterized probability distribution
     2. Compute the object function and quantities of interest (e.g. energy, gradient, etc.)
     3. Optimize the parameters of the probability distribution with respect to the object function using certain optimization algorithms

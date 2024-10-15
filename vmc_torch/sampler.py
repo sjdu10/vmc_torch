@@ -154,15 +154,8 @@ class MetropolisExchangeSampler(Sampler):
             psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
 
             # compute the connected non-zero operator matrix elements <eta|O|sigma>
-            if self.spin is None:
-                eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
-                psi_eta = vstate.amplitude(eta)
-            else:
-                assert self.spin == 0.5, "Only support spin 1/2 for now."
-                sigma_netket = from_quimb_config_to_netket_config(sigma.numpy())
-                eta_netket, O_etasigma = op.get_conn(sigma_netket) # Non-zero matrix elements and corresponding configurations
-                eta = from_netket_config_to_quimb_config(eta_netket)
-                psi_eta = vstate.amplitude(eta)
+            eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
+            psi_eta = vstate.amplitude(eta)
 
             # convert torch tensors to numpy arrays
             psi_sigma = psi_sigma.detach().numpy()
