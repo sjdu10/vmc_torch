@@ -18,8 +18,8 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from experiment.tn_model import fTNModel, fTN_NNiso_Model, fTN_NN_Model, fTN_Transformer_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
-from experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
+from vmc_torch.experiment.tn_model import fTNModel, fTN_NNiso_Model, fTN_NN_Model, fTN_Transformer_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
+from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinless, MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR

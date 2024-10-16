@@ -18,7 +18,7 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from experiment.tn_model import PEPS_model, PEPS_NN_Model, init_weights_to_zero, PEPS_NNproj_Model
+from vmc_torch.experiment.tn_model import PEPS_model, PEPS_NN_Model, init_weights_to_zero, PEPS_NNproj_Model
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinless, MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
@@ -45,7 +45,7 @@ H = spin_Heisenberg_square_lattice(L, J, total_sz=0.0)
 graph = H.graph
 # TN parameters
 D = 2
-chi = -1
+chi = 2
 dtype=torch.float64
 
 # Load PEPS
