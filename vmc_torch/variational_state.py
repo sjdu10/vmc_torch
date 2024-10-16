@@ -205,13 +205,16 @@ class Variational_State:
             sub_chain_num = 2*SIZE
             B = sub_chain_length * np.var(chain_means, ddof=1)
             W = W_sum/sub_chain_num
+
             # sampling variability correction of the sample mean
             mean_correction = B/(sub_chain_length * sub_chain_num)
+
             # estimated variance: V\hat
             V_hat = (sub_chain_length - 1)/sub_chain_length * W + B/sub_chain_length# + mean_correction
             R_hat = np.sqrt(V_hat/W)
             print('R_hat: {}'.format(R_hat))
             print('V_hat:{}, OP_var:{}'.format(V_hat, op_var))
+
             if DEBUG:
                 print('logamp_grad_matrix shape: {}'.format(self.logamp_grad_matrix.shape))
                 # each logamp_grad is a long vector as (10000,)
@@ -221,9 +224,9 @@ class Variational_State:
             op_grad = op_logamp_grad_product - op_expect*mean_logamp_grad
             # is forming the whole list too memory consuming?
 
-            op_err = np.sqrt(op_var/self.Ns)
+            op_mean_err = np.sqrt(op_var/self.Ns) # standard error of the mean value of the local op
 
-            return op_expect, op_grad, op_var, op_err
+            return op_expect, op_grad, op_var, op_mean_err
         
         else:
             return None, None, None, None

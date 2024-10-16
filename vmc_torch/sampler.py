@@ -78,18 +78,12 @@ class Sampler:
         self.dtype = dtype
         self.initial_config = None
         self.current_config = None
-        self.spin = hi.spin
         self.reset()
     
     def reset(self):
         """Reset the current sampler configuration to a random config in the Hilbert space."""
         rand_int = random.randint(0, 2**32-1)
-        if self.spin is None:
-            self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=self.dtype)
-        else:
-            assert self.spin == 0.5, "Only support spin 1/2 for now."
-            config = from_netket_config_to_quimb_config(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))))
-            self.initial_config = torch.tensor(config, dtype=self.dtype)
+        self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=self.dtype)
         self.current_config = self.initial_config.clone()
 
     def _sample_next(self, vstate_func):
@@ -120,7 +114,11 @@ class MetropolisExchangeSampler(Sampler):
     
     def sample(self, op, vstate, chain_length=1):
         """Sample the local energy and amplitude gradient for each configuration."""
+        if RANK == 0:
+            print('Burn-in starts on rank 0...')
         self.burn_in(vstate)
+        if RANK == 0:
+            print('Burn-in ends on rank 0...')
 
         op_loc_sum = 0
         logpsi_sigma_grad_sum = np.zeros(vstate.Np)
@@ -194,14 +192,14 @@ class MetropolisExchangeSampler(Sampler):
             pbar.close()
         
         # The following is for computing the Rhat diagnostic using the Gelman-Rubin formula
+
         # Step 1：split the chain in half and compute the within chain variance
         split_chains = np.split(op_loc_vec, 2)
         # Step 2: compute the within chain variance
-        W_loc = np.mean([np.var(split_chain) for split_chain in split_chains])
+        W_loc = np.sum([np.var(split_chain) for split_chain in split_chains])
         chain_means_loc = [np.mean(split_chain) for split_chain in split_chains]
 
         samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
-
         return samples
 
 
@@ -238,7 +236,7 @@ class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
             if random.random() < acceptance_ratio:
                 self.current_config = proposed_config
                 current_prob = proposed_prob
-            
+
         return self.current_config
     
 class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):

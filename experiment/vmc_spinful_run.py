@@ -45,8 +45,9 @@ symmetry = 'U1'
 t = 1.0
 U = 8.0
 N_f = int(Lx*Ly)
+n_fermions_per_spin = (N_f//2, N_f//2)
 # H, hi, graph = square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f)
-H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f)
+H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, n_fermions_per_spin)
 graph = H.graph
 # TN parameters
 D = 4
