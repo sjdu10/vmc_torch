@@ -18,7 +18,7 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from experiment.tn_model import PEPS_model, PEPS_NN_Model
+from experiment.tn_model import PEPS_model, PEPS_NN_Model, init_weights_to_zero, PEPS_NNproj_Model
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinless, MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
@@ -55,16 +55,19 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = 2**9
+N_samples = 2**11
 N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = PEPS_model(peps, max_bond=None)
-model = PEPS_NN_Model(peps, max_bond=chi)
+# model = PEPS_NN_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=L**2)
+model = PEPS_NNproj_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=L**2)
+model.apply(init_weights_to_zero)
 model_names = {
     PEPS_model: 'PEPS',
-    PEPS_NN_Model: 'PEPS_NN'
+    PEPS_NN_Model: 'PEPS_NN',
+    PEPS_NNproj_Model: 'PEPS_NNproj'
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
@@ -81,7 +84,7 @@ if init_step != 0:
 
 # optimizer = SignedSGD(learning_rate=0.05)
 optimizer = SGD(learning_rate=0.05)
-sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=50, reset_chain=False, random_edge=True, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=True, dtype=dtype)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.05, iter_step=1e5, dtype=dtype)
 vmc = VMC(H, variational_state, optimizer, preconditioner)

@@ -331,6 +331,134 @@ class PEPS_NN_Model(torch.nn.Module):
             return torch.stack([func(xi) for xi in x])
 
 
+class PEPS_NNproj_Model(torch.nn.Module):
+    def __init__(self, peps, max_bond=None, nn_hidden_dim=64, nn_eta=1e-3, activation='ReLU', param_dtype=torch.float32):
+        super().__init__()
+        self.peps = peps
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.param_dtype = param_dtype
+        self.model_structure = {
+            'PEPS':{'D': peps.max_bond(), 'Lx': peps.Lx, 'Ly': peps.Ly, 'nn_hidden_dim': nn_hidden_dim, 'nn_eta': nn_eta, 'max_bond': max_bond, 'NN': '2LayerMLP', 'Activation': activation},
+        }
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(peps)
+
+        self.torch_tn_params = {
+            str(tid): nn.Parameter(data)  # Convert Tensor to Parameter
+            for tid, data in params.items()
+        }
+        # register the torch tensors as parameters
+        for tid, param in self.torch_tn_params.items():
+            self.register_parameter(tid, param)
+        
+        dummy_config = torch.zeros(peps.nsites)
+        dummy_tn_amp = peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(dummy_config)})
+        dummy_tn_w_proj = dummy_tn_amp.contract_boundary_from(
+            xrange=None, 
+            yrange=(0,peps.Ly-2), 
+            max_bond=self.max_bond,
+            cutoff=0.0, 
+            from_which='ymin',
+            mode='projector2d',
+            lazy=True, 
+            new_tags=['proj'],
+            )
+        dummy_tn, proj_tn = dummy_tn_w_proj.partition(tags='proj')
+        proj_params, proj_skeleton = qtn.pack(proj_tn)
+        proj_params_vec = self.from_tn_params_to_vec(proj_params)
+        self.proj_params_vec_len = len(proj_params_vec)
+        self.proj_params_example = proj_params
+
+        # Define an MLP layer (or any other neural network layers)
+        activation_func = getattr(nn, activation)
+        self.mlp = nn.Sequential(
+            nn.Linear(peps.nsites, nn_hidden_dim),
+            activation_func(),
+            nn.Linear(nn_hidden_dim, self.proj_params_vec_len)
+        )
+        self.nn_eta = nn_eta
+    
+    def from_tn_params_to_vec(self, tn_params):
+        return torch.cat([param.flatten() for param in tn_params.values()])
+    
+    def from_vec_to_tn_params(self, vec, tn_params_example):
+        pointer = 0
+        new_tn_params = {}
+        for tid, param in tn_params_example.items():
+            num_param = param.numel()
+            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
+            new_tn_params[tid] = new_param_values
+            pointer += num_param
+        return new_tn_params
+    
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    def load_params(self, vec):
+        pointer = 0
+        for param in self.parameters():
+            num_param = param.numel()
+            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            param.grad = None
+    
+    def forward(self, x):
+        if x.ndim == 1:
+            # If input is not batched, add a batch dimension
+            x = x.unsqueeze(0)
+        return self.amplitude(x)
+    
+    def amplitude(self, x):
+        params ={
+            int(tid): data
+            for tid, data in self.torch_tn_params.items()
+        }
+
+        peps = qtn.unpack(params, self.skeleton)
+        def func(xi):
+            tn_amp = peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)})
+            tn_w_proj = tn_amp.contract_boundary_from(
+                xrange=None,
+                yrange=(0,peps.Ly-2),
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                from_which='ymin',
+                mode='projector2d',
+                lazy=True,
+                new_tags=['proj'],
+            )
+            tn, proj_tn = tn_w_proj.partition(tags='proj')
+            proj_params, proj_skeleton = qtn.pack(proj_tn)
+            proj_params_vec = self.from_tn_params_to_vec(proj_params)
+            if type(xi) is not torch.Tensor:
+                xi = torch.tensor(xi, dtype=self.param_dtype)
+            proj_params_vec = proj_params_vec + self.mlp(xi)*self.nn_eta
+            new_proj_params = self.from_vec_to_tn_params(proj_params_vec, self.proj_params_example)
+            new_proj_tn = qtn.unpack(new_proj_params, proj_skeleton)
+            new_tn_w_proj = tn | new_proj_tn
+            return new_tn_w_proj.contract()
+        
+        if x.ndim == 1:
+            return func(x)
+        else:
+            return torch.stack([func(xi) for xi in x])
+
+
 class fTN_NNiso_Model(torch.nn.Module):
     
     def __init__(self, ftn, max_bond, nn_hidden_dim=64, nn_eta=1e-3, param_dtype=torch.float32):
