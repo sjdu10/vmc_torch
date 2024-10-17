@@ -19,6 +19,7 @@ class Hilbert:
     
     @property
     def hi(self):
+        """Netket Hilbert space"""
         return self._hi
     
     @property
@@ -58,9 +59,10 @@ class SpinlessFermion(Hilbert):
 
 class SpinfulFermion(Hilbert):
     def __init__(self, n_orbitals, n_fermions, n_fermions_per_spin=None):
-        if n_fermions_per_spin == (None, None):
-            n_fermions_per_spin = None
-        hi = nkx.hilbert.SpinOrbitalFermions(n_orbitals, s=1/2, n_fermions=n_fermions, n_fermions_per_spin=n_fermions_per_spin)
+        if n_fermions_per_spin is None:
+            hi = nkx.hilbert.SpinOrbitalFermions(n_orbitals, s=1/2, n_fermions=n_fermions)
+        else:
+            hi = nkx.hilbert.SpinOrbitalFermions(n_orbitals, s=1/2, n_fermions_per_spin=n_fermions_per_spin)
         super().__init__(hi)
     
     def to_quimb_config(self, config):
@@ -104,10 +106,12 @@ class Hamiltonian:
     
     @property
     def hi(self):
+        """Netket Hilbert space"""
         return self._hi
     
     @property
     def hilbert(self):
+        """Customized Hilbert space"""
         raise NotImplementedError
     
     @property
@@ -170,7 +174,7 @@ class spinless_Fermi_Hubbard_square_lattice(Hamiltonian):
     def __init__(self, Lx, Ly, t, V, N_f, pbc=False):
         H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc)
         super().__init__(H, hi, graph)
-        self._hilbert = SpinlessFermion(self.hi.size, self.hi.n_fermions)
+        self._hilbert = SpinlessFermion(self.hi.n_orbitals, self.hi.n_fermions)
     
     @property
     def hilbert(self):
@@ -184,7 +188,7 @@ class spinful_Fermi_Hubbard_square_lattice(Hamiltonian):
     def __init__(self, Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None):
         H, hi, graph = square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc, n_fermions_per_spin)
         super().__init__(H, hi, graph)
-        self._hilbert = SpinfulFermion(self.hi.size, self.hi.n_fermions, self.hi.n_fermions_per_spin)
+        self._hilbert = SpinfulFermion(hi.n_orbitals, hi.n_fermions, hi.n_fermions_per_spin)
     
     @property
     def hilbert(self):

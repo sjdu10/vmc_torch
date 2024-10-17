@@ -1,6 +1,6 @@
 import numpy as np
 from mpi4py import MPI
-from .global_var import DEBUG, set_debug
+from .global_var import DEBUG, set_debug, TIME_PROFILING
 import torch
 import json
 
