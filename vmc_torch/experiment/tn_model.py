@@ -462,6 +462,105 @@ class PEPS_NNproj_Model(torch.nn.Module):
         else:
             return torch.stack([func(xi) for xi in x])
 
+class PEPS_delocalized_Model(torch.nn.Module):
+    def __init__(self, peps, max_bond=None):
+        super().__init__()
+        dpeps = self.delocalize_in_cross(peps)
+        self.peps = dpeps
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.model_structure = {
+            'PEPS_delocalized':{'D': self.peps.max_bond(), 'Lx': self.peps.Lx, 'Ly': self.peps.Ly},
+        }
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(self.peps)
+
+        self.torch_tn_params = {
+            str(tid): nn.Parameter(data)  # Convert Tensor to Parameter
+            for tid, data in params.items()
+        }
+        # register the torch tensors as parameters
+        for tid, param in self.torch_tn_params.items():
+            self.register_parameter(tid, param)
+        
+    
+    def delocalize_in_cross(self, peps):
+
+        peps = peps.copy()
+
+        for (i, j) in peps.sites:
+            t = peps[i, j]
+
+            for neighbor in [
+                (i + 1, j),
+                (i - 1, j),
+                (i, j + 1),
+                (i, j - 1),
+            ]:
+                if peps.valid_coo(neighbor):
+                    t.new_ind(peps.site_ind(neighbor), mode="repeat", size=peps.phys_dim())
+
+        return peps
+    
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    def load_params(self, vec):
+        pointer = 0
+        for param in self.parameters():
+            num_param = param.numel()
+            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+    
+    def from_vec_to_params(self, vec):
+        # XXX: useful at all?
+        pointer = 0
+        new_params = {}
+        for tid, param in self.torch_tn_params.items():
+            num_param = param.numel()
+            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
+            new_params[tid] = new_param_values
+            pointer += num_param
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            param.grad = None
+    
+    def amplitude(self, x):
+        # update self.PEPS
+        params ={
+            int(tid): data
+            for tid, data in self.torch_tn_params.items()
+        }
+        peps = qtn.unpack(params, self.skeleton)
+        def func(xi):
+            if self.max_bond is None:
+                return peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)}).contract()
+            else:
+                return peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)}).contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, peps.Ly-2]).contract()
+        
+        if x.ndim == 1:
+            return func(x)
+        else:
+            return torch.stack([func(xi) for xi in x])
+    
+    def forward(self, x):
+        if x.ndim == 1:
+            # If input is not batched, add a batch dimension
+            x = x.unsqueeze(0)
+        return self.amplitude(x)
+
 
 class fTN_NNiso_Model(torch.nn.Module):
     
