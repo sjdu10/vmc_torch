@@ -118,13 +118,11 @@ class MetropolisExchangeSampler(Sampler):
         if RANK == 0:
             print('Burn-in...')
             t_burnin0 = time.time()
-        with pyinstrument.Profiler() as prof:
-            self.burn_in(vstate)
+        self.burn_in(vstate)
         if RANK == 0:
             t_burnin1 = time.time()
             print('Burn-in time:', t_burnin1 - t_burnin0)
-            if TIME_PROFILING:
-                prof.print(short_mode=True)
+
             
 
         op_loc_sum = 0
@@ -143,59 +141,56 @@ class MetropolisExchangeSampler(Sampler):
         if RANK == 0:
             pbar = tqdm(total=chain_length, desc='Sampling starts on rank 0...')
         
-        with pyinstrument.Profiler() as prof1:
-            for chain_step in range(chain_length):
-                if RANK == 0:
-                    time0 = time.time()
+        # with pyinstrument.Profiler() as prof1:
+        for chain_step in range(chain_length):
+            if RANK == 0:
+                time0 = time.time()
 
-                # sample the next configuration
-                sigma = self._sample_next(vstate)
+            # sample the next configuration
+            sigma = self._sample_next(vstate)
 
-                n += 1
-                if RANK == 0:
-                    time1 = time.time()
-                    pbar.set_postfix({'Time per sample': (time1 - time0)})
+            n += 1
+            if RANK == 0:
+                time1 = time.time()
+                pbar.set_postfix({'Time per sample': (time1 - time0)})
 
-                # compute local energy and amplitude gradient
-                psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
+            # compute local energy and amplitude gradient
+            psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
 
-                # compute the connected non-zero operator matrix elements <eta|O|sigma>
-                eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
-                psi_eta = vstate.amplitude(eta)
+            # compute the connected non-zero operator matrix elements <eta|O|sigma>
+            eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
+            psi_eta = vstate.amplitude(eta)
 
-                # convert torch tensors to numpy arrays
-                psi_sigma = psi_sigma.detach().numpy()
-                psi_eta = psi_eta.detach().numpy()
-                logpsi_sigma_grad = logpsi_sigma_grad.detach().numpy()
+            # convert torch tensors to numpy arrays
+            psi_sigma = psi_sigma.detach().numpy()
+            psi_eta = psi_eta.detach().numpy()
+            logpsi_sigma_grad = logpsi_sigma_grad.detach().numpy()
 
-                # compute the local operator
-                op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
-                op_loc_vec[chain_step] = op_loc
+            # compute the local operator
+            op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+            op_loc_vec[chain_step] = op_loc
 
-                # accumulate the local energy and amplitude gradient
-                op_loc_sum += op_loc
-                logpsi_sigma_grad_sum += logpsi_sigma_grad
-                op_logpsi_sigma_grad_product_sum += op_loc * logpsi_sigma_grad
+            # accumulate the local energy and amplitude gradient
+            op_loc_sum += op_loc
+            logpsi_sigma_grad_sum += logpsi_sigma_grad
+            op_logpsi_sigma_grad_product_sum += op_loc * logpsi_sigma_grad
 
-                # collect the log-amplitude gradient
-                logpsi_sigma_grad_mat[:, chain_step] = logpsi_sigma_grad
+            # collect the log-amplitude gradient
+            logpsi_sigma_grad_mat[:, chain_step] = logpsi_sigma_grad
 
-                # update the sample variance of op_loc
-                op_loc_mean_prev = op_loc_mean
-                op_loc_mean += (op_loc - op_loc_mean) / n
-                op_loc_M2 += (op_loc - op_loc_mean_prev) * (op_loc - op_loc_mean)
+            # update the sample variance of op_loc
+            op_loc_mean_prev = op_loc_mean
+            op_loc_mean += (op_loc - op_loc_mean) / n
+            op_loc_M2 += (op_loc - op_loc_mean_prev) * (op_loc - op_loc_mean)
 
-                # update the sample variance
-                if n > 1:
-                    op_loc_var = op_loc_M2 / (n - 1)
+            # update the sample variance
+            if n > 1:
+                op_loc_var = op_loc_M2 / (n - 1)
 
-                # add a progress bar if rank == 0
-                if RANK == 0:
-                    pbar.update(1)
+            # add a progress bar if rank == 0
+            if RANK == 0:
+                pbar.update(1)
         
-        if RANK == 0 and TIME_PROFILING:
-            print(f'MCMC sampling profiling (Chain length: {chain_length}):')
-            prof1.print(short_mode=True)
         
         if self.reset_chain:
             self.reset()
