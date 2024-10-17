@@ -38,19 +38,21 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(4)
+Lx = int(4)
+Ly = int(4)
 J = 1.0
 # H, hi, graph = square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f)
-H = spin_Heisenberg_square_lattice(L, J, total_sz=0.0)
+H = spin_Heisenberg_square_lattice(Lx,Ly, J, total_sz=0.0)
 graph = H.graph
 # TN parameters
 D = 2
-chi = 2
+chi = -1
+chi_nn = 2
 dtype=torch.float64
 
 # Load PEPS
-skeleton = pickle.load(open(f"../data/{L}x{L}/J={J}/D={D}/peps_skeleton.pkl", "rb"))
-peps_params = pickle.load(open(f"../data/{L}x{L}/J={J}/D={D}/peps_su_params.pkl", "rb"))
+skeleton = pickle.load(open(f"../../data/{Lx}x{Ly}/J={J}/D={D}/peps_skeleton.pkl", "rb"))
+peps_params = pickle.load(open(f"../../data/{Lx}x{Ly}/J={J}/D={D}/peps_su_params.pkl", "rb"))
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
@@ -60,9 +62,9 @@ N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# model = PEPS_model(peps, max_bond=None)
-# model = PEPS_NN_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=L**2)
-model = PEPS_NNproj_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=L**2)
+model = PEPS_model(peps, max_bond=chi)
+# model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
+# model = PEPS_NNproj_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 model.apply(init_weights_to_zero)
 model_names = {
     PEPS_model: 'PEPS',
@@ -74,7 +76,7 @@ model_name = model_names.get(type(model), 'UnknownModel')
 init_step = 0
 total_steps = 200
 if init_step != 0:
-    saved_model_params = torch.load(f'../data/{L}x{L}/J={J}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/J={J}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -91,6 +93,6 @@ vmc = VMC(H, variational_state, optimizer, preconditioner)
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../data/{L}x{L}/J={J}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../data/{L}x{L}/J={J}/D={D}/{model_name}/chi={chi}/')
+    os.makedirs(f'../../data/{Lx}x{Ly}/J={J}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/J={J}/D={D}/{model_name}/chi={chi}/')
 

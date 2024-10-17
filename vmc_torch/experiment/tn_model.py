@@ -68,6 +68,8 @@ class fTNModel(torch.nn.Module):
         self.model_structure = {
             'fPEPS (exact contraction)':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
         }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
         self.max_bond = max_bond
         
     
@@ -149,6 +151,8 @@ class PEPS_model(torch.nn.Module):
     def __init__(self, peps, max_bond=None):
         super().__init__()
         self.peps = peps
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
         self.max_bond = max_bond
         self.model_structure = {
             'PEPS':{'D': peps.max_bond(), 'Lx': peps.Lx, 'Ly': peps.Ly},

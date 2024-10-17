@@ -153,11 +153,9 @@ def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermion
         H += U * nc(hi,i,+1) * nc(hi,i,-1)
     return H, hi, graph
 
-def square_lattice_spin_Heisenberg(L, J, pbc=False, total_sz=None):
+def square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=False, total_sz=None):
     # Build square lattice with nearest and next-nearest neighbor edges
-    # lattice = nk.graph.Square(L, max_neighbor_order=1, pbc=False)
-    lattice = nk.graph.Hypercube(L, n_dim=2, pbc=pbc)
-    # g = lattice = nk.graph.Pyrochlore([L, L, L], pbc=pbc)
+    lattice = nk.graph.Grid([Lx, Ly], pbc=pbc)
     n = lattice.n_nodes
     hi = nk.hilbert.Spin(s=1/2, total_sz=total_sz, N=n)
     # Heisenberg with coupling J=1.0 for nearest neighbors
@@ -211,8 +209,8 @@ class spinful_Fermi_Hubbard_square_lattice(Hamiltonian):
 
 
 class spin_Heisenberg_square_lattice(Hamiltonian):
-    def __init__(self, L, J, pbc=False, total_sz=None):
-        H, hi, graph = square_lattice_spin_Heisenberg(L, J, pbc, total_sz)
+    def __init__(self, Lx, Ly, J, pbc=False, total_sz=None):
+        H, hi, graph = square_lattice_spin_Heisenberg(Lx, Ly, J, pbc, total_sz)
         super().__init__(H, hi, graph)
         self._hilbert = Spin(self.hi._s, self.hi.size, total_sz)
     

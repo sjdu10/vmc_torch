@@ -213,6 +213,33 @@ class MetropolisExchangeSampler(Sampler):
 
         samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         return samples
+    
+    def sample_expectation(self, vstate, op, chain_length=1):
+        """Sample the expectation value of the operator `op`."""
+        self.burn_in(vstate)
+        E_loc_list = []
+        configs = []
+        op_loc_sum = 0
+        for chain_step in range(chain_length):
+            sigma = self._sample_next(vstate)
+            psi_sigma = vstate.amplitude(sigma)
+            eta, O_etasigma = op.get_conn(sigma)
+            psi_eta = vstate.amplitude(eta)
+            psi_sigma = psi_sigma.detach().numpy()
+            psi_eta = psi_eta.detach().numpy()
+            op_loc = O_etasigma @ (psi_eta / psi_sigma)
+            op_loc_sum += op_loc
+            E_loc_list.append(op_loc)
+            configs.append(sigma)
+        return op_loc_sum / chain_length, E_loc_list, configs
+
+    def sample_dense(self, vstate, op):
+        all_config = self.hi.all_states()
+        all_config = np.asarray(all_config)
+        psi_vec = vstate.amplitude(all_config)
+        op_dense = op.to_dense()
+        expect_op = psi_vec.conj().T @ (op_dense @ psi_vec)/(psi_vec.conj().T @ psi_vec)
+        return expect_op
 
 
 
