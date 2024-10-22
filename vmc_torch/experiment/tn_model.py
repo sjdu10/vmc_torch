@@ -1260,14 +1260,14 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
             num_decoder_layers=6, 
             dim_feedforward=512, 
             dropout=0.1,
-            param_dtype=torch.float32,
+            dtype=torch.float32,
             lazy=False,
         ):
         super().__init__()
         self.max_bond = max_bond
         self.nn_eta = nn_eta
         self.phys_dim = ftn.phys_dim()
-        self.param_dtype = param_dtype
+        self.param_dtype = dtype
         self.lazy = lazy
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
