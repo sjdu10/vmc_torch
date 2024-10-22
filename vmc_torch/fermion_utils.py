@@ -630,7 +630,7 @@ def insert_compressor(tn, ltags, rtags, new_ltags=None, new_rtags=None, max_bond
 
     return tn0
 
-def insert_proj_peps(amp, max_bond, yrange, xrange=None, from_which='ymin'):
+def insert_proj_peps(amp, max_bond, yrange, xrange=None, from_which='ymin', lazy=False):
     """Insert projectors in a PEPS along the x direction towards y direction."""
     if yrange is None:
         yrange = [0, amp.Ly-1]
@@ -661,6 +661,14 @@ def insert_proj_peps(amp, max_bond, yrange, xrange=None, from_which='ymin'):
                     new_ltags=new_ltags,
                     new_rtags=new_rtags,
                     max_bond=max_bond,
+                )
+        # tn_calc.draw(color='proj')
+        
+        if not lazy:
+            # contract each pair of boundary tensors with their projectors
+            for j in r.sweep_other:
+                tn_calc.contract_tags_(
+                    (r.site_tag(i, j), r.site_tag(inext, j)),
                 )
 
     return tn_calc

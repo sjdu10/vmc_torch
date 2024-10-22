@@ -123,8 +123,6 @@ class MetropolisExchangeSampler(Sampler):
             t_burnin1 = time.time()
             print('Burn-in time:', t_burnin1 - t_burnin0)
 
-            
-
         op_loc_sum = 0
         logpsi_sigma_grad_sum = np.zeros(vstate.Np)
         op_logpsi_sigma_grad_product_sum = np.zeros(vstate.Np)

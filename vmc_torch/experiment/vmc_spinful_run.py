@@ -46,12 +46,11 @@ t = 1.0
 U = 8.0
 N_f = int(Lx*Ly)
 n_fermions_per_spin = (N_f//2, N_f//2)
-# H, hi, graph = square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = 4
 dtype=torch.float64
 
 # Load PEPS
@@ -61,7 +60,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = 20
+N_samples = 2000
 N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
