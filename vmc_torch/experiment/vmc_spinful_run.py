@@ -18,7 +18,8 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from vmc_torch.experiment.tn_model import fTNModel, fTN_NNiso_Model, fTN_NN_Model, fTN_Transformer_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
+from vmc_torch.experiment.tn_model import fTNModel, fTN_NNiso_Model, fTN_NN_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
+from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
 from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinless, MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
@@ -83,6 +84,18 @@ model = fTNModel(peps, max_bond=chi)
 # model=NeuralBackflow(hi, param_dtype=dtype, hidden_dim=hi.size)
 # model = NeuralJastrow(hi, param_dtype=dtype, hidden_dim=hi.size)
 # model = FFNN(hi, hidden_dim=2*hi.size)
+# model = fTN_Transformer_Proj_Model(
+#     peps,
+#     max_bond=chi,
+#     nn_eta=1.0,
+#     d_model=2**5,
+#     nhead=4,
+#     num_encoder_layers=2,
+#     num_decoder_layers=2,
+#     dim_feedforward=2**5,
+#     dropout=0.0,
+#     param_dtype=dtype,
+# )
 
 # model.apply(init_weights_to_zero)
 model.apply(init_weights_xavier)
@@ -92,6 +105,8 @@ model_names = {
     fTN_NNiso_Model: 'fTN_NNiso',
     fTN_NN_Model: 'fTN_NN',
     fTN_Transformer_Model: 'fTN_Transformer',
+    fTN_Transformer_Proj_Model:'fTN_Transformer_Proj',
+    fTN_Transformer_Proj_lazy_Model:'fTN_Transformer_Proj_lazy',
     SlaterDeterminant: 'SlaterDeterminant',
     NeuralBackflow: 'NeuralBackflow',
     FFNN: 'FFNN',

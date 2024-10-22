@@ -878,10 +878,10 @@ class fTN_NN_Model(torch.nn.Module):
 # ----------------- Transformer model -----------------
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+    def __init__(self, d_model, max_len=5000, dtype=torch.float32):
         super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        pe = torch.zeros(max_len, d_model, dtype=dtype)
+        position = torch.arange(0, max_len, dtype=dtype).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -902,28 +902,30 @@ class TransformerModel(nn.Module):
             num_encoder_layers=6, 
             num_decoder_layers=6, 
             dim_feedforward=512, 
-            dropout=0.1
+            dropout=0.1,
+            dtype=torch.float32
         ):
         super(TransformerModel, self).__init__()
+        self.dtype = dtype
         # Embedding layer for integer input sequence
         self.embedding = nn.Embedding(phys_dim, d_model)
         # Embedding layer for floating-point input sequence
-        self.float_embedding = nn.Linear(1, d_model)
+        self.float_embedding = nn.Linear(1, d_model, dtype=dtype)
         # Positional encoding for fixed-length sequences
-        self.pos_encoder = PositionalEncoding(d_model)
+        self.pos_encoder = PositionalEncoding(d_model, dtype=dtype)
         # Transformer layers
-        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout)
+        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout, dtype=dtype)
         # Linear layer for output generation
-        self.fc_out = nn.Linear(d_model, output_size)
+        self.fc_out = nn.Linear(d_model, output_size, dtype=dtype)
         
     def forward(self, src, tgt, src_mask=None, tgt_mask=None):
         src = src.transpose(0, 1) # [seq_len, batch_size]
         tgt = tgt.transpose(0, 1)
         # Encode source (input) sequence
-        src = self.embedding(src) * torch.sqrt(torch.tensor(self.embedding.embedding_dim, dtype=torch.float32))
+        src = self.embedding(src) * torch.sqrt(torch.tensor(self.embedding.embedding_dim, dtype=self.dtype))
         src = self.pos_encoder(src)
         # Encode target (output) sequence
-        tgt = self.float_embedding(tgt) * torch.sqrt(torch.tensor(self.float_embedding.out_features, dtype=torch.float32))
+        tgt = self.float_embedding(tgt) * torch.sqrt(torch.tensor(self.float_embedding.out_features, dtype=self.dtype))
         tgt = self.pos_encoder(tgt)
         # Apply transformer
         output = self.transformer(src, tgt, src_mask=src_mask, tgt_mask=tgt_mask)
@@ -944,6 +946,7 @@ class fTN_Transformer_Model(torch.nn.Module):
     num_decoder_layers: int
     dim_feedforward: int
     dropout: float
+    dtype: torch.dtype
 
     def __init__(
             self, 
@@ -955,13 +958,15 @@ class fTN_Transformer_Model(torch.nn.Module):
             num_encoder_layers=6, 
             num_decoder_layers=6, 
             dim_feedforward=512, 
-            dropout=0.1
+            dropout=0.1,
+            dtype=torch.float32
         ):
 
         super().__init__()
         self.max_bond = max_bond
         self.nn_eta = nn_eta
         self.phys_dim = ftn.phys_dim()
+        self.param_dtype = dtype
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
         # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
@@ -991,6 +996,7 @@ class fTN_Transformer_Model(torch.nn.Module):
             num_decoder_layers=num_decoder_layers, 
             dim_feedforward=dim_feedforward, 
             dropout=dropout,
+            dtype=self.param_dtype,
         )
 
         # Store the shapes of the parameters XXX: needed at all?
@@ -1089,7 +1095,7 @@ class fTN_Transformer_Model(torch.nn.Module):
             x = x.unsqueeze(0)
         return self.amplitude(x)
 
-class fTN_Transformer_Proj_Model(torch.nn.Module):
+class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
     def __init__(
             self, 
             ftn, 
@@ -1101,14 +1107,14 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
             num_decoder_layers=6, 
             dim_feedforward=512, 
             dropout=0.1,
-            param_dtype=torch.float32,
+            dtype=torch.float32,
             lazy=True,
         ):
         super().__init__()
         self.max_bond = max_bond
         self.nn_eta = nn_eta
         self.phys_dim = ftn.phys_dim()
-        self.param_dtype = param_dtype
+        self.param_dtype = dtype
         self.lazy = lazy
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
@@ -1141,7 +1147,8 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
             num_encoder_layers=num_encoder_layers, 
             num_decoder_layers=num_decoder_layers, 
             dim_feedforward=dim_feedforward, 
-            dropout=dropout
+            dropout=dropout,
+            dtype=self.param_dtype,
         )
 
         # Store the shapes of the parameters
@@ -1241,7 +1248,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
             x = x.unsqueeze(0)
         return self.amplitude(x)
 
-class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
+class fTN_Transformer_Proj_Model(torch.nn.Module):
     def __init__(
             self, 
             ftn, 
@@ -1293,7 +1300,8 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
             num_encoder_layers=num_encoder_layers, 
             num_decoder_layers=num_decoder_layers, 
             dim_feedforward=dim_feedforward, 
-            dropout=dropout
+            dropout=dropout,
+            dtype=self.param_dtype,
         )
 
         # Store the shapes of the parameters
@@ -1354,7 +1362,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
 
         # Check x_i type
         if not type(x_i) == torch.Tensor or x_i.dtype != torch.int32:
-            x_i = torch.tensor(x_i, dtype=torch.int32)
+            x_i = x_i.detach().clone().to(torch.int32)
 
         # Input of the transformer
         src = x_i.unsqueeze(0) # Shape: [batch_size==1, seq_len]
@@ -1456,6 +1464,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
         return self.amplitude(x)
 
 
+# ----------------- Neural Network Quantum States Benchmark -----------------
 
 
 class SlaterDeterminant(nn.Module):
