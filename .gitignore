@@ -4,7 +4,7 @@ symmray/
 local/
 __pycache__/
 vmc_torch.egg-info/
-vmc_torch/vmc_torch/experiment/
+vmc_torch/vmc_torch/experiment/*
 
 # # Jupyter notebook files
 # *.ipynb
