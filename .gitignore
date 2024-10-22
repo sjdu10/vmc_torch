@@ -1,22 +1,18 @@
-# # Public version:
-# data/*
-# symmray/
-# local/
-# __pycache__/
-# vmc_torch.egg-info/
+# Public version:
+data/*
+symmray/
+local/
+__pycache__/
+vmc_torch.egg-info/
+vmc_torch/experiment/
 
 # # Jupyter notebook files
 # *.ipynb
 
-# # Experiment
-# experiment/experiment.md
-# experiment/tn_model.py
-# vmc_torch/fermion_utils.py
-# vmc_torch/SU_run.py
 
-# Private version:
-data/*
-symmray/
-# local/
-__pycache__/
-vmc_torch.egg-info/
+# # Private version:
+# data/*
+# symmray/
+# # local/
+# __pycache__/
+# vmc_torch.egg-info/
