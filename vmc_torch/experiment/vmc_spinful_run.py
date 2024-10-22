@@ -66,7 +66,7 @@ N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fTNModel(peps, max_bond=chi)
+# model = fTNModel(peps, max_bond=chi)
 # model = fTN_NNiso_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
 # model = fTN_NN_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
 # model = fTN_Transformer_Model(
@@ -84,18 +84,18 @@ model = fTNModel(peps, max_bond=chi)
 # model=NeuralBackflow(hi, param_dtype=dtype, hidden_dim=hi.size)
 # model = NeuralJastrow(hi, param_dtype=dtype, hidden_dim=hi.size)
 # model = FFNN(hi, hidden_dim=2*hi.size)
-# model = fTN_Transformer_Proj_Model(
-#     peps,
-#     max_bond=chi,
-#     nn_eta=1.0,
-#     d_model=2**5,
-#     nhead=4,
-#     num_encoder_layers=2,
-#     num_decoder_layers=2,
-#     dim_feedforward=2**5,
-#     dropout=0.0,
-#     param_dtype=dtype,
-# )
+model = fTN_Transformer_Proj_Model(
+    peps,
+    max_bond=chi,
+    nn_eta=1.0,
+    d_model=2**5,
+    nhead=4,
+    num_encoder_layers=2,
+    num_decoder_layers=2,
+    dim_feedforward=2**5,
+    dropout=0.0,
+    dtype=dtype,
+)
 
 # model.apply(init_weights_to_zero)
 model.apply(init_weights_xavier)

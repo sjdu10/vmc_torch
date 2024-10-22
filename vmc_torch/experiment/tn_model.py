@@ -914,15 +914,13 @@ class TransformerModel(nn.Module):
         # Positional encoding for fixed-length sequences
         self.pos_encoder = PositionalEncoding(d_model, dtype=dtype)
         # Transformer layers
-        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout, dtype=dtype)
+        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout, dtype=dtype, batch_first=True)
         # Linear layer for output generation
         self.fc_out = nn.Linear(d_model, output_size, dtype=dtype)
         
     def forward(self, src, tgt, src_mask=None, tgt_mask=None):
-        src = src.transpose(0, 1) # [seq_len, batch_size]
-        tgt = tgt.transpose(0, 1)
         # Encode source (input) sequence
-        src = self.embedding(src) * torch.sqrt(torch.tensor(self.embedding.embedding_dim, dtype=self.dtype))
+        src = self.embedding(src) * torch.sqrt(torch.tensor(self.embedding.embedding_dim, dtype=self.dtype)) # [batch_size, seq_len, d_model]
         src = self.pos_encoder(src)
         # Encode target (output) sequence
         tgt = self.float_embedding(tgt) * torch.sqrt(torch.tensor(self.float_embedding.out_features, dtype=self.dtype))
@@ -930,9 +928,7 @@ class TransformerModel(nn.Module):
         # Apply transformer
         output = self.transformer(src, tgt, src_mask=src_mask, tgt_mask=tgt_mask)
         # Generate output for each position in the sequence
-        output = self.fc_out(output)
-        # Transpose output to match the shape [batch_size, seq_len, output_size]
-        output = output.transpose(0, 1)
+        output = self.fc_out(output) # [batch_size, seq_len, output_size]
         return output
 
 
@@ -1220,7 +1216,9 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
             proj_params_vec = flatten_proj_params(proj_params)
             
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if type(x_i) == torch.Tensor:
+                x_i = x_i.detach().clone().to(torch.int32)
+            else:
                 x_i = torch.tensor(x_i, dtype=torch.int32)
 
             # Input of the transformer
@@ -1367,13 +1365,14 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
         proj_params_vec = flatten_proj_params(proj_params)
 
         # Check x_i type
-        if not type(x_i) == torch.Tensor:
+        if type(x_i) == torch.Tensor:
             x_i = x_i.detach().clone().to(torch.int32)
-
+        else:
+            x_i = torch.tensor(x_i, dtype=torch.int32)
         # Input of the transformer
         src = x_i.unsqueeze(0) # Shape: [batch_size==1, seq_len]
         # Target of the transformer
-        tgt = torch.tensor(proj_params_vec, dtype=self.param_dtype).unsqueeze(0) # Shape: [batch_size==1, seq_len]
+        tgt = proj_params_vec.unsqueeze(0) # Shape: [batch_size==1, seq_len]
         tgt.unsqueeze_(-1) # Shape: [batch_size==1, seq_len, 1]
         # Forward pass
         nn_output = self.transformer(src, tgt)
