@@ -1,0 +1,18 @@
+# Public version:
+data/*
+symmray/
+local/
+__pycache__/
+vmc_torch.egg-info/
+vmc_torch/vmc_torch/experiment/
+
+# # Jupyter notebook files
+# *.ipynb
+
+
+# # Private version:
+# data/*
+# symmray/
+# # local/
+# __pycache__/
+# vmc_torch.egg-info/
