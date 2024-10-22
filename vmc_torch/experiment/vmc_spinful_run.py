@@ -61,7 +61,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = 2000
+N_samples = 40
 N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -87,11 +87,11 @@ if (N_samples/SIZE)%2 != 0:
 model = fTN_Transformer_Proj_Model(
     peps,
     max_bond=chi,
-    nn_eta=1.0,
-    d_model=2**5,
-    nhead=4,
-    num_encoder_layers=2,
-    num_decoder_layers=2,
+    nn_eta=1e-2,
+    d_model=2**3,
+    nhead=2,
+    num_encoder_layers=1,
+    num_decoder_layers=1,
     dim_feedforward=2**5,
     dropout=0.0,
     dtype=dtype,

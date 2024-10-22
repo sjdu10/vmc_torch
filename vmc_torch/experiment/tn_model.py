@@ -87,7 +87,8 @@ class fTNModel(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def from_vec_to_params(self, vec, quimb_format=False):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
@@ -206,7 +207,8 @@ class PEPS_model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def amplitude(self, x):
         # update self.PEPS
@@ -307,7 +309,8 @@ class PEPS_NN_Model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def forward(self, x):
         if x.ndim == 1:
@@ -423,7 +426,8 @@ class PEPS_NNproj_Model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def forward(self, x):
         if x.ndim == 1:
@@ -539,7 +543,8 @@ class PEPS_delocalized_Model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def amplitude(self, x):
         # update self.PEPS
@@ -687,7 +692,8 @@ class fTN_NNiso_Model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
@@ -820,7 +826,8 @@ class fTN_NN_Model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
@@ -1024,7 +1031,8 @@ class fTN_Transformer_Model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
@@ -1176,7 +1184,8 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
@@ -1337,7 +1346,8 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
@@ -1407,7 +1417,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
             """Insert projectors in a PEPS along the x direction towards y direction."""
             r = Rotator2D(amp, xrange=None, yrange=[0, psi.Ly-2], from_which='ymin')
             tn_calc = amp.copy()
-            tn_body_nn_value = None
+            # tn_body_nn_value = None
             try:
                 for i, inext in pairwise(r.sweep):
                     i_passed = [x for x in range(i)]
@@ -1436,32 +1446,33 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
                             )
                 
                     tn_body, proj_tn = tn_calc.partition('proj') # projectors computed from untouched TN
-                    _, tn_body_skeleton = qtn.pack(tn_body)
+                    # _, tn_body_skeleton = qtn.pack(tn_body)
                     new_proj_tn = self.add_transformer_values(proj_tn, x_i) # Add transformer values to the projectors
                     
-                    if tn_body_nn_value is None:
-                        tn_body_nn = tn_body.copy()
-                    else:
-                        tn_body_nn = self.reload_tn(tn_body_skeleton, tn_body_nn_value)
+                    # if tn_body_nn_value is None:
+                    #     tn_body_nn = tn_body.copy()
+                    # else:
+                    #     tn_body_nn = self.reload_tn(tn_body_skeleton, tn_body_nn_value)
                     
-                    tn_calc_nn = tn_body_nn | new_proj_tn
+                    tn_calc = tn_body | new_proj_tn
                     
                     # contract each pair of boundary tensors with their projectors
                     for j in r.sweep_other:
                         tn_calc.contract_tags_(
                             (r.site_tag(i, j), r.site_tag(inext, j)),
                         )
-                        tn_calc_nn.contract_tags_(
-                            (r.site_tag(i, j), r.site_tag(inext, j)),
-                        )
-                    tn_body_nn_value = tn_calc_nn.copy()
+                    #     tn_calc_nn.contract_tags_(
+                    #         (r.site_tag(i, j), r.site_tag(inext, j)),
+                    #     )
+                    # tn_body_nn_value = tn_calc_nn.copy()
         
             except ZeroDivisionError:
                 amp_value = torch.tensor(0.0, dtype=self.param_dtype)
                 batch_amps.append(amp_value)
                 continue
 
-            amp_value = tn_calc_nn.contract()
+            # amp_value = tn_calc_nn.contract()
+            amp_value = tn_calc.contract()
             if amp_value == 0:
                 amp_value = torch.tensor(0.0, dtype=self.param_dtype)
             batch_amps.append(amp_value)
@@ -1514,7 +1525,8 @@ class SlaterDeterminant(nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
@@ -1591,7 +1603,8 @@ class NeuralJastrow(nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
@@ -1673,7 +1686,8 @@ class NeuralBackflow(nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
@@ -1754,7 +1768,8 @@ class FFNN(nn.Module):
 
     def clear_grad(self):
         for param in self.parameters():
-            param.grad = None
+            if param is not None:
+                param.grad = None
     
     def load_params(self, new_params):
         pointer = 0
