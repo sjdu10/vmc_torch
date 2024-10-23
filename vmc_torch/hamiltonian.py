@@ -1,6 +1,6 @@
 import netket as nk
 import netket.experimental as nkx
-import netket.nn as nknn
+from netket.graph import Lattice
 
 from math import pi
 from autoray import do
@@ -154,17 +154,33 @@ def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermion
     return H, hi, graph
 
 def square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=False, total_sz=None):
-    # Build square lattice with nearest and next-nearest neighbor edges
-    lattice = nk.graph.Grid([Lx, Ly], pbc=pbc)
-    n = lattice.n_nodes
+    # Build square lattice with nearest neighbor edges
+    graph = nk.graph.Grid([Lx, Ly], pbc=pbc)
+    n = graph.n_nodes
     hi = nk.hilbert.Spin(s=1/2, total_sz=total_sz, N=n)
     # Heisenberg with coupling J=1.0 for nearest neighbors
-    # and J=0.5 for next-nearest neighbors
-    # H = nk.operator.Ising(hilbert=hi, graph=lattice, J=1.0, h=1.0)
-    H = nk.operator.Heisenberg(hilbert=hi, graph=lattice, J=J, sign_rule=False) # In Netket, the spin operators are Pauli matrices, while in Quimb they are 1/2*Pauli matrices
-    return H, hi, lattice
+    H = nk.operator.Heisenberg(hilbert=hi, graph=graph, J=J, sign_rule=False) # In Netket, the spin operators are Pauli matrices, while in Quimb they are 1/2*Pauli matrices
+    return H, hi, graph
 
+def square_lattice_spin_J1J2(Lx, Ly, J1, J2, pbc=False, total_sz=None):
+    """J1-J2 model on a square lattice"""
+    basis = do('array', [
+     [1.0,0.0],
+     [0.0,1.0],
+    ])
+    custom_edges = [
+        (0, 0, [1.0,0.0], 0),
+        (0, 0, [0.0,1.0], 0),
+        (0, 0, [1.0, 1.0], 1),
+        (0, 0, [1.0, -1.0], 1),
+    ]
+    graph = Lattice(basis_vectors=basis, pbc=pbc, extent=[Lx, Ly],
+        custom_edges=custom_edges)
+    n = graph.n_nodes
+    hi = nk.hilbert.Spin(s=1/2, total_sz=total_sz, N=n)
+    H = nk.operator.Heisenberg(hilbert=hi, graph=graph, J=(J1,J2))
 
+    return H, hi, graph
 
 #----- self-customized Hamiltonian class -----#
 
@@ -207,10 +223,28 @@ class spinful_Fermi_Hubbard_square_lattice(Hamiltonian):
 
         return eta_calc, H_etasigma
 
-
 class spin_Heisenberg_square_lattice(Hamiltonian):
     def __init__(self, Lx, Ly, J, pbc=False, total_sz=None):
         H, hi, graph = square_lattice_spin_Heisenberg(Lx, Ly, J, pbc, total_sz)
+        super().__init__(H, hi, graph)
+        self._hilbert = Spin(self.hi._s, self.hi.size, total_sz)
+    
+    @property
+    def hilbert(self):
+        return self._hilbert
+    
+    def get_conn(self, sigma):
+        # Quimb2Netket
+        config_calc = self.hilbert.from_quimb_to_netket_spin_config(sigma)
+        eta_calc_netket, H_etasigma = self.H.get_conn(config_calc)
+        # Netket2Quimb
+        eta_calc = self.hilbert.to_quimb_config(eta_calc_netket)
+        return eta_calc, H_etasigma
+
+
+class spin_J1J2_square_lattice(Hamiltonian):
+    def __init__(self, Lx, Ly, J1, J2, pbc=False, total_sz=None):
+        H, hi, graph = square_lattice_spin_J1J2(Lx, Ly, J1, J2, pbc, total_sz)
         super().__init__(H, hi, graph)
         self._hilbert = Spin(self.hi._s, self.hi.size, total_sz)
     
