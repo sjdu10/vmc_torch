@@ -5,6 +5,7 @@ import pickle
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
 
 # torch
 from torch.nn.parameter import Parameter
@@ -45,7 +46,7 @@ J2 = 0.5
 H = spin_J1J2_square_lattice(Lx, Ly, J1, J2, total_sz=0.0) 
 graph = H.graph
 # TN parameters
-D = 4
+D = 2
 chi = -1
 chi_nn = 2
 dtype=torch.float64
@@ -62,8 +63,8 @@ N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = PEPS_model(peps, max_bond=chi)
-# model = PEPS_delocalized_Model(peps, max_bond=chi, diag=True)
+# model = PEPS_model(peps, max_bond=chi)
+model = PEPS_delocalized_Model(peps, max_bond=chi, diag=True)
 # model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model = PEPS_NNproj_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model.apply(init_weights_to_zero)
@@ -76,7 +77,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 init_step = 0
-total_steps = 100
+total_steps = 80
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']

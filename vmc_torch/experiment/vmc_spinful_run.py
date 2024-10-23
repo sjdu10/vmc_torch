@@ -2,6 +2,7 @@ import numpy as np
 from quimb.utils import progbar as Progbar
 from mpi4py import MPI
 import pickle
+import pyinstrument
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -61,14 +62,12 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = 40
+N_samples = 10
 N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = fTNModel(peps, max_bond=chi)
-# model = fTN_NNiso_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
-# model = fTN_NN_Model(peps, max_bond=chi, nn_hidden_dim=8, nn_eta=1e-3)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -80,18 +79,26 @@ if (N_samples/SIZE)%2 != 0:
 #     dim_feedforward=32,
 #     dropout=0.0,
 # )
-# model = SlaterDeterminant(hi)
-# model=NeuralBackflow(hi, param_dtype=dtype, hidden_dim=hi.size)
-# model = NeuralJastrow(hi, param_dtype=dtype, hidden_dim=hi.size)
-# model = FFNN(hi, hidden_dim=2*hi.size)
-model = fTN_Transformer_Proj_Model(
+# model = fTN_Transformer_Proj_Model(
+#     peps,
+#     max_bond=chi,
+#     nn_eta=1e-2,
+#     d_model=2**3,
+#     nhead=2,
+#     num_encoder_layers=1,
+#     num_decoder_layers=1,
+#     dim_feedforward=2**5,
+#     dropout=0.0,
+#     dtype=dtype,
+# )
+model = fTN_Transformer_Proj_lazy_Model(
     peps,
     max_bond=chi,
     nn_eta=1e-2,
-    d_model=2**3,
+    d_model=2**2,
     nhead=2,
-    num_encoder_layers=1,
-    num_decoder_layers=1,
+    num_encoder_layers=2,
+    num_decoder_layers=2,
     dim_feedforward=2**5,
     dropout=0.0,
     dtype=dtype,
@@ -115,7 +122,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 init_step = 0
-total_steps = 200
+total_steps = 1
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
@@ -137,5 +144,8 @@ vmc = VMC(H, variational_state, optimizer, preconditioner)
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
     os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    with pyinstrument.Profiler() as prof:
+        vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    if RANK == 0:
+        prof.print()
 

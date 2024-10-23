@@ -1,4 +1,4 @@
-DEBUG = False
+DEBUG = True
 TIME_PROFILING = False
 
 def set_debug(debug):
