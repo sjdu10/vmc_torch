@@ -185,11 +185,11 @@ class MetropolisExchangeSampler(Sampler):
             if n > 1:
                 op_loc_var = op_loc_M2 / (n - 1)
 
-            total_n = COMM.reduce(n, op=MPI.SUM, root=0)
+            # total_n = COMM.reduce(n, op=MPI.SUM, root=0)
             # add a progress bar if rank == 0
             if RANK == 0:
                 pbar.update(1)
-                pbar.set_description(f'Sampling progress: {total_n}/{chain_length*SIZE}')
+                # pbar.set_description(f'Sampling progress: {total_n}/{chain_length*SIZE}')
         
         
         if self.reset_chain:

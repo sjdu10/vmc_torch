@@ -63,8 +63,8 @@ N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = PEPS_model(peps, max_bond=chi)
-# model = PEPS_delocalized_Model(peps, max_bond=chi, diag=True)
+# model = PEPS_model(peps, max_bond=chi)
+model = PEPS_delocalized_Model(peps, max_bond=chi, diag=True)
 # model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model = PEPS_NNproj_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model.apply(init_weights_to_zero)
@@ -76,8 +76,9 @@ model_names = {
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
-init_step = 44
-total_steps = 36
+init_step = 79
+final_step = 150
+total_steps = final_step - init_step
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
