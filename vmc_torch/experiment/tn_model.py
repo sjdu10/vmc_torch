@@ -471,15 +471,16 @@ class PEPS_NNproj_Model(torch.nn.Module):
             return torch.stack([func(xi) for xi in x])
 
 class PEPS_delocalized_Model(torch.nn.Module):
-    def __init__(self, peps, max_bond=None):
+    def __init__(self, peps, max_bond=None, diag=False):
         super().__init__()
-        dpeps = self.delocalize_in_cross(peps)
+        dpeps = self.delocalize_in_cross(peps, diag=diag)
         self.peps = dpeps
+        self.diag = diag
         if max_bond is None or max_bond <= 0:
             max_bond = None
         self.max_bond = max_bond
         self.model_structure = {
-            'PEPS_delocalized':{'D': self.peps.max_bond(), 'Lx': self.peps.Lx, 'Ly': self.peps.Ly},
+            'PEPS_delocalized':{'D': self.peps.max_bond(), 'Lx': self.peps.Lx, 'Ly': self.peps.Ly, 'diag': diag},
         }
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(self.peps)
@@ -493,21 +494,30 @@ class PEPS_delocalized_Model(torch.nn.Module):
             self.register_parameter(tid, param)
         
     
-    def delocalize_in_cross(self, peps):
+    def delocalize_in_cross(self, peps, diag=False):
 
         peps = peps.copy()
 
         for (i, j) in peps.sites:
             t = peps[i, j]
-
-            for neighbor in [
-                (i + 1, j),
-                (i - 1, j),
-                (i, j + 1),
-                (i, j - 1),
-            ]:
+            if diag:
+                neighbors = [
+                    (i + 1, j + 1),
+                    (i - 1, j - 1),
+                    (i + 1, j - 1),
+                    (i - 1, j + 1),
+                ]
+            else:
+                neighbors = [
+                    (i + 1, j),
+                    (i - 1, j),
+                    (i, j + 1),
+                    (i, j - 1),
+                ]
+            
+            for neighbor in neighbors:
                 if peps.valid_coo(neighbor):
-                    t.new_ind(peps.site_ind(neighbor), mode="repeat", size=peps.phys_dim())
+                    t.new_ind(peps.site_ind(neighbor), mode="repeat", size=2)
 
         return peps
     
