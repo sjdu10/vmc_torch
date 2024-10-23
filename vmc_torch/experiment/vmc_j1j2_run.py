@@ -45,7 +45,7 @@ J2 = 0.5
 H = spin_J1J2_square_lattice(Lx, Ly, J1, J2, total_sz=0.0) 
 graph = H.graph
 # TN parameters
-D = 2
+D = 4
 chi = -1
 chi_nn = 2
 dtype=torch.float64
@@ -57,24 +57,26 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = 2**11
+N_samples = 2**12
 N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 model = PEPS_model(peps, max_bond=chi)
+# model = PEPS_delocalized_Model(peps, max_bond=chi, diag=True)
 # model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model = PEPS_NNproj_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model.apply(init_weights_to_zero)
 model_names = {
     PEPS_model: 'PEPS',
+    PEPS_delocalized_Model: 'PEPS_delocalized_diag='+str(model.diag) if type (model)==PEPS_delocalized_Model else None,
     PEPS_NN_Model: 'PEPS_NN',
     PEPS_NNproj_Model: 'PEPS_NNproj'
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
 init_step = 0
-total_steps = 200
+total_steps = 100
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
@@ -85,10 +87,10 @@ if init_step != 0:
         model.load_params(saved_model_params_vec)
 
 # optimizer = SignedSGD(learning_rate=0.05)
-optimizer = SGD(learning_rate=0.05)
+optimizer = SGD(learning_rate=5e-2)
 sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=True, dtype=dtype)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.05, iter_step=1e5, dtype=dtype)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-2, iter_step=1e5, dtype=dtype)
 vmc = VMC(H, variational_state, optimizer, preconditioner)
 
 if __name__ == "__main__":
