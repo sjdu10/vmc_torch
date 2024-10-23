@@ -137,7 +137,7 @@ class MetropolisExchangeSampler(Sampler):
         op_loc_vec = np.zeros(chain_length)
 
         if RANK == 0:
-            pbar = tqdm(total=chain_length, desc='Sampling starts on rank 0...')
+            pbar = tqdm(total=chain_length, desc='Sampling starts for rank 0...')
         
         # with pyinstrument.Profiler() as prof1:
         for chain_step in range(chain_length):
@@ -150,7 +150,7 @@ class MetropolisExchangeSampler(Sampler):
             n += 1
             if RANK == 0:
                 time1 = time.time()
-                pbar.set_postfix({'Time per sample': (time1 - time0)})
+                pbar.set_postfix({'Time per sample for each rank': (time1 - time0)})
 
             # compute local energy and amplitude gradient
             psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
@@ -185,9 +185,11 @@ class MetropolisExchangeSampler(Sampler):
             if n > 1:
                 op_loc_var = op_loc_M2 / (n - 1)
 
+            total_n = COMM.reduce(n, op=MPI.SUM, root=0)
             # add a progress bar if rank == 0
             if RANK == 0:
                 pbar.update(1)
+                pbar.set_description(f'Sampling progress: {total_n}/{chain_length*SIZE}')
         
         
         if self.reset_chain:
