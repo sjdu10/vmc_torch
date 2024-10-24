@@ -26,6 +26,7 @@ from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
 from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian import spin_J1J2_square_lattice
 from vmc_torch.torch_utils import SVD,QR
+from vmc_torch.utils import closest_divisible
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)
@@ -59,7 +60,7 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
 N_samples = 2**12
-N_samples = N_samples - N_samples % SIZE + SIZE
+N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
