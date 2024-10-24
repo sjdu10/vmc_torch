@@ -166,9 +166,11 @@ class Variational_State:
         W_loc = local_samples[5]
         chain_means_loc = local_samples[6]
         
-        # # clean the memory
-        # del local_samples
+        # clean the memory
+        del local_samples
         
+        t0 = MPI.Wtime()
+
         # Compute the op expectation value on all ranks
         op_expect = COMM.allreduce(local_op_loc_sum, op=MPI.SUM)/self.Ns # op_expect is seen by all ranks
         mean_logamp_grad = COMM.allreduce(local_logamp_grad, op=MPI.SUM)/self.Ns
@@ -188,6 +190,7 @@ class Variational_State:
         # between-chain variance (B)
         chain_means = COMM.gather(chain_means_loc, root=0) # [[m_11, m_12], [m_21, m_22], ..., [m_q1, m_q2]] where q is the number of ranks
 
+        t1 = MPI.Wtime()
 
         # set the logamp_grad_matrix and mean_logamp_grad for all ranks
         # each rank has their local batch of logamp_grad_matrix, but shares the same mean_logamp_grad
@@ -195,8 +198,8 @@ class Variational_State:
         self.mean_logamp_grad = mean_logamp_grad
 
         if RANK == 0:
-
             print('RANK{}, sample size: {}, chain length per rank: {}'.format(RANK, self.Ns, chain_length))
+            print('Time for MPI communication: {}'.format(t1-t0))
             op_logamp_grad_product = op_logamp_grad_product_sum/self.Ns
             op_var = op_var/self.Ns
 

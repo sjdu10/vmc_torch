@@ -63,8 +63,8 @@ N_samples = N_samples - N_samples % SIZE + SIZE
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# model = PEPS_model(peps, max_bond=chi)
-model = PEPS_delocalized_Model(peps, max_bond=chi, diag=True)
+model = PEPS_model(peps, max_bond=chi)
+# model = PEPS_delocalized_Model(peps, max_bond=chi, diag=False)
 # model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model = PEPS_NNproj_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model.apply(init_weights_to_zero)
