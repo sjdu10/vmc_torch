@@ -1186,9 +1186,8 @@ class fTN_Transformer_Model(torch.nn.Module):
             # Input of the transformer
             src = x_i.unsqueeze(0) # Shape: [batch_size==1, seq_len]
             # Target of the transformer
-            tgt = torch.tensor(amp_2row_params_vec, dtype=torch.float32)
-            tgt.unsqueeze_(0)
-            tgt.unsqueeze_(-1) # Shape: [batch_size==1, seq_len, output_size==1]
+            tgt = torch.tensor(amp_2row_params_vec, dtype=self.param_dtype).unsqueeze(0) # Shape: [batch_size==1, seq_len]
+            tgt.unsqueeze_(-1) # Shape: [batch_size==1, seq_len, 1]
             # Forward pass
             nn_output = self.transformer(src, tgt)
             # concatenate the output to get the final vector of length vec_len
