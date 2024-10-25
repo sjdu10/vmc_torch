@@ -68,7 +68,7 @@ N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fTNModel(peps, max_bond=chi)
+# model = fTNModel(peps, max_bond=chi)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -104,8 +104,7 @@ model = fTNModel(peps, max_bond=chi)
 #     dropout=0.0,
 #     dtype=dtype,
 # )
-# model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=30)
-
+model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=30)
 # model.apply(init_weights_kaiming)
 model.apply(init_weights_to_zero)
 

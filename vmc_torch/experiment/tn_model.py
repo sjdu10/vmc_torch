@@ -735,7 +735,8 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
         self.parity_config = [array.parity for array in ftn.arrays]
         self.N_fermion = sum(self.parity_config)
         dummy_config = torch.zeros(ftn.nsites)
-        dummy_config[:self.N_fermion] = 1
+        dummy_config[:self.N_fermion//2] = 1
+        dummy_config[self.N_fermion//2:self.N_fermion] = 2
         dummy_amp = ftn.get_amp(dummy_config)
         dummy_amp_w_proj = insert_proj_peps(dummy_amp, max_bond=max_bond, yrange=[0, ftn.Ly-2])
         dummy_amp_tn, dummy_proj_tn = dummy_amp_w_proj.partition(tags='proj')
@@ -1338,10 +1339,9 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
             
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.int64)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                x_i = x_i.to(torch.int64)
 
             # Input of the transformer
             src = x_i.unsqueeze(0) # Shape: [batch_size==1, seq_len]
