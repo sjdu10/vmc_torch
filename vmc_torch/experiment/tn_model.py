@@ -714,7 +714,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
 
 class fTN_NN_proj_variable_Model(torch.nn.Module):
     
-    def __init__(self, ftn, max_bond, nn_hidden_dim=64, nn_eta=1e-3, dtype=torch.float32, padded_length=0):
+    def __init__(self, ftn, max_bond, nn_hidden_dim=64, nn_eta=1e-3, dtype=torch.float32, padded_length=0, dummy_config=None):
         super().__init__()
         self.max_bond = max_bond
         self.nn_eta = nn_eta
@@ -734,9 +734,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
         
         self.parity_config = [array.parity for array in ftn.arrays]
         self.N_fermion = sum(self.parity_config)
-        dummy_config = torch.zeros(ftn.nsites)
-        dummy_config[:self.N_fermion//2] = 1
-        dummy_config[self.N_fermion//2:self.N_fermion] = 2
+        assert dummy_config is not None, "Please provide a dummy configuration for the model."
         dummy_amp = ftn.get_amp(dummy_config)
         dummy_amp_w_proj = insert_proj_peps(dummy_amp, max_bond=max_bond, yrange=[0, ftn.Ly-2])
         dummy_amp_tn, dummy_proj_tn = dummy_amp_w_proj.partition(tags='proj')
