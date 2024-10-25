@@ -1179,10 +1179,9 @@ class fTN_Transformer_Model(torch.nn.Module):
             
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                x_i = x_i.to(torch.long)
 
             # Input of the transformer
             src = x_i.unsqueeze(0) # Shape: [batch_size==1, seq_len]
