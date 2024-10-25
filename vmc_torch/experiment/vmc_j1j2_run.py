@@ -47,8 +47,8 @@ J2 = 0.5
 H = spin_J1J2_square_lattice(Lx, Ly, J1, J2, total_sz=0.0) 
 graph = H.graph
 # TN parameters
-D = 2
-chi = -1
+D = 4
+chi = 4
 chi_nn = 2
 dtype=torch.float64
 
@@ -59,7 +59,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = 2**12
+N_samples = int(1e2)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -77,8 +77,8 @@ model_names = {
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
-init_step = 79
-final_step = 150
+init_step = 0
+final_step = 1
 total_steps = final_step - init_step
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')

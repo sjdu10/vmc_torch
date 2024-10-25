@@ -19,7 +19,7 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from vmc_torch.experiment.tn_model import fTNModel, fTN_NNiso_Model, fTN_NN_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
+from vmc_torch.experiment.tn_model import fTNModel, fTN_NN_proj_Model, fTN_NN_2row_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
 from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinless, MetropolisExchangeSamplerSpinful
@@ -34,6 +34,7 @@ ar.register_function('torch','linalg.svd',SVD.apply)
 ar.register_function('torch','linalg.qr',QR.apply)
 
 from vmc_torch.global_var import DEBUG
+from vmc_torch.utils import closest_divisible
 
 
 COMM = MPI.COMM_WORLD
@@ -52,7 +53,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = 4
+chi = -1
 dtype=torch.float64
 
 # Load PEPS
@@ -62,12 +63,12 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = 10
-N_samples = N_samples - N_samples % SIZE + SIZE
+N_samples = int(1e2)
+N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# model = fTNModel(peps, max_bond=chi)
+model = fTNModel(peps, max_bond=chi)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -91,26 +92,27 @@ if (N_samples/SIZE)%2 != 0:
 #     dropout=0.0,
 #     dtype=dtype,
 # )
-model = fTN_Transformer_Proj_lazy_Model(
-    peps,
-    max_bond=chi,
-    nn_eta=1e-2,
-    d_model=2**2,
-    nhead=2,
-    num_encoder_layers=2,
-    num_decoder_layers=2,
-    dim_feedforward=2**5,
-    dropout=0.0,
-    dtype=dtype,
-)
+# model = fTN_Transformer_Proj_lazy_Model(
+#     peps,
+#     max_bond=chi,
+#     nn_eta=1.0,
+#     d_model=2**2,
+#     nhead=2,
+#     num_encoder_layers=2,
+#     num_decoder_layers=2,
+#     dim_feedforward=2**5,
+#     dropout=0.0,
+#     dtype=dtype,
+# )
+# model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=30)
 
-# model.apply(init_weights_to_zero)
-model.apply(init_weights_xavier)
+# model.apply(init_weights_kaiming)
+model.apply(init_weights_to_zero)
 
 model_names = {
     fTNModel: 'fTN',
-    fTN_NNiso_Model: 'fTN_NNiso',
-    fTN_NN_Model: 'fTN_NN',
+    fTN_NN_proj_Model: 'fTN_NN_proj',
+    fTN_NN_proj_variable_Model: 'fTN_NN_proj_variable',
     fTN_Transformer_Model: 'fTN_Transformer',
     fTN_Transformer_Proj_Model:'fTN_Transformer_Proj',
     fTN_Transformer_Proj_lazy_Model:'fTN_Transformer_Proj_lazy',
@@ -122,7 +124,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 init_step = 0
-total_steps = 1
+total_steps = 2
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
@@ -134,7 +136,7 @@ if init_step != 0:
 
 # optimizer = SignedSGD(learning_rate=0.05)
 optimizer = SGD(learning_rate=0.05)
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=True, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=True, dtype=dtype)
 # sampler = None
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.05, iter_step=1e5, dtype=dtype)
@@ -144,8 +146,8 @@ vmc = VMC(H, variational_state, optimizer, preconditioner)
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
     os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-    with pyinstrument.Profiler() as prof:
-        vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
-    if RANK == 0:
-        prof.print()
+    # with pyinstrument.Profiler() as prof:
+    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    # if RANK == 0:
+    #     prof.print()
 

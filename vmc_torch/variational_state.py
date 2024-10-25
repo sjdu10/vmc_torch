@@ -69,7 +69,12 @@ class Variational_State:
         if not type(x) == torch.Tensor:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
         amp = self.vstate_func(x)
-        amp.backward()
+        try:
+            amp.backward()
+        except RuntimeError:
+            # amp is 0
+            self.reset()
+            return amp, torch.zeros((self.Np,), dtype=self.dtype)
         vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
         # Clear the gradient
         self.reset()
@@ -156,7 +161,11 @@ class Variational_State:
         # Sample on each rank
         # this should be a list of local samples statistics:
         # a tuple of (op_loc_sum, logamp_grad_sum, op_loc_logamp_grad_product_sum, op_loc_var, logamp_grad_matrix)
+        t_sample_start = MPI.Wtime()
         local_samples = self.sampler.sample(op, vstate, chain_length=chain_length)
+        t_sample_end = MPI.Wtime()
+        if DEBUG:
+            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
 
         local_op_loc_sum = local_samples[0]
         local_logamp_grad = local_samples[1]
@@ -174,9 +183,11 @@ class Variational_State:
         # Compute the op expectation value on all ranks
         op_expect = COMM.allreduce(local_op_loc_sum, op=MPI.SUM)/self.Ns # op_expect is seen by all ranks
         mean_logamp_grad = COMM.allreduce(local_logamp_grad, op=MPI.SUM)/self.Ns
+        t01 = MPI.Wtime()
 
         # Collect the op_logamp_grad_product ONLY on rank 0
         op_logamp_grad_product_sum = COMM.reduce(local_op_logamp_grad_product_sum, op=MPI.SUM, root=0)
+        t02 = MPI.Wtime()
 
         # Total sample variance calculation is collected ONLY on rank 0
         local_op_loc_mean = local_op_loc_sum/chain_length
@@ -200,6 +211,10 @@ class Variational_State:
         if RANK == 0:
             print('RANK{}, sample size: {}, chain length per rank: {}'.format(RANK, self.Ns, chain_length))
             print('Time for MPI communication: {}'.format(t1-t0))
+            if DEBUG:
+                print('     Time for op_expect: {}'.format(t01-t0))
+                print('     Time for op_logamp_grad_product_sum: {}'.format(t02-t01))
+                print('     Time for op_var: {}'.format(t1-t02))
             op_logamp_grad_product = op_logamp_grad_product_sum/self.Ns
             op_var = op_var/self.Ns
 
@@ -217,11 +232,9 @@ class Variational_State:
             R_hat = np.sqrt(V_hat/W)
             print('R_hat: {}'.format(R_hat))
             print('V_hat:{}, OP_var:{}'.format(V_hat, op_var))
-
-            if DEBUG:
-                print('logamp_grad_matrix shape: {}'.format(self.logamp_grad_matrix.shape))
-                # each logamp_grad is a long vector as (10000,)
-                # thus the matrix can be as large as (10000, 10000)
+            print('logamp_grad_matrix shape: {}'.format(self.logamp_grad_matrix.shape))
+            # each logamp_grad is a long vector as (10000,)
+            # thus the matrix can be as large as (10000, 10000)
 
             # Compute the op gradient
             op_grad = op_logamp_grad_product - op_expect*mean_logamp_grad
