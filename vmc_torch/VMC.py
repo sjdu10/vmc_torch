@@ -101,7 +101,7 @@ class VMC:
             + f"\n  state = {self._state})"
         )
     
-    
+    # @profile
     def run(self, start, stop, tmpdir=None, save=True): # Now naive implementation
         """Run the VMC optimization loop."""
         self.Einit = 0.
@@ -164,9 +164,12 @@ class VMC:
                 
             else:
                 new_param_vec = np.empty(self._state.Np, dtype=float)
+                self._state.reset()
+            
+            self._state.clear_memory() # Clear out the memory
 
             # Broadcast the new parameter vector to all ranks
-            new_param_vec = np.ascontiguousarray(new_param_vec)
+            # new_param_vec = np.ascontiguousarray(new_param_vec)
             COMM.Bcast(new_param_vec,root=0)
             # Update the quantum state with the new parameter vector
             self._state.update_state(new_param_vec) # Reload the new parameter vector into the quantum state

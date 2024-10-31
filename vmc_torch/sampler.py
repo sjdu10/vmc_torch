@@ -113,7 +113,7 @@ class MetropolisExchangeSampler(Sampler):
         """Sample the next configuration. Change the current configuration in place.
         Must be implemented in the derived class."""
         raise NotImplementedError
-    
+
     def sample(self, op, vstate, chain_length=1):
         """Sample the local energy and amplitude gradient for each configuration."""
         assert self.equal_partition, "The number of samples must be equal for all MPI processes."
@@ -246,7 +246,7 @@ class MetropolisExchangeSampler(Sampler):
             # Discard messages from previous steps
             while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
                 redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
-                # print(f"Discarding redundant message from rank {redundant_message[0]}")
+                del redundant_message
             
             while not terminate:
                 # Receive the local sample count from each rank

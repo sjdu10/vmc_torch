@@ -126,7 +126,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 init_step = 0
-total_steps = 2
+total_steps = 5
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']

@@ -122,6 +122,7 @@ class SR(Preconditioner):
                 t1 = time.time()
                 if RANK == 0:
                     print("Time for solving the linear equation: ", t1-t0)
+                state.clear_memory()
                 return torch.tensor(dp, dtype=self.dtype)
 
 

@@ -41,14 +41,14 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 Lx = int(4)
-Ly = int(4)
+Ly = int(6)
 J1 = 1.0
 J2 = 0.5
 H = spin_J1J2_square_lattice(Lx, Ly, J1, J2, total_sz=0.0) 
 graph = H.graph
 # TN parameters
-D = 4
-chi = 4
+D = 2
+chi = -1
 chi_nn = 2
 dtype=torch.float64
 
@@ -59,13 +59,13 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e3)
+N_samples = int(8e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = PEPS_model(peps, max_bond=chi)
-# model = PEPS_delocalized_Model(peps, max_bond=chi, diag=False)
+# model = PEPS_model(peps, max_bond=chi)
+model = PEPS_delocalized_Model(peps, max_bond=chi, diag=False)
 # model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model = PEPS_NNproj_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model.apply(init_weights_to_zero)
@@ -77,8 +77,8 @@ model_names = {
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
-init_step = 0
-final_step = 5
+init_step = 89
+final_step = 200
 total_steps = final_step - init_step
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
@@ -90,7 +90,7 @@ if init_step != 0:
         model.load_params(saved_model_params_vec)
 
 # optimizer = SignedSGD(learning_rate=0.05)
-optimizer = SGD(learning_rate=5e-2)
+optimizer = SGD(learning_rate=3e-2)
 sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=True, equal_partition=False, dtype=dtype)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-2, iter_step=1e5, dtype=dtype)

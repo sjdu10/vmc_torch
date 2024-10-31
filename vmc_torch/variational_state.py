@@ -53,6 +53,12 @@ class Variational_State:
     def reset(self):
         """Clear the gradient of the variational state."""
         self.vstate_func.clear_grad()
+    
+    def clear_memory(self):
+        """Clear the memory of the variational state."""
+        self.logamp_grad_matrix = None
+        self.mean_logamp_grad = None
+        self.reset()
 
     def update_state(self, new_param_vec):
         """Update the variational state with the new parameter vector."""
@@ -128,7 +134,6 @@ class Variational_State:
         self.reset()
         return stats_dict, op_grad
         
-    
     def expect_and_grad(self, op, full_hi=False, message_tag=None):
         """
         Compute the expectation value of the operator `op` and its gradient.
@@ -152,14 +157,20 @@ class Variational_State:
         else:
             assert message_tag is not None, "Message tag must be provided for eager sampling!"
             # use MPI for sampling, but sampler may have different number of samples per rank
+            t0 = MPI.Wtime()
             op_expect, op_grad, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag)
+            t1 = MPI.Wtime()
+            if RANK == 0:
+                print('Time for eager sampling: {}'.format(t1-t0))
         
         # return statistics of the MC sampling
         stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_err}
 
+        assert self.logamp_grad_matrix is not None, "Logamp gradient matrix must be computed during sampling!"
+
         return stats_dict, op_grad
 
-    
+    # @profile
     def collect_samples(self, op, chain_length=1):
 
         vstate = self
@@ -300,7 +311,7 @@ class Variational_State:
         op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
 
         if RANK == 0:
-            print('RANK{}, sample size: {}'.format(RANK, total_sample_Ns))
+            print('Total sample size: {}'.format(total_sample_Ns))
             if DEBUG:
                 print('     Time for op_expect: {}'.format(t01-t0))
                 print('     Time for op_logamp_grad_product_sum: {}'.format(t02-t01))
