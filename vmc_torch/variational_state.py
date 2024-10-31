@@ -21,6 +21,7 @@ class Variational_State:
         self.Np = vstate_func.num_params
         self.hi = sampler.hi if sampler is not None else hi
         self.Ns = sampler.Ns if sampler is not None else self.hi.n_states
+        self.equal_partition = sampler.equal_partition
         self.nsites = self.hi.size
         self.logamp_grad_matrix = None
         self.mean_logamp_grad = None
@@ -128,7 +129,7 @@ class Variational_State:
         return stats_dict, op_grad
         
     
-    def expect_and_grad(self, op, full_hi=False):
+    def expect_and_grad(self, op, full_hi=False, message_tag=None):
         """
         Compute the expectation value of the operator `op` and its gradient.
 
@@ -143,10 +144,15 @@ class Variational_State:
         if full_hi or self.sampler is None:
             return self.full_hi_expect_and_grad(op)
         
-        # use MPI for sampling
-        chain_length = self.Ns//SIZE # Number of samples per rank
-
-        op_expect, op_grad, op_var, op_err = self.collect_samples(op, chain_length=chain_length)
+        if self.equal_partition:
+            chain_length = self.Ns//SIZE # Number of samples per rank
+            # use MPI for sampling
+            op_expect, op_grad, op_var, op_err = self.collect_samples(op, chain_length=chain_length)
+        
+        else:
+            assert message_tag is not None, "Message tag must be provided for eager sampling!"
+            # use MPI for sampling, but sampler may have different number of samples per rank
+            op_expect, op_grad, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag)
         
         # return statistics of the MC sampling
         stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_err}
@@ -160,7 +166,7 @@ class Variational_State:
         
         # Sample on each rank
         # this should be a list of local samples statistics:
-        # a tuple of (op_loc_sum, logamp_grad_sum, op_loc_logamp_grad_product_sum, op_loc_var, logamp_grad_matrix)
+        # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         t_sample_start = MPI.Wtime()
         local_samples = self.sampler.sample(op, vstate, chain_length=chain_length)
         t_sample_end = MPI.Wtime()
@@ -246,7 +252,69 @@ class Variational_State:
         
         else:
             return None, None, None, None
+    
+    def collect_samples_eager(self, op, message_tag=None):
+        vstate = self
+        
+        # Sample on each rank
+        # this should be a list of local samples statistics:
+        # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
+
+        t_sample_start = MPI.Wtime()
+        local_samples = self.sampler.sample_eager(op, vstate, message_tag=message_tag)
+        t_sample_end = MPI.Wtime()
+        if DEBUG:
+            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
+
+        local_op_loc_sum = local_samples[0]
+        local_logamp_grad = local_samples[1]
+        local_op_logamp_grad_product_sum = local_samples[2]
+        local_op_var = local_samples[3]
+        local_logamp_grad_matrix = local_samples[4]
+        n_local_samples = local_logamp_grad_matrix.shape[1]
+        total_sample_Ns = COMM.allreduce(n_local_samples, op=MPI.SUM)
+
+        # clean the memory
+        del local_samples
+        
+        t0 = MPI.Wtime()
+
+        # Compute the op expectation value on all ranks
+        op_expect = COMM.allreduce(local_op_loc_sum, op=MPI.SUM)/total_sample_Ns # op_expect is seen by all ranks
+        mean_logamp_grad = COMM.allreduce(local_logamp_grad, op=MPI.SUM)/total_sample_Ns
+        t01 = MPI.Wtime()
+
+        # Collect the op_logamp_grad_product ONLY on rank 0
+        op_logamp_grad_product_sum = COMM.reduce(local_op_logamp_grad_product_sum, op=MPI.SUM, root=0)
+        t02 = MPI.Wtime()
+        
+        # set the logamp_grad_matrix and mean_logamp_grad for all ranks
+        # each rank has their local batch of logamp_grad_matrix, but shares the same mean_logamp_grad
+        self.logamp_grad_matrix = local_logamp_grad_matrix
+        self.mean_logamp_grad = mean_logamp_grad
         
 
+        # compute the total sample variance
+        local_op_loc_mean = local_op_loc_sum/n_local_samples
+        local_W_var = (n_local_samples-1)*local_op_var + n_local_samples*(local_op_loc_mean - op_expect)**2
+        op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
+
+        if RANK == 0:
+            print('RANK{}, sample size: {}'.format(RANK, total_sample_Ns))
+            if DEBUG:
+                print('     Time for op_expect: {}'.format(t01-t0))
+                print('     Time for op_logamp_grad_product_sum: {}'.format(t02-t01))
+            op_logamp_grad_product = op_logamp_grad_product_sum/total_sample_Ns
+
+            # Compute the op gradient
+            op_grad = op_logamp_grad_product - op_expect*mean_logamp_grad
+
+            op_var = op_var/total_sample_Ns
+            op_mean_err = np.sqrt(op_var/total_sample_Ns)
+
+            return op_expect, op_grad, op_var, op_mean_err
+        
+        else:
+            return None, None, None, None
             
 

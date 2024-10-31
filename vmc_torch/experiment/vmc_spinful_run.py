@@ -53,7 +53,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = 4
 dtype=torch.float64
 
 # Load PEPS
@@ -93,21 +93,21 @@ if (N_samples/SIZE)%2 != 0:
 #     dropout=0.0,
 #     dtype=dtype,
 # )
-# model = fTN_Transformer_Proj_lazy_Model(
-#     peps,
-#     max_bond=chi,
-#     nn_eta=1.0,
-#     d_model=2**2,
-#     nhead=2,
-#     num_encoder_layers=2,
-#     num_decoder_layers=2,
-#     dim_feedforward=2**5,
-#     dropout=0.0,
-#     dtype=dtype,
-# )
-import jax
-dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
-model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=30, dummy_config=dummy_config)
+model = fTN_Transformer_Proj_lazy_Model(
+    peps,
+    max_bond=chi,
+    nn_eta=1.0,
+    d_model=2**2,
+    nhead=2,
+    num_encoder_layers=2,
+    num_decoder_layers=2,
+    dim_feedforward=2**5,
+    dropout=0.0,
+    dtype=dtype,
+)
+# import jax
+# dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
+# model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=30, dummy_config=dummy_config)
 # model.apply(init_weights_kaiming)
 model.apply(init_weights_to_zero)
 
@@ -138,7 +138,7 @@ if init_step != 0:
 
 # optimizer = SignedSGD(learning_rate=0.05)
 optimizer = SGD(learning_rate=0.05)
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=True, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=True, equal_partition=False, dtype=dtype)
 # sampler = None
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.05, iter_step=1e5, dtype=dtype)

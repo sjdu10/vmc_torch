@@ -114,7 +114,10 @@ class VMC:
 
             # Use MPI for the sampling
             # Only rank 0 collects the energy statistics, but all ranks must have the energy gradient
-            state_MC_energy, state_MC_energy_grad = self._state.expect_and_grad(self._hamiltonian)
+            if self._state.equal_partition:
+                state_MC_energy, state_MC_energy_grad = self._state.expect_and_grad(self._hamiltonian)
+            else:
+                state_MC_energy, state_MC_energy_grad = self._state.expect_and_grad(self._hamiltonian, message_tag=step)
             state_MC_energy_grad = COMM.bcast(state_MC_energy_grad, root=0)
             
             MC_energy_stats['mean'].append(state_MC_energy['mean'])

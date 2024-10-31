@@ -70,7 +70,7 @@ def from_quimb_config_to_netket_config(quimb_config):
 # --- Sampler ---
 
 class Sampler:
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, dtype=torch.float32):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, equal_partition=True, dtype=torch.float32):
         self.hi = hi
         self.Ns = N_samples
         self.graph = graph
@@ -79,6 +79,7 @@ class Sampler:
         self.dtype = dtype
         self.initial_config = None
         self.current_config = None
+        self.equal_partition = equal_partition
         self.reset()
     
     def reset(self):
@@ -98,8 +99,8 @@ class Sampler:
 
 class MetropolisExchangeSampler(Sampler):
     """Metropolis-Hastings sampler that uses the exchange move as the sampling rule."""
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, dtype=torch.float32):
-        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain)
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, equal_partition)
         self.random_edge = random_edge
         self.subchain_length = hi.size if subchain_length is None else subchain_length
     
@@ -115,6 +116,7 @@ class MetropolisExchangeSampler(Sampler):
     
     def sample(self, op, vstate, chain_length=1):
         """Sample the local energy and amplitude gradient for each configuration."""
+        assert self.equal_partition, "The number of samples must be equal for all MPI processes."
         if RANK == 0:
             print('Burn-in...')
             t_burnin0 = time.time()
@@ -204,6 +206,121 @@ class MetropolisExchangeSampler(Sampler):
         samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         return samples
     
+    def sample_eager(self, op, vstate, message_tag=None):
+        """Sample eagerly for the local energy and amplitude gradient for each configuration."""
+        assert self.equal_partition == False, 'Must not use equal partition for eager sampling.'
+
+        if RANK == 0:
+            print('Burn-in...')
+            t_burnin0 = time.time()
+        self.burn_in(vstate)
+        if RANK == 0:
+            t_burnin1 = time.time()
+            print('Burn-in time:', t_burnin1 - t_burnin0)
+
+        op_loc_sum = 0
+        logpsi_sigma_grad_sum = np.zeros(vstate.Np)
+        op_logpsi_sigma_grad_product_sum = np.zeros(vstate.Np)
+
+        logpsi_sigma_grad_mat = []
+        # We only estimate the variance of op_loc locally
+        n = 0
+        n_total = 0
+        op_loc_vec = []
+        terminate = False
+
+        if RANK == 0:
+            pbar = tqdm(total=self.Ns, desc='Sampling starts...')
+            for _ in range(2):
+                op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
+                op_loc_vec.append(op_loc)
+                op_loc_sum += op_loc
+                logpsi_sigma_grad_sum += logpsi_sigma_grad
+                op_logpsi_sigma_grad_product_sum += op_loc * logpsi_sigma_grad
+                logpsi_sigma_grad_mat.append(logpsi_sigma_grad)
+
+                n += 1
+                n_total += 1
+                pbar.update(1)
+            
+            # Discard messages from previous steps
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
+                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
+                # print(f"Discarding redundant message from rank {redundant_message[0]}")
+            
+            while not terminate:
+                # Receive the local sample count from each rank
+                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2))
+                dest_rank = buf[0]
+                n_total += 1
+                pbar.update(1)
+                # Check if we have enough samples
+                if n_total >= self.Ns:
+                    terminate = True
+                    for dest_rank in range(1, SIZE):
+                        COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                # Send the termination signal to the rank
+                COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+            
+            pbar.close()
+        
+        else:
+            while not terminate:
+                op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
+                n += 1
+                op_loc_vec.append(op_loc)
+                # accumulate the local energy and amplitude gradient
+                op_loc_sum += op_loc
+                logpsi_sigma_grad_sum += logpsi_sigma_grad
+                op_logpsi_sigma_grad_product_sum += op_loc * logpsi_sigma_grad
+
+                # collect the log-amplitude gradient
+                logpsi_sigma_grad_mat.append(logpsi_sigma_grad)
+
+                buf = (RANK,)
+                # Send the local sample count to rank 0
+                COMM.send(buf, dest=0, tag=message_tag+np.sqrt(2))
+                # Receive the termination signal from rank 0
+                terminate = COMM.recv(source=0, tag=message_tag+1)
+
+        
+        if self.reset_chain:
+            self.reset()
+        
+        if RANK == 0:
+            pbar.close()
+        
+        # convert the list to numpy array
+        logpsi_sigma_grad_mat = np.asarray(logpsi_sigma_grad_mat).T
+        op_loc_vec = np.asarray(op_loc_vec)
+        op_loc_var = np.var(op_loc_vec, ddof=1)
+        samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
+
+        return samples
+
+    def _sample_expect_grad(self, vstate, op):
+        """Get one sample of the local energy and amplitude gradient."""
+        time0 = MPI.Wtime()
+        # sample the next configuration
+        sigma = self._sample_next(vstate)
+        time1 = MPI.Wtime()
+
+        # compute local energy and amplitude gradient
+        psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
+        # compute the connected non-zero operator matrix elements <eta|O|sigma>
+        eta, O_etasigma = op.get_conn(sigma)
+        psi_eta = vstate.amplitude(eta)
+
+        # convert torch tensors to numpy arrays
+        psi_sigma = psi_sigma.detach().numpy()
+        psi_eta = psi_eta.detach().numpy()
+        logpsi_sigma_grad = logpsi_sigma_grad.detach().numpy()
+
+        # compute the local operator
+        op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+
+        return op_loc, logpsi_sigma_grad, time1 - time0
+    
     def sample_expectation(self, vstate, op, chain_length=1):
         """Sample the expectation value of the operator `op`."""
         self.burn_in(vstate)
@@ -234,8 +351,8 @@ class MetropolisExchangeSampler(Sampler):
 
 
 class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, dtype=torch.float32):
-        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, dtype)
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
     
     def _sample_next(self, vstate):
         """Sample the next configuration. Change the current configuration in place."""
@@ -269,8 +386,8 @@ class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
         return self.current_config
     
 class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, dtype=torch.float32):
-        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, dtype)
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
 
     def _sample_next(self, vstate):
         """Sample the next configuration. Change the current configuration in place."""

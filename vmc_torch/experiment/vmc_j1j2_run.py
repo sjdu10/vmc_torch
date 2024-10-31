@@ -59,7 +59,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e2)
+N_samples = int(1e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -78,7 +78,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 init_step = 0
-final_step = 1
+final_step = 5
 total_steps = final_step - init_step
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
@@ -91,7 +91,7 @@ if init_step != 0:
 
 # optimizer = SignedSGD(learning_rate=0.05)
 optimizer = SGD(learning_rate=5e-2)
-sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=True, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=True, equal_partition=False, dtype=dtype)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-2, iter_step=1e5, dtype=dtype)
 vmc = VMC(H, variational_state, optimizer, preconditioner)
