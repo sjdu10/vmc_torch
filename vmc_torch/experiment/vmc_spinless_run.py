@@ -1,10 +1,11 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ["OMP_NUM_THREADS"] = '1'
 import numpy as np
 from quimb.utils import progbar as Progbar
 from mpi4py import MPI
 import pickle
-import os
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
 
 # torch
 from torch.nn.parameter import Parameter

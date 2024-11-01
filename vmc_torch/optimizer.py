@@ -1,3 +1,7 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ["OMP_NUM_THREADS"] = '1'
 import numpy as np
 from mpi4py import MPI
 import time
@@ -6,10 +10,14 @@ import scipy
 from scipy.sparse import csr_matrix
 
 # torch
+import scipy.sparse
+import scipy.sparse.linalg
 import torch
 
 # quimb
 from autoray import do
+
+from .global_var import DEBUG
 
 
 COMM = MPI.COMM_WORLD
@@ -106,10 +114,11 @@ class SR(Preconditioner):
                     energy_grad = COMM.bcast(energy_grad, root=0)
                 def R_dot_x(x, eta=1e-6):
                     x_out_local = np.zeros_like(x)
-                    for i in range(local_logamp_grad_matrix.shape[1]):
-                        x_out_local += np.dot(local_logamp_grad_matrix[:, i], x)*local_logamp_grad_matrix[:, i]
+                    # for i in range(local_logamp_grad_matrix.shape[1]):
+                    #     x_out_local += do('dot', local_logamp_grad_matrix[:, i], x)*local_logamp_grad_matrix[:, i]
                     # use matrix multiplication for speedup
-                    # x_out_local = np.dot(local_logamp_grad_matrix, np.dot(local_logamp_grad_matrix.T, x))
+                    x_out_local = do('dot', local_logamp_grad_matrix, do('dot', local_logamp_grad_matrix.T, x))
+                    # synchronize the result
                     x_out = COMM.allreduce(x_out_local, op=MPI.SUM)/state.Ns
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
                     return x_out + eta*x
