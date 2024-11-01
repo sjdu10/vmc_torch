@@ -312,6 +312,7 @@ class Variational_State:
 
         if RANK == 0:
             print('Total sample size: {}'.format(total_sample_Ns))
+            print('Np = {}'.format(self.logamp_grad_matrix.shape[0]))
             if DEBUG:
                 print('     Time for op_expect: {}'.format(t01-t0))
                 print('     Time for op_logamp_grad_product_sum: {}'.format(t02-t01))

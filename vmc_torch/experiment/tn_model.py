@@ -1069,7 +1069,7 @@ class fTN_Transformer_Model(torch.nn.Module):
             num_encoder_layers=6, 
             num_decoder_layers=6, 
             dim_feedforward=512, 
-            dropout=0.1,
+            dropout=0.0,
             dtype=torch.float32
         ):
 
@@ -1173,7 +1173,6 @@ class fTN_Transformer_Model(torch.nn.Module):
             amp_2row = amp_2row.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
             amp_2row_params, amp_2row_skeleton = qtn.pack(amp_2row)
             amp_2row_params_vec = flatten_proj_params(amp_2row_params)
-            vec_len = len(amp_2row_params_vec)
             
             # Check x_i type
             if not type(x_i) == torch.Tensor:
@@ -1268,7 +1267,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'fPEPS (transformer-two-row)':{'D': ftn.max_bond(), 'chi': self.max_bond, 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+            'fPEPS (transformer-proj)':{'D': ftn.max_bond(), 'chi': self.max_bond, 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
             'transformer':{'input_size': ftn.nsites, 'output_size': 1}
         }
 

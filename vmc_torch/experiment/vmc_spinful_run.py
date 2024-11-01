@@ -63,7 +63,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e2)
+N_samples = int(5e2)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -93,21 +93,21 @@ if (N_samples/SIZE)%2 != 0:
 #     dropout=0.0,
 #     dtype=dtype,
 # )
-model = fTN_Transformer_Proj_lazy_Model(
-    peps,
-    max_bond=chi,
-    nn_eta=1.0,
-    d_model=2**2,
-    nhead=2,
-    num_encoder_layers=2,
-    num_decoder_layers=2,
-    dim_feedforward=2**5,
-    dropout=0.0,
-    dtype=dtype,
-)
-# import jax
-# dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
-# model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=30, dummy_config=dummy_config)
+# model = fTN_Transformer_Proj_lazy_Model(
+#     peps,
+#     max_bond=chi,
+#     nn_eta=1.0,
+#     d_model=2**2,
+#     nhead=2,
+#     num_encoder_layers=2,
+#     num_decoder_layers=2,
+#     dim_feedforward=2**5,
+#     dropout=0.0,
+#     dtype=dtype,
+# )
+import jax
+dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
+model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=30, dummy_config=dummy_config)
 # model.apply(init_weights_kaiming)
 model.apply(init_weights_to_zero)
 
