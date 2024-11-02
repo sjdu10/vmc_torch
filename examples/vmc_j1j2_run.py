@@ -47,6 +47,7 @@ J1 = 1.0
 J2 = 0.5
 H = spin_J1J2_square_lattice(Lx, Ly, J1, J2, total_sz=0.0) 
 graph = H.graph
+
 # TN parameters
 D = 2
 chi = 2
@@ -54,17 +55,12 @@ chi_nn = 2
 dtype=torch.float64
 
 # Load PEPS
-skeleton = pickle.load(open(f"../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/peps_skeleton.pkl", "rb"))
-peps_params = pickle.load(open(f"../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/peps_su_params.pkl", "rb"))
+skeleton = pickle.load(open(f"../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/peps_skeleton.pkl", "rb"))
+peps_params = pickle.load(open(f"../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/peps_su_params.pkl", "rb"))
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
-# VMC sample size
-N_samples = int(1e3)
-N_samples = closest_divisible(N_samples, SIZE)
-if (N_samples/SIZE)%2 != 0:
-    N_samples += SIZE
-
+# Define torch model
 model = PEPS_model(peps, max_bond=chi)
 # model = PEPS_delocalized_Model(peps, max_bond=chi, diag=False)
 # model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
@@ -78,11 +74,18 @@ model_names = {
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
+# VMC sample size
+N_samples = int(1e3)
+N_samples = closest_divisible(N_samples, SIZE)
+if (N_samples/SIZE)%2 != 0:
+    N_samples += SIZE
+
+# VMC length and load model
 init_step = 0
 final_step = 200
 total_steps = final_step - init_step
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(f'../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -90,7 +93,7 @@ if init_step != 0:
     except:
         model.load_params(saved_model_params_vec)
 
-# optimizer = SignedSGD(learning_rate=0.05)
+# Define VMC optimizer, sampler, variational state, and VMC
 optimizer = SGD(learning_rate=5e-2)
 sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=True, equal_partition=False, dtype=dtype)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
@@ -99,6 +102,6 @@ vmc = VMC(H, variational_state, optimizer, preconditioner)
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/')
+    os.makedirs(f'../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    vmc.run(init_step, init_step+total_steps, tmpdir=f'../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/')
 

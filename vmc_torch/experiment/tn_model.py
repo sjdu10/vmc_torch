@@ -567,7 +567,10 @@ class PEPS_delocalized_Model(torch.nn.Module):
             if self.max_bond is None:
                 return peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)}).contract()
             else:
-                return peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)}).contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, peps.Ly-2]).contract()
+                amp = peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)})
+                amp.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, peps.Ly//2-1])
+                amp.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[peps.Ly//2, peps.Ly-1])
+                return amp.contract()
         
         if x.ndim == 1:
             return func(x)

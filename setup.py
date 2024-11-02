@@ -22,7 +22,7 @@ setup(
         "autoray",
         "numpy",
         "torch",
-        "quimb @ git+https://github.com/jcmgray/quimb.git",
+        "quimb @ git+https://github.com/sjdu10/quimb.git",
         "symmray @ git+https://github.com/sjdu10/symmray.git",
     ],
     include_package_data=True,
