@@ -7,14 +7,14 @@ A quantum variational Monte Carlo (VMC) framework for general pytorch models. Cu
 **Installing the latest version directly from github:**
 
 ```bash
-pip install -U git+https://github.com/sjdu10/vmc_torch.git
+pip install -U git+https://github.com/sjdu10/vmc_torch_experiment.git
 ```
 
 **Installing a local, editable development version:**
 
 ```bash
-git clone https://github.com/sjdu10/vmc_torch.git
-pip install --no-deps -U -e vmc_torch/
+git clone https://github.com/sjdu10/vmc_torch_experiment.git
+pip install --no-deps -U -e vmc_torch_experiment/
 ```
 
 ## Usage
