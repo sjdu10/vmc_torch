@@ -35,11 +35,11 @@ def init_weights_kaiming(m):
             nn.init.constant_(m.bias, 0.0)
 
 # Define the custom zero-initialization function
-def init_weights_to_zero(m):
+def init_weights_to_zero(m, std=1e-3):
     if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding, nn.LayerNorm)):
         # Set weights and biases to zero
         if hasattr(m, 'weight') and m.weight is not None:
-            nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+            nn.init.normal_(m.weight, mean=0.0, std=std)
         if hasattr(m, 'bias') and m.bias is not None:
             nn.init.constant_(m.bias, 0.0)
 
@@ -219,9 +219,14 @@ class PEPS_model(torch.nn.Module):
         peps = qtn.unpack(params, self.skeleton)
         def func(xi):
             if self.max_bond is None:
-                return peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)}).contract()
+                amp_val = peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)}).contract()
+                return amp_val
             else:
-                return peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)}).contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, peps.Ly-2]).contract()
+                amp = peps.isel({peps.site_inds[i]: int(s) for i, s in enumerate(xi)})
+                amp.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, peps.Ly//2-1],canonize=True)
+                amp.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[peps.Ly//2, peps.Ly-1],canonize=True)
+                amp_val = amp.contract()
+                return amp_val
         
         if x.ndim == 1:
             return func(x)

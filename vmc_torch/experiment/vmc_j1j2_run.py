@@ -49,7 +49,7 @@ H = spin_J1J2_square_lattice(Lx, Ly, J1, J2, total_sz=0.0)
 graph = H.graph
 # TN parameters
 D = 2
-chi = 2
+chi = 10
 chi_nn = 2
 dtype=torch.float64
 
@@ -60,7 +60,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e3)
+N_samples = int(1e1)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -92,7 +92,7 @@ if init_step != 0:
 
 # optimizer = SignedSGD(learning_rate=0.05)
 optimizer = SGD(learning_rate=5e-2)
-sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=True, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=True, equal_partition=True, dtype=dtype)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=5e-2, iter_step=1e5, dtype=dtype)
 vmc = VMC(H, variational_state, optimizer, preconditioner)
