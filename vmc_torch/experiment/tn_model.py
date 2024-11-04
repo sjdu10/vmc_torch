@@ -1332,7 +1332,8 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
             # Insert projectors
             try:
                 amp_w_proj = insert_proj_peps(amp, max_bond=self.max_bond, yrange=[0, psi.Ly-2], lazy=self.lazy)
-            except ZeroDivisionError:
+            except:
+                print('ill configuration:', x_i)
                 amp_value = torch.tensor(0.0, dtype=self.param_dtype)
                 batch_amps.append(amp_value)
                 continue

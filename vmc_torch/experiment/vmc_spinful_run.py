@@ -107,6 +107,10 @@ model = fTN_Transformer_Proj_lazy_Model(
     dtype=dtype,
 )
 model.apply(lambda x: init_weights_to_zero(x, std=5e-1))
+# import jax
+# dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
+# model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=50, dummy_config=dummy_config, lazy=True)
+# model.apply(lambda x: init_weights_to_zero(x, std=2e-2))
 
 model_names = {
     fTNModel: 'fTN',
