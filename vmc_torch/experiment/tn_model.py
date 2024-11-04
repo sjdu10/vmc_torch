@@ -722,12 +722,13 @@ class fTN_NN_proj_Model(torch.nn.Module):
 
 class fTN_NN_proj_variable_Model(torch.nn.Module):
     
-    def __init__(self, ftn, max_bond, nn_hidden_dim=64, nn_eta=1e-3, dtype=torch.float32, padded_length=0, dummy_config=None):
+    def __init__(self, ftn, max_bond, nn_hidden_dim=64, nn_eta=1e-3, dtype=torch.float32, padded_length=0, dummy_config=None, lazy=False):
         super().__init__()
         self.max_bond = max_bond
         self.nn_eta = nn_eta
         self.param_dtype = dtype
         self.padded_length = padded_length
+        self.lazy = lazy
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
 
@@ -744,7 +745,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
         self.N_fermion = sum(self.parity_config)
         assert dummy_config is not None, "Please provide a dummy configuration for the model."
         dummy_amp = ftn.get_amp(dummy_config)
-        dummy_amp_w_proj = insert_proj_peps(dummy_amp, max_bond=max_bond, yrange=[0, ftn.Ly-2])
+        dummy_amp_w_proj = insert_proj_peps(dummy_amp, max_bond=max_bond, yrange=[0, ftn.Ly-2], lazy=lazy)
         dummy_amp_tn, dummy_proj_tn = dummy_amp_w_proj.partition(tags='proj')
         dummy_proj_params, dummy_proj_skeleton = qtn.pack(dummy_proj_tn)
         dummy_proj_params_vec = flatten_proj_params(dummy_proj_params)
@@ -823,7 +824,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
 
             # Insert projectors
             try:
-                amp_w_proj = insert_proj_peps(amp, max_bond=self.max_bond, yrange=[0, psi.Ly-2])
+                amp_w_proj = insert_proj_peps(amp, max_bond=self.max_bond, yrange=[0, psi.Ly-2], lazy=self.lazy)
             except ZeroDivisionError:
                 amp_val = torch.tensor(0.0, dtype=self.param_dtype)
                 batch_amps.append(amp_val)
