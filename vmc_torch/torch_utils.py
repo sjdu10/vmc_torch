@@ -161,6 +161,7 @@ class QR(torch.autograd.Function):
         if M * N == 0:
             raise ValueError(f"input matrix to custom QR is size {(M,N)}")
         if not torch.all(torch.isfinite(A)): # A not finite
+            print(A)
             raise ValueError("input matrix to custom QR is not finite")
         try:
             Q, R = torch.linalg.qr(A,mode='reduced')

@@ -54,7 +54,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = 4
+chi = 6
 dtype=torch.float64
 
 # Load PEPS
@@ -64,7 +64,7 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = int(5e2)
+N_samples = int(5e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -94,23 +94,19 @@ if (N_samples/SIZE)%2 != 0:
 #     dropout=0.0,
 #     dtype=dtype,
 # )
-# model = fTN_Transformer_Proj_lazy_Model(
-#     peps,
-#     max_bond=chi,
-#     nn_eta=1.0,
-#     d_model=2**2,
-#     nhead=2,
-#     num_encoder_layers=2,
-#     num_decoder_layers=2,
-#     dim_feedforward=2**5,
-#     dropout=0.0,
-#     dtype=dtype,
-# )
-import jax
-dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
-model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=30, dummy_config=dummy_config)
-# model.apply(init_weights_kaiming)
-model.apply(init_weights_to_zero)
+model = fTN_Transformer_Proj_lazy_Model(
+    peps,
+    max_bond=chi,
+    nn_eta=1.0,
+    d_model=8,
+    nhead=2,
+    num_encoder_layers=1,
+    num_decoder_layers=1,
+    dim_feedforward=16,
+    dropout=0.0,
+    dtype=dtype,
+)
+model.apply(lambda x: init_weights_to_zero(x, std=5e-1))
 
 model_names = {
     fTNModel: 'fTN',
@@ -127,7 +123,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 init_step = 0
-total_steps = 5
+total_steps = 10
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
