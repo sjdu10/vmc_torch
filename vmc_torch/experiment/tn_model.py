@@ -43,113 +43,8 @@ def init_weights_to_zero(m, std=1e-3):
         if hasattr(m, 'bias') and m.bias is not None:
             nn.init.constant_(m.bias, 0.0)
 
-class fTNModel(torch.nn.Module):
 
-    def __init__(self, ftn, max_bond=None):
-        super().__init__()
-        
-        # extract the raw arrays and a skeleton of the TN
-        params, self.skeleton = qtn.pack(ftn)
-
-        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
-        self.torch_tn_params = nn.ModuleDict({
-            str(tid): nn.ParameterDict({
-                str(sector): nn.Parameter(data)
-                for sector, data in blk_array.items()
-            })
-            for tid, blk_array in params.items()
-        })
-
-        # Get symmetry
-        self.symmetry = ftn.arrays[0].symmetry
-
-        # Store the shapes of the parameters
-        self.param_shapes = [param.shape for param in self.parameters()]
-
-        self.model_structure = {
-            'fPEPS (exact contraction)':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
-        }
-        if max_bond is None or max_bond <= 0:
-            max_bond = None
-        self.max_bond = max_bond
-        
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def from_vec_to_params(self, vec, quimb_format=False):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        # XXX: useful at all?
-        params = {}
-        idx = 0
-        for tid, blk_array in self.torch_tn_params.items():
-            params[tid] = {}
-            for sector, data in blk_array.items():
-                shape = data.shape
-                size = data.numel()
-                if quimb_format:
-                    params[tid][ast.literal_eval(sector)] = vec[idx:idx+size].view(shape)
-                else:
-                    params[tid][sector] = vec[idx:idx+size].view(shape)
-                idx += size
-        return params
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
-
-    
-    def amplitude(self, x):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        params = {
-            int(tid): {
-                ast.literal_eval(sector): data
-                for sector, data in blk_array.items()
-            }
-            for tid, blk_array in self.torch_tn_params.items()
-        }
-        # Reconstruct the TN with the new parameters
-        psi = qtn.unpack(params, self.skeleton)
-        # `x` is expected to be batched as (batch_size, input_dim)
-        # Loop through the batch and compute amplitude for each sample
-        batch_amps = []
-        for x_i in x:
-            amp = psi.get_amp(x_i, conj=True)
-            if self.max_bond is None:
-                amp = amp
-            else:
-                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-2])
-            amp_val = amp.contract()
-            if amp_val==0.0:
-                amp_val = torch.tensor(0.0)
-            batch_amps.append(amp_val)
-
-        # Return the batch of amplitudes stacked as a tensor
-        return torch.stack(batch_amps)
-    
-    def forward(self, x):
-        if x.ndim == 1:
-            # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x)
+#------------ bosonic TN model ------------
 
 
 class PEPS_model(torch.nn.Module):
@@ -588,12 +483,239 @@ class PEPS_delocalized_Model(torch.nn.Module):
             x = x.unsqueeze(0)
         return self.amplitude(x)
 
+#------------ fermionic TN model ------------
 
+class fTNModel(torch.nn.Module):
+
+    def __init__(self, ftn, max_bond=None):
+        super().__init__()
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS (exact contraction)':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        
+    
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            if param is not None:
+                param.grad = None
+    
+    def from_vec_to_params(self, vec, quimb_format=False):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        # XXX: useful at all?
+        params = {}
+        idx = 0
+        for tid, blk_array in self.torch_tn_params.items():
+            params[tid] = {}
+            for sector, data in blk_array.items():
+                shape = data.shape
+                size = data.numel()
+                if quimb_format:
+                    params[tid][ast.literal_eval(sector)] = vec[idx:idx+size].view(shape)
+                else:
+                    params[tid][sector] = vec[idx:idx+size].view(shape)
+                idx += size
+        return params
+    
+    def load_params(self, new_params):
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(params, self.skeleton)
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            amp = psi.get_amp(x_i, conj=True)
+            if self.max_bond is None:
+                amp = amp
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-2])
+            amp_val = amp.contract()
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+    
+    def forward(self, x):
+        if x.ndim == 1:
+            # If input is not batched, add a batch dimension
+            x = x.unsqueeze(0)
+        return self.amplitude(x)
+
+
+class fTN_backflow_Model(torch.nn.Module):
+
+    def __init__(self, ftn, max_bond=None, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly
+        tn_params_vec = flatten_proj_params(params)
+        self.nn = nn.Sequential(
+            nn.Linear(input_dim, nn_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(nn_hidden_dim, tn_params_vec.numel())
+        )
+        self.nn.to(self.param_dtype)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS (exact contraction)':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        
+        
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            if param is not None:
+                param.grad = None
+    
+    def load_params(self, new_params):
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_proj_params(params)
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+            # Get the NN correction to the parameters
+            nn_correction = self.nn(x_i)
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta*nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            if self.max_bond is None:
+                amp = amp
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-2])
+
+            amp_val = amp.contract()
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+    
+    def forward(self, x):
+        if x.ndim == 1:
+            # If input is not batched, add a batch dimension
+            x = x.unsqueeze(0)
+        return self.amplitude(x)
+    
 class fTN_NN_proj_Model(torch.nn.Module):
     
     def __init__(self, ftn, max_bond, nn_hidden_dim=64, nn_eta=1e-3, param_dtype=torch.float32):
         super().__init__()
-        self.max_bond = max_bond
+        self.max_bond = max_bond if max_bond > 0 else None
         self.nn_eta = nn_eta
         self.param_dtype = param_dtype
         # extract the raw arrays and a skeleton of the TN
@@ -724,7 +846,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
     
     def __init__(self, ftn, max_bond, nn_hidden_dim=64, nn_eta=1e-3, dtype=torch.float32, padded_length=0, dummy_config=None, lazy=False):
         super().__init__()
-        self.max_bond = max_bond
+        self.max_bond = max_bond if max_bond > 0 else None
         self.nn_eta = nn_eta
         self.param_dtype = dtype
         self.padded_length = padded_length
@@ -825,7 +947,8 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
             # Insert projectors
             try:
                 amp_w_proj = insert_proj_peps(amp, max_bond=self.max_bond, yrange=[0, psi.Ly-2], lazy=self.lazy)
-            except ZeroDivisionError:
+            except:
+                print('ill configuration:', x_i)
                 amp_val = torch.tensor(0.0, dtype=self.param_dtype)
                 batch_amps.append(amp_val)
                 continue
@@ -871,7 +994,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
     """2-row fTN with NN insertion."""
     def __init__(self, ftn, max_bond, nn_hidden_dim=64, nn_eta=1e-3, param_dtype=torch.float32):
         super().__init__()
-        self.max_bond = max_bond
+        self.max_bond = max_bond if max_bond > 0 else None
         self.nn_eta = nn_eta
         self.param_dtype = param_dtype
         # extract the raw arrays and a skeleton of the TN
@@ -1083,7 +1206,7 @@ class fTN_Transformer_Model(torch.nn.Module):
         ):
 
         super().__init__()
-        self.max_bond = max_bond
+        self.max_bond = max_bond if max_bond > 0 else None
         self.nn_eta = nn_eta
         self.phys_dim = ftn.phys_dim()
         self.param_dtype = dtype
@@ -1232,7 +1355,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
             lazy=True,
         ):
         super().__init__()
-        self.max_bond = max_bond
+        self.max_bond = max_bond if max_bond > 0 else None
         self.nn_eta = nn_eta
         self.phys_dim = ftn.phys_dim()
         self.param_dtype = dtype
@@ -1395,7 +1518,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
             lazy=False,
         ):
         super().__init__()
-        self.max_bond = max_bond
+        self.max_bond = max_bond if max_bond > 0 else None
         self.nn_eta = nn_eta
         self.phys_dim = ftn.phys_dim()
         self.param_dtype = dtype

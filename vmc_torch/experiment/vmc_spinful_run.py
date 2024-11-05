@@ -20,14 +20,15 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from vmc_torch.experiment.tn_model import fTNModel, fTN_NN_proj_Model, fTN_NN_2row_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
+from vmc_torch.experiment.tn_model import fTNModel, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
+from vmc_torch.experiment.tn_model import fTN_backflow_Model
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
 from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
-from vmc_torch.sampler import MetropolisExchangeSamplerSpinless, MetropolisExchangeSamplerSpinful
+from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
+from vmc_torch.optimizer import SGD, SR
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import square_lattice_spinless_Fermi_Hubbard, spinful_Fermi_Hubbard_square_lattice, spinless_Fermi_Hubbard_square_lattice, square_lattice_spinful_Fermi_Hubbard
+from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_square_lattice
 from vmc_torch.torch_utils import SVD,QR
 
 # Register safe SVD and QR functions to torch
@@ -53,8 +54,8 @@ n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 4
-chi = 6
+D = 3
+chi = -1
 dtype=torch.float64
 
 # Load PEPS
@@ -64,12 +65,13 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = int(5e3)
+N_samples = int(1e2)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = fTNModel(peps, max_bond=chi)
+model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -94,19 +96,19 @@ if (N_samples/SIZE)%2 != 0:
 #     dropout=0.0,
 #     dtype=dtype,
 # )
-model = fTN_Transformer_Proj_lazy_Model(
-    peps,
-    max_bond=chi,
-    nn_eta=1.0,
-    d_model=8,
-    nhead=2,
-    num_encoder_layers=1,
-    num_decoder_layers=1,
-    dim_feedforward=16,
-    dropout=0.0,
-    dtype=dtype,
-)
-model.apply(lambda x: init_weights_to_zero(x, std=5e-1))
+# model = fTN_Transformer_Proj_lazy_Model(
+#     peps,
+#     max_bond=chi,
+#     nn_eta=1.0,
+#     d_model=8,
+#     nhead=2,
+#     num_encoder_layers=1,
+#     num_decoder_layers=1,
+#     dim_feedforward=16,
+#     dropout=0.0,
+#     dtype=dtype,
+# )
+model.apply(lambda x: init_weights_to_zero(x, std=1e-2))
 # import jax
 # dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
 # model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=50, dummy_config=dummy_config, lazy=True)
@@ -114,6 +116,7 @@ model.apply(lambda x: init_weights_to_zero(x, std=5e-1))
 
 model_names = {
     fTNModel: 'fTN',
+    fTN_backflow_Model: 'fTN_backflow',
     fTN_NN_proj_Model: 'fTN_NN_proj',
     fTN_NN_proj_variable_Model: 'fTN_NN_proj_variable',
     fTN_Transformer_Model: 'fTN_Transformer',
