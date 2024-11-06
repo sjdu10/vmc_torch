@@ -64,6 +64,7 @@ class SR(Preconditioner):
         """iter_step is for iterative solvers."""
         
         if self.exact:
+            assert SIZE == 1, "Exact SR preconditioner is not supported in MPI mode."
             if energy_grad is None:
                 return torch.zeros(state.Np, dtype=self.dtype)
             parameter_amp_grad, amp_arr = state.get_logamp_grad_matrix()

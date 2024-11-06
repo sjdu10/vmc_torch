@@ -194,7 +194,7 @@ class fPEPS(qtn.PEPS):
 
             oddpos = None
             if not self.spinless:
-                assert self.symmetry == 'U1', "Only U1 symmetry is supported for spinful fermions for now."
+                # assert self.symmetry == 'U1', "Only U1 symmetry is supported for spinful fermions for now."
                 if int(n) == 1:
                     oddpos = (3*tid+1)*(-1)#**reverse
                 elif int(n) == 2:

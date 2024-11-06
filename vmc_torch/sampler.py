@@ -106,7 +106,7 @@ class MetropolisExchangeSampler(Sampler):
     def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, equal_partition)
         self.random_edge = random_edge
-        self.subchain_length = hi.size if subchain_length is None else subchain_length
+        self.subchain_length = graph.n_edges if subchain_length is None else subchain_length
     
     def burn_in(self, vstate):
         """Discard the initial samples. (Burn-in)"""

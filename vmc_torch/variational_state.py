@@ -26,7 +26,6 @@ class Variational_State:
         self.hi = sampler.hi if sampler is not None else hi
         self.Ns = sampler.Ns if sampler is not None else self.hi.n_states
         self.equal_partition = sampler.equal_partition
-        self.nsites = self.hi.size
         self.logamp_grad_matrix = None
         self.mean_logamp_grad = None
         self.dtype = dtype
@@ -122,7 +121,6 @@ class Variational_State:
         Only for sanity check on small systems.
         """
         hi = op.hilbert # netket hilbert object
-        N = hi.size
         all_config = hi.all_states()
         all_config = np.asarray(all_config)
         psi = self.vstate_func(all_config)
