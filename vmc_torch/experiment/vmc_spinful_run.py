@@ -26,10 +26,11 @@ from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer
 from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import SGD, SR
+from vmc_torch.optimizer import SGD, SR, Adam, SGD_momentum
 from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_square_lattice
 from vmc_torch.torch_utils import SVD,QR
+from vmc_torch.fermion_utils import generate_random_fpeps
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)
@@ -44,7 +45,7 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-Lx = int(2)
+Lx = int(4)
 Ly = int(2)
 symmetry = 'U1'
 t = 1.0
@@ -54,25 +55,28 @@ n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 3
+D = 4
 chi = -1
 dtype=torch.float64
 
-# Load PEPS
+# # Load PEPS
 skeleton = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
 peps_params = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl", "rb"))
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
+# # randomize the PEPS tensors
+# peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
+
 # VMC sample size
-N_samples = int(6e3)
+N_samples = int(5e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# model = fTNModel(peps, max_bond=chi)
-# model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTNModel(peps, max_bond=chi, dtype=dtype)
+# model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -113,7 +117,8 @@ model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_h
 # import jax
 # dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
 # model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=50, dummy_config=dummy_config, lazy=True)
-# model.apply(lambda x: init_weights_to_zero(x, std=2e-2))
+model.apply(lambda x: init_weights_to_zero(x, std=5e-2))
+# model.apply(lambda x: init_weights_kaiming(x))
 
 model_names = {
     fTNModel: 'fTN',
@@ -131,9 +136,14 @@ model_names = {
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
-init_step = 0
-final_step = 150
+
+init_step = 144
+final_step = 250
 total_steps = final_step - init_step
+
+learning_rate = 5e-2
+optimizer_state = None
+use_prev_opt = True
 if init_step != 0:
     saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
@@ -142,13 +152,33 @@ if init_step != 0:
         model.load_state_dict(saved_model_state_dict)
     except:
         model.load_params(saved_model_params_vec)
+    optimizer_state = saved_model_params.get('optimizer_state', None)
 
-# optimizer = SignedSGD(learning_rate=0.05)
-optimizer = SGD(learning_rate=0.1)
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=True, equal_partition=False, dtype=dtype)
+if optimizer_state is not None and use_prev_opt:
+    optimizer_name = optimizer_state['optimizer']
+    if optimizer_name == 'SGD_momentum':
+        optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.9)
+    elif optimizer_name == 'Adam':
+        optimizer = Adam(learning_rate=learning_rate, weight_decay=1e-5)
+    print('Loading optimizer: ', optimizer)
+    optimizer.lr = learning_rate
+    if isinstance(optimizer, SGD_momentum):
+        optimizer.velocity = optimizer_state['velocity']
+    if isinstance(optimizer, Adam):
+        optimizer.m = optimizer_state['m']
+        optimizer.v = optimizer_state['v']
+        optimizer.t = optimizer_state['t']
+else:
+    # optimizer = SignedSGD(learning_rate=0.05)
+    optimizer = SGD(learning_rate=learning_rate)
+    # optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.1)
+    # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=0.0)
+
+
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
 # sampler = None
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.05, iter_step=1e5, dtype=dtype)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-3, iter_step=1e5, dtype=dtype)
 # preconditioner = TrivialPreconditioner()
 vmc = VMC(H, variational_state, optimizer, preconditioner)
 

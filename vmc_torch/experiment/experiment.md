@@ -1,10 +1,58 @@
-# TODO:
+# Code-TODO:
 
-1. Compare fPEPS-NN model with Neural Backflow model on 4x4 spinful Fermi-Hubbard model. U/t=8, n=0.875, E_ed = -11.868. [ ]
-2. Implement variational PEPS model using BP TN contraction. [ ]
+1. Compare fPEPS-NN model with Neural Backflow model on 4x4 spinful Fermi-Hubbard model. U/t=8, n=0.875, E_ed = -11.868. [?] -- Optimization,initialization problems..
+2. Implement variational PEPS model using BP TN contraction. [?] -- may have convergence issue?
 3. Implement variational model for spinful fermions. [x]
 4. Implement function to transform a U1 array to a Z2 array. [ ]
 5. Or implement a NN model with dynamic output length! [x] -- used a transformer NN model
+6. Supervised Wavefunction Optimization (SWO): https://arxiv.org/pdf/1811.12423 and https://journals.aps.org/prb/pdf/10.1103/PhysRevB.110.115124
+    --- Better convergence?
+    --- Is it better than SR? or is the imaginary-time SWO equivalent to SR?
+    --- Seems to work well with Adam, shall we implement?
+    --- VMC for fidelity: $F = |1/S * \sum_c <c|\phi>/<c|\psi>|^2 / (1/S * \sum_c |<c|\phi>/<c|\psi>|^2)$, where c is sampled from unnormalized \psi
+    --- Better use log fidelity?
 
-6. Check Quimb's MPO contruction routine for QSK model/SYK model using Jordan-Wigner transformation. [ ]
-7. Try Johnnie's non-local TN model. [ ]
+
+
+
+
+# Volume-law:
+
+1. Check Quimb's MPO contruction routine for QSK model/SYK model using Jordan-Wigner transformation. [ ]
+
+
+
+
+
+
+
+
+
+
+
+# Misc
+
+1. Try Johnnie's non-local TN model. [x] -- delocalized PEPS, indeed increase variational power but boson case too many other equally good ansatz, like deep NNQS.
+
+
+# Ideas
+
+To-do:
+
+VMC variational ansatz:
+
+1. fPEPS + NN, now using transformer and inject the NN values to projectors, performance unknown for spinful Hubbard model at half filling.
+    a. currently transformer model for the variable-length tensor element calculation. but not very efficient.
+    b. need to brainstorm about other possible ways to inject the NN values.
+
+2. For spin J1J2 model, delocalized PEPS; decompose each on-site tensor into a smaller tensor network where all tensors share one physical index? how to do the decomposition?
+    a. delocalized PEPS for J1J2 model versus Wenyuan's results. Compare accuracy and the number of parameters, cost for contracting the amplitude.
+    b. decomposition of the on-site tensors in PEPS.
+
+
+TN function for volume-law states:
+
+1. ground state of quantum SK model.
+    a. construct the simple update algorithm for long-range hamiltonian.
+    b. construct the imaginary time evolution operator exp(-tH) as an MPO using quimb's operator constructor
+    c. use vmc_torch to do global optimization for the (1+1)d TN variational ansatz, need to consider how to write the hamiltonian object.

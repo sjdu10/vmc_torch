@@ -1,5 +1,6 @@
 import netket as nk
 import netket.experimental as nkx
+import jax
 from netket.graph import Lattice
 
 from math import pi
@@ -33,6 +34,8 @@ class Hilbert:
         return do('array',self.to_quimb_config(self.hi.all_states()))
     
     def random_state(self, key):
+        if type(key) is int:
+            key = jax.random.PRNGKey(key)
         """key is a random key for jax"""
         return self.to_quimb_config(self.hi.random_state(key))
 

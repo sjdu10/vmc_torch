@@ -7,6 +7,7 @@ from mpi4py import MPI
 from .global_var import DEBUG, set_debug, TIME_PROFILING
 import torch
 import json
+from vmc_torch.optimizer import *
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -160,6 +161,24 @@ class VMC:
                         'model_state_dict': self._state.state_dict,  # PyTorch state_dict
                         'MC_energy_stats': state_MC_energy
                     }
+
+                    # Include optimizer state if using SGD with momentum
+                    if isinstance(self.optimizer, SGD_momentum):
+                        optimizer_state = {
+                            'optimizer': 'SGD_momentum',  # Store the optimizer object
+                            'velocity': self.optimizer.velocity  # Store the velocity term
+                        }
+                        combined_data['optimizer_state'] = optimizer_state
+                    
+                    if isinstance(self.optimizer, Adam):
+                        optimizer_state = {
+                            'optimizer': 'Adam',  # Store the optimizer object
+                            'm': self.optimizer.m,  # Store the m term
+                            'v': self.optimizer.v,  # Store the v term
+                            't': self.optimizer.t,  # Store the t_step term
+                        }
+                        combined_data['optimizer_state'] = optimizer_state
+
                     torch.save(combined_data, params_path)
 
                     # update the MC_energy_stats.json

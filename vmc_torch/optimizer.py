@@ -181,6 +181,23 @@ class SGD(Optimizer):
     def compute_update_params(self, params, grad):
         return params - self.lr*grad
 
+class SGD_momentum(Optimizer):
+    def __init__(self, learning_rate=1e-3, momentum=0.9):
+        super().__init__(learning_rate)
+        self.momentum = momentum
+        self.velocity = None  # Initialize velocity as None
+
+    def compute_update_params(self, params, grad):
+        # Initialize velocity if it hasn't been initialized yet
+        if self.velocity is None:
+            self.velocity = torch.zeros_like(grad)
+
+        # Update velocity using the momentum formula
+        self.velocity = self.momentum * self.velocity + self.lr * grad
+
+        # Update the parameters using the velocity
+        return params - self.velocity
+
 class SignedSGD(Optimizer):
     def __init__(self, learning_rate=1e-3):
         super().__init__(learning_rate)
@@ -196,3 +213,44 @@ class SignedRandomSGD(Optimizer):
     
     def compute_update_params(self, params, grad):
         return params - self.lr*torch.sign(grad)*torch.rand(1)
+
+class Adam(Optimizer):
+    def __init__(self, learning_rate=1e-3, beta1=0.9, beta2=0.999, epsilon=1e-8, t_step=0, weight_decay=1e-5):
+        super().__init__(learning_rate)
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.weight_decay = weight_decay
+        self.t = t_step  # Time step
+
+        # Initialize moment estimates 
+        self.m = None
+        self.v = None
+
+    def compute_update_params(self, params, grad):
+        if self.m is None:
+            self.m = torch.zeros_like(grad)
+        if self.v is None:
+            self.v = torch.zeros_like(grad)
+        # Increment the time step
+        self.t += 1
+
+        # Apply weight decay to the gradient
+        if self.weight_decay != 0:
+            grad = grad + self.weight_decay * params
+
+        # Update biased first moment estimate
+        self.m = self.beta1 * self.m + (1 - self.beta1) * grad
+
+        # Update biased second moment estimate
+        self.v = self.beta2 * self.v + (1 - self.beta2) * (grad ** 2)
+
+        # Correct bias in moment estimates
+        m_hat = self.m / (1 - self.beta1 ** self.t)
+        v_hat = self.v / (1 - self.beta2 ** self.t)
+
+        # Compute the parameter update
+        update = self.lr * m_hat / (torch.sqrt(v_hat) + self.epsilon)
+
+        # Return the updated parameters
+        return params - update

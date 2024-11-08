@@ -24,9 +24,9 @@ from quimb.tensor.tensor_2d import Rotator2D, pairwise
 #             p_tag = self.site_tag_id.format(*site)
 #             tid = self.sites.index(site)
 #             if no_odd:
-#                 tsr_data = sr.FermionicArray.from_blocks(blocks={(int(n),):do('array', [1.0,], like=backend)}, duals=(True,), symmetry=self.symmetry, charge=0)
+#                 tsr_data = sr.FermionicArray.from_blocks(blocks={(int(n),):do('array', [1.0,], like=config)}, duals=(True,), symmetry=self.symmetry, charge=0)
 #             else:
-#                 tsr_data = sr.FermionicArray.from_blocks(blocks={(int(n),):do('array', [1.0,], like=backend)}, duals=(True,),symmetry=self.symmetry, charge=int(n), oddpos=2*tid+1 if int(n)%2 else None)
+#                 tsr_data = sr.FermionicArray.from_blocks(blocks={(int(n),):do('array', [1.0,], like=config)}, duals=(True,),symmetry=self.symmetry, charge=int(n), oddpos=2*tid+1 if int(n)%2 else None)
 #             tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
 #             product_tn |= tsr
 #         return product_tn
@@ -158,30 +158,31 @@ class fPEPS(qtn.PEPS):
     def product_bra_state(self, config):
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
+        device = config.device
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
 
         if self.spinless:
             index_map = {0: 0, 1: 1}
             array_map = {
-                0: do('array',[1.0,],like=backend,dtype=dtype), 
-                1: do('array',[1.0,],like=backend,dtype=dtype)
+                0: do('array',[1.0,],like=config,dtype=dtype,device=device), 
+                1: do('array',[1.0,],like=config,dtype=dtype,device=device)
             }
         else:
             if self.symmetry == 'Z2':
                 index_map = {0:0, 1:1, 2:1, 3:0}
                 array_map = {
-                    0: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
-                    1: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
-                    2: do('array',[0.0, 1.0],like=backend,dtype=dtype), 
-                    3: do('array',[0.0, 1.0],like=backend,dtype=dtype)
+                    0: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
+                    1: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
+                    2: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), 
+                    3: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device)
                 }
             elif self.symmetry == 'U1':
                 index_map = {0:0, 1:1, 2:1, 3:2}
                 array_map = {
-                    0: do('array',[1.0,],like=backend,dtype=dtype), 
-                    1: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
-                    2: do('array',[0.0, 1.0],like=backend,dtype=dtype), 
-                    3: do('array',[1.0,],like=backend,dtype=dtype)
+                    0: do('array',[1.0,],like=config,dtype=dtype,device=device), 
+                    1: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
+                    2: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), 
+                    3: do('array',[1.0,],like=config,dtype=dtype,device=device)
                 }
 
         for n, site in zip(config, self.sites):
@@ -339,29 +340,30 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
 def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
     product_tn = qtn.TensorNetwork()
     backend = psi.tensors[0].data.backend
+    device = config.device
     dtype = eval(backend+'.'+psi.tensors[0].data.dtype)
     if psi.spinless:
         index_map = {0: 0, 1: 1}
         array_map = {
-            0: do('array',[1.0],like=backend,dtype=dtype), 
-            1: do('array',[1.0],like=backend,dtype=dtype)
+            0: do('array',[1.0],like=config,dtype=dtype,device=device), 
+            1: do('array',[1.0],like=config,dtype=dtype,device=device)
         }
     else:
         if psi.symmetry == 'Z2':
             index_map = {0:0, 1:1, 2:1, 3:0}
             array_map = {
-                0: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
-                1: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
-                2: do('array',[0.0, 1.0],like=backend,dtype=dtype), 
-                3: do('array',[0.0, 1.0],like=backend,dtype=dtype)
+                0: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
+                1: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
+                2: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), 
+                3: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device)
             }
         elif psi.symmetry == 'U1':
             index_map = {0:0, 1:1, 2:1, 3:2}
             array_map = {
-                0: do('array',[1.0],like=backend,dtype=dtype), 
-                1: do('array',[1.0, 0.0],like=backend,dtype=dtype), 
-                2: do('array',[0.0, 1.0],like=backend,dtype=dtype), 
-                3: do('array',[1.0],like=backend,dtype=dtype)
+                0: do('array',[1.0],like=config,dtype=dtype,device=device), 
+                1: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
+                2: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), 
+                3: do('array',[1.0],like=config,dtype=dtype,device=device)
             }
 
     iter = zip(config, psi.sites) if not reverse else zip(config[::-1], psi.sites[::-1])
@@ -396,13 +398,13 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
         
         if check:
             if int(n)==0:
-                blocks = {(0,): do('array',[1.0],like=backend,dtype=dtype), (1,): do('array',[0.0, 0.0],like=backend,dtype=dtype), (2,):do('array',[0.0],like=backend,dtype=dtype)}
+                blocks = {(0,): do('array',[1.0],like=config,dtype=dtype,device=device), (1,): do('array',[0.0, 0.0],like=config,dtype=dtype,device=device), (2,):do('array',[0.0],like=config,dtype=dtype,device=device)}
             elif int(n)==1:
-                blocks = {(0,): do('array',[0.0],like=backend,dtype=dtype), (1,): do('array',[1.0, 0.0],like=backend,dtype=dtype), (2,):do('array',[0.0],like=backend,dtype=dtype)}
+                blocks = {(0,): do('array',[0.0],like=config,dtype=dtype,device=device), (1,): do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), (2,):do('array',[0.0],like=config,dtype=dtype,device=device)}
             elif int(n)==2:
-                blocks = {(0,): do('array',[0.0],like=backend,dtype=dtype), (1,): do('array',[0.0, 1.0],like=backend,dtype=dtype), (2,):do('array',[0.0],like=backend,dtype=dtype)}
+                blocks = {(0,): do('array',[0.0],like=config,dtype=dtype,device=device), (1,): do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), (2,):do('array',[0.0],like=config,dtype=dtype,device=device)}
             elif int(n)==3:
-                blocks = {(0,): do('array',[0.0],like=backend,dtype=dtype), (1,): do('array',[0.0, 0.0],like=backend,dtype=dtype), (2,):do('array',[1.0],like=backend,dtype=dtype)}
+                blocks = {(0,): do('array',[0.0],like=config,dtype=dtype,device=device), (1,): do('array',[0.0, 0.0],like=config,dtype=dtype,device=device), (2,):do('array',[1.0],like=config,dtype=dtype,device=device)}
             tsr_data = sr.FermionicArray.from_blocks(
                 blocks=blocks, 
                 duals=(dualness,),
