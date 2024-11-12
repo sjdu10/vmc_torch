@@ -20,17 +20,16 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from vmc_torch.experiment.tn_model import fTNModel, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
+from vmc_torch.experiment.tn_model import fMPSModel
 from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model
-from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
-from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
+from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPreconditioner, Adam, SGD_momentum, DecayScheduler
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_square_lattice
+from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_chain
 from vmc_torch.torch_utils import SVD,QR
-from vmc_torch.fermion_utils import generate_random_fpeps
+from vmc_torch.fermion_utils import generate_random_fmps
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)
@@ -45,94 +44,44 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-Lx = int(2)
-Ly = int(2)
+L = int(4)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
-N_f = int(Lx*Ly)
+N_f = int(L)
 n_fermions_per_spin = (N_f//2, N_f//2)
-H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
+H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 3
-chi = -2
+D = 4
+chi = -1
 dtype=torch.float64
 
-# # Load PEPS
-skeleton = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
-peps_params = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl", "rb"))
-peps = qtn.unpack(peps_params, skeleton)
-peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
+# Load mps
+skeleton = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_skeleton.pkl", "rb"))
+mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_su_params.pkl", "rb"))
+mps = qtn.unpack(mps_params, skeleton)
+mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
-# # randomize the PEPS tensors
-# peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
+# # randomize the mps tensors
+# mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(3e3)
+N_samples = int(2e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# model = fTNModel(peps, max_bond=chi, dtype=dtype)
-model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_Transformer_Model(
-#     peps, 
-#     max_bond=chi, 
-#     nn_eta=1.0, 
-#     d_model=2**2, 
-#     nhead=2, 
-#     num_encoder_layers=2, 
-#     num_decoder_layers=2,
-#     dim_feedforward=32,
-#     dropout=0.0,
-#     dtype=dtype,
-# )
-# model = fTN_Transformer_Proj_Model(
-#     peps,
-#     max_bond=chi,
-#     nn_eta=1e-2,
-#     d_model=2**3,
-#     nhead=2,
-#     num_encoder_layers=1,
-#     num_decoder_layers=1,
-#     dim_feedforward=2**5,
-#     dropout=0.0,
-#     dtype=dtype,
-# )
-# model = fTN_Transformer_Proj_lazy_Model(
-#     peps,
-#     max_bond=chi,
-#     nn_eta=1.0,
-#     d_model=8,
-#     nhead=2,
-#     num_encoder_layers=1,
-#     num_decoder_layers=1,
-#     dim_feedforward=16,
-#     dropout=0.0,
-#     dtype=dtype,
-# )
-# model.apply(lambda x: init_weights_to_zero(x, std=5e-2))
-# import jax
-# dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
-# model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=50, dummy_config=dummy_config, lazy=True)
+model = fMPSModel(mps, max_bond=chi, dtype=dtype)
+# model = fTN_backflow_Model(mps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
+# model = fTN_backflow_attn_Model(mps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 model.apply(lambda x: init_weights_to_zero(x, std=5e-3))
 # model.apply(lambda x: init_weights_kaiming(x))
 
 model_names = {
-    fTNModel: 'fTN',
+    fMPSModel: 'fMPS',
     fTN_backflow_Model: 'fTN_backflow',
     fTN_backflow_attn_Model: 'fTN_backflow_attn',
-    fTN_NN_proj_Model: 'fTN_NN_proj',
-    fTN_NN_proj_variable_Model: 'fTN_NN_proj_variable',
-    fTN_Transformer_Model: 'fTN_Transformer',
-    fTN_Transformer_Proj_Model:'fTN_Transformer_Proj',
-    fTN_Transformer_Proj_lazy_Model:'fTN_Transformer_Proj_lazy',
-    SlaterDeterminant: 'SlaterDeterminant',
-    NeuralBackflow: 'NeuralBackflow',
-    FFNN: 'FFNN',
-    NeuralJastrow: 'NeuralJastrow',
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
@@ -142,7 +91,7 @@ final_step = 250
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -189,9 +138,9 @@ vmc = VMC(H, variational_state, optimizer, preconditioner, scheduler)
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    os.makedirs(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
     # with pyinstrument.Profiler() as prof:
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
     # if RANK == 0:
     #     prof.print()
 

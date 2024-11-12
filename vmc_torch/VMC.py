@@ -28,6 +28,7 @@ class VMC:
         variational_state,
         optimizer,
         preconditioner=None,
+        scheduler=None,
         step_count=0,
         **kwargs,
     ):
@@ -53,6 +54,8 @@ class VMC:
         self._optimizer = optimizer
 
         self._preconditioner = preconditioner
+
+        self._scheduler = scheduler
 
         self.step_count = step_count
         
@@ -85,6 +88,13 @@ class VMC:
         return self._optimizer
     
     @property
+    def scheduler(self):
+        """
+        The scheduler used to update the learning rate of the optimizer.
+        """
+        return self._scheduler
+    
+    @property
     def state(self):
         """
         The variational state of the driver.
@@ -105,18 +115,23 @@ class VMC:
             + f"\n  step_count = {self.step_count},"
             + f"\n  state = {self._state})"
         )
-    
-    # @profile
+
     def run(self, start, stop, tmpdir=None, save=True): # Now naive implementation
         """Run the VMC optimization loop."""
         self.Einit = 0.
         MC_energy_stats = {'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
+        self.step_count = start
         for step in range(start, stop):
             if RANK == 0:
                 print('Variational step {}'.format(step))
             self.step_count += 1
-            # Compute the average energy and estimated energy gradient, meanwhile also record the amplitude_grad matrix
 
+            # Update the learning rate if a scheduler is provided
+            if self.scheduler is not None:
+                learning_rate = self.scheduler(self.step_count)
+                self._optimizer.lr = learning_rate
+
+            # Compute the average energy and estimated energy gradient, meanwhile also record the amplitude_grad matrix
             # Use MPI for the sampling
             # Only rank 0 collects the energy statistics, but all ranks must have the energy gradient
             if self._state.equal_partition:

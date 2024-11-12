@@ -7,10 +7,16 @@
 5. Or implement a NN model with dynamic output length! [x] -- used a transformer NN model
 6. Supervised Wavefunction Optimization (SWO): https://arxiv.org/pdf/1811.12423 and https://journals.aps.org/prb/pdf/10.1103/PhysRevB.110.115124
     --- Better convergence?
-    --- Is it better than SR? or is the imaginary-time SWO equivalent to SR?
+    --- Is it better than SR? or is the imaginary-time SWO equivalent to SR? 
+        A: At small step size limit IT-SWO is equivalent to SR, while at large step size it is more like power method for extreme eigenvalue problem.
     --- Seems to work well with Adam, shall we implement?
+        A: Yes, start from wave-function fitting MC code -- log-fidelity minimization.
     --- VMC for fidelity: $F = |1/S * \sum_c <c|\phi>/<c|\psi>|^2 / (1/S * \sum_c |<c|\phi>/<c|\psi>|^2)$, where c is sampled from unnormalized \psi
     --- Better use log fidelity?
+        A: Yes, as the components are separated and easier to evaluate by sampling.
+7. 1D system:
+    --- fMPS [x]
+    --- Netket, quimb Ham [ ]
 
 
 
@@ -19,10 +25,6 @@
 # Volume-law:
 
 1. Check Quimb's MPO contruction routine for QSK model/SYK model using Jordan-Wigner transformation. [ ]
-
-
-
-
 
 
 

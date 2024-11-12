@@ -106,6 +106,7 @@ class Hamiltonian:
         self._H = H
         self._hi = hi
         self._graph = graph
+        self._hilbert = None # Customized Hilbert space
     
     @property
     def hi(self):
@@ -114,8 +115,10 @@ class Hamiltonian:
     
     @property
     def hilbert(self):
-        """Customized Hilbert space"""
-        raise NotImplementedError
+        """Return the customized Hilbert space"""
+        if self._hilbert is None:
+            raise NotImplementedError("The customized Hilbert space is not defined.")
+        return self._hilbert
     
     @property
     def H(self):
@@ -142,6 +145,7 @@ def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc=False):
     return H, hi, graph
 
 def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+    """Netket implementation of spinful Fermi-Hubbard model on a square lattice"""
     graph = nk.graph.Grid([Lx,Ly], pbc=pbc)
     N = graph.n_nodes
     if n_fermions_per_spin is None:
@@ -185,17 +189,31 @@ def square_lattice_spin_J1J2(Lx, Ly, J1, J2, pbc=False, total_sz=None):
 
     return H, hi, graph
 
+def chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+    """Netket implementation of spinful Fermi-Hubbard model on a 1D chain"""
+    graph = nk.graph.Chain(L, pbc=pbc)
+    N = graph.n_nodes
+    if n_fermions_per_spin is None:
+        hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions=N_f)
+    else:
+        hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_per_spin)
+    H = 0.0
+    for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
+        for spin in (1,-1):
+            H -= t * (cdag(hi,i,spin) * c(hi,j,spin) + cdag(hi,j,spin) * c(hi,i,spin))
+    for i in graph.nodes():
+        H += U * nc(hi,i,+1) * nc(hi,i,-1)
+    return H, hi, graph
+
 #----- self-customized Hamiltonian class -----#
+
+# Fermionic Hamiltonians
 
 class spinless_Fermi_Hubbard_square_lattice(Hamiltonian):
     def __init__(self, Lx, Ly, t, V, N_f, pbc=False):
         H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc)
         super().__init__(H, hi, graph)
         self._hilbert = SpinlessFermion(self.hi.n_orbitals, self.hi.n_fermions)
-    
-    @property
-    def hilbert(self):
-        return self._hilbert
     
     def get_conn(self, sigma):
         # assert self.hi.spin is None
@@ -206,10 +224,6 @@ class spinful_Fermi_Hubbard_square_lattice(Hamiltonian):
         H, hi, graph = square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc, n_fermions_per_spin)
         super().__init__(H, hi, graph)
         self._hilbert = SpinfulFermion(hi.n_orbitals, hi.n_fermions, hi.n_fermions_per_spin)
-    
-    @property
-    def hilbert(self):
-        return self._hilbert
 
     def get_conn(self, sigma):
         # Quimb2Netket
@@ -226,15 +240,35 @@ class spinful_Fermi_Hubbard_square_lattice(Hamiltonian):
 
         return eta_calc, H_etasigma
 
+class spinful_Fermi_Hubbard_chain(Hamiltonian):
+    def __init__(self, L, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+        H, hi, graph = chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc, n_fermions_per_spin)
+        super().__init__(H, hi, graph)
+        self._hilbert = SpinfulFermion(hi.n_orbitals, hi.n_fermions, hi.n_fermions_per_spin)
+
+    def get_conn(self, sigma):
+        # Quimb2Netket
+        if len(sigma) == self.graph.n_nodes:
+            config_calc = from_quimb_config_to_netket_config(sigma)
+        else:
+            raise ValueError("The input configuration is not compatible with the Netket Hamiltonian Hilbert space.")
+        eta_calc_netket, H_etasigma = self.H.get_conn(config_calc)
+        # Netket2Quimb
+        eta_calc = from_netket_config_to_quimb_config(eta_calc_netket)
+        # Calculate the phase correction
+        correction_phase_vec = do('array', ([calc_phase_correction_netket_symmray(sigma, eta) for eta in eta_calc]))
+        H_etasigma *= correction_phase_vec
+
+        return eta_calc, H_etasigma
+
+
+# Spin Hamiltonians
+
 class spin_Heisenberg_square_lattice(Hamiltonian):
     def __init__(self, Lx, Ly, J, pbc=False, total_sz=None):
         H, hi, graph = square_lattice_spin_Heisenberg(Lx, Ly, J, pbc, total_sz)
         super().__init__(H, hi, graph)
         self._hilbert = Spin(self.hi._s, self.hi.size, total_sz)
-    
-    @property
-    def hilbert(self):
-        return self._hilbert
     
     def get_conn(self, sigma):
         # Quimb2Netket
@@ -250,10 +284,6 @@ class spin_J1J2_square_lattice(Hamiltonian):
         H, hi, graph = square_lattice_spin_J1J2(Lx, Ly, J1, J2, pbc, total_sz)
         super().__init__(H, hi, graph)
         self._hilbert = Spin(self.hi._s, self.hi.size, total_sz)
-    
-    @property
-    def hilbert(self):
-        return self._hilbert
     
     def get_conn(self, sigma):
         # Quimb2Netket

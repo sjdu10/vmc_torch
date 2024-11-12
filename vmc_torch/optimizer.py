@@ -163,9 +163,34 @@ class SR(Preconditioner):
                 dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step)
                 return torch.tensor(dp, dtype=self.dtype)
 
+#------------------------------------------------------------
+# Scheduler
+class Scheduler:
+    def __init__(self, init_lr=1e-3):
+        self.init_lr = init_lr
+        pass
+    def __call__(self, step):
+        # compute the learning rate at the current step
+        raise NotImplementedError
+
+class TrivialScheduler(Scheduler):
+    def __init__(self, init_lr=1e-3):
+        super().__init__(init_lr)
+    def __call__(self, step):
+        return self.init_lr
+
+class DecayScheduler(Scheduler):
+    def __init__(self, init_lr=1e-3, decay_rate=0.9, patience=100, min_lr=1e-4):
+        super().__init__(init_lr)
+        self.decay_rate = decay_rate
+        self.patience = patience
+        self.min_lr = min_lr
+    def __call__(self, step):
+        # compute the learning rate at the current step
+        return max(self.init_lr * (self.decay_rate ** (step // self.patience)), self.min_lr)
 
 
-
+#------------------------------------------------------------
 
 class Optimizer:
     def __init__(self, learning_rate=1e-3):
