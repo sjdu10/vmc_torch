@@ -96,7 +96,7 @@ class Sampler:
         """Sample the next configuration."""
         raise NotImplementedError
     
-    def sample(self, op, vstate, chain_length=1):
+    def sample(self, vstate, op, chain_length=1):
         """Sample the local energy and amplitude gradient for each configuration."""
         raise NotImplementedError
     
@@ -118,8 +118,9 @@ class MetropolisExchangeSampler(Sampler):
         Must be implemented in the derived class."""
         raise NotImplementedError
 
-    def sample(self, op, vstate, chain_length=1):
-        """Sample the local energy and amplitude gradient for each configuration."""
+    def sample(self, vstate, op, chain_length=1):
+        """Sample the local energy and amplitude gradient for each configuration.
+        return a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)"""
         assert self.equal_partition, "The number of samples must be equal for all MPI processes."
         if RANK == 0:
             print('Burn-in...')
@@ -148,7 +149,7 @@ class MetropolisExchangeSampler(Sampler):
         for chain_step in range(chain_length):
             time0 = MPI.Wtime()
             # sample the next configuration
-            sigma = self._sample_next(vstate)
+            sigma, psi_sigma = self._sample_next(vstate)
 
             time1 = MPI.Wtime()
             n += 1
@@ -210,8 +211,9 @@ class MetropolisExchangeSampler(Sampler):
         samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         return samples
     
-    def sample_eager(self, op, vstate, message_tag=None):
-        """Sample eagerly for the local energy and amplitude gradient for each configuration."""
+    def sample_eager(self, vstate, op, message_tag=None):
+        """Sample eagerly for the local energy and amplitude gradient for each configuration.
+        return a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)"""
         assert self.equal_partition == False, 'Must not use equal partition for eager sampling.'
 
         if RANK == 0:
@@ -239,7 +241,8 @@ class MetropolisExchangeSampler(Sampler):
                 op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
                 op_loc_vec.append(op_loc)
                 op_loc_sum += op_loc
-                logpsi_sigma_grad_sum += logpsi_sigma_grad
+                logpsi_sigma_grad_sum += logpsi_sigma_grad # summed to save memory ?
+                #XXX: summing is not necessary, we can put all post-processing of the samples in variational_state module
                 op_logpsi_sigma_grad_product_sum += op_loc * logpsi_sigma_grad
                 logpsi_sigma_grad_mat.append(logpsi_sigma_grad)
 
@@ -306,7 +309,7 @@ class MetropolisExchangeSampler(Sampler):
         """Get one sample of the local energy and amplitude gradient."""
         time0 = MPI.Wtime()
         # sample the next configuration
-        sigma = self._sample_next(vstate)
+        sigma, psi_sigma = self._sample_next(vstate)
         time1 = MPI.Wtime()
 
         # compute local energy and amplitude gradient
@@ -332,7 +335,7 @@ class MetropolisExchangeSampler(Sampler):
         configs = []
         op_loc_sum = 0
         for chain_step in range(chain_length):
-            sigma = self._sample_next(vstate)
+            sigma, psi_sigma = self._sample_next(vstate)
             psi_sigma = vstate.amplitude(sigma)
             eta, O_etasigma = op.get_conn(sigma)
             psi_eta = vstate.amplitude(eta)
@@ -351,7 +354,113 @@ class MetropolisExchangeSampler(Sampler):
         op_dense = op.to_dense()
         expect_op = psi_vec.conj().T @ (op_dense @ psi_vec)/(psi_vec.conj().T @ psi_vec)
         return expect_op
+    
+    def sample_SWO_dataset_eager(self, vstate, op, message_tag=None):
+        """
+        Sample the configurations {c}_(t-1) according to |<c|Psi_(t-1)>|^2, 
+        and collect the corresponding amplitudes <c|Psi_(t-1)>, <c|op|Psi_(t-1)> for supervised wavefunction optimization in each rank.
 
+        Parameters
+        ----------
+        vstate : VariationalState
+            The variational state.
+        op : CustomizedOperator
+            The operator.
+        message_tag : int
+            The message tag for MPI communication.
+
+        Returns
+        -------
+        list
+            A list of tuples (config, <c|Psi_(t-1)>, <c|op|Psi_(t-1)>).
+        """
+        if RANK == 0:
+            print('Burn-in...')
+            t_burnin0 = time.time()
+        self.burn_in(vstate)
+        if RANK == 0:
+            t_burnin1 = time.time()
+            print('Burn-in time:', t_burnin1 - t_burnin0)
+
+        n = 0
+        n_total = 0
+        config_list = []
+        config_amplitudes_dict = {}
+        terminate = False
+
+        if RANK == 0:
+            pbar = tqdm(total=self.Ns, desc='Sampling starts...')
+            for _ in range(2):
+                config, psi_sigma = self._sample_next(vstate)
+                config_list.append(config)
+                if config not in config_amplitudes_dict:
+                    eta, O_etasigma = op.get_conn(config)
+                    psi_eta = vstate.amplitude(eta)
+                    psi_eta = psi_eta.detach().numpy()
+                    psi_sigma = psi_sigma.detach().numpy()
+                    op_psi_eta = np.sum(O_etasigma * psi_eta, axis=-1)
+                    config_amplitudes_dict[config] = (psi_sigma, op_psi_eta)
+                else:
+                    psi_sigma, op_psi_eta = config_amplitudes_dict[config] #XXX: not needed actually
+                n += 1
+                n_total += 1
+                pbar.update(1)
+            
+            # Discard messages from previous steps
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
+                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
+                del redundant_message
+            
+            while not terminate:
+                # Receive the local sample count from each rank
+                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2))
+                dest_rank = buf[0]
+                n_total += 1
+                pbar.update(1)
+                # Check if we have enough samples
+                if n_total >= self.Ns:
+                    terminate = True
+                    for dest_rank in range(1, SIZE):
+                        COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                # Send the termination signal to the rank
+                COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+            
+            pbar.close()
+        
+        else:
+            while not terminate:
+                config, psi_sigma = self._sample_next(vstate)
+                config_list.append(config)
+                if config not in config_amplitudes_dict:
+                    eta, O_etasigma = op.get_conn(config)
+                    psi_eta = vstate.amplitude(eta)
+                    psi_eta = psi_eta.detach().numpy()
+                    psi_sigma = psi_sigma.detach().numpy()
+                    op_psi_eta = np.sum(O_etasigma * psi_eta, axis=-1)
+                    config_amplitudes_dict[config] = (psi_sigma, op_psi_eta)
+                else:
+                    psi_sigma, op_psi_eta = config_amplitudes_dict[config]
+                n += 1
+
+                buf = (RANK,)
+                # Send the local sample count to rank 0
+                COMM.send(buf, dest=0, tag=message_tag+np.sqrt(2))
+                # Receive the termination signal from rank 0
+                terminate = COMM.recv(source=0, tag=message_tag+1)
+            
+        if self.reset_chain:
+            self.reset()
+
+        if RANK == 0:
+            pbar.close()
+        
+        dataset = (config_list, config_amplitudes_dict)
+
+        return dataset
+
+        
+
+    
 
 
 class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
@@ -360,7 +469,8 @@ class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
     
     def _sample_next(self, vstate):
         """Sample the next configuration. Change the current configuration in place."""
-        current_prob = abs(vstate.amplitude(self.current_config))**2
+        current_amp = vstate.amplitude(self.current_config)
+        current_prob = abs(current_amp)**2
         proposed_config = self.current_config.clone()
         if self.random_edge:
             # Randomly select an edge to exchange, until the subchain_length is reached.
@@ -376,7 +486,8 @@ class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
             temp = proposed_config[i].item()
             proposed_config[i] = proposed_config[j]
             proposed_config[j] = temp
-            proposed_prob = abs(vstate.amplitude(proposed_config))**2
+            proposed_amp = vstate.amplitude(proposed_config)
+            proposed_prob = abs(proposed_amp)**2
 
             try:
                 acceptance_ratio = proposed_prob/current_prob
@@ -385,9 +496,10 @@ class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
 
             if random.random() < acceptance_ratio:
                 self.current_config = proposed_config
+                current_amp = proposed_amp
                 current_prob = proposed_prob
 
-        return self.current_config
+        return self.current_config, current_amp
     
 class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
     def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
@@ -395,7 +507,8 @@ class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
 
     def _sample_next(self, vstate):
         """Sample the next configuration. Change the current configuration in place."""
-        current_prob = abs(vstate.amplitude(self.current_config))**2
+        current_amp = vstate.amplitude(self.current_config)
+        current_prob = abs(current_amp)**2
         proposed_config = self.current_config.clone()
         attempts = 0
         accepts = 0
@@ -420,19 +533,22 @@ class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
             if delta_n == 1:
                 proposed_config[i] = config_j
                 proposed_config[j] = config_i
-                proposed_prob = abs(vstate.amplitude(proposed_config))**2
+                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_prob = abs(proposed_amp)**2
             elif delta_n == 0:
                 choices = [(0, 3), (3, 0), (config_j, config_i)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_prob = abs(vstate.amplitude(proposed_config))**2
+                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_prob = abs(proposed_amp)**2
             elif delta_n == 2:
                 choices = [(config_j, config_i), (1,2), (2,1)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_prob = abs(vstate.amplitude(proposed_config))**2
+                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_prob = abs(proposed_amp)**2
             else:
                 raise ValueError("Invalid configuration")
             try:
@@ -442,7 +558,8 @@ class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
 
             if random.random() < acceptance_ratio:
                 self.current_config = proposed_config
+                current_amp = proposed_amp
                 current_prob = proposed_prob
                 accepts += 1
         
-        return self.current_config
+        return self.current_config, current_amp

@@ -138,7 +138,7 @@ class Variational_State:
         
     def expect_and_grad(self, op, full_hi=False, message_tag=None):
         """
-        Compute the expectation value of the operator `op` and its gradient.
+        Compute the expectation value of the operator `op` and the gradient of corresponding loss function.
 
         Args:
             op (netket operator object): The operator for which the expectation value and gradient are calculated.
@@ -146,7 +146,7 @@ class Variational_State:
 
         Returns:
             torch.tensor: The expectation value of the operator.
-            torch.tensor: The gradient of the expectation value with respect to the parameters.
+            torch.tensor: The gradient of the loss function with respect to the parameters.
         """
         if full_hi or self.sampler is None:
             return self.full_hi_expect_and_grad(op)
@@ -171,8 +171,8 @@ class Variational_State:
         assert self.logamp_grad_matrix is not None, "Logamp gradient matrix must be computed during sampling!"
 
         return stats_dict, op_grad
+    
 
-    # @profile
     def collect_samples(self, op, chain_length=1):
 
         vstate = self
@@ -181,7 +181,7 @@ class Variational_State:
         # this should be a list of local samples statistics:
         # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         t_sample_start = MPI.Wtime()
-        local_samples = self.sampler.sample(op, vstate, chain_length=chain_length)
+        local_samples = self.sampler.sample(op=op, vstate=vstate, chain_length=chain_length)
         t_sample_end = MPI.Wtime()
         if DEBUG:
             print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
@@ -255,17 +255,18 @@ class Variational_State:
             # each logamp_grad is a long vector as (10000,)
             # thus the matrix can be as large as (10000, 10000)
 
-            # Compute the op gradient
-            op_grad = op_logamp_grad_product - op_expect*mean_logamp_grad
-            # is forming the whole list too memory consuming?
+            # Compute the loss gradient
+            # Compute the energy gradient
+            loss_grad = op_logamp_grad_product - op_expect*mean_logamp_grad
 
             op_mean_err = np.sqrt(op_var/self.Ns) # standard error of the mean value of the local op
 
-            return op_expect, op_grad, op_var, op_mean_err
+            return op_expect, loss_grad, op_var, op_mean_err
         
         else:
             return None, None, None, None
     
+
     def collect_samples_eager(self, op, message_tag=None):
         vstate = self
         
@@ -274,7 +275,7 @@ class Variational_State:
         # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
 
         t_sample_start = MPI.Wtime()
-        local_samples = self.sampler.sample_eager(op, vstate, message_tag=message_tag)
+        local_samples = self.sampler.sample_eager(op=op, vstate=vstate, message_tag=message_tag)
         t_sample_end = MPI.Wtime()
         if DEBUG:
             print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
@@ -305,7 +306,6 @@ class Variational_State:
         # each rank has their local batch of logamp_grad_matrix, but shares the same mean_logamp_grad
         self.logamp_grad_matrix = local_logamp_grad_matrix
         self.mean_logamp_grad = mean_logamp_grad
-        
 
         # compute the total sample variance
         local_op_loc_mean = local_op_loc_sum/n_local_samples
@@ -320,15 +320,29 @@ class Variational_State:
                 print('     Time for op_logamp_grad_product_sum: {}'.format(t02-t01))
             op_logamp_grad_product = op_logamp_grad_product_sum/total_sample_Ns
 
-            # Compute the op gradient
-            op_grad = op_logamp_grad_product - op_expect*mean_logamp_grad
+            # Compute the energy gradient
+            loss_grad = op_logamp_grad_product - op_expect*mean_logamp_grad
 
+            # Standard error of the mean value of the local op
             op_var = op_var/total_sample_Ns
             op_mean_err = np.sqrt(op_var/total_sample_Ns)
 
-            return op_expect, op_grad, op_var, op_mean_err
+            return op_expect, loss_grad, op_var, op_mean_err
         
         else:
             return None, None, None, None
-            
+    
+
+    def collect_SWO_dataset_eager(self, op, message_tag=None):
+
+        vstate = self
+
+        t_sample_start = MPI.Wtime()
+        local_dataset = self.sampler.sample_SWO_dataset_eager(vstate=vstate, op=op, message_tag=message_tag)
+        t_sample_end = MPI.Wtime()
+
+        if DEBUG:
+            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
+
+        return local_dataset
 

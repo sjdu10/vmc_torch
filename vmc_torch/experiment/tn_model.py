@@ -548,12 +548,27 @@ class fMPSModel(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'fMPS (exact contraction)':{'D': ftn.max_bond(), 'L': ftn.L, 'symmetry': self.symmetry, 'cyclic': ftn.cyclic},
+            'fMPS (exact contraction)':{'D': ftn.max_bond(), 'L': ftn.L, 'symmetry': self.symmetry, 'cyclic': ftn.cyclic, 'skeleton': self.skeleton},
         }
 
         if max_bond is None or max_bond <= 0:
             max_bond = None
         self.max_bond = max_bond
+    
+    def copy(self):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(params, self.skeleton)
+        new_model = fMPSModel(psi, max_bond=self.max_bond, dtype=self.param_dtype)
+        new_model.load_state_dict(self.state_dict())
+        return new_model
     
     def amplitude(self, x):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
@@ -751,6 +766,7 @@ class fTN_backflow_Model(torch.nn.Module):
             max_bond = None
         self.max_bond = max_bond
         self.nn_eta = nn_eta
+
         
         
     def from_params_to_vec(self):

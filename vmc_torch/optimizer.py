@@ -198,6 +198,9 @@ class Optimizer:
     
     def compute_update_params(self, params, grad):
         raise NotImplementedError
+    
+    def reset(self):
+        pass
 
 class SGD(Optimizer):
     def __init__(self, learning_rate=1e-3):
@@ -222,6 +225,10 @@ class SGD_momentum(Optimizer):
 
         # Update the parameters using the velocity
         return params - self.velocity
+    
+    def reset(self):
+        self.velocity = None
+
 
 class SignedSGD(Optimizer):
     def __init__(self, learning_rate=1e-3):
@@ -279,3 +286,7 @@ class Adam(Optimizer):
 
         # Return the updated parameters
         return params - update
+    
+    def reset(self):
+        self.m = None
+        self.v = None

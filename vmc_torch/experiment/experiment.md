@@ -14,9 +14,10 @@
     --- VMC for fidelity: $F = |1/S * \sum_c <c|\phi>/<c|\psi>|^2 / (1/S * \sum_c |<c|\phi>/<c|\psi>|^2)$, where c is sampled from unnormalized \psi
     --- Better use log fidelity?
         A: Yes, as the components are separated and easier to evaluate by sampling.
+    --- Store sampled configuration in each rank [ ]
 7. 1D system:
     --- fMPS [x]
-    --- Netket, quimb Ham [ ]
+    --- Netket, quimb Hamiltonian [x]
 
 
 

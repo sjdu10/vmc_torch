@@ -52,9 +52,10 @@ N_f = int(L)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
+
 # TN parameters
 D = 4
-chi = -3
+chi = -2
 dtype=torch.float64
 
 # Load mps
@@ -63,35 +64,29 @@ mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/
 mps = qtn.unpack(mps_params, skeleton)
 mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
-# # randomize the mps tensors
-# mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
-
 # VMC sample size
-N_samples = int(2e3)
+N_samples = int(1e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
+# Select model
 model = fMPSModel(mps, max_bond=chi, dtype=dtype)
-# model = fTN_backflow_Model(mps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
-# model = fTN_backflow_attn_Model(mps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 model.apply(lambda x: init_weights_to_zero(x, std=5e-3))
 # model.apply(lambda x: init_weights_kaiming(x))
-
 model_names = {
     fMPSModel: 'fMPS',
-    fTN_backflow_Model: 'fTN_backflow',
-    fTN_backflow_attn_Model: 'fTN_backflow_attn',
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
-
-init_step = 1
+# Set VMC step range
+init_step = 0
 final_step = 100
 total_steps = final_step - init_step
+
 # Load model parameters
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(f'../../data/SWO/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -124,23 +119,22 @@ else:
     # optimizer = SignedRandomSGD(learning_rate=learning_rate)
     optimizer = SGD(learning_rate=learning_rate)
     # optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.9)
-    # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
+    # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=0.0)
 
 # Set up sampler
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=40, reset_chain=True, random_edge=False, equal_partition=False, dtype=dtype)
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
-# Set up SR preconditioner
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-3, iter_step=1e5, dtype=dtype)
-# preconditioner = TrivialPreconditioner()
+# Set up preconditioner (Trivial for SWO)
+preconditioner = TrivialPreconditioner()
 # Set up VMC
-vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler, SWO=False, beta=0.01)
+vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler, SWO=True, beta=0.1)
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    os.makedirs(f'../../data/SWO/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
     # with pyinstrument.Profiler() as prof:
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    vmc.run_SWO(init_step, init_step+total_steps, SWO_max_iter=50, log_fidelity_tol=0.0, tmpdir=f'../../data/SWO/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
     # if RANK == 0:
     #     prof.print()
 
