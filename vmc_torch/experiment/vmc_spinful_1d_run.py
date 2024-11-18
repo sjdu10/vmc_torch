@@ -86,7 +86,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 1
+init_step = 0
 final_step = 100
 total_steps = final_step - init_step
 # Load model parameters
@@ -127,7 +127,7 @@ else:
     # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
 
 # Set up sampler
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=False, equal_partition=True, dtype=dtype)
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner

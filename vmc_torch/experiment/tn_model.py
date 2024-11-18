@@ -706,7 +706,8 @@ class fTNModel(torch.nn.Module):
             if self.max_bond is None:
                 amp = amp
             else:
-                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-2])
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
             amp_val = amp.contract()
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
@@ -827,7 +828,8 @@ class fTN_backflow_Model(torch.nn.Module):
             if self.max_bond is None:
                 amp = amp
             else:
-                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-2])
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
 
             amp_val = amp.contract()
             if amp_val==0.0:
@@ -989,7 +991,8 @@ class fTN_backflow_attn_Model(torch.nn.Module):
             if self.max_bond is None:
                 amp = amp
             else:
-                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-2])
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
 
             amp_val = amp.contract()
             if amp_val==0.0:

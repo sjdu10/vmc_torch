@@ -10,6 +10,12 @@ from quimb.tensor.tensor_core import bonds, tags_to_oset, rand_uuid
 from quimb.tensor.tensor_2d import Rotator2D, pairwise
 
 
+#------Symmray function utils------
+try:
+    parse_edges_to_site_info = sr.utils.parse_edges_to_site_info
+except:
+    parse_edges_to_site_info = sr.parse_edges_to_site_info
+
 #------Amplitude Calculation------
 
 class fPEPS(qtn.PEPS):
@@ -110,7 +116,7 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
     assert symmetry == 'Z2' or symmetry == 'U1', "Only Z2 and U1 symmetries are supported."
     
     edges = qtn.edges_2d_square(Lx, Ly, cyclic=cyclic)
-    site_info = sr.utils.parse_edges_to_site_info(
+    site_info = parse_edges_to_site_info(
         edges,
         D,
         phys_dim=2 if spinless else 4,
@@ -421,7 +427,7 @@ def generate_random_fmps(L, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless
     assert symmetry == 'Z2' or symmetry == 'U1', "Only Z2 and U1 symmetries are supported."
 
     edges = qtn.edges_1d_chain(L, cyclic=cyclic)
-    site_info = sr.utils.parse_edges_to_site_info(
+    site_info = parse_edges_to_site_info(
         edges,
         D,
         phys_dim=2 if spinless else 4,

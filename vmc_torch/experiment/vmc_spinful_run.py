@@ -2,6 +2,7 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
+import sys
 import numpy as np
 from quimb.utils import progbar as Progbar
 from mpi4py import MPI
@@ -45,8 +46,8 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-Lx = int(2)
-Ly = int(2)
+Lx = int(4)
+Ly = int(4)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
@@ -55,8 +56,8 @@ n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 3
-chi = -2
+D = 4
+chi = 4
 dtype=torch.float64
 
 # # Load PEPS
@@ -69,14 +70,14 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(3e3)
+N_samples = int(1e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = fTNModel(peps, max_bond=chi, dtype=dtype)
-model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+# model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -117,7 +118,8 @@ model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, n
 # import jax
 # dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
 # model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=50, dummy_config=dummy_config, lazy=True)
-model.apply(lambda x: init_weights_to_zero(x, std=5e-3))
+init_std = 5e-2
+model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 # model.apply(lambda x: init_weights_kaiming(x))
 
 model_names = {
@@ -185,11 +187,29 @@ variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtyp
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-3, iter_step=1e5, dtype=dtype)
 # preconditioner = TrivialPreconditioner()
 # Set up VMC
-vmc = VMC(H, variational_state, optimizer, preconditioner, scheduler)
+vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
 
 if __name__ == "__main__":
+    
     torch.autograd.set_detect_anomaly(False)
     os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    record_file = open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
+    sys.stdout = record_file
+
+    if RANK == 0:
+        # print training information
+        print(f"Running VMC for {model_name}")
+        print(f"Optimizer: {optimizer}")
+        print(f"Preconditioner: {preconditioner}")
+        print(f"Scheduler: {scheduler}")
+        print(f"Sampler: {sampler}")
+        print(f'2D Fermi-Hubbard model on {Lx}x{Ly} lattice with {N_f} fermions, Sz=0, t={t}, U={U}')
+        print(f"Running {total_steps} steps from {init_step} to {final_step}")
+        print(f'Model initialized with mean=0, std={init_std}')
+        print(f'Learning rate: {learning_rate}')
+        print(f'Sample size: {N_samples}')
+        print(f'fPEPS bond dimension: {D}, max bond: {chi}')
+        print(f'fPEPS symmetry: {symmetry}\n')
     # with pyinstrument.Profiler() as prof:
     vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
     # if RANK == 0:
