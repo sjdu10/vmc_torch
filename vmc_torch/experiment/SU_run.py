@@ -72,7 +72,7 @@ terms = {
             site_info[sitea]['coordination'],
             site_info[siteb]['coordination'],
         ),
-    ).fuse((0, 1), (2, 3))
+    )
     for (sitea, siteb) in peps.gen_bond_coos()
 }
 ham = qtn.LocalHam2D(Lx, Ly, terms)

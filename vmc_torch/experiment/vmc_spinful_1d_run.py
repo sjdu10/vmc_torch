@@ -44,7 +44,7 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(4)
+L = int(8)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
@@ -53,8 +53,8 @@ n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 4
-chi = -3
+D = 8
+chi = -1
 dtype=torch.float64
 
 # Load mps
@@ -67,7 +67,7 @@ mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(2e3)
+N_samples = int(5e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -127,7 +127,7 @@ else:
     # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
 
 # Set up sampler
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=False, equal_partition=True, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=40, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner

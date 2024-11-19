@@ -20,8 +20,7 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from vmc_torch.experiment.tn_model import fMPSModel
-from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model
+from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
@@ -44,7 +43,7 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(4)
+L = int(8)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
@@ -54,46 +53,67 @@ H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_f
 graph = H.graph
 
 # TN parameters
-D = 4
-chi = -1
+D1 = 4
+D2 = 8
+chi1 = -1
+chi2 = -1
 dtype=torch.float64
 
-# Load mps
-skeleton = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_skeleton.pkl", "rb"))
-mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_su_params.pkl", "rb"))
-mps = qtn.unpack(mps_params, skeleton)
-mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
+# Load mps1
+skeleton = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D1}/mps_skeleton.pkl", "rb"))
+mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D1}/mps_su_params.pkl", "rb"))
+mps1 = qtn.unpack(mps_params, skeleton)
+mps1.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
+# Load mps2
+skeleton = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D2}/mps_skeleton.pkl", "rb"))
+mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D2}/mps_su_params.pkl", "rb"))
+mps2 = qtn.unpack(mps_params, skeleton)
+mps2.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
+
+# Select model
+model1 = fMPS_backflow_Model(mps1, nn_hidden_dim=2*L, num_hidden_layer=2, nn_eta=1.0, dtype=dtype)
+model2 = fMPSModel(mps2, dtype=dtype)
+init_std = 5e-2
+model1.apply(lambda x: init_weights_to_zero(x, std=init_std))
+model_names = {
+    fMPSModel: 'fMPS',
+    fMPS_backflow_Model: 'fMPS_backflow'
+}
+model_name = model_names.get(type(model1), 'UnknownModel')
+target_model_name = model_names.get(type(model2), 'UnknownModel')
 
 # VMC sample size
-N_samples = int(1e4)
+N_samples = int(1e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# Select model
-model = fMPSModel(mps, max_bond=chi, dtype=dtype)
-model.apply(lambda x: init_weights_to_zero(x, std=5e-3))
-# model.apply(lambda x: init_weights_kaiming(x))
-model_names = {
-    fMPSModel: 'fMPS',
-}
-model_name = model_names.get(type(model), 'UnknownModel')
-
 # Set VMC step range
 init_step = 0
-final_step = 100
+final_step = 10
 total_steps = final_step - init_step
+target_step = 73
 
-# Load model parameters
+# Load variational model parameters
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/SWO/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(f'../../data/SWO_fit/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D1}_Dt={D2}/{model_name}/chi={chi1}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
-        model.load_state_dict(saved_model_state_dict)
+        model1.load_state_dict(saved_model_state_dict)
     except:
-        model.load_params(saved_model_params_vec)
+        model1.load_params(saved_model_params_vec)
     optimizer_state = saved_model_params.get('optimizer_state', None)
+
+# Load target model parameters
+if target_step != 0:
+    saved_model_params = torch.load(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D2}/{target_model_name}/chi={chi2}/model_params_step{target_step}.pth')
+    saved_model_state_dict = saved_model_params['model_state_dict']
+    saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
+    try:
+        model2.load_state_dict(saved_model_state_dict)
+    except:
+        model2.load_params(saved_model_params_vec)
 
 # Set up optimizer and scheduler
 learning_rate = 5e-2
@@ -124,7 +144,8 @@ else:
 # Set up sampler
 sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=40, reset_chain=True, random_edge=False, equal_partition=False, dtype=dtype)
 # Set up variational state
-variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
+variational_state = Variational_State(model1, hi=H.hilbert, sampler=sampler, dtype=dtype)
+target_state = Variational_State(model2, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up preconditioner (Trivial for SWO)
 preconditioner = TrivialPreconditioner()
 # Set up VMC
@@ -132,9 +153,9 @@ vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimize
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../../data/SWO/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    os.makedirs(f'../../data/SWO_fit/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D1}_Dt={D2}/{model_name}/chi={chi1}/', exist_ok=True)
     # with pyinstrument.Profiler() as prof:
-    vmc.run_SWO(init_step, init_step+total_steps, SWO_max_iter=50, log_fidelity_tol=0.0, tmpdir=f'../../data/SWO/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    vmc.run_SWO_state_fitting(target_state=target_state, SWO_max_iter=100, log_fidelity_tol=0.0, sample_times=total_steps, tmpdir=f'../../data/SWO_fit/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D1}_Dt={D2}/{model_name}/chi={chi1}/')
     # if RANK == 0:
     #     prof.print()
 

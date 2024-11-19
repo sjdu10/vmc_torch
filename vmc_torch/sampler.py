@@ -149,7 +149,10 @@ class MetropolisExchangeSampler(Sampler):
         for chain_step in range(chain_length):
             time0 = MPI.Wtime()
             # sample the next configuration
-            sigma, psi_sigma = self._sample_next(vstate)
+            psi_sigma = 0
+            while psi_sigma == 0:
+                # We need to make sure that the amplitude is not zero
+                sigma, psi_sigma = self._sample_next(vstate)
 
             time1 = MPI.Wtime()
             n += 1
@@ -309,7 +312,10 @@ class MetropolisExchangeSampler(Sampler):
         """Get one sample of the local energy and amplitude gradient."""
         time0 = MPI.Wtime()
         # sample the next configuration
-        sigma, psi_sigma = self._sample_next(vstate)
+        psi_sigma = 0
+        while psi_sigma == 0:
+            # We need to make sure that the amplitude is not zero
+            sigma, psi_sigma = self._sample_next(vstate)
         time1 = MPI.Wtime()
 
         # compute local energy and amplitude gradient
@@ -457,10 +463,103 @@ class MetropolisExchangeSampler(Sampler):
         dataset = (config_list, config_amplitudes_dict)
 
         return dataset
+    
+    def sample_SWO_state_fitting_dataset_eager(self, vstate, target_state, message_tag=None):
+        """
+        Sample the configurations {c}_(t-1) according to |<c|Psi_(t-1)>|^2, 
+        and collect the corresponding amplitudes <c|Psi_(t-1)>, <c|Psi_target> for supervised wavefunction fitting in each rank.
+
+        Parameters
+        ----------
+        vstate : VariationalState
+            The variational state.
+        target_state : VariationalState
+            The target state.
+        message_tag : int
+            The message tag for MPI communication.
+
+        Returns
+        -------
+        list
+            A list of tuples (config, <c|Psi_(t-1)>, <c|Psi_target>).
+        """
+        if RANK == 0:
+            print('Burn-in...')
+            t_burnin0 = time.time()
+        self.burn_in(vstate)
+        if RANK == 0:
+            t_burnin1 = time.time()
+            print('Burn-in time:', t_burnin1 - t_burnin0)
+
+        n = 0
+        n_total = 0
+        config_list = []
+        config_amplitudes_dict = {}
+        terminate = False
+
+        if RANK == 0:
+            pbar = tqdm(total=self.Ns, desc='Sampling starts...')
+            for _ in range(2):
+                config, psi_sigma = self._sample_next(vstate)
+                config_list.append(config)
+                if config not in config_amplitudes_dict:
+                    psi_target_sigma = target_state.amplitude(config)
+                    config_amplitudes_dict[config] = (psi_sigma, psi_target_sigma)
+                else:
+                    psi_sigma, psi_target_sigma = config_amplitudes_dict[config] #XXX: not needed actually
+                n += 1
+                n_total += 1
+                pbar.update(1)
+            
+            # Discard messages from previous steps
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
+                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
+                del redundant_message
+            
+            while not terminate:
+                # Receive the local sample count from each rank
+                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2))
+                dest_rank = buf[0]
+                n_total += 1
+                pbar.update(1)
+                # Check if we have enough samples
+                if n_total >= self.Ns:
+                    terminate = True
+                    for dest_rank in range(1, SIZE):
+                        COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                # Send the termination signal to the rank
+                COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+            
+            pbar.close()
+        
+        else:
+            while not terminate:
+                config, psi_sigma = self._sample_next(vstate)
+                config_list.append(config)
+                if config not in config_amplitudes_dict:
+                    psi_target_sigma = target_state.amplitude(config)
+                    config_amplitudes_dict[config] = (psi_sigma, psi_target_sigma)
+                else:
+                    psi_sigma, psi_target_sigma = config_amplitudes_dict[config]
+                n += 1
+
+                buf = (RANK,)
+                # Send the local sample count to rank 0
+                COMM.send(buf, dest=0, tag=message_tag+np.sqrt(2))
+                # Receive the termination signal from rank 0
+                terminate = COMM.recv(source=0, tag=message_tag+1)
+            
+        if self.reset_chain:
+            self.reset()
+
+        if RANK == 0:
+            pbar.close()
+        
+        dataset = (config_list, config_amplitudes_dict)
+
+        return dataset
 
         
-
-    
 
 
 class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
@@ -556,10 +655,13 @@ class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
 
-            if random.random() < acceptance_ratio:
+            if random.random() < acceptance_ratio or (current_prob == 0):
                 self.current_config = proposed_config
                 current_amp = proposed_amp
                 current_prob = proposed_prob
                 accepts += 1
+            
+        if current_amp == 0 and DEBUG:
+            print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')
         
         return self.current_config, current_amp

@@ -51,13 +51,13 @@ Ly = int(4)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
-N_f = int(Lx*Ly)
+N_f = int(Lx*Ly-2)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
 D = 4
-chi = 4
+chi = -1
 dtype=torch.float64
 
 # # Load PEPS
@@ -194,7 +194,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
     os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
     record_file = open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
-    sys.stdout = record_file
+    # sys.stdout = record_file
 
     if RANK == 0:
         # print training information
