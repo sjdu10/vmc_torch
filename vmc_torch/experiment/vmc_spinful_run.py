@@ -22,7 +22,7 @@ import autoray as ar
 from autoray import do
 
 from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
-from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model
+from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model, fTN_backflow_Model_Blockwise
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
 from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
@@ -70,15 +70,16 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e3)
+N_samples = int(1e2)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTNModel_test(peps, max_bond=chi, dtype=dtype)
-# model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+# model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -128,6 +129,7 @@ model_names = {
     fTNModel_test: 'fTN_test',
     fTN_backflow_Model: 'fTN_backflow',
     fTN_backflow_attn_Model: 'fTN_backflow_attn',
+    fTN_backflow_Model_Blockwise: 'fTN_backflow_Blockwise',
     fTN_NN_proj_Model: 'fTN_NN_proj',
     fTN_NN_proj_variable_Model: 'fTN_NN_proj_variable',
     fTN_Transformer_Model: 'fTN_Transformer',
@@ -141,7 +143,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 399
+init_step = 0
 final_step = 450
 total_steps = final_step - init_step
 # Load model parameters
@@ -196,7 +198,21 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
     os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
     record_file = open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
-    # sys.stdout = record_file
+    if RANK == 0:
+        # print training information
+        print(f"Running VMC for {model_name}")
+        print(f"Optimizer: {optimizer}")
+        print(f"Preconditioner: {preconditioner}")
+        print(f"Scheduler: {scheduler}")
+        print(f"Sampler: {sampler}")
+        print(f'2D Fermi-Hubbard model on {Lx}x{Ly} lattice with {N_f} fermions, Sz=0, t={t}, U={U}')
+        print(f"Running {total_steps} steps from {init_step} to {final_step}")
+        print(f'Model initialized with mean=0, std={init_std}')
+        print(f'Learning rate: {learning_rate}')
+        print(f'Sample size: {N_samples}')
+        print(f'fPEPS bond dimension: {D}, max bond: {chi}')
+        print(f'fPEPS symmetry: {symmetry}\n')
+    sys.stdout = record_file
 
     if RANK == 0:
         # print training information

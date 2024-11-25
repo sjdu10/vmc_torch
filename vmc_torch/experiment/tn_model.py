@@ -664,7 +664,7 @@ class fMPS_backflow_Model(wavefunctionModel):
 
 
 
-class fTNModel(torch.nn.Module):
+class fTNModel(wavefunctionModel):
 
     def __init__(self, ftn, max_bond=None, dtype=torch.float32):
         super().__init__()
@@ -693,49 +693,6 @@ class fTNModel(torch.nn.Module):
         if max_bond is None or max_bond <= 0:
             max_bond = None
         self.max_bond = max_bond
-        
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def from_vec_to_params(self, vec, quimb_format=False):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        # XXX: useful at all?
-        params = {}
-        idx = 0
-        for tid, blk_array in self.torch_tn_params.items():
-            params[tid] = {}
-            for sector, data in blk_array.items():
-                shape = data.shape
-                size = data.numel()
-                if quimb_format:
-                    params[tid][ast.literal_eval(sector)] = vec[idx:idx+size].view(shape)
-                else:
-                    params[tid][sector] = vec[idx:idx+size].view(shape)
-                idx += size
-        return params
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
 
     
     def amplitude(self, x):
@@ -773,15 +730,9 @@ class fTNModel(torch.nn.Module):
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
-    
-    def forward(self, x):
-        if x.ndim == 1:
-            # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x)
 
 
-class fTNModel_test(torch.nn.Module):
+class fTNModel_test(wavefunctionModel):
     """The oddpos in this model is ordered so that no global phase is generated during contraction."""
 
     def __init__(self, ftn, max_bond=None, dtype=torch.float32):
@@ -812,49 +763,6 @@ class fTNModel_test(torch.nn.Module):
             max_bond = None
         self.max_bond = max_bond
         
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def from_vec_to_params(self, vec, quimb_format=False):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        # XXX: useful at all?
-        params = {}
-        idx = 0
-        for tid, blk_array in self.torch_tn_params.items():
-            params[tid] = {}
-            for sector, data in blk_array.items():
-                shape = data.shape
-                size = data.numel()
-                if quimb_format:
-                    params[tid][ast.literal_eval(sector)] = vec[idx:idx+size].view(shape)
-                else:
-                    params[tid][sector] = vec[idx:idx+size].view(shape)
-                idx += size
-        return params
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
-
     
     def amplitude(self, x):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
@@ -892,14 +800,8 @@ class fTNModel_test(torch.nn.Module):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
-    def forward(self, x):
-        if x.ndim == 1:
-            # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x)
 
-
-class fTN_backflow_Model(torch.nn.Module):
+class fTN_backflow_Model(wavefunctionModel):
 
     def __init__(self, ftn, max_bond=None, nn_hidden_dim=128, nn_eta=1e-3, num_hidden_layer=1, dtype=torch.float32):
         super().__init__()
@@ -943,34 +845,6 @@ class fTN_backflow_Model(torch.nn.Module):
             max_bond = None
         self.max_bond = max_bond
         self.nn_eta = nn_eta
-
-        
-        
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
-
     
     def amplitude(self, x):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
@@ -1014,12 +888,124 @@ class fTN_backflow_Model(torch.nn.Module):
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
+
+class fTN_backflow_Model_Blockwise(wavefunctionModel):
+    def __init__(self, ftn, block_size=(2, 2), max_bond=None, nn_hidden_dim=128, nn_eta=1e-3, num_hidden_layer=1, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # Store symmetry and other properties
+        self.symmetry = ftn.arrays[0].symmetry
+        self.block_size = block_size
+        Lx, Ly = ftn.Lx, ftn.Ly
+
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+        
+        # Initialize bulk and block storage
+        self.block_ts = {}
+        self.nn_blocks = nn.ModuleDict()
+        
+        # Partition the lattice into blocks
+        block_id = 0
+        for x_start in range(0, Lx, block_size[0]):
+            for y_start in range(0, Ly, block_size[1]):
+                x_end = min(x_start + block_size[0], Lx)
+                y_end = min(y_start + block_size[1], Ly)
+                
+                # Define the site labels for this block
+                block_sites = [f"I{x},{y}" for x in range(x_start, x_end) for y in range(y_start, y_end)]
+                
+                # Partition the tensors into blocks and store the block tensors tid
+                tid_list = [next(iter(ftn.tag_map[s])) for s in block_sites]
+                self.block_ts[block_id] = tid_list
+
+                # Create a neural network for this block
+                block_tn_params = {
+                    tid: params[tid]
+                    for tid in tid_list
+                }
+                block_tn_params_vec = flatten_proj_params(block_tn_params)
+                input_dim = Lx * Ly
+                layers = []
+                current_input_dim = input_dim
+                for _ in range(num_hidden_layer):
+                    layers.append(nn.Linear(current_input_dim, nn_hidden_dim))
+                    layers.append(nn.LeakyReLU())
+                    current_input_dim = nn_hidden_dim
+                layers.append(nn.Linear(current_input_dim, block_tn_params_vec.numel()))
+                self.nn_blocks[str(block_id)] = nn.Sequential(*layers)
+                
+                block_id += 1
+
+        # Convert NNs to the appropriate data type
+        self.nn_blocks.to(self.param_dtype)
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+        
+        # Store model details
+        self.model_structure = {
+            'fPEPS_backflow_blockwise': {'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 
+                                         'symmetry': self.symmetry, 'nn_hidden_dim': nn_hidden_dim, 
+                                         'nn_eta': nn_eta, 'max_bond': max_bond},
+        }
+        self.nn_eta = nn_eta
+        self.max_bond = max_bond if max_bond and max_bond > 0 else None
     
-    def forward(self, x):
-        if x.ndim == 1:
-            # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x)
+    def amplitude(self, x):
+        tn_params = {}
+        
+        batch_amps = []
+        for x_i in x:
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+            
+            # Neural network corrections for each block
+            for block_id, nn in self.nn_blocks.items():
+                block_tid_list = self.block_ts[int(block_id)]
+                block_tn_params = {
+                    tid: {
+                        ast.literal_eval(sector): data
+                        for sector, data in self.torch_tn_params[str(tid)].items()
+                    }
+                    for tid in block_tid_list
+                }
+                block_tn_params_vec = flatten_proj_params(block_tn_params)
+                nn_correction = nn(x_i)
+                block_tn_params_vec = block_tn_params_vec + self.nn_eta * nn_correction
+                block_tn_params = reconstruct_proj_params(block_tn_params_vec, block_tn_params)
+                tn_params.update(block_tn_params)
+            
+            psi = qtn.unpack(tn_params, self.skeleton)
+            # Compute the amplitude for the corrected TN
+            amp = psi.get_amp(x_i, conj=True)
+
+            if self.max_bond is not None:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, amp.Ly // 2 - 1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[amp.Ly // 2, amp.Ly - 1])
+
+            amp_val = amp.contract()
+            batch_amps.append(amp_val if amp_val != 0.0 else torch.tensor(0.0))
+
+        return torch.stack(batch_amps)
+
+
 
 
 #------------ fermionic TN model with attention mechanism ------------

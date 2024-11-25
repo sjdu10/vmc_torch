@@ -21,6 +21,10 @@
     --- Fully-connected random hopping Hubbard model (arXiv:2311.05749) that demonstrate volume-law, and expensive for DMRG (MPS). Try fTNF. [ ]
     --- SYK model, hard even for HFDS (arXiv:2411.04527), what about for fMPS+NN+attention? Or for TNF? [ ]
 
+# TN+NN:
+1. 2D Hubbard model various bond dimension D [ ]
+2. Non-fully connected neural network for large D fPEPS to reduce number of parameters. [ ]
+
 
 
 
