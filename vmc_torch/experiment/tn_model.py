@@ -1006,53 +1006,10 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
         return torch.stack(batch_amps)
 
 
-
-
 #------------ fermionic TN model with attention mechanism ------------
-import torch.nn.functional as F
-class SelfAttn_FFNN_block(nn.Module):
-    def __init__(self, n_site, num_classes, embedding_dim, attention_heads, nn_hidden_dim, output_dim):
-        super(SelfAttn_FFNN_block, self).__init__()
-        self.num_classes = num_classes
-        self.embedding_dim = embedding_dim
+from .nn_sublayers import SelfAttn_FFNN_block, StackedSelfAttn_FFNN
 
-        # Linear layer to project one-hot vectors to the embedding dimension
-        self.embedding = nn.Linear(num_classes, embedding_dim)
-
-        # Self-attention block
-        self.self_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=attention_heads, batch_first=True)
-
-        # Final feed-forward network to project the flattened attention output to `output_dim`
-        self.final_ffn = nn.Sequential(
-            nn.Linear(embedding_dim * n_site, nn_hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(nn_hidden_dim, output_dim)
-        )
-
-    def forward(self, input_seq):
-        # Step 1: One-hot encode the input sequence
-        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).float()
-
-        # Step 2: Embed the one-hot encoded sequence
-        embedded = self.embedding(one_hot_encoded)
-
-        # Step 3: Pass through the self-attention block
-        attn_output, _ = self.self_attention(embedded, embedded, embedded)
-
-        # Step 4: Residual connection and layer normalization
-        attn_output = F.layer_norm(attn_output + embedded, attn_output.size()[1:])
-
-        # Step 5: Reshape the output and flatten it
-        flattened_output = attn_output.view(-1)
-
-        # Step 6: Pass through the final feed-forward network to get fixed-length output
-        final_output = self.final_ffn(flattened_output)
-
-        return final_output
-
-
-class fTN_backflow_attn_Model(torch.nn.Module):
-
+class fTN_backflow_attn_Model(wavefunctionModel):
     def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
         super().__init__()
         self.param_dtype = dtype
@@ -1096,33 +1053,6 @@ class fTN_backflow_attn_Model(torch.nn.Module):
             max_bond = None
         self.max_bond = max_bond
         self.nn_eta = nn_eta
-        
-        
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
-
     
     def amplitude(self, x):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
@@ -1163,13 +1093,121 @@ class fTN_backflow_attn_Model(torch.nn.Module):
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
-    
-    def forward(self, x):
-        if x.ndim == 1:
-            # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x)
 
+
+class fTN_backflow_attn_Model_Stacked(wavefunctionModel):
+    def __init__(
+            self, 
+            ftn, 
+            max_bond=None, 
+            num_attention_blocks=1, 
+            embedding_dim=32, 
+            d_inner=16, 
+            attention_heads=4, 
+            nn_hidden_dim=128, 
+            nn_eta=1e-3, 
+            dtype=torch.float32
+        ):
+        super().__init__()
+        self.param_dtype = dtype
+
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly
+        phys_dim = ftn.phys_dim()
+        tn_params_vec = flatten_proj_params(params)
+        
+        self.nn = StackedSelfAttn_FFNN(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            num_attention_blocks=num_attention_blocks,
+            embedding_dim=embedding_dim,
+            d_inner=d_inner,
+            attention_heads=attention_heads,
+            nn_hidden_dim=nn_hidden_dim,
+            output_dim=tn_params_vec.numel(),
+        )
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS_backflow_attn_stacked':{
+                'D': ftn.max_bond(),
+                'max_bond': max_bond, 
+                'Lx': ftn.Lx, 
+                'Ly': ftn.Ly, 
+                'symmetry': self.symmetry, 
+                'num_attention_blocks': num_attention_blocks,
+                'nn_hidden_dim': nn_hidden_dim,
+                'embedding_dim': embedding_dim,
+                'd_inner': d_inner,
+                'nn_eta': nn_eta, 
+            },
+        }
+        
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_proj_params(params)
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i)
+            # Get the NN correction to the parameters
+            nn_correction = self.nn(x_i)
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta*nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            if self.max_bond is None:
+                amp = amp
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+
+            amp_val = amp.contract()
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
+
+#------------ fermionic TN model with NN projectors insertion ------------
 
     
 class fTN_NN_proj_Model(torch.nn.Module):

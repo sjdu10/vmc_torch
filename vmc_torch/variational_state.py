@@ -51,6 +51,10 @@ class Variational_State:
     def state_dict(self):
         return self.vstate_func.state_dict()
     
+    @property
+    def num_params(self):
+        return self.vstate_func.num_params
+    
     # state methods
     
     def reset(self):

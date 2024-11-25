@@ -22,7 +22,7 @@ import autoray as ar
 from autoray import do
 
 from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
-from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model, fTN_backflow_Model_Blockwise
+from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
 from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
@@ -77,9 +77,20 @@ if (N_samples/SIZE)%2 != 0:
 
 # model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTNModel_test(peps, max_bond=chi, dtype=dtype)
-model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+# model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTN_backflow_attn_Model_Stacked(
+    peps,
+    max_bond=chi, 
+    num_attention_blocks=10,
+    embedding_dim=8, 
+    d_inner=16,
+    attention_heads=2, 
+    nn_eta=1.0, 
+    nn_hidden_dim=2*Lx*Ly, 
+    dtype=dtype
+)
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -116,10 +127,6 @@ model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, n
 #     dropout=0.0,
 #     dtype=dtype,
 # )
-# model.apply(lambda x: init_weights_to_zero(x, std=5e-2))
-# import jax
-# dummy_config = H.hilbert.random_state(key=jax.random.PRNGKey(0))
-# model = fTN_NN_proj_variable_Model(peps, max_bond=chi, nn_eta=1.0, nn_hidden_dim=32, dtype=dtype, padded_length=50, dummy_config=dummy_config, lazy=True)
 init_std = 5e-2
 model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 # model.apply(lambda x: init_weights_kaiming(x))
@@ -130,6 +137,7 @@ model_names = {
     fTN_backflow_Model: 'fTN_backflow',
     fTN_backflow_attn_Model: 'fTN_backflow_attn',
     fTN_backflow_Model_Blockwise: 'fTN_backflow_Blockwise',
+    fTN_backflow_attn_Model_Stacked: 'fTN_backflow_attn_Stacked',
     fTN_NN_proj_Model: 'fTN_NN_proj',
     fTN_NN_proj_variable_Model: 'fTN_NN_proj_variable',
     fTN_Transformer_Model: 'fTN_Transformer',
@@ -201,6 +209,7 @@ if __name__ == "__main__":
     if RANK == 0:
         # print training information
         print(f"Running VMC for {model_name}")
+        print(f'model params: {variational_state.num_params}')
         print(f"Optimizer: {optimizer}")
         print(f"Preconditioner: {preconditioner}")
         print(f"Scheduler: {scheduler}")
@@ -212,11 +221,12 @@ if __name__ == "__main__":
         print(f'Sample size: {N_samples}')
         print(f'fPEPS bond dimension: {D}, max bond: {chi}')
         print(f'fPEPS symmetry: {symmetry}\n')
-    sys.stdout = record_file
+    # sys.stdout = record_file
 
     if RANK == 0:
         # print training information
         print(f"Running VMC for {model_name}")
+        print(f'model params: {variational_state.num_params}')
         print(f"Optimizer: {optimizer}")
         print(f"Preconditioner: {preconditioner}")
         print(f"Scheduler: {scheduler}")
