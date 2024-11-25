@@ -73,9 +73,10 @@ class Variational_State:
         self.vstate_func.load_state_dict(state_dict)
 
     def amplitude(self, x):
-        if not type(x) == torch.Tensor:
-            x = torch.tensor(np.asarray(x), dtype=self.dtype)
-        return self.vstate_func(x)
+        with torch.no_grad():
+            if not type(x) == torch.Tensor:
+                x = torch.tensor(np.asarray(x), dtype=self.dtype)
+            return self.vstate_func(x)
     
     def amplitude_grad(self, x):
         if not type(x) == torch.Tensor:
@@ -350,14 +351,14 @@ class Variational_State:
 
         return local_dataset
     
-    def collect_SWO_state_fitting_dataset_eager(self, target_state, message_tag=None):
+    def collect_SWO_state_fitting_dataset_eager(self, target_state, message_tag=None, compute_energy=False, op=None):
         # -- Dataset format: [[c1,c2,...], {c1:(x_c1,y_c1), c2:(x_c2,y_c2), ...}], where x_c=<c|Psi_(t-1)>, y_c=<c|Psi_target>.
         # -- The dataset is sampled from the current wavefunction |Psi_(t-1)>.
         # -- In short, the dataset: [local_configs, local_configs_amps_dict]
         vstate = self
 
         t_sample_start = MPI.Wtime()
-        local_dataset = self.sampler.sample_SWO_state_fitting_dataset_eager(vstate=vstate, target_state=target_state, message_tag=message_tag)
+        local_dataset = self.sampler.sample_SWO_state_fitting_dataset_eager(vstate=vstate, target_state=target_state, message_tag=message_tag, compute_energy=compute_energy, op=op)
         t_sample_end = MPI.Wtime()
 
         if DEBUG:

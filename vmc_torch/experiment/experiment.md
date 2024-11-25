@@ -1,6 +1,6 @@
 # Code-TODO:
 
-1. Compare fPEPS-NN model with Neural Backflow model on 4x4 spinful Fermi-Hubbard model. U/t=8, n=0.875, E_ed = -11.868. [?] -- Optimization,initialization problems..
+1. Compare fPEPS-NN model with Neural Backflow model on 4x4 spinful Fermi-Hubbard model. U/t=8, n=0.875, E_ed = -11.868. [x] -- Optimization,initialization problems..(sample#:50000)
 2. Implement variational PEPS model using BP TN contraction. [?] -- may have convergence issue?
 3. Implement variational model for spinful fermions. [x]
 4. Implement function to transform a U1 array to a Z2 array. [ ]
@@ -26,7 +26,6 @@
 
 
 # Volume-law TNF: (HFDS and DMRG benchmarks: arXiv:2311.05749 & arXiv:2411.04527)
-
 1. Check Quimb's MPO contruction routine for QSK model/SYK model using Jordan-Wigner transformation. [ ]
 2. Fully-connected random hopping Hubbard model; SYK model. [ ]
 

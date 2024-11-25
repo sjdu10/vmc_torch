@@ -24,34 +24,37 @@ class fPEPS(qtn.PEPS):
         self.symmetry = self.arrays[0].symmetry
         self.spinless = True if self.phys_dim() == 2 else False
     
-    def product_bra_state(self, config):
+    def product_bra_state(self, config, reverse=1):
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
         device = config.device
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
-
+        if type(config) == numpy.ndarray:
+            kwargs = {'like':config, 'dtype':dtype}
+        elif type(config) == torch.Tensor:
+            kwargs = {'like':config, 'device':device, 'dtype':dtype}
         if self.spinless:
             index_map = {0: 0, 1: 1}
             array_map = {
-                0: do('array',[1.0,],like=config,dtype=dtype,device=device), 
-                1: do('array',[1.0,],like=config,dtype=dtype,device=device)
+                0: do('array',[1.0,],**kwargs), 
+                1: do('array',[1.0,],**kwargs)
             }
         else:
             if self.symmetry == 'Z2':
                 index_map = {0:0, 1:1, 2:1, 3:0}
                 array_map = {
-                    0: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
-                    1: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
-                    2: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), 
-                    3: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device)
+                    0: do('array',[1.0, 0.0],**kwargs), 
+                    1: do('array',[1.0, 0.0],**kwargs), 
+                    2: do('array',[0.0, 1.0],**kwargs), 
+                    3: do('array',[0.0, 1.0],**kwargs)
                 }
             elif self.symmetry == 'U1':
                 index_map = {0:0, 1:1, 2:1, 3:2}
                 array_map = {
-                    0: do('array',[1.0,],like=config,dtype=dtype,device=device), 
-                    1: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
-                    2: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), 
-                    3: do('array',[1.0,],like=config,dtype=dtype,device=device)
+                    0: do('array',[1.0,],**kwargs), 
+                    1: do('array',[1.0, 0.0],**kwargs), 
+                    2: do('array',[0.0, 1.0],**kwargs), 
+                    3: do('array',[1.0,],**kwargs)
                 }
 
         for n, site in zip(config, self.sites):
@@ -66,14 +69,14 @@ class fPEPS(qtn.PEPS):
             if not self.spinless:
                 # assert self.symmetry == 'U1', "Only U1 symmetry is supported for spinful fermions for now."
                 if int(n) == 1:
-                    oddpos = (3*tid+1)*(-1)#**reverse
+                    oddpos = (3*tid+1)*(-1)**reverse
                 elif int(n) == 2:
-                    oddpos = (3*tid+2)*(-1)#**reverse
+                    oddpos = (3*tid+2)*(-1)**reverse
                 elif int(n) == 3:
                     # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
                     oddpos = None
             else:
-                oddpos = (3*tid+1)*(-1)
+                oddpos = (3*tid+1)*(-1)**reverse
 
             tsr_data = sr.FermionicArray.from_blocks(
                 blocks={(n_charge,):n_array}, 
@@ -88,10 +91,10 @@ class fPEPS(qtn.PEPS):
         return product_tn
     
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
-    def get_amp(self, config, inplace=False, conj=True):
+    def get_amp(self, config, inplace=False, conj=True, reverse=1):
         """Get the amplitude of a configuration in a PEPS."""
         peps = self if inplace else self.copy()
-        product_state = self.product_bra_state(config).conj() if conj else self.product_bra_state(config)
+        product_state = self.product_bra_state(config, reverse=reverse).conj() if conj else self.product_bra_state(config, reverse=reverse)
         
         amp = peps|product_state # ---T---<---|n>
         
@@ -211,31 +214,35 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
     backend = psi.tensors[0].data.backend
     device = config.device
     dtype = eval(backend+'.'+psi.tensors[0].data.dtype)
+    if type(config) == numpy.ndarray:
+        kwargs = {'like':config, 'dtype':dtype}
+    elif type(config) == torch.Tensor:
+        kwargs = {'like':config, 'device':device, 'dtype':dtype}
     if psi.spinless:
         index_map = {0: 0, 1: 1}
         array_map = {
-            0: do('array',[1.0],like=config,dtype=dtype,device=device), 
-            1: do('array',[1.0],like=config,dtype=dtype,device=device)
+            0: do('array',[1.0],**kwargs), 
+            1: do('array',[1.0],**kwargs)
         }
     else:
         if psi.symmetry == 'Z2':
             index_map = {0:0, 1:1, 2:1, 3:0}
             array_map = {
-                0: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
-                1: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
-                2: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), 
-                3: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device)
+                0: do('array',[1.0, 0.0],**kwargs), 
+                1: do('array',[1.0, 0.0],**kwargs), 
+                2: do('array',[0.0, 1.0],**kwargs), 
+                3: do('array',[0.0, 1.0],**kwargs)
             }
         elif psi.symmetry == 'U1':
             index_map = {0:0, 1:1, 2:1, 3:2}
             array_map = {
-                0: do('array',[1.0],like=config,dtype=dtype,device=device), 
-                1: do('array',[1.0, 0.0],like=config,dtype=dtype,device=device), 
-                2: do('array',[0.0, 1.0],like=config,dtype=dtype,device=device), 
-                3: do('array',[1.0],like=config,dtype=dtype,device=device)
+                0: do('array',[1.0],**kwargs), 
+                1: do('array',[1.0, 0.0],**kwargs), 
+                2: do('array',[0.0, 1.0],**kwargs), 
+                3: do('array',[1.0],**kwargs)
             }
 
-    iter = zip(config, psi.sites) if not reverse else zip(config[::-1], psi.sites[::-1])
+    iter = zip(config, psi.sites) # if not reverse else zip(config[::-1], psi.sites[::-1])
 
     for n, site in iter:
         p_ind = psi.site_ind_id.format(*site)
@@ -248,14 +255,14 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
         oddpos = None
         if not psi.spinless:
             if int(n) == 1:
-                oddpos = (3*tid+1)*(-1)
+                oddpos = (3*tid+1)*(-1)**reverse
             elif int(n) == 2:
-                oddpos = (3*tid+2)*(-1)
+                oddpos = (3*tid+2)*(-1)**reverse
             elif int(n) == 3:
                 # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
                 oddpos = None
         else:
-            oddpos = (3*tid+1)*(-1)
+            oddpos = (3*tid+1)*(-1)**reverse
         
         tsr_data = sr.FermionicArray.from_blocks(
             blocks={(n_charge,):n_array}, 
@@ -339,6 +346,8 @@ class fMPS(qtn.MatrixProductState):
         self.spinless = True if self.phys_dim() == 2 else False
     
     def product_bra_state(self, config):
+        """For product state ALWAYS make sure the set of oddposes are different from the set of oddposes in the TNS |psi>.
+        When using some overlapping oddposes, the computation of the amplitude will gain some unphysical global phase!!"""
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
         device = config.device
@@ -576,7 +585,9 @@ def detect_hopping(configi, configj):
         return None
 
 def calc_phase_netket(configi, configj):
-    """Calculate the phase factor for the matrix element in the netket basis, where all spin-up spins are placed before all spin-down spins"""
+    """Calculate the phase factor for the matrix element in the netket basis, where all spin-up spins are placed before all spin-down spins.
+    Globally, this convention gives a spin configuration (|uuu...ddd...>) when the configuration is flattened to 1D.
+    Physically, the basis is written as a^d_1u a^d_2u ... a^d_nu a^d_1d a^d_2d ... a^d_nd |0>."""
     hopping = detect_hopping(configi, configj)
     if hopping is not None:
         netket_config_i = from_quimb_config_to_netket_config(configi)
@@ -589,7 +600,8 @@ def calc_phase_netket(configi, configj):
 
 def calc_phase_symmray(configi, configj):
     """Calculate the operator matrix element phase in symmray, assuming local basis convention for spinful fermion is (|up, down>).
-    Globally, this convention gives a staggered spin configuration (|dududu...>) when the configuration is flattened to 1D."""
+    Globally, this convention gives a staggered spin configuration (|dududu...>) when the configuration is flattened to 1D.
+    Physically, the basis is written as a^d_1d a^d_1u... a^d_nu a^d_nd |0>."""
     hopping = detect_hopping(configi, configj)
     if hopping is not None:
         netket_config_i = from_quimb_config_to_netket_config(configi)

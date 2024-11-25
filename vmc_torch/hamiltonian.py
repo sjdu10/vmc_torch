@@ -55,9 +55,6 @@ class SpinlessFermion(Hilbert):
     
     def all_states(self):
         return self.hi.all_states()
-    
-    def random_state(self, key):
-        return self.hi.random_state(key)
 
 
 class SpinfulFermion(Hilbert):
@@ -205,6 +202,36 @@ def chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc=False, n_fermions_per_spin=Non
         H += U * nc(hi,i,+1) * nc(hi,i,-1)
     return H, hi, graph
 
+def chain_spinful_random_Hubbard(L, t_mean, t_std, U, N_f, n_fermions_per_spin=None, seed=42):
+    import numpy as np
+    np.random.seed(seed)
+    """Netket implementation of fully-connected random hopping Hubbard model"""
+    # Generate all possible edges for a fully connected graph
+    edges = [(i, j) for i in range(L) for j in range(i + 1, L)]
+
+    # Create the fully connected graph
+    graph = nk.graph.Graph(edges=edges)
+    N = graph.n_nodes
+
+    # Generate edge-hopping dictionary
+    edge_to_hopping = {}
+    for (i,j) in graph.edges():
+        t = np.random.normal(t_mean, t_std)
+        edge_to_hopping[(i,j)] = t
+
+    if n_fermions_per_spin is None:
+        hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions=N_f)
+    else:
+        hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_per_spin)
+    H = 0.0
+    for (i,j) in graph.edges():
+        t = edge_to_hopping[(i,j)]
+        for spin in (1,-1):
+            H -= t * (cdag(hi,i,spin) * c(hi,j,spin) + cdag(hi,j,spin) * c(hi,i,spin))
+    for i in graph.nodes():
+        H += U * nc(hi,i,+1) * nc(hi,i,-1)
+    return H, hi, graph
+
 #----- self-customized Hamiltonian class -----#
 
 # Fermionic Hamiltonians
@@ -243,6 +270,27 @@ class spinful_Fermi_Hubbard_square_lattice(Hamiltonian):
 class spinful_Fermi_Hubbard_chain(Hamiltonian):
     def __init__(self, L, t, U, N_f, pbc=False, n_fermions_per_spin=None):
         H, hi, graph = chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc, n_fermions_per_spin)
+        super().__init__(H, hi, graph)
+        self._hilbert = SpinfulFermion(hi.n_orbitals, hi.n_fermions, hi.n_fermions_per_spin)
+
+    def get_conn(self, sigma):
+        # Quimb2Netket
+        if len(sigma) == self.graph.n_nodes:
+            config_calc = from_quimb_config_to_netket_config(sigma)
+        else:
+            raise ValueError("The input configuration is not compatible with the Netket Hamiltonian Hilbert space.")
+        eta_calc_netket, H_etasigma = self.H.get_conn(config_calc)
+        # Netket2Quimb
+        eta_calc = from_netket_config_to_quimb_config(eta_calc_netket)
+        # Calculate the phase correction
+        correction_phase_vec = do('array', ([calc_phase_correction_netket_symmray(sigma, eta) for eta in eta_calc]))
+        H_etasigma *= correction_phase_vec
+
+        return eta_calc, H_etasigma
+
+class spinful_random_Hubbard_chain(Hamiltonian):
+    def __init__(self, L, t_mean, t_std, U, N_f, n_fermions_per_spin=None, seed=42):
+        H, hi, graph = chain_spinful_random_Hubbard(L, t_mean, t_std, U, N_f, n_fermions_per_spin,seed)
         super().__init__(H, hi, graph)
         self._hilbert = SpinfulFermion(hi.n_orbitals, hi.n_fermions, hi.n_fermions_per_spin)
 

@@ -464,7 +464,7 @@ class MetropolisExchangeSampler(Sampler):
 
         return dataset
     
-    def sample_SWO_state_fitting_dataset_eager(self, vstate, target_state, message_tag=None):
+    def sample_SWO_state_fitting_dataset_eager(self, vstate, target_state, message_tag=None, compute_energy=False, op=None):
         """
         Sample the configurations {c}_(t-1) according to |<c|Psi_(t-1)>|^2, 
         and collect the corresponding amplitudes <c|Psi_(t-1)>, <c|Psi_target> for supervised wavefunction fitting in each rank.
@@ -496,6 +496,7 @@ class MetropolisExchangeSampler(Sampler):
         config_list = []
         config_amplitudes_dict = {}
         terminate = False
+        op_expect = 0
 
         if RANK == 0:
             pbar = tqdm(total=self.Ns, desc='Sampling starts...')
@@ -507,6 +508,15 @@ class MetropolisExchangeSampler(Sampler):
                     config_amplitudes_dict[config] = (psi_sigma, psi_target_sigma)
                 else:
                     psi_sigma, psi_target_sigma = config_amplitudes_dict[config] #XXX: not needed actually
+                if compute_energy:
+                    eta, O_etasigma = op.get_conn(config)
+                    psi_eta = vstate.amplitude(eta)
+                    psi_eta = psi_eta.detach().numpy()
+                    psi_sigma = psi_sigma.detach().numpy()
+                    op_loc = np.sum(O_etasigma * psi_eta / psi_sigma, axis=-1)
+                    op_expect += op_loc
+                    ...#XXX: compute variance
+
                 n += 1
                 n_total += 1
                 pbar.update(1)
@@ -541,6 +551,14 @@ class MetropolisExchangeSampler(Sampler):
                     config_amplitudes_dict[config] = (psi_sigma, psi_target_sigma)
                 else:
                     psi_sigma, psi_target_sigma = config_amplitudes_dict[config]
+                if compute_energy:
+                    eta, O_etasigma = op.get_conn(config)
+                    psi_eta = vstate.amplitude(eta)
+                    psi_eta = psi_eta.detach().numpy()
+                    psi_sigma = psi_sigma.detach().numpy()
+                    op_loc = np.sum(O_etasigma * psi_eta / psi_sigma, axis=-1)
+                    op_expect += op_loc
+                    ...#XXX: compute variance
                 n += 1
 
                 buf = (RANK,)
@@ -555,7 +573,7 @@ class MetropolisExchangeSampler(Sampler):
         if RANK == 0:
             pbar.close()
         
-        dataset = (config_list, config_amplitudes_dict)
+        dataset = (config_list, config_amplitudes_dict, op_expect)
 
         return dataset
 

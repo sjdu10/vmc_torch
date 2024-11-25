@@ -5,9 +5,6 @@ os.environ["OMP_NUM_THREADS"] = '1'
 import numpy as np
 from quimb.utils import progbar as Progbar
 from mpi4py import MPI
-import pickle
-import pyinstrument
-
 # torch
 from torch.nn.parameter import Parameter
 import torch
@@ -15,7 +12,7 @@ import torch.nn as nn
 torch.autograd.set_detect_anomaly(False)
 
 # quimb
-import quimb as qu
+import symmray as sr
 import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
@@ -25,9 +22,9 @@ from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPreconditioner, Adam, SGD_momentum, DecayScheduler
+from vmc_torch.optimizer import SGD, SR, Adam, SGD_momentum, DecayScheduler
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_chain
+from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_chain, spinful_random_Hubbard_chain
 from vmc_torch.torch_utils import SVD,QR
 from vmc_torch.fermion_utils import generate_random_fmps
 
@@ -44,23 +41,23 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(8)
+L = int(6)
 symmetry = 'U1'
-t = 1.0
 U = 8.0
 N_f = int(L)
 n_fermions_per_spin = (N_f//2, N_f//2)
-H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
+t_mean = 0.0
+t_std = 1.0
+seed = 2
+H = spinful_random_Hubbard_chain(L, t_mean, t_std, U, N_f, n_fermions_per_spin=n_fermions_per_spin, seed=seed)
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = -2
 dtype=torch.float64
 
-# Load mps
-skeleton = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_skeleton.pkl", "rb"))
-mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_su_params.pkl", "rb"))
-mps = qtn.unpack(mps_params, skeleton)
+# Create random fMPS
+mps, _ = generate_random_fmps(L=L, D=D, seed=seed, Nf=N_f, cyclic=True, spinless=False)
 mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # # randomize the mps tensors
@@ -76,7 +73,6 @@ if (N_samples/SIZE)%2 != 0:
 model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
 init_std = 5e-2
 model.apply(lambda x: init_weights_to_zero(x, std=init_std))
-# model.apply(lambda x: init_weights_kaiming(x))
 
 model_names = {
     fMPSModel: 'fMPS',
@@ -92,7 +88,7 @@ final_step = 100
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(f'../../data/L={L}/random_t_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -139,9 +135,9 @@ vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimize
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    os.makedirs(f'../../data/L={L}/random_t_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
     # with pyinstrument.Profiler() as prof:
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/L={L}/random_t_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
     # if RANK == 0:
     #     prof.print()
 

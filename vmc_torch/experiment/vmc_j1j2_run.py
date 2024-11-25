@@ -49,7 +49,7 @@ H = spin_J1J2_square_lattice(Lx, Ly, J1, J2, total_sz=0.0)
 graph = H.graph
 # TN parameters
 D = 2
-chi = 10
+chi = -1
 chi_nn = 2
 dtype=torch.float64
 
@@ -60,13 +60,13 @@ peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e1)
+N_samples = int(1e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = PEPS_model(peps, max_bond=chi)
-# model = PEPS_delocalized_Model(peps, max_bond=chi, diag=False)
+# model = PEPS_model(peps, max_bond=chi)
+model = PEPS_delocalized_Model(peps, max_bond=chi, diag=False)
 # model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model = PEPS_NNproj_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=L**2)
 # model.apply(init_weights_to_zero)
@@ -91,14 +91,26 @@ if init_step != 0:
         model.load_params(saved_model_params_vec)
 
 # optimizer = SignedSGD(learning_rate=0.05)
-optimizer = SGD(learning_rate=5e-2)
-sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=True, equal_partition=True, dtype=dtype)
+learning_rate = 5e-2
+optimizer = SGD(learning_rate=learning_rate)
+sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=True, equal_partition=False, dtype=dtype)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=5e-2, iter_step=1e5, dtype=dtype)
-vmc = VMC(H, variational_state, optimizer, preconditioner)
+vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner)
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
+    if RANK == 0:
+        # print training information
+        print(f"Running VMC for {model_name}")
+        print(f"Optimizer: {optimizer}")
+        print(f"Preconditioner: {preconditioner}")
+        print(f"Sampler: {sampler}")
+        print(f'2D j1j2 model on {Lx}x{Ly} lattice with J1={J1}, J2={J2}')
+        print(f"Running {total_steps} steps from {init_step} to {final_step}")
+        print(f'Learning rate: {learning_rate}')
+        print(f'Sample size: {N_samples}')
+        print(f'fPEPS bond dimension: {D}, max bond: {chi}')
     os.makedirs(f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
     vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/J1={J1}_J2={J2}/D={D}/{model_name}/chi={chi}/')
 

@@ -71,7 +71,8 @@ mps2 = qtn.unpack(mps_params, skeleton)
 mps2.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # Select model
-model1 = fMPS_backflow_Model(mps1, nn_hidden_dim=2*L, num_hidden_layer=2, nn_eta=1.0, dtype=dtype)
+# model1 = fMPS_backflow_Model(mps1, nn_hidden_dim=2*L, num_hidden_layer=2, nn_eta=1.0, dtype=dtype)
+model1 = fMPSModel(mps1, dtype=dtype)
 model2 = fMPSModel(mps2, dtype=dtype)
 init_std = 5e-2
 model1.apply(lambda x: init_weights_to_zero(x, std=init_std))
@@ -83,7 +84,7 @@ model_name = model_names.get(type(model1), 'UnknownModel')
 target_model_name = model_names.get(type(model2), 'UnknownModel')
 
 # VMC sample size
-N_samples = int(1e3)
+N_samples = int(3e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -155,7 +156,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
     os.makedirs(f'../../data/SWO_fit/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D1}_Dt={D2}/{model_name}/chi={chi1}/', exist_ok=True)
     # with pyinstrument.Profiler() as prof:
-    vmc.run_SWO_state_fitting(target_state=target_state, SWO_max_iter=100, log_fidelity_tol=0.0, sample_times=total_steps, tmpdir=f'../../data/SWO_fit/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D1}_Dt={D2}/{model_name}/chi={chi1}/')
+    vmc.run_SWO_state_fitting(target_state=target_state, sample_times=total_steps, compute_energy=True, SWO_max_iter=100, log_fidelity_tol=0.0, tmpdir=f'../../data/SWO_fit/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D1}_Dt={D2}/{model_name}/chi={chi1}/')
     # if RANK == 0:
     #     prof.print()
 

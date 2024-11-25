@@ -21,7 +21,7 @@ import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
 
-from vmc_torch.experiment.tn_model import fTNModel, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
+from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
 from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
 from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
@@ -51,7 +51,7 @@ Ly = int(4)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
-N_f = int(Lx*Ly-2)
+N_f = int(Lx*Ly)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
@@ -76,6 +76,7 @@ if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = fTNModel(peps, max_bond=chi, dtype=dtype)
+# model = fTNModel_test(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_Transformer_Model(
@@ -124,6 +125,7 @@ model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 
 model_names = {
     fTNModel: 'fTN',
+    fTNModel_test: 'fTN_test',
     fTN_backflow_Model: 'fTN_backflow',
     fTN_backflow_attn_Model: 'fTN_backflow_attn',
     fTN_NN_proj_Model: 'fTN_NN_proj',
@@ -139,8 +141,8 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 0
-final_step = 250
+init_step = 399
+final_step = 450
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:

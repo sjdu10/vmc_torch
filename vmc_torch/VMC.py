@@ -124,7 +124,13 @@ class VMC:
             + f"\n  state = {self._state})"
         )
 
-    def run(self, start, stop, tmpdir=None, save=True): # Now naive implementation
+    def run(
+            self, 
+            start, 
+            stop, 
+            tmpdir=None, 
+            save=True
+        ): # Now naive implementation
         """Run the VMC optimization loop."""
         self.Einit = 0.
         MC_energy_stats = {'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
@@ -224,7 +230,15 @@ class VMC:
     
 
     
-    def run_SWO(self, start, stop, SWO_max_iter=int(1e3), log_fidelity_tol=1e-4, tmpdir=None, save=True):
+    def run_SWO(
+            self, 
+            start, 
+            stop, 
+            SWO_max_iter=int(1e3), 
+            log_fidelity_tol=1e-4, 
+            tmpdir=None, 
+            save=True
+        ):
         """Run SWO for ground state calculation."""
         assert self.SWO, "SWO is not enabled!"
         self.Einit = 0.
@@ -411,12 +425,21 @@ class VMC:
                         json.dump(MC_energy_stats, f)
 
 
-    def run_SWO_state_fitting(self, target_state, SWO_max_iter=int(1e3), log_fidelity_tol=1e-4, sample_times=10, tmpdir=None, save=True):
+    def run_SWO_state_fitting(
+            self, 
+            target_state, 
+            sample_times=10, 
+            SWO_max_iter=int(1e3), 
+            log_fidelity_tol=1e-4, 
+            compute_energy=False, 
+            tmpdir=None, 
+            save=True
+        ):
         #XXX: todo
         """Run SWO for target state fitting."""
         assert self.SWO, "SWO is not enabled!"
         self.Einit = 0.
-        MC_stats = {'sample size:': self._state.Ns, '-logf': [], 'fidelity': []}
+        MC_stats = {'sample size:': self._state.Ns, '-logf': [], 'fidelity': [], 'mean': []}
         self.step_count = 0
 
         # Initialize the SWO parameters
@@ -427,7 +450,7 @@ class VMC:
             # Step 1: Sample the SWO dataset at the current step for current wavefunction. In this step we use MPI for the sampling.
             # -- Dataset format: [[c1,c2,...], {c1:(x_c1,y_c1), c2:(x_c2,y_c2), ...}] where x_c=<c|Psi_(t-1)>, y_c=<c|H|Psi_(t-1)>.
             # -- The dataset is sampled from the current wavefunction |Psi_(t-1)>.
-            SWO_dataset = self._state.collect_SWO_state_fitting_dataset_eager(target_state, message_tag=t_step)
+            SWO_dataset = self._state.collect_SWO_state_fitting_dataset_eager(target_state, message_tag=t_step, compute_energy=compute_energy, op=self._hamiltonian)
             # -- Compute energy estimation and record energy statistics
             local_configs = SWO_dataset[0]
             local_configs_amps_dict = SWO_dataset[1]
@@ -437,6 +460,11 @@ class VMC:
             n_total_local = len(local_configs)
             n_total = COMM.allreduce(n_total_local, op=MPI.SUM)
 
+            # Potentially compute the energy
+            if compute_energy:
+                E_loc_sum = SWO_dataset[2]
+                E_expect = COMM.allreduce(E_loc_sum, op=MPI.SUM)/n_total
+            
             # Compute initial fidelity
             f1_loc = sum([local_configs_SWO_amps_dict[c][1]/local_configs_SWO_amps_dict[c][0] for c in local_configs])
             f2_loc = sum([local_configs_SWO_amps_dict[c][1]**2/local_configs_SWO_amps_dict[c][0]**2 for c in local_configs])
@@ -449,6 +477,9 @@ class VMC:
                     print('Initial fidelity: {}, Negative log-fidelity: {}'.format(init_fidelity[0], -np.log(init_fidelity)[0]))
                     MC_stats['-logf'].append(float(-np.log(init_fidelity)[0]))
                     MC_stats['fidelity'].append(float(init_fidelity[0]))
+                    if compute_energy:
+                        print('Energy: {}'.format(E_expect))
+                        MC_stats['mean'].append(float(E_expect))
             
             # Step 2: Inner loop: perform supervised learning on the dataset to fit the trainable wavefunction to the target wavefunction
             # -- Inner loop is a normal torch supervised learning loop, with the log-fidelity as the loss function.
