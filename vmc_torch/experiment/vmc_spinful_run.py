@@ -200,7 +200,6 @@ preconditioner = SR(dense=False, exact=True if sampler is None else False, use_M
 # preconditioner = TrivialPreconditioner()
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
-
 if __name__ == "__main__":
     
     torch.autograd.set_detect_anomaly(False)
