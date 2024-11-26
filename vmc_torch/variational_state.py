@@ -10,6 +10,7 @@ import torch
 from autoray import do
 
 from .global_var import DEBUG, set_debug
+from .utils import tensor_aware_lru_cache
 
 
 COMM = MPI.COMM_WORLD
@@ -61,6 +62,15 @@ class Variational_State:
         """Clear the gradient of the variational state."""
         self.vstate_func.clear_grad()
     
+    def clear_cache(self):
+        try:
+            if RANK == 1:
+                print(self.amplitude.cache_info(), self.amplitude_grad.cache_info())
+            self.amplitude.cache_clear()
+            self.amplitude_grad.cache_clear()
+        except AttributeError:
+            pass
+    
     def clear_memory(self):
         """Clear the memory of the variational state."""
         self.logamp_grad_matrix = None
@@ -76,12 +86,14 @@ class Variational_State:
     def load_state_dict(self, state_dict):
         self.vstate_func.load_state_dict(state_dict)
 
+    @tensor_aware_lru_cache(maxsize=128)
     def amplitude(self, x):
         with torch.no_grad():
             if not type(x) == torch.Tensor:
                 x = torch.tensor(np.asarray(x), dtype=self.dtype)
             return self.vstate_func(x)
     
+    @tensor_aware_lru_cache(maxsize=128)
     def amplitude_grad(self, x):
         if not type(x) == torch.Tensor:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
@@ -189,6 +201,7 @@ class Variational_State:
         # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         t_sample_start = MPI.Wtime()
         local_samples = self.sampler.sample(op=op, vstate=vstate, chain_length=chain_length)
+        self.clear_cache()
         t_sample_end = MPI.Wtime()
         if DEBUG:
             print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
@@ -283,6 +296,7 @@ class Variational_State:
 
         t_sample_start = MPI.Wtime()
         local_samples = self.sampler.sample_eager(op=op, vstate=vstate, message_tag=message_tag)
+        self.clear_cache()
         t_sample_end = MPI.Wtime()
         if DEBUG:
             print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
@@ -348,6 +362,7 @@ class Variational_State:
 
         t_sample_start = MPI.Wtime()
         local_dataset = self.sampler.sample_SWO_dataset_eager(vstate=vstate, op=op, message_tag=message_tag)
+        self.clear_cache()
         t_sample_end = MPI.Wtime()
 
         if DEBUG:
@@ -363,6 +378,7 @@ class Variational_State:
 
         t_sample_start = MPI.Wtime()
         local_dataset = self.sampler.sample_SWO_state_fitting_dataset_eager(vstate=vstate, target_state=target_state, message_tag=message_tag, compute_energy=compute_energy, op=op)
+        self.clear_cache()
         t_sample_end = MPI.Wtime()
 
         if DEBUG:

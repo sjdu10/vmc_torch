@@ -1159,7 +1159,7 @@ class fTN_backflow_attn_Model_Stacked(wavefunctionModel):
                 'nn_eta': nn_eta, 
             },
         }
-        
+
         if max_bond is None or max_bond <= 0:
             max_bond = None
         self.max_bond = max_bond
@@ -2385,7 +2385,7 @@ class NeuralJastrow(nn.Module):
         batch_size = n.shape[0]
         return torch.stack([slater_det_Jastrow(n[i]) for i in range(batch_size)])
 
-class NeuralBackflow(nn.Module):
+class NeuralBackflow(wavefunctionModel):
     def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
         super(NeuralBackflow, self).__init__()
         
@@ -2412,33 +2412,6 @@ class NeuralBackflow(nn.Module):
         self.model_structure = {
             'Neuralbackflow':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
         }
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
-    
 
     def forward(self, n):
         if not type(n) == torch.Tensor:

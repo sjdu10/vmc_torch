@@ -47,7 +47,7 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 Lx = int(4)
-Ly = int(4)
+Ly = int(2)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
@@ -70,7 +70,7 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e2)
+N_samples = int(1e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
