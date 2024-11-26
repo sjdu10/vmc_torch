@@ -47,7 +47,7 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 Lx = int(4)
-Ly = int(2)
+Ly = int(4)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
@@ -200,45 +200,45 @@ preconditioner = SR(dense=False, exact=True if sampler is None else False, use_M
 # preconditioner = TrivialPreconditioner()
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
-if __name__ == "__main__":
+# if __name__ == "__main__":
     
-    torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-    record_file = open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
-    if RANK == 0:
-        # print training information
-        print(f"Running VMC for {model_name}")
-        print(f'model params: {variational_state.num_params}')
-        print(f"Optimizer: {optimizer}")
-        print(f"Preconditioner: {preconditioner}")
-        print(f"Scheduler: {scheduler}")
-        print(f"Sampler: {sampler}")
-        print(f'2D Fermi-Hubbard model on {Lx}x{Ly} lattice with {N_f} fermions, Sz=0, t={t}, U={U}')
-        print(f"Running {total_steps} steps from {init_step} to {final_step}")
-        print(f'Model initialized with mean=0, std={init_std}')
-        print(f'Learning rate: {learning_rate}')
-        print(f'Sample size: {N_samples}')
-        print(f'fPEPS bond dimension: {D}, max bond: {chi}')
-        print(f'fPEPS symmetry: {symmetry}\n')
-    # sys.stdout = record_file
+torch.autograd.set_detect_anomaly(False)
+os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+record_file = open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
+if RANK == 0:
+    # print training information
+    print(f"Running VMC for {model_name}")
+    print(f'model params: {variational_state.num_params}')
+    print(f"Optimizer: {optimizer}")
+    print(f"Preconditioner: {preconditioner}")
+    print(f"Scheduler: {scheduler}")
+    print(f"Sampler: {sampler}")
+    print(f'2D Fermi-Hubbard model on {Lx}x{Ly} lattice with {N_f} fermions, Sz=0, t={t}, U={U}')
+    print(f"Running {total_steps} steps from {init_step} to {final_step}")
+    print(f'Model initialized with mean=0, std={init_std}')
+    print(f'Learning rate: {learning_rate}')
+    print(f'Sample size: {N_samples}')
+    print(f'fPEPS bond dimension: {D}, max bond: {chi}')
+    print(f'fPEPS symmetry: {symmetry}\n')
+    sys.stdout = record_file
 
-    if RANK == 0:
-        # print training information
-        print(f"Running VMC for {model_name}")
-        print(f'model params: {variational_state.num_params}')
-        print(f"Optimizer: {optimizer}")
-        print(f"Preconditioner: {preconditioner}")
-        print(f"Scheduler: {scheduler}")
-        print(f"Sampler: {sampler}")
-        print(f'2D Fermi-Hubbard model on {Lx}x{Ly} lattice with {N_f} fermions, Sz=0, t={t}, U={U}')
-        print(f"Running {total_steps} steps from {init_step} to {final_step}")
-        print(f'Model initialized with mean=0, std={init_std}')
-        print(f'Learning rate: {learning_rate}')
-        print(f'Sample size: {N_samples}')
-        print(f'fPEPS bond dimension: {D}, max bond: {chi}')
-        print(f'fPEPS symmetry: {symmetry}\n')
-    # with pyinstrument.Profiler() as prof:
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
-    # if RANK == 0:
-    #     prof.print()
+if RANK == 0:
+    # print training information
+    print(f"Running VMC for {model_name}")
+    print(f'model params: {variational_state.num_params}')
+    print(f"Optimizer: {optimizer}")
+    print(f"Preconditioner: {preconditioner}")
+    print(f"Scheduler: {scheduler}")
+    print(f"Sampler: {sampler}")
+    print(f'2D Fermi-Hubbard model on {Lx}x{Ly} lattice with {N_f} fermions, Sz=0, t={t}, U={U}')
+    print(f"Running {total_steps} steps from {init_step} to {final_step}")
+    print(f'Model initialized with mean=0, std={init_std}')
+    print(f'Learning rate: {learning_rate}')
+    print(f'Sample size: {N_samples}')
+    print(f'fPEPS bond dimension: {D}, max bond: {chi}')
+    print(f'fPEPS symmetry: {symmetry}\n')
+# with pyinstrument.Profiler() as prof:
+vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+# if RANK == 0:
+#     prof.print()
 
