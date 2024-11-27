@@ -46,17 +46,17 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-Lx = int(4)
-Ly = int(4)
+Lx = int(3)
+Ly = int(2)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
-N_f = int(Lx*Ly)
+N_f = int(Lx*Ly-2)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 4
+D = 6
 chi = -1
 dtype=torch.float64
 
@@ -70,27 +70,27 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e3)
+N_samples = int(1e4)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# model = fTNModel(peps, max_bond=chi, dtype=dtype)
+model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTNModel_test(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-model = fTN_backflow_attn_Model_Stacked(
-    peps,
-    max_bond=chi, 
-    num_attention_blocks=10,
-    embedding_dim=8, 
-    d_inner=16,
-    attention_heads=2, 
-    nn_eta=1.0, 
-    nn_hidden_dim=2*Lx*Ly, 
-    dtype=dtype
-)
+# model = fTN_backflow_attn_Model_Stacked(
+#     peps,
+#     max_bond=chi, 
+#     num_attention_blocks=2,
+#     embedding_dim=8, 
+#     d_inner=2*Lx*Ly,
+#     attention_heads=2, 
+#     nn_eta=1.0, 
+#     nn_hidden_dim=2*Lx*Ly, 
+#     dtype=dtype
+# )
 # model = fTN_Transformer_Model(
 #     peps, 
 #     max_bond=chi, 
@@ -166,8 +166,8 @@ if init_step != 0:
     optimizer_state = saved_model_params.get('optimizer_state', None)
 
 # Set up optimizer and scheduler
-learning_rate = 5e-2
-scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-3)
+learning_rate = 1e-1
+scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=10, min_lr=5e-2)
 optimizer_state = None
 use_prev_opt = True
 if optimizer_state is not None and use_prev_opt:
