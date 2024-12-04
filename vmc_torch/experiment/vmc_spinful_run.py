@@ -22,9 +22,9 @@ import autoray as ar
 from autoray import do
 
 from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
-from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked
+from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked, fTN_backflow_attn_Model_boundary
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
-from vmc_torch.experiment.tn_model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
+from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPreconditioner, Adam, SGD_momentum, DecayScheduler
@@ -46,17 +46,17 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-Lx = int(3)
-Ly = int(2)
+Lx = int(4)
+Ly = int(4)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
-N_f = int(Lx*Ly-2)
+N_f = int(Lx*Ly)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 6
+D = 4
 chi = -1
 dtype=torch.float64
 
@@ -70,15 +70,16 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e4)
+N_samples = int(1e2)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fTNModel(peps, max_bond=chi, dtype=dtype)
+# model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTNModel_test(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=4*Lx*Ly, dtype=dtype)
+model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_Stacked(
 #     peps,
@@ -128,6 +129,8 @@ model = fTNModel(peps, max_bond=chi, dtype=dtype)
 #     dtype=dtype,
 # )
 init_std = 5e-2
+seed = 2
+torch.manual_seed(seed)
 model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 # model.apply(lambda x: init_weights_kaiming(x))
 
@@ -138,6 +141,7 @@ model_names = {
     fTN_backflow_attn_Model: 'fTN_backflow_attn',
     fTN_backflow_Model_Blockwise: 'fTN_backflow_Blockwise',
     fTN_backflow_attn_Model_Stacked: 'fTN_backflow_attn_Stacked',
+    fTN_backflow_attn_Model_boundary: 'fTN_backflow_attn_boundary',
     fTN_NN_proj_Model: 'fTN_NN_proj',
     fTN_NN_proj_variable_Model: 'fTN_NN_proj_variable',
     fTN_Transformer_Model: 'fTN_Transformer',
@@ -220,6 +224,10 @@ if RANK == 0:
     print(f'Sample size: {N_samples}')
     print(f'fPEPS bond dimension: {D}, max bond: {chi}')
     print(f'fPEPS symmetry: {symmetry}\n')
+    try:
+        print(model.model_structure)
+    except:
+        pass
     sys.stdout = record_file
 
 if RANK == 0:
@@ -237,6 +245,10 @@ if RANK == 0:
     print(f'Sample size: {N_samples}')
     print(f'fPEPS bond dimension: {D}, max bond: {chi}')
     print(f'fPEPS symmetry: {symmetry}\n')
+    try:
+        print(model.model_structure)
+    except:
+        pass
 # with pyinstrument.Profiler() as prof:
 vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
 # if RANK == 0:

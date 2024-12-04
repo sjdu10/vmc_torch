@@ -140,15 +140,17 @@ class SR(Preconditioner):
                 """Solve the linear equation in rank 0 after sending all logamp_grad vectors to rank 0 from all ranks."""
                 local_logamp_grad_matrix, mean_logamp_grad = state.get_logamp_grad_matrix()
                 logamp_grad_matrix_list = COMM.gather(local_logamp_grad_matrix, root=0)
-                if energy_grad is None:
+                if RANK != 0:
                     # All ranks but rank 0 return zeros
                     return torch.zeros(state.Np, dtype=self.dtype)
                 logamp_grad_matrix = np.concatenate(logamp_grad_matrix_list, axis=1)
                 # define function of (S+eta*I) dot x
                 def R_dot_x(x, logamp_grad_matrix, mean_logamp_grad, eta=1e-6):
                     x_out = np.zeros_like(x)
-                    for i in range(logamp_grad_matrix.shape[1]):
-                        x_out += np.dot(logamp_grad_matrix[:, i], x)*logamp_grad_matrix[:, i]
+                    # for i in range(logamp_grad_matrix.shape[1]):
+                    #     x_out += np.dot(logamp_grad_matrix[:, i], x)*logamp_grad_matrix[:, i]
+                    # use matrix multiplication for speedup
+                    x_out = np.dot(logamp_grad_matrix, np.dot(logamp_grad_matrix.T, x))
                     x_out = x_out/state.Ns
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
                     return x_out + eta*x 
@@ -160,7 +162,10 @@ class SR(Preconditioner):
                 # Right-hand side vector
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 # Solve the linear equation
+                t0 = time.time()
                 dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step)
+                t1 = time.time()
+                print("Time for solving the linear equation: ", t1-t0)
                 return torch.tensor(dp, dtype=self.dtype)
 
 #------------------------------------------------------------

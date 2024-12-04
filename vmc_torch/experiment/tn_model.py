@@ -606,7 +606,8 @@ class fMPS_backflow_Model(wavefunctionModel):
         current_input_dim = input_dim
         for i in range(num_hidden_layer):
             layers.append(nn.Linear(current_input_dim, nn_hidden_dim))
-            layers.append(nn.LeakyReLU())
+            # layers.append(nn.LeakyReLU())
+            layers.append(nn.Tanh())
             current_input_dim = nn_hidden_dim
         layers.append(nn.Linear(current_input_dim, tn_params_vec.numel()))
         self.nn = nn.Sequential(*layers)
@@ -889,6 +890,10 @@ class fTN_backflow_Model(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
 
+class fTN_backflow_Model_embedding(wavefunctionModel):
+    ...
+    #TODO: add embedding layer to the input x
+
 class fTN_backflow_Model_Blockwise(wavefunctionModel):
     def __init__(self, ftn, block_size=(2, 2), max_bond=None, nn_hidden_dim=128, nn_eta=1e-3, num_hidden_layer=1, dtype=torch.float32):
         super().__init__()
@@ -929,7 +934,7 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
                 tid_list = [next(iter(ftn.tag_map[s])) for s in block_sites]
                 self.block_ts[block_id] = tid_list
 
-                # Create a neural network for this block
+                # Create a neural network for this block, first flatten the parameters according to tid in the whole TN
                 block_tn_params = {
                     tid: params[tid]
                     for tid in tid_list
@@ -1206,6 +1211,127 @@ class fTN_backflow_attn_Model_Stacked(wavefunctionModel):
         return torch.stack(batch_amps)
 
 
+class fTN_backflow_attn_Model_boundary(wavefunctionModel):
+    def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Get the boundary tensors tids and parameter shapes
+        boundary_sites = [site for site in ftn.gen_site_coos() if any(c == 0 or c == ftn.Lx - 1 for c in site)]
+        boundary_tags = [ftn.site_tag_id.format(*site) for site in boundary_sites]
+        bulk_site_tags = [ftn.site_tag_id.format(*site) for site in ftn.gen_site_coos() if site not in boundary_sites]
+        self.bulk_tid_list = [next(iter(ftn._get_tids_from_tags([tag]))) for tag in bulk_site_tags]
+        self.boundary_tid_list = [next(iter(ftn._get_tids_from_tags([tag]))) for tag in boundary_tags]
+        boundary_tn_params = {
+            tid: params[tid]
+            for tid in self.boundary_tid_list
+        }
+        boundary_tn_params_vec = flatten_proj_params(boundary_tn_params)
+
+        # Define the neural network for the backflow transformation to boundary tensors
+        input_dim = ftn.Lx * ftn.Ly
+        phys_dim = ftn.phys_dim()
+        
+        self.nn = SelfAttn_FFNN_block(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embedding_dim=embedding_dim,
+            attention_heads=attention_heads,
+            nn_hidden_dim=nn_hidden_dim,
+            output_dim=boundary_tn_params_vec.numel()
+        )
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS_backflow_attn_boundary':
+            {
+                'D': ftn.max_bond(), 
+                'Lx': ftn.Lx, 'Ly': ftn.Ly, 
+                'symmetry': self.symmetry, 
+                'nn_hidden_dim': nn_hidden_dim, 
+                'nn_eta': nn_eta, 
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+                'max_bond': max_bond,
+            },
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+    
+    def amplitude(self, x):
+        tn_nn_params = {}
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i)
+            
+            # Get the bulk parameters
+            bulk_tn_params = {
+                tid: {
+                    ast.literal_eval(sector): data
+                    for sector, data in self.torch_tn_params[str(tid)].items()
+                }
+                for tid in self.bulk_tid_list
+            }
+            tn_nn_params.update(bulk_tn_params)
+            
+            # Get the boundary parameters
+            boundary_tn_params = {
+                tid: {
+                    ast.literal_eval(sector): data
+                    for sector, data in self.torch_tn_params[str(tid)].items()
+                }
+                for tid in self.boundary_tid_list
+            }
+            boundary_tn_params_vec = flatten_proj_params(boundary_tn_params)
+
+            # Get the NN correction to the boundary parameters
+            nn_correction = self.nn(x_i)
+            # Add the correction to the original parameters
+            new_boundary_tn_params_vec = boundary_tn_params_vec + self.nn_eta*nn_correction
+            new_boundary_tn_params = reconstruct_proj_params(new_boundary_tn_params_vec, boundary_tn_params)
+            tn_nn_params.update(new_boundary_tn_params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            if self.max_bond is None:
+                amp = amp
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+
+            amp_val = amp.contract()
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
 
 #------------ fermionic TN model with NN projectors insertion ------------
 

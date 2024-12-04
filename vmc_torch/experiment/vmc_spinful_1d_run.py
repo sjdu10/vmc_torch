@@ -54,7 +54,7 @@ H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_f
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = -2
 dtype=torch.float64
 
 # Load mps
@@ -75,6 +75,8 @@ if (N_samples/SIZE)%2 != 0:
 # model = fMPSModel(mps, dtype=dtype)
 model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
 init_std = 5e-2
+seed = 2
+torch.manual_seed(seed)
 model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 # model.apply(lambda x: init_weights_kaiming(x))
 

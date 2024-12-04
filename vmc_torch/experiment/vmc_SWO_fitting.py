@@ -84,14 +84,14 @@ model_name = model_names.get(type(model1), 'UnknownModel')
 target_model_name = model_names.get(type(model2), 'UnknownModel')
 
 # VMC sample size
-N_samples = int(3e3)
+N_samples = int(1e4)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # Set VMC step range
 init_step = 0
-final_step = 10
+final_step = 20
 total_steps = final_step - init_step
 target_step = 73
 
