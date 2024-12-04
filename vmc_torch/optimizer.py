@@ -111,6 +111,8 @@ class SR(Preconditioner):
                 This is at the cost of having to broadcast the energy_grad to all ranks
                 and solve the linear equation locally in every rank."""
                 local_logamp_grad_matrix, mean_logamp_grad = state.get_logamp_grad_matrix()
+                n_local_samples = local_logamp_grad_matrix.shape[1]
+                total_samples = COMM.allreduce(n_local_samples, op=MPI.SUM)
                 if energy_grad is None:
                     energy_grad = COMM.bcast(energy_grad, root=0)
                 def R_dot_x(x, eta=1e-6):
@@ -120,7 +122,7 @@ class SR(Preconditioner):
                     # use matrix multiplication for speedup
                     x_out_local = do('dot', local_logamp_grad_matrix, do('dot', local_logamp_grad_matrix.T, x))
                     # synchronize the result
-                    x_out = COMM.allreduce(x_out_local, op=MPI.SUM)/state.Ns
+                    x_out = COMM.allreduce(x_out_local, op=MPI.SUM)/total_samples
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
                     return x_out + eta*x
                 n = state.Np
