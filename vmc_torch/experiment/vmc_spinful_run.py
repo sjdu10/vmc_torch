@@ -3,23 +3,16 @@ os.environ["OPENBLAS_NUM_THREADS"] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
 import sys
-import numpy as np
-from quimb.utils import progbar as Progbar
 from mpi4py import MPI
 import pickle
-import pyinstrument
 
 # torch
-from torch.nn.parameter import Parameter
 import torch
-import torch.nn as nn
 torch.autograd.set_detect_anomaly(False)
 
 # quimb
-import quimb as qu
 import quimb.tensor as qtn
 import autoray as ar
-from autoray import do
 
 from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
 from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked, fTN_backflow_attn_Model_boundary
@@ -47,7 +40,7 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 Lx = int(4)
-Ly = int(4)
+Ly = int(2)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
@@ -70,7 +63,7 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e2)
+N_samples = int(1e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -228,7 +221,7 @@ if RANK == 0:
         print(model.model_structure)
     except:
         pass
-    sys.stdout = record_file
+    # sys.stdout = record_file
 
 if RANK == 0:
     # print training information

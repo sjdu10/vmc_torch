@@ -89,8 +89,8 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 0
-final_step = 100
+init_step = 99
+final_step = 200
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
