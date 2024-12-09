@@ -3,6 +3,7 @@ import ast
 # torch
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # quimb
 import quimb.tensor as qtn
@@ -891,8 +892,105 @@ class fTN_backflow_Model(wavefunctionModel):
         return torch.stack(batch_amps)
 
 class fTN_backflow_Model_embedding(wavefunctionModel):
-    ...
-    #TODO: add embedding layer to the input x
+
+    def __init__(self, ftn, num_class=4, embedding_dim=32, max_bond=None, nn_hidden_dim=128, nn_eta=1e-3, num_hidden_layer=1, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the embedding layer for each on-site configuration
+        self.embedding = nn.Linear(num_class, embedding_dim)
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly * embedding_dim
+        tn_params_vec = flatten_proj_params(params)
+        layers = []
+        current_input_dim = input_dim
+        for i in range(num_hidden_layer):
+            layers.append(nn.Linear(current_input_dim, nn_hidden_dim))
+            layers.append(nn.LeakyReLU())
+            current_input_dim = nn_hidden_dim
+        layers.append(nn.Linear(current_input_dim, tn_params_vec.numel()))
+        self.nn = nn.Sequential(*layers)
+        self.nn.to(self.param_dtype)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS _backflow':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry, 'nn_hidden_dim': nn_hidden_dim, 'nn_eta': nn_eta, 'max_bond': max_bond},
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_proj_params(params)
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # One-hot encode the input sequence
+        one_hot_encoded = F.one_hot(x.long(), num_classes=self.embedding.in_features).float()
+
+        # Apply the embedding to each on-site configuration
+        x_embedded = self.embedding(one_hot_encoded)
+        x_embedded_flat = x_embedded.view(x_embedded.size(0), -1)  # Flatten the embedding dimensions
+
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i, x_embedded_i in zip(x, x_embedded_flat):
+            # Check x_embedded_i type
+            if not type(x_embedded_i) == torch.Tensor:
+                x_embedded_i = torch.tensor(x_embedded_i, dtype=self.param_dtype)
+            else:
+                if x_embedded_i.dtype != self.param_dtype:
+                    x_embedded_i = x_embedded_i.to(self.param_dtype)
+            # Get the NN correction to the parameters
+            nn_correction = self.nn(x_embedded_i)
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta * nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            if self.max_bond is None:
+                amp = amp
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly // 2 - 1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly // 2, psi.Ly - 1])
+
+            amp_val = amp.contract()
+            if amp_val == 0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
 
 class fTN_backflow_Model_Blockwise(wavefunctionModel):
     def __init__(self, ftn, block_size=(2, 2), max_bond=None, nn_hidden_dim=128, nn_eta=1e-3, num_hidden_layer=1, dtype=torch.float32):
@@ -1014,6 +1112,52 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
 #------------ fermionic TN model with attention mechanism ------------
 from .nn_sublayers import SelfAttn_FFNN_block, StackedSelfAttn_FFNN
 
+class PureAttention_Model(wavefunctionModel):
+    def __init__(self, phys_dim=4, n_site=None, num_attention_blocks=1, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+
+        # Define the neural network
+        input_dim = n_site
+        self.nn = StackedSelfAttn_FFNN(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            num_attention_blocks=num_attention_blocks,
+            embedding_dim=embedding_dim,
+            attention_heads=attention_heads,
+            nn_hidden_dim=nn_hidden_dim,
+            output_dim=1
+        )
+
+        self.model_structure = {
+            'pure attention':
+            {'n_site': n_site, 
+             'phys_dim': phys_dim, 
+             'num_attention_blocks': num_attention_blocks, 
+             'embedding_dim': embedding_dim, 
+             'attention_heads': attention_heads, 
+             'nn_hidden_dim': nn_hidden_dim, 
+             'nn_eta': nn_eta
+            },
+        }
+        self.nn_eta = nn_eta
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+    
+    
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i)
+            amp = self.nn(x_i)
+            batch_amps.append(amp.squeeze())
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
 class fTN_backflow_attn_Model(wavefunctionModel):
     def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
         super().__init__()
@@ -1052,7 +1196,7 @@ class fTN_backflow_attn_Model(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'fPEPS_backflow_attn':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry, 'nn_hidden_dim': nn_hidden_dim, 'nn_eta': nn_eta, 'max_bond': max_bond},
+            'fPEPS_backflow_attn':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry, 'nn_hidden_dim': nn_hidden_dim, 'nn_eta': nn_eta, 'max_bond': max_bond, 'embedding_dim': embedding_dim, 'attention_heads': attention_heads},
         }
         if max_bond is None or max_bond <= 0:
             max_bond = None
@@ -2357,7 +2501,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
 # ----------------- Neural Network Quantum States Benchmark -----------------
 
 
-class SlaterDeterminant(nn.Module):
+class SlaterDeterminant(wavefunctionModel):
     def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32):
         super(SlaterDeterminant, self).__init__()
         
@@ -2377,32 +2521,6 @@ class SlaterDeterminant(nn.Module):
         self.model_structure = {
             'SlaterDeterminant':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
         }
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
     
     def _determinant(self, A):
         # Compute the determinant of matrix A
@@ -2428,7 +2546,7 @@ class SlaterDeterminant(nn.Module):
         batch_size = n.shape[0]
         return torch.stack([slater_det(n[i]) for i in range(batch_size)])
 
-class NeuralJastrow(nn.Module):
+class NeuralJastrow(wavefunctionModel):
     def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
         super(NeuralJastrow, self).__init__()
         
@@ -2455,32 +2573,6 @@ class NeuralJastrow(nn.Module):
         self.model_structure = {
             'NeuralJastrow':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
         }
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
     
     def _determinant(self, A):
         # Compute the determinant of matrix A
@@ -2566,7 +2658,7 @@ class NeuralBackflow(wavefunctionModel):
 
 
 
-class FFNN(nn.Module):
+class FFNN(wavefunctionModel):
     def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
         super(FFNN, self).__init__()
         
@@ -2593,32 +2685,6 @@ class FFNN(nn.Module):
         self.model_structure = {
             'FFNN':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
         }
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
 
     def forward(self, n):
         if not type(n) == torch.Tensor:

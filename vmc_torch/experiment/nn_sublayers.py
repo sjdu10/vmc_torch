@@ -47,7 +47,7 @@ class SelfAttn_FFNN_block(nn.Module):
         embedded = self.embedding(one_hot_encoded)
 
         # Step 3: Pass through the self-attention block
-        attn_output, _ = self.self_attention(embedded, embedded, embedded)
+        attn_output, _ = self.self_attention(embedded, embedded, embedded, need_weights=False)
 
         # Step 4: Residual connection and layer normalization
         attn_output = F.layer_norm(attn_output + embedded, attn_output.size()[1:])
