@@ -583,6 +583,80 @@ class fMPSModel(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
 
+class fMPS_TNFModel(wavefunctionModel):
+    def __init__(self, ftn, dtype=torch.float32, max_bond=None, direction='y'):
+        super().__init__()
+        self.param_dtype = dtype
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+        self.max_bond = max_bond
+        self.direction = direction
+        self.depth = ftn.Lx
+
+        self.model_structure = {
+            'fMPS_TNF (1+1)D':
+            {'D': ftn.max_bond(), 
+             'chi': max_bond,
+             'L': ftn.L, 
+             'total depth': self.depth,
+             'symmetry': self.symmetry, 
+             'cyclic': ftn.cyclic, 
+             'skeleton': self.skeleton,
+             'direction': self.direction,
+            },
+        }
+
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(params, self.skeleton)
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+            if self.max_bond is None or self.max_bond <= 0:
+                amp_val = amp.contract()
+            else:
+                if self.direction == 'y':
+                    amp.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.L//2-1])
+                    amp.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.L//2, psi.L-1])
+                amp_val = amp.contract()
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
 
 class fMPS_backflow_Model(wavefunctionModel):
 

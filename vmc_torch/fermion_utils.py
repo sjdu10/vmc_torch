@@ -304,7 +304,7 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
 
     return product_tn
 
-def get_amp(peps, config, inplace=False, symmetry='Z2', conj=True):
+def get_amp(peps, config, inplace=False, conj=True):
     """Get the amplitude of a configuration in a PEPS."""
     if not inplace:
         peps = peps.copy()
@@ -345,7 +345,7 @@ class fMPS(qtn.MatrixProductState):
         self.symmetry = self.arrays[0].symmetry
         self.spinless = True if self.phys_dim() == 2 else False
     
-    def product_bra_state(self, config):
+    def product_bra_state(self, config, reverse=1):
         """For product state ALWAYS make sure the set of oddposes are different from the set of oddposes in the TNS |psi>.
         When using some overlapping oddposes, the computation of the amplitude will gain some unphysical global phase!!"""
         product_tn = qtn.TensorNetwork()
@@ -389,9 +389,9 @@ class fMPS(qtn.MatrixProductState):
             if not self.spinless:
                 # assert self.symmetry == 'U1', "Only U1 symmetry is supported for spinful fermions for now."
                 if int(n) == 1:
-                    oddpos = (3*tid+1)*(-1)#**reverse
+                    oddpos = (3*tid+1)*(-1)**reverse
                 elif int(n) == 2:
-                    oddpos = (3*tid+2)*(-1)#**reverse
+                    oddpos = (3*tid+2)*(-1)**reverse
                 elif int(n) == 3:
                     # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
                     oddpos = None
@@ -428,6 +428,44 @@ class fMPS(qtn.MatrixProductState):
             site_tag_id="I{}",
             L=mps.L,
             cyclic=mps.cyclic,
+        )
+        return amp
+
+class fMPS_TNF(fMPS):
+    def __init__(self, arrays, depth=None, L=None, *args, **kwargs):
+        # short-circuit for copying TNFs
+        if isinstance(arrays, fMPS_TNF):
+            self.Lx = arrays.Lx
+            self.Ly = arrays.Ly
+            super().__init__(arrays, *args, **kwargs)
+            return
+        self.Lx = depth+1
+        self.Ly = L
+        super().__init__(arrays, *args, **kwargs)
+    
+    def set_Lx(self, Lx):
+        self.Lx = Lx
+    def set_Ly(self, Ly):
+        self.Ly = Ly
+    # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
+    def get_amp(self, config, inplace=False, conj=True, reverse=1):
+        """Get the amplitude of a configuration in a PEPS."""
+        tnf = self if inplace else self.copy()
+        product_state = self.product_bra_state(config, reverse=reverse).conj() if conj else self.product_bra_state(config, reverse=reverse)
+        
+        amp = tnf|product_state # ---T---<---|n>
+        
+        for ind in tnf.site_inds:
+            amp.contract_ind(ind)
+
+        amp.view_as_(
+            qtn.PEPS,
+            site_ind_id="k{}",
+            x_tag_id="ROUND_{}",
+            y_tag_id="I{}", 
+            site_tag_id="I{},{}",
+            Lx=tnf.Lx,
+            Ly=tnf.Ly,
         )
         return amp
 
@@ -518,6 +556,55 @@ def generate_random_fmps(L, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless
     )
     mps = mps.copy() # set symmetry during initialization
     return mps, charge_config
+
+
+def form_gated_fmps_tnf(
+        fmps, 
+        ham, 
+        depth,
+        tau = 0.5,
+        nn_where_list=None,
+        x_tag_id="ROUND_{}",
+        y_tag_id="I{}",
+        site_tag_id="I{},{}",
+    ):
+    fmps1 = fmps.copy()
+
+    if not isinstance(nn_where_list, list):
+        Warning("nn_where_list is not a list of tuples, using all nearest neighbor terms in the Hamiltonian")
+        nn_where_list = [(i, i+1) for i in range(fmps.L-1)]
+    
+    # Change tags for the initial MPS
+    for ts in fmps1.tensors:
+        ts.modify(tags=['ROUND_0']+list(ts.tags))
+    
+    # Apply the gates and add corresponding tags
+    for i in range(depth):
+        for where in nn_where_list:
+            gate = ham.get_gate_expm(where, -1*tau)
+            site_inds = [fmps1.site_ind_id.format(site) for site in where]
+            extra_tags = ['ROUND_{}'.format(i+1)]
+            ltag = fmps1.site_tag_id.format(where[0])
+            rtag = fmps1.site_tag_id.format(where[1])
+            fmps1 = fmps1.gate_inds(gate, inds=site_inds, contract='split-gate', tags=extra_tags, ltags=ltag, rtags=rtag)
+    
+    # Contract the gates in each round to a MPO
+    for i in range(1,depth+1):
+        for site in fmps1.sites:
+            fmps1.contract_tags_([fmps1.site_tag_id.format(site), f'ROUND_{i}'], inplace=True, which='all')
+    
+    # Add site tags
+    for x in range(0,depth+1):
+        for y in range(fmps1.L):
+            ts = fmps1[[x_tag_id.format(x), y_tag_id.format(y)]]
+            ts.add_tag(site_tag_id.format(x,y))
+    
+    fmps1 = fMPS_TNF.from_TN(fmps1)
+    fmps1.set_Lx(depth+1)
+    fmps1.set_Ly(fmps1.L)
+
+    return fmps1
+
 
 # --- Utils for calculating global phase on product states ---
 

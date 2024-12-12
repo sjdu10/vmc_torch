@@ -230,7 +230,7 @@ def chain_spinful_random_Hubbard(L, t_mean, t_std, U, N_f, n_fermions_per_spin=N
             H -= t * (cdag(hi,i,spin) * c(hi,j,spin) + cdag(hi,j,spin) * c(hi,i,spin))
     for i in graph.nodes():
         H += U * nc(hi,i,+1) * nc(hi,i,-1)
-    return H, hi, graph
+    return H, hi, graph, edge_to_hopping
 
 #----- self-customized Hamiltonian class -----#
 
@@ -290,7 +290,7 @@ class spinful_Fermi_Hubbard_chain(Hamiltonian):
 
 class spinful_random_Hubbard_chain(Hamiltonian):
     def __init__(self, L, t_mean, t_std, U, N_f, n_fermions_per_spin=None, seed=42):
-        H, hi, graph = chain_spinful_random_Hubbard(L, t_mean, t_std, U, N_f, n_fermions_per_spin,seed)
+        H, hi, graph, self.edge_to_hopping = chain_spinful_random_Hubbard(L, t_mean, t_std, U, N_f, n_fermions_per_spin,seed)
         super().__init__(H, hi, graph)
         self._hilbert = SpinfulFermion(hi.n_orbitals, hi.n_fermions, hi.n_fermions_per_spin)
 
@@ -340,4 +340,40 @@ class spin_J1J2_square_lattice(Hamiltonian):
         # Netket2Quimb
         eta_calc = self.hilbert.to_quimb_config(eta_calc_netket)
         return eta_calc, H_etasigma
-    
+
+
+
+# ----- Quimb Hamiltonians ----- #
+import quimb.tensor as qtn
+import symmray as sr
+
+def spinful_Fermi_Hubbard_chain_quimb(L, t, U, mu, symmetry, pbc=False, **kwargs):
+    """Quimb implementation of spinful Fermi-Hubbard model on a 1D chain"""
+    edges = qtn.edges_1d_chain(L, cyclic=pbc)
+    try:
+        parse_edges_to_site_info = sr.utils.parse_edges_to_site_info
+    except AttributeError:
+        parse_edges_to_site_info = sr.parse_edges_to_site_info
+
+    site_info = parse_edges_to_site_info(
+        edges,
+        2,
+        phys_dim=4,
+        site_ind_id="k{}",
+        site_tag_id="I{}",
+    )
+    terms = {
+        (sitea, siteb): sr.fermi_hubbard_local_array(
+            t=t, U=U, mu=mu,
+            symmetry=symmetry,
+            coordinations=(
+                site_info[sitea]['coordination'],
+                site_info[siteb]['coordination'],
+            ),
+        )
+        for (sitea, siteb) in edges
+    }
+    ham = qtn.LocalHam1D(L, terms, cyclic=pbc)
+    return ham
+
+

@@ -2,34 +2,27 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
-import numpy as np
-from quimb.utils import progbar as Progbar
 from mpi4py import MPI
 import pickle
-import pyinstrument
 
 # torch
-from torch.nn.parameter import Parameter
 import torch
-import torch.nn as nn
 torch.autograd.set_detect_anomaly(False)
 
 # quimb
-import quimb as qu
 import quimb.tensor as qtn
 import autoray as ar
-from autoray import do
 
-from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model
+from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_TNFModel
 from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPreconditioner, Adam, SGD_momentum, DecayScheduler
+from vmc_torch.optimizer import SGD, SR, Adam, SGD_momentum, DecayScheduler
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_chain
+from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_chain, spinful_Fermi_Hubbard_chain_quimb
 from vmc_torch.torch_utils import SVD,QR
-from vmc_torch.fermion_utils import generate_random_fmps
+from vmc_torch.fermion_utils import generate_random_fmps, form_gated_fmps_tnf
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)
@@ -44,23 +37,25 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(8)
+L = int(6)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
 N_f = int(L)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
+quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t, U, mu=0.0, pbc=False, symmetry=symmetry)
 graph = H.graph
 # TN parameters
 D = 4
-chi = -2
+chi = -1
 dtype=torch.float64
 
 # Load mps
 skeleton = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_skeleton.pkl", "rb"))
 mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_su_params.pkl", "rb"))
 mps = qtn.unpack(mps_params, skeleton)
+# fmps_tnf = form_gated_fmps_tnf(fmps=mps, ham=quimb_ham, depth=2)
 mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # # randomize the mps tensors
@@ -89,7 +84,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 99
+init_step = 0
 final_step = 200
 total_steps = final_step - init_step
 # Load model parameters

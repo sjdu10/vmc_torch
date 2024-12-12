@@ -42,7 +42,7 @@ RANK = COMM.Get_rank()
 # Hamiltonian parameters
 Lx = int(3)
 Ly = int(2)
-symmetry = 'Z2'
+symmetry = 'U1'
 t = 1.0
 U = 8.0
 N_f = int(Lx*Ly-2)
@@ -51,7 +51,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = -3
 dtype=torch.float64
 
 # # Load PEPS
@@ -74,7 +74,7 @@ if (N_samples/SIZE)%2 != 0:
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=4, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_Stacked(
@@ -153,7 +153,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 0
+init_step = 10
 final_step = 450
 total_steps = final_step - init_step
 # Load model parameters
@@ -226,7 +226,7 @@ if RANK == 0:
         print(model.model_structure)
     except:
         pass
-    # sys.stdout = record_file
+    sys.stdout = record_file
 
 if RANK == 0:
     # print training information
