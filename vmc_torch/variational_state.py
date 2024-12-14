@@ -84,14 +84,14 @@ class Variational_State:
     def load_state_dict(self, state_dict):
         self.vstate_func.load_state_dict(state_dict)
 
-    @tensor_aware_lru_cache(maxsize=2048)
+    @tensor_aware_lru_cache(maxsize=4096)
     def amplitude(self, x):
         with torch.no_grad():
             if not type(x) == torch.Tensor:
                 x = torch.tensor(np.asarray(x), dtype=self.dtype)
             return self.vstate_func(x)
     
-    @tensor_aware_lru_cache(maxsize=256)
+    @tensor_aware_lru_cache(maxsize=4096)
     def amplitude_grad(self, x):
         if not type(x) == torch.Tensor:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
