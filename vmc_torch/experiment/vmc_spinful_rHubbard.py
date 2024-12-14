@@ -2,29 +2,24 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
-import numpy as np
-from quimb.utils import progbar as Progbar
+import sys
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'
 from mpi4py import MPI
 # torch
-from torch.nn.parameter import Parameter
 import torch
-import torch.nn as nn
 torch.autograd.set_detect_anomaly(False)
 
 # quimb
-import symmray as sr
-import quimb.tensor as qtn
 import autoray as ar
-from autoray import do
 
-from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model
+from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_TNFModel
 from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SR, Adam, SGD_momentum, DecayScheduler
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_chain, spinful_random_Hubbard_chain
+from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_chain, spinful_random_Hubbard_chain, spinful_Fermi_Hubbard_chain_quimb
 from vmc_torch.torch_utils import SVD,QR
 from vmc_torch.fermion_utils import generate_random_fmps, form_gated_fmps_tnf
 
@@ -42,7 +37,7 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 L = int(6)
-symmetry = 'U1'
+symmetry = 'Z2'
 U = 8.0
 N_f = int(L)
 n_fermions_per_spin = (N_f//2, N_f//2)
@@ -50,27 +45,33 @@ t_mean = 0.0
 t_std = 1.0
 seed = 2
 H = spinful_random_Hubbard_chain(L, t_mean, t_std, U, N_f, n_fermions_per_spin=n_fermions_per_spin, seed=seed)
+quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t_mean, U, mu=0.0, pbc=False, symmetry=symmetry)
 graph = H.graph
 # TN parameters
 D = 4
-chi = -2
+chi = 4
 dtype=torch.float64
 
 # Create random fMPS
-mps, _ = generate_random_fmps(L=L, D=D, seed=seed, Nf=N_f, cyclic=True, spinless=False)
-mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
+mps, _ = generate_random_fmps(L=L, D=D, seed=seed, Nf=N_f, cyclic=False, spinless=False)
+tnf_depth = 2
+tnf_init_tau = 0.1
+fmps_tnf = form_gated_fmps_tnf(fmps=mps, ham=quimb_ham, depth=tnf_depth, tau=tnf_init_tau)
+fmps_tnf.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
+# mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # # randomize the mps tensors
 # mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e4)
+N_samples = int(1e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = fMPSModel(mps, dtype=dtype)
-model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
+# model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
+model = fMPS_TNFModel(fmps_tnf, dtype=dtype, max_bond=chi, direction='y')
 init_std = 5e-2
 model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 
@@ -79,16 +80,17 @@ model_names = {
     fMPS_backflow_Model: 'fMPS_backflow',
     fTN_backflow_Model: 'fTN_backflow',
     fTN_backflow_attn_Model: 'fTN_backflow_attn',
+    fMPS_TNFModel: f'fMPS_TNF_depth{tnf_depth}_tau{tnf_init_tau}',
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
 init_step = 0
-final_step = 100
+final_step = 30
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/L={L}/random_t_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(pwd+f'/L={L}/random_t_U={U}/seed{seed}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -98,7 +100,7 @@ if init_step != 0:
     optimizer_state = saved_model_params.get('optimizer_state', None)
 
 # Set up optimizer and scheduler
-learning_rate = 5e-2
+learning_rate = 1e-1
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-3)
 optimizer_state = None
 use_prev_opt = True
@@ -135,9 +137,48 @@ vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimize
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../../data/L={L}/random_t_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-    # with pyinstrument.Profiler() as prof:
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/L={L}/random_t_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    os.makedirs(pwd+f'/L={L}/random_t_U={U}/seed{seed}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    record_file = open(pwd+f'/L={L}/random_t_U={U}/seed{seed}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
+    if RANK == 0:
+        # print training information
+        print(f"Running VMC for {model_name}")
+        print(f'model params: {variational_state.num_params}')
+        print(f"Optimizer: {optimizer}")
+        print(f"Preconditioner: {preconditioner}")
+        print(f"Scheduler: {scheduler}")
+        print(f"Sampler: {sampler}")
+        print(f"1D random Fermi-Hubbard chain: L={L}, t_m={t_mean}, U={U}, N={N_f}, symmetry={symmetry}")
+        print(f"Running {total_steps} steps from {init_step} to {final_step}")
+        print(f'Model initialized with mean=0, std={init_std}')
+        print(f'Learning rate: {learning_rate}')
+        print(f'Sample size: {N_samples}')
+        print(f'fMPS TNF Lx: {tnf_depth+1}, init_tau: {tnf_init_tau}')
+        print(f'Contraction max bond: {chi}')
+        print(f'Symmetry: {symmetry}')
+        try:
+            print(model.model_structure)
+        except:
+            pass
+        sys.stdout = record_file
+
+    if RANK == 0:
+        # print training information
+        print(f"Running VMC for {model_name}")
+        print(f'model params: {variational_state.num_params}')
+        print(f"Optimizer: {optimizer}")
+        print(f"Preconditioner: {preconditioner}")
+        print(f"Scheduler: {scheduler}")
+        print(f"Sampler: {sampler}")
+        print(f"1D random Fermi-Hubbard chain: L={L}, t_m={t_mean}, U={U}, N={N_f}, symmetry={symmetry}")
+        print(f"Running {total_steps} steps from {init_step} to {final_step}")
+        print(f'Model initialized with mean=0, std={init_std}')
+        print(f'Learning rate: {learning_rate}')
+        print(f'Sample size: {N_samples}')
+        print(f'fMPS TNF Lx: {tnf_depth+1}, init_tau: {tnf_init_tau}')
+        print(f'Contraction max bond: {chi}')
+        print(f'Symmetry: {symmetry}')
+
+    vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/L={L}/random_t_U={U}/seed{seed}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
     # if RANK == 0:
     #     prof.print()
 

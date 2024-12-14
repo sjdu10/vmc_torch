@@ -56,7 +56,7 @@ dtype=torch.float64
 skeleton = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_skeleton.pkl", "rb"))
 mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_su_params.pkl", "rb"))
 mps = qtn.unpack(mps_params, skeleton)
-tnf_depth = 2
+tnf_depth = 4
 tnf_init_tau = 0.1
 fmps_tnf = form_gated_fmps_tnf(fmps=mps, ham=quimb_ham, depth=tnf_depth, tau=tnf_init_tau)
 fmps_tnf.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
@@ -81,7 +81,7 @@ model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 
 model_names = {
     fMPSModel: 'fMPS',
-    fMPS_TNFModel: 'fMPS_TNF',
+    fMPS_TNFModel: f'fMPS_TNF_depth{tnf_depth}_tau{tnf_init_tau}',
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 

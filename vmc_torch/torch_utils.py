@@ -52,8 +52,8 @@ def SVDforward(A):
         S = torch.from_numpy(S)
         Vh = torch.from_numpy(Vh)
 
-    if is_one(S): # A is isometry
-        raise ValueError
+    # if is_one(S): # A is isometry
+    #     raise ValueError
 
     if fix_sign:
         # make SVD result sign-consistent across multiple runs
@@ -173,9 +173,9 @@ class QR(torch.autograd.Function):
             R = torch.from_numpy(R)
 
         diag = R.diag()
-        if is_one(diag):
-            print(R)
-            raise ValueError
+        # if is_one(diag):
+        #     print(R)
+        #     raise ValueError
         inds = torch.abs(diag) < epsilon
         if len(inds) > 0: # rank deficient, revert to svd
             U,S,Vh = SVDforward(A)
