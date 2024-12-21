@@ -738,7 +738,7 @@ class fMPS_backflow_Model(wavefunctionModel):
         return torch.stack(batch_amps)
         
 
-
+#------------ fermionic PEPS based model ------------
 
 class fTNModel(wavefunctionModel):
 
@@ -1312,7 +1312,100 @@ class fTN_backflow_attn_Model(wavefunctionModel):
             amp_val = amp.contract()
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
+
             batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
+    def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly
+        phys_dim = ftn.phys_dim()
+        tn_params_vec = flatten_proj_params(params)
+        
+        self.nn = SelfAttn_FFNN_block(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embedding_dim=embedding_dim,
+            attention_heads=attention_heads,
+            nn_hidden_dim=nn_hidden_dim,
+            output_dim=tn_params_vec.numel()
+        )
+
+        self.Jastrow = nn.Sequential(
+            nn.Linear(input_dim, nn_hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(nn_hidden_dim, 1)
+        )
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS_backflow_attn':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry, 'nn_hidden_dim': nn_hidden_dim, 'nn_eta': nn_eta, 'max_bond': max_bond, 'embedding_dim': embedding_dim, 'attention_heads': attention_heads},
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_proj_params(params)
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i)
+            # Get the NN correction to the parameters
+            nn_correction = self.nn(x_i)
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta*nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            if self.max_bond is None:
+                amp = amp
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+
+            amp_val = amp.contract()
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            jastrow_factor = self.Jastrow(x_i)
+            batch_amps.append(amp_val*jastrow_factor)
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
@@ -2729,6 +2822,72 @@ class NeuralBackflow(wavefunctionModel):
         # Apply slater_det to each element in the batch
         batch_size = n.shape[0]
         return torch.stack([backflow_det(n[i]) for i in range(batch_size)])
+
+from vmc_torch.fermion_utils import from_quimb_config_to_netket_config
+
+class NeuralBackflow_spinful(wavefunctionModel):
+    """Assuming total Sz=0."""
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
+        super(NeuralBackflow_spinful, self).__init__()
+        
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        
+        # Initialize the parameter M (N x Nf matrix)
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.size, self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)
+        )
+
+        # Initialize the neural network layer, input is n and output a matrix with the same shape as M
+        self.nn = nn.Sequential(
+            nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)
+        )
+
+        # Convert NNs to the appropriate data type
+        self.nn.to(self.param_dtype)
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
+        }
+
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(n):
+            # Compute the backflow matrix F using the neural network
+            F = self.nn(n)
+            M  = self.M + F.reshape(self.M.shape)
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the 2Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = M[R]
+
+            det1 = torch.linalg.det(A[:self.hilbert.n_fermions_per_spin[0]])
+            det2 = torch.linalg.det(A[self.hilbert.n_fermions_per_spin[0]:])
+
+            amp = det1*det2
+            return amp
+        
+        batch_amps = []
+        for x_i in x:
+            n_i = from_quimb_config_to_netket_config(x_i)
+            # Check x_i type
+            if not type(n_i) == torch.Tensor:
+                n_i = torch.tensor(n_i, dtype=self.param_dtype)
+
+            amp_val=backflow_det(n_i)
+            batch_amps.append(amp_val)
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
 
 
 

@@ -37,7 +37,7 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(6)
+L = int(8)
 symmetry = 'U1'
 t = 1.0
 U = 8.0
@@ -67,8 +67,8 @@ N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# model = fMPSModel(mps, dtype=dtype)
-model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
+model = fMPSModel(mps, dtype=dtype)
+# model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
 init_std = 5e-2
 seed = 2
 torch.manual_seed(seed)
@@ -84,8 +84,8 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 0
-final_step = 200
+init_step = 199
+final_step = 250
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
@@ -99,8 +99,8 @@ if init_step != 0:
     optimizer_state = saved_model_params.get('optimizer_state', None)
 
 # Set up optimizer and scheduler
-learning_rate = 5e-2
-scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-3)
+learning_rate = 1e-1
+scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-2)
 optimizer_state = None
 use_prev_opt = True
 if optimizer_state is not None and use_prev_opt:

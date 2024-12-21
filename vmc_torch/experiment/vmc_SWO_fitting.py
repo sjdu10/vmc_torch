@@ -71,8 +71,8 @@ mps2 = qtn.unpack(mps_params, skeleton)
 mps2.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # Select model
-# model1 = fMPS_backflow_Model(mps1, nn_hidden_dim=2*L, num_hidden_layer=2, nn_eta=1.0, dtype=dtype)
-model1 = fMPSModel(mps1, dtype=dtype)
+model1 = fMPS_backflow_Model(mps1, nn_hidden_dim=2*L, num_hidden_layer=2, nn_eta=1.0, dtype=dtype)
+# model1 = fMPSModel(mps1, dtype=dtype)
 model2 = fMPSModel(mps2, dtype=dtype)
 init_std = 5e-2
 model1.apply(lambda x: init_weights_to_zero(x, std=init_std))

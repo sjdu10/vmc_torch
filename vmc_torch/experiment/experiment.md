@@ -20,18 +20,22 @@
     --- Netket, quimb Hamiltonian [x]
     --- Fully-connected random hopping Hubbard model (arXiv:2311.05749) that demonstrate volume-law, and expensive for DMRG (MPS). Try fTNF. [ ]
     --- SYK model, hard even for HFDS (arXiv:2411.04527), what about for fMPS+NN+attention? Or for TNF? [ ]
+# Ideas
 
 # TN+NN:
-1. 2D Hubbard model various bond dimension D [ ]
-2. Non-fully connected neural network for large D fPEPS to reduce number of parameters. [ ]
+1. 2D Hubbard model various bond dimension D [...]
+2. Non-fully connected neural network for large D fPEPS to reduce number of parameters. [wrong]
+3. Add Jastrow factor. [x] need to test effect
+4. Check SWO fitting for fMPS+backflow  D=4 [x]
+5. Check extended fermionc PEPS ansatz. [ ]
 
 
 
 
 
 # Volume-law TNF: (HFDS and DMRG benchmarks: arXiv:2311.05749 & arXiv:2411.04527)
-1. Check Quimb's MPO contruction routine for QSK model/SYK model using Jordan-Wigner transformation. [ ]
-2. Fully-connected random hopping Hubbard model; SYK model. [ ]
+1. Check Quimb's MPO contruction routine for QSK model/SYK model using Jordan-Wigner transformation. [x]
+2. Fully-connected random hopping Hubbard model (arXiv:2311.05749) that demonstrate volume-law, and expensive for DMRG (MPS). Try fTNF. [...]
 
 
 
@@ -40,24 +44,7 @@
 1. Try Johnnie's non-local TN model. [x] -- delocalized PEPS, indeed increase variational power but boson case too many other equally good ansatz, like deep NNQS.
 
 
-# Ideas
-
-To-do:
-
-VMC variational ansatz:
-
-1. fPEPS + NN, now using transformer and inject the NN values to projectors, performance unknown for spinful Hubbard model at half filling.
-    a. currently transformer model for the variable-length tensor element calculation. but not very efficient.
-    b. need to brainstorm about other possible ways to inject the NN values.
-
-2. For spin J1J2 model, delocalized PEPS; decompose each on-site tensor into a smaller tensor network where all tensors share one physical index? how to do the decomposition?
-    a. delocalized PEPS for J1J2 model versus Wenyuan's results. Compare accuracy and the number of parameters, cost for contracting the amplitude.
-    b. decomposition of the on-site tensors in PEPS.
 
 
-TN function for volume-law states:
 
-1. ground state of quantum SK model.
-    a. construct the simple update algorithm for long-range hamiltonian.
-    b. construct the imaginary time evolution operator exp(-tH) as an MPO using quimb's operator constructor
-    c. use vmc_torch to do global optimization for the (1+1)d TN variational ansatz, need to consider how to write the hamiltonian object.
+

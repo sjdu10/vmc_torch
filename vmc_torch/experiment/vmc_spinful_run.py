@@ -17,7 +17,7 @@ import autoray as ar
 from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_NN_proj_Model, fTN_NN_proj_variable_Model, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
 from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked, fTN_backflow_attn_Model_boundary, fTN_backflow_Model_embedding
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
-from vmc_torch.experiment.tn_model import PureAttention_Model
+from vmc_torch.experiment.tn_model import PureAttention_Model, NeuralBackflow_spinful
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
@@ -51,7 +51,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = -3
+chi = -2
 dtype=torch.float64
 
 # # Load PEPS
@@ -74,7 +74,7 @@ if (N_samples/SIZE)%2 != 0:
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=4, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=4, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_Stacked(
@@ -124,6 +124,7 @@ model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=4, attention_h
 #     dropout=0.0,
 #     dtype=dtype,
 # )
+model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
 init_std = 5e-2
 seed = 2
 torch.manual_seed(seed)
@@ -147,14 +148,15 @@ model_names = {
     PureAttention_Model: 'PureAttention',
     SlaterDeterminant: 'SlaterDeterminant',
     NeuralBackflow: 'NeuralBackflow',
+    NeuralBackflow_spinful: 'NeuralBackflow_spinful',
     FFNN: 'FFNN',
     NeuralJastrow: 'NeuralJastrow',
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 10
-final_step = 450
+init_step = 0
+final_step = 500
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
@@ -226,7 +228,7 @@ if RANK == 0:
         print(model.model_structure)
     except:
         pass
-    sys.stdout = record_file
+    # sys.stdout = record_file
 
 if RANK == 0:
     # print training information

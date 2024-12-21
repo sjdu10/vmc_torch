@@ -37,7 +37,7 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 L = int(6)
-symmetry = 'Z2'
+symmetry = 'U1'
 U = 8.0
 N_f = int(L)
 n_fermions_per_spin = (N_f//2, N_f//2)
@@ -49,12 +49,12 @@ quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t_mean, U, mu=0.0, pbc=False, s
 graph = H.graph
 # TN parameters
 D = 4
-chi = 4
+chi = 6
 dtype=torch.float64
 
 # Create random fMPS
 mps, _ = generate_random_fmps(L=L, D=D, seed=seed, Nf=N_f, cyclic=False, spinless=False)
-tnf_depth = 2
+tnf_depth = 4
 tnf_init_tau = 0.1
 fmps_tnf = form_gated_fmps_tnf(fmps=mps, ham=quimb_ham, depth=tnf_depth, tau=tnf_init_tau)
 fmps_tnf.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
@@ -86,7 +86,7 @@ model_name = model_names.get(type(model), 'UnknownModel')
 
 
 init_step = 0
-final_step = 30
+final_step = 10
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
