@@ -97,7 +97,7 @@ class SR(Preconditioner):
             R = S + self.diag_eta*np.eye(S.shape[0])
             R = csr_matrix(R)
             # dp = scipy.linalg.solve(R, energy_grad)
-            dp = scipy.sparse.linalg.cg(R, energy_grad)[0]
+            dp = scipy.sparse.linalg.cg(R, energy_grad, maxiter=self.iter_step, rtol=1e-4)[0]
 
             return torch.tensor(dp, dtype=self.dtype)
         
@@ -127,7 +127,7 @@ class SR(Preconditioner):
                 A = scipy.sparse.linalg.LinearOperator((n, n), matvec=matvec)
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 t0 = time.time()
-                dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step)
+                dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step,rtol=1e-4)
                 t1 = time.time()
                 if RANK == 0:
                     print("Time for solving the linear equation: ", t1-t0)
@@ -162,7 +162,7 @@ class SR(Preconditioner):
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 # Solve the linear equation
                 t0 = time.time()
-                dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step)
+                dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step,rtol=1e-4)
                 t1 = time.time()
                 print("Time for solving the linear equation: ", t1-t0)
                 return torch.tensor(dp, dtype=self.dtype)
