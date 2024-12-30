@@ -75,6 +75,7 @@ model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=4, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_Stacked(
@@ -155,7 +156,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 92
+init_step = 176
 final_step = 1000
 total_steps = final_step - init_step
 # Load model parameters
@@ -202,7 +203,7 @@ sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-3, iter_step=1e5, dtype=dtype)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-3, iter_step=1e3, dtype=dtype, rtol=1e-5, atol=0)
 # preconditioner = TrivialPreconditioner()
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
