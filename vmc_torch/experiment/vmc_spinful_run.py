@@ -42,7 +42,7 @@ RANK = COMM.Get_rank()
 # Hamiltonian parameters
 Lx = int(4)
 Ly = int(2)
-symmetry = 'U1'
+symmetry = 'Z2'
 t = 1.0
 U = 8.0
 N_f = int(Lx*Ly-2)
@@ -51,7 +51,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = -2
 dtype=torch.float64
 
 # # Load PEPS
@@ -156,8 +156,8 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 176
-final_step = 1000
+init_step = 0
+final_step = 500
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
@@ -203,7 +203,7 @@ sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-3, iter_step=1e3, dtype=dtype, rtol=1e-5, atol=0)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, solver='minres', diag_eta=1e-3, iter_step=1e3, dtype=dtype, rtol=1e-5, atol=0)
 # preconditioner = TrivialPreconditioner()
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
