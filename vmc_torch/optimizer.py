@@ -58,12 +58,14 @@ class SR(Preconditioner):
         self.exact = exact
         self.diag_eta = diag_eta
         self.rtol = rtol
-        if solver == 'cg':
+        if solver == 'cg': # Conjugate Gradient, works for hermitian positive definite matrices
             self.solver = spla.cg
-        elif solver == 'gmres':
-            self.solver = spla.gmres
-        elif solver == 'minres':
+        elif solver == 'gmres': # For real or complex N-by-N matrix
+            self.solver = spla.gmres 
+        elif solver == 'minres': # For real symmetric matrix, unlike cg the matrix does not need to be positive definite
             self.solver = spla.minres
+        elif solver == 'lgmres': # LGMRES is a variant of GMRES that allows for fewer iterations before convergence
+            self.solver = spla.lgmres 
     def __call__(self, state, energy_grad):
         """iter_step is for iterative solvers."""
         
