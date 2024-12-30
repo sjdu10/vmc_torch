@@ -8,7 +8,7 @@ from scipy.sparse import csr_matrix
 
 # torch
 import scipy.sparse
-import scipy.sparse.linalg
+import scipy.sparse.linalg as spla
 import torch
 
 # quimb
@@ -51,7 +51,7 @@ class SR(Preconditioner):
     In practice, one does not need to compute the dense S matrix to solve for dp.
     One can solve the linear equation S*dp = g iteratively using scipy.sparse.linalg.
     """
-    def __init__(self, dense=False, exact=False, iter_step=1e5, use_MPI4Solver=False, diag_eta=1e-2, dtype=torch.float32, rtol=1e-4, atol=0):
+    def __init__(self, dense=False, exact=False, iter_step=1e5, use_MPI4Solver=False, diag_eta=1e-2, dtype=torch.float32, rtol=1e-4, atol=0, solver='cg'):
         super().__init__(use_MPI4Solver, dtype=dtype)
         self.dense = dense
         self.iter_step = int(iter_step)
@@ -59,6 +59,12 @@ class SR(Preconditioner):
         self.diag_eta = diag_eta
         self.rtol = rtol
         self.atol = atol
+        if solver == 'cg':
+            self.solver = spla.cg
+        elif solver == 'gmres':
+            self.solver = spla.gmres
+        elif solver == 'minres':
+            self.solver = spla.minres
     def __call__(self, state, energy_grad):
         """iter_step is for iterative solvers."""
         
@@ -99,7 +105,7 @@ class SR(Preconditioner):
             R = S + self.diag_eta*np.eye(S.shape[0])
             R = csr_matrix(R)
             # dp = scipy.linalg.solve(R, energy_grad)
-            dp = scipy.sparse.linalg.cg(R, energy_grad, maxiter=self.iter_step, rtol=self.rtol, atol=self.atol)[0]
+            dp = self.solver(R, energy_grad, maxiter=self.iter_step, rtol=self.rtol, atol=self.atol)[0]
 
             return torch.tensor(dp, dtype=self.dtype)
         
@@ -126,10 +132,10 @@ class SR(Preconditioner):
                     return x_out + eta*x
                 n = state.Np
                 matvec = lambda x: R_dot_x(x, self.diag_eta)
-                A = scipy.sparse.linalg.LinearOperator((n, n), matvec=matvec)
+                A = spla.LinearOperator((n, n), matvec=matvec)
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 t0 = time.time()
-                dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step,rtol=self.rtol, atol=self.atol)
+                dp, _ = self.solver(A, b, maxiter=self.iter_step,rtol=self.rtol, atol=self.atol)
                 t1 = time.time()
                 if RANK == 0:
                     print("Time for solving the linear equation: ", t1-t0)
@@ -159,12 +165,12 @@ class SR(Preconditioner):
                 # define the linear operator
                 n = state.Np
                 matvec = lambda x: R_dot_x(x, logamp_grad_matrix, mean_logamp_grad, self.diag_eta)
-                A = scipy.sparse.linalg.LinearOperator((n, n), matvec=matvec)
+                A = spla.LinearOperator((n, n), matvec=matvec)
                 # Right-hand side vector
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 # Solve the linear equation
                 t0 = time.time()
-                dp, _ = scipy.sparse.linalg.cg(A, b, maxiter=self.iter_step,rtol=self.rtol, atol=self.atol)
+                dp, _ = self.solver(A, b, maxiter=self.iter_step,rtol=self.rtol, atol=self.atol)
                 t1 = time.time()
                 print("Time for solving the linear equation: ", t1-t0)
                 return torch.tensor(dp, dtype=self.dtype)
