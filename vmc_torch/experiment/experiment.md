@@ -20,6 +20,20 @@
     --- Netket, quimb Hamiltonian [x]
     --- Fully-connected random hopping Hubbard model (arXiv:2311.05749) that demonstrate volume-law, and expensive for DMRG (MPS). Try fTNF. [ ]
     --- SYK model, hard even for HFDS (arXiv:2411.04527), what about for fMPS+NN+attention? Or for TNF? [ ]
+
+# Numerics TODO:
+1. check 4x2 doped calculation. Compare fPEPS and fPEPS+NN
+    --- u1
+    --- z2
+2. check 4x4 calculation
+    --- half-filling
+        --- u1
+        --- z2
+
+    --- doped filling
+        --- u1
+        --- z2
+
 # Ideas
 
 # TN+NN:

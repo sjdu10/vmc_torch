@@ -25,7 +25,7 @@ from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPrec
 from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_square_lattice
 from vmc_torch.torch_utils import SVD,QR
-from vmc_torch.fermion_utils import generate_random_fpeps
+from vmc_torch.fermion_utils import generate_random_fpeps, get_psi_from_fTN
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)
@@ -60,70 +60,27 @@ peps_params = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symme
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
-# # randomize the PEPS tensors
-# peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
+# Load GO-PEPS  
+model_ftn = fTNModel(peps, max_bond=chi, dtype=dtype)
+go_peps_step = 92
 
-# VMC sample size
-N_samples = int(2e4)
-N_samples = closest_divisible(N_samples, SIZE)
-if (N_samples/SIZE)%2 != 0:
-    N_samples += SIZE
+# Load go peps model parameters
+if go_peps_step != 0:
+    saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/fTN/chi={chi}/model_params_step{go_peps_step}.pth')
+    saved_model_state_dict = saved_model_params['model_state_dict']
+    saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
+    try:
+        model_ftn.load_state_dict(saved_model_state_dict)
+    except:
+        model_ftn.load_params(saved_model_params_vec)
+peps = get_psi_from_fTN(model_ftn)
 
-model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTNModel_test(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=4, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_backflow_attn_Model_Stacked(
-#     peps,
-#     max_bond=chi, 
-#     num_attention_blocks=2,
-#     embedding_dim=8, 
-#     d_inner=2*Lx*Ly,
-#     attention_heads=2, 
-#     nn_eta=1.0, 
-#     nn_hidden_dim=2*Lx*Ly, 
-#     dtype=dtype
-# )
-# model = fTN_Transformer_Model(
-#     peps, 
-#     max_bond=chi, 
-#     nn_eta=1.0, 
-#     d_model=2**2, 
-#     nhead=2, 
-#     num_encoder_layers=2, 
-#     num_decoder_layers=2,
-#     dim_feedforward=32,
-#     dropout=0.0,
-#     dtype=dtype,
-# )
-# model = fTN_Transformer_Proj_Model(
-#     peps,
-#     max_bond=chi,
-#     nn_eta=1e-2,
-#     d_model=2**3,
-#     nhead=2,
-#     num_encoder_layers=1,
-#     num_decoder_layers=1,
-#     dim_feedforward=2**5,
-#     dropout=0.0,
-#     dtype=dtype,
-# )
-# model = fTN_Transformer_Proj_lazy_Model(
-#     peps,
-#     max_bond=chi,
-#     nn_eta=1.0,
-#     d_model=8,
-#     nhead=2,
-#     num_encoder_layers=1,
-#     num_decoder_layers=1,
-#     dim_feedforward=16,
-#     dropout=0.0,
-#     dtype=dtype,
-# )
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
 init_std = 5e-2
 seed = 2
@@ -154,9 +111,9 @@ model_names = {
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
-
-init_step = 92
-final_step = 1000
+# Set VMC step range
+init_step = 0
+final_step = 100
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
@@ -165,11 +122,15 @@ if init_step != 0:
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
         model.load_state_dict(saved_model_state_dict)
-        print('Loading model parameters')
     except:
         model.load_params(saved_model_params_vec)
-        print('Loading model parameters failed, loading model parameters vector instead')
     optimizer_state = saved_model_params.get('optimizer_state', None)
+
+# VMC sample size
+N_samples = int(2e4)
+N_samples = closest_divisible(N_samples, SIZE)
+if (N_samples/SIZE)%2 != 0:
+    N_samples += SIZE
 
 # Set up optimizer and scheduler
 learning_rate = 1e-1
@@ -230,7 +191,7 @@ if RANK == 0:
         print(model.model_structure)
     except:
         pass
-    sys.stdout = record_file
+    # sys.stdout = record_file
 
 if RANK == 0:
     # print training information

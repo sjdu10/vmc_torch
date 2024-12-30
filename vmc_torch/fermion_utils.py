@@ -8,6 +8,27 @@ from autoray import do
 from quimb.tensor.tensor_core import  *
 from quimb.tensor.tensor_core import bonds, tags_to_oset, rand_uuid
 from quimb.tensor.tensor_2d import Rotator2D, pairwise
+import ast
+
+#------Read PEPS from fTN model------
+def get_psi_from_fTN(fTN_model):
+    """
+    Parameters
+    ----------
+    fTN_model : fTNModel
+        fTN model to extract the wavefunction from.
+    """
+    # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+    params = {
+        int(tid): {
+            ast.literal_eval(sector): data
+            for sector, data in blk_array.items()
+        }
+        for tid, blk_array in fTN_model.torch_tn_params.items()
+    }
+    # Reconstruct the TN with the new parameters
+    psi = qtn.unpack(params, fTN_model.skeleton)
+    return psi
 
 
 #------Symmray function utils------
