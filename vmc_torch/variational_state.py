@@ -6,7 +6,7 @@ import torch
 # quimb
 from autoray import do
 
-from .global_var import DEBUG, set_debug
+from .global_var import DEBUG, set_debug, AMP_CACHE_SIZE, GRAD_CACHE_SIZE
 from .utils import tensor_aware_lru_cache
 
 
@@ -84,14 +84,14 @@ class Variational_State:
     def load_state_dict(self, state_dict):
         self.vstate_func.load_state_dict(state_dict)
 
-    @tensor_aware_lru_cache(maxsize=4096)
+    @tensor_aware_lru_cache(maxsize=AMP_CACHE_SIZE)
     def amplitude(self, x):
         with torch.no_grad():
             if not type(x) == torch.Tensor:
                 x = torch.tensor(np.asarray(x), dtype=self.dtype)
             return self.vstate_func(x)
     
-    @tensor_aware_lru_cache(maxsize=100)
+    @tensor_aware_lru_cache(maxsize=GRAD_CACHE_SIZE)
     def amplitude_grad(self, x):
         if not type(x) == torch.Tensor:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
