@@ -60,7 +60,8 @@ peps_params = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symme
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
-# Load GO-PEPS  
+# Load GO-PEPS
+go_chi=-1
 model_ftn = fTNModel(peps, max_bond=chi, dtype=dtype)
 go_peps_step = 92
 

@@ -37,7 +37,7 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 L = int(6)
-symmetry = 'U1'
+symmetry = 'Z2'
 U = 8.0
 N_f = int(L)
 n_fermions_per_spin = (N_f//2, N_f//2)
@@ -49,29 +49,29 @@ quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t_mean, U, mu=0.0, pbc=False, s
 graph = H.graph
 # TN parameters
 D = 4
-chi = 6
+chi = 4
 dtype=torch.float64
 
 # Create random fMPS
-mps, _ = generate_random_fmps(L=L, D=D, seed=seed, Nf=N_f, cyclic=False, spinless=False)
+mps, _ = generate_random_fmps(L=L, D=D, seed=seed, Nf=N_f, cyclic=False, spinless=False, symmetry=symmetry)
 tnf_depth = 4
 tnf_init_tau = 0.1
 fmps_tnf = form_gated_fmps_tnf(fmps=mps, ham=quimb_ham, depth=tnf_depth, tau=tnf_init_tau)
 fmps_tnf.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
-# mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
+mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # # randomize the mps tensors
 # mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e3)
+N_samples = int(1e4)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = fMPSModel(mps, dtype=dtype)
-# model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
-model = fMPS_TNFModel(fmps_tnf, dtype=dtype, max_bond=chi, direction='y')
+model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
+# model = fMPS_TNFModel(fmps_tnf, dtype=dtype, max_bond=chi, direction='y')
 init_std = 5e-2
 model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 
@@ -86,7 +86,7 @@ model_name = model_names.get(type(model), 'UnknownModel')
 
 
 init_step = 0
-final_step = 10
+final_step = 50
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
@@ -130,7 +130,7 @@ sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-3, iter_step=1e5, dtype=dtype)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, solver='minres', diag_eta=1e-3, iter_step=1e3, dtype=dtype, rtol=1e-5)
 # preconditioner = TrivialPreconditioner()
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler, SWO=False, beta=0.01)

@@ -69,12 +69,12 @@ N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fTNModel(peps, max_bond=chi, dtype=dtype)
+# model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTNModel_test(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=4, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_Blockwise(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
@@ -156,7 +156,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 1
+init_step = 0
 final_step = 500
 total_steps = final_step - init_step
 # Load model parameters
