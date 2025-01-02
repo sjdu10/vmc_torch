@@ -136,10 +136,11 @@ class SR(Preconditioner):
                 A = spla.LinearOperator((n, n), matvec=matvec)
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 t0 = time.time()
-                dp, _ = self.solver(A, b, maxiter=self.iter_step, rtol=self.rtol)
+                dp, info = self.solver(A, b, maxiter=self.iter_step, rtol=self.rtol)
                 t1 = time.time()
                 if RANK == 0:
                     print("Time for solving the linear equation: ", t1-t0)
+                    print("SR solver convergence: ", info)
                 state.clear_memory()
                 return torch.tensor(dp, dtype=self.dtype)
 

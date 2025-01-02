@@ -1355,6 +1355,8 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
             nn.Linear(nn_hidden_dim, 1)
         )
 
+        self.Jastrow.to(self.param_dtype)
+
         # Get symmetry
         self.symmetry = ftn.arrays[0].symmetry
 
@@ -1385,7 +1387,10 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i)
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
             # Get the NN correction to the parameters
             nn_correction = self.nn(x_i)
             # Add the correction to the original parameters
@@ -1404,7 +1409,7 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
             amp_val = amp.contract()
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
-            jastrow_factor = self.Jastrow(x_i)
+            jastrow_factor = self.Jastrow(x_i).squeeze()
             batch_amps.append(amp_val*jastrow_factor)
 
         # Return the batch of amplitudes stacked as a tensor
