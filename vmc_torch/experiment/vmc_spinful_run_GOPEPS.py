@@ -5,7 +5,7 @@ os.environ["OMP_NUM_THREADS"] = '1'
 import sys
 from mpi4py import MPI
 import pickle
-
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'
 # torch
 import torch
 torch.autograd.set_detect_anomaly(False)
@@ -55,8 +55,8 @@ chi = -2
 dtype=torch.float64
 
 # # Load PEPS
-skeleton = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
-peps_params = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl", "rb"))
+skeleton = pickle.load(open(pwd+f"/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
+peps_params = pickle.load(open(pwd+f"/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl", "rb"))
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
@@ -66,7 +66,7 @@ go_chi=-1
 model_ftn = fTNModel(peps, max_bond=chi, dtype=dtype)
 # Load go peps model parameters
 if go_peps_step != 0:
-    saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/fTN/chi={go_chi}/model_params_step{go_peps_step}.pth')
+    saved_model_params = torch.load(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/fTN/chi={go_chi}/model_params_step{go_peps_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -83,8 +83,8 @@ model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_h
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
 init_std = 5e-2
-seed = 2
-torch.manual_seed(seed)
+# seed = 2
+# torch.manual_seed(seed)
 model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 # model.apply(lambda x: init_weights_kaiming(x))
 
@@ -112,12 +112,12 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 # Set VMC step range
-init_step = 99
+init_step = 0
 final_step = 200
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -154,8 +154,8 @@ if optimizer_state is not None and use_prev_opt:
 else:
     # optimizer = SignedSGD(learning_rate=learning_rate)
     # optimizer = SignedRandomSGD(learning_rate=learning_rate)
-    optimizer = SGD(learning_rate=learning_rate)
-    # optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.9)
+    # optimizer = SGD(learning_rate=learning_rate)
+    optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.9)
     # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
 
 # Set up sampler
@@ -163,15 +163,15 @@ sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, solver='minres', diag_eta=1e-3, iter_step=1e2, dtype=dtype, rtol=1e-4)
-# preconditioner = TrivialPreconditioner()
+# preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, solver='minres', diag_eta=1e-3, iter_step=1e2, dtype=dtype, rtol=1e-4)
+preconditioner = TrivialPreconditioner()
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
-# if __name__ == "__main__":
-    
+
+
 torch.autograd.set_detect_anomaly(False)
-os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-record_file = open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
+os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+record_file = open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
 if RANK == 0:
     # print training information
     print(f"Running VMC for {model_name}")
@@ -191,7 +191,7 @@ if RANK == 0:
         print(model.model_structure)
     except:
         pass
-    # sys.stdout = record_file
+    sys.stdout = record_file
 
 if RANK == 0:
     # print training information
@@ -213,7 +213,7 @@ if RANK == 0:
     except:
         pass
 # with pyinstrument.Profiler() as prof:
-vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
 # if RANK == 0:
 #     prof.print()
 

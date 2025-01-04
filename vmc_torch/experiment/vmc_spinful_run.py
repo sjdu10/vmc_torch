@@ -5,7 +5,7 @@ os.environ["OMP_NUM_THREADS"] = '1'
 import sys
 from mpi4py import MPI
 import pickle
-
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'
 # torch
 import torch
 torch.autograd.set_detect_anomaly(False)
@@ -55,8 +55,8 @@ chi = -1
 dtype=torch.float64
 
 # # Load PEPS
-skeleton = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
-peps_params = pickle.load(open(f"../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl", "rb"))
+skeleton = pickle.load(open(pwd+f"/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
+peps_params = pickle.load(open(pwd+f"/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl", "rb"))
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
@@ -128,8 +128,8 @@ model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # )
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
 init_std = 5e-2
-seed = 2
-torch.manual_seed(seed)
+# seed = 2
+# torch.manual_seed(seed)
 model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 # model.apply(lambda x: init_weights_kaiming(x))
 
@@ -163,7 +163,7 @@ final_step = 500
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -212,8 +212,8 @@ vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimize
 # if __name__ == "__main__":
     
 torch.autograd.set_detect_anomaly(False)
-os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-record_file = open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
+os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+record_file = open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
 if RANK == 0:
     # print training information
     print(f"Running VMC for {model_name}")
@@ -255,7 +255,7 @@ if RANK == 0:
     except:
         pass
 # with pyinstrument.Profiler() as prof:
-vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
 # if RANK == 0:
 #     prof.print()
 
