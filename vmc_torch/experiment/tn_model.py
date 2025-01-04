@@ -2894,6 +2894,9 @@ class NeuralBackflow_spinful(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
 
+class HFDS(wavefunctionModel):
+     def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64, num_hidden_fermions=4):
+         ...
 
 
 class FFNN(wavefunctionModel):

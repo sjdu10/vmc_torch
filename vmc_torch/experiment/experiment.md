@@ -18,13 +18,16 @@
 7. 1D system:
     --- fMPS [x]
     --- Netket, quimb Hamiltonian [x]
-    --- Fully-connected random hopping Hubbard model (arXiv:2311.05749) that demonstrate volume-law, and expensive for DMRG (MPS). Try fTNF. [ ]
+    --- Fully-connected random hopping Hubbard model (arXiv:2311.05749) that demonstrate volume-law, and expensive for DMRG (MPS). Try fTNF. [? hard to optimize]
     --- SYK model, hard even for HFDS (arXiv:2411.04527), what about for fMPS+NN+attention? Or for TNF? [ ]
+
+8. Implement NNBF [x]
+9. Implement HFDS [ ]
 
 # Numerics TODO:
 1. check 4x2 doped calculation. Compare fPEPS and fPEPS+NN
-    --- u1
-    --- z2
+    --- u1 [x for D=4]
+    --- z2 [x for D=4]
 2. check 4x4 calculation
     --- half-filling
         --- u1

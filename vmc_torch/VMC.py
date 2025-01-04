@@ -174,9 +174,6 @@ class VMC:
                 
                 
                 if tmpdir is not None and save:
-                    # with open(tmpdir, 'a') as f:
-                        # f.write('Variational step {}\n'.format(step))
-                        # f.write('Energy: {}, Err: {}\n'.format(state_MC_energy['mean'], state_MC_energy['error']))
                     # save the energy statistics and model parameters to local directory
                     path = tmpdir
                     params_path = path + f'/model_params_step{step}.pth'
@@ -438,9 +435,6 @@ class VMC:
         self.Einit = 0.
         MC_stats = {'sample size:': self._state.Ns, '-logf': [], 'fidelity': [], 'mean': []}
         self.step_count = 0
-
-        # Initialize the SWO parameters
-        beta = self.beta
 
         for t_step in range(sample_times):
             self.step_count += 1

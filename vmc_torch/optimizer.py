@@ -224,16 +224,21 @@ class SGD(Optimizer):
         return params - self.lr*grad
 
 class SGD_momentum(Optimizer):
-    def __init__(self, learning_rate=1e-3, momentum=0.9):
+    def __init__(self, learning_rate=1e-3, momentum=0.9, weight_decay=1e-5):
         super().__init__(learning_rate)
         self.momentum = momentum
         self.velocity = None  # Initialize velocity as None
+        self.weight_decay = weight_decay
 
     def compute_update_params(self, params, grad):
         # Initialize velocity if it hasn't been initialized yet
         if self.velocity is None:
             self.velocity = torch.zeros_like(grad)
 
+        # Apply weight decay to the gradient
+        if self.weight_decay != 0:
+            grad = grad + self.weight_decay * params
+        
         # Update velocity using the momentum formula
         self.velocity = self.momentum * self.velocity + self.lr * grad
 

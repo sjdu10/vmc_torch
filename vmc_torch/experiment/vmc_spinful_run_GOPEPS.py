@@ -51,7 +51,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = -2
 dtype=torch.float64
 
 # # Load PEPS
@@ -112,8 +112,8 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 # Set VMC step range
-init_step = 0
-final_step = 100
+init_step = 99
+final_step = 200
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
@@ -134,7 +134,7 @@ if (N_samples/SIZE)%2 != 0:
 
 # Set up optimizer and scheduler
 learning_rate = 1e-1
-scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=10, min_lr=5e-2)
+scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=10, min_lr=5e-3)
 optimizer_state = None
 use_prev_opt = True
 if optimizer_state is not None and use_prev_opt:
