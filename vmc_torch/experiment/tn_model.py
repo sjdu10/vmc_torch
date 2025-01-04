@@ -44,6 +44,15 @@ def init_weights_to_zero(m, std=1e-3):
         if hasattr(m, 'bias') and m.bias is not None:
             nn.init.constant_(m.bias, 0.0)
 
+# Define the custom uniform initialization function
+def init_weights_uniform(m, a=-5e-3, b=5e-3):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding, nn.LayerNorm)):
+        # Set weights and biases to zero
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.uniform_(m.weight, a=a, b=b)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.uniform_(m.bias, a=a, b=b)
+
 
 #------------ bosonic TN model ------------
 
