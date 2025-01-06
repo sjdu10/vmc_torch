@@ -13,7 +13,7 @@ import autoray as ar
 
 from vmc_torch.model import SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow
 from vmc_torch.model import init_weights_xavier, init_weights_kaiming, init_weights_to_zero
-from vmc_torch.sampler import MetropolisExchangeSampler
+from vmc_torch.sampler import MetropolisExchangeSamplerSpinless
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
 from vmc_torch.VMC import VMC
@@ -78,7 +78,7 @@ N_samples = N_samples - N_samples % SIZE + SIZE - 1
 
 
 """Choose the sampler""" 
-sampler = MetropolisExchangeSampler(H.hilbert, H.graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=True, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinless(H.hilbert, H.graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=True, dtype=dtype)
 # sampler = None
 
 
