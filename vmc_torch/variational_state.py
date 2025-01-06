@@ -327,8 +327,12 @@ class Variational_State:
         self.mean_logamp_grad = mean_logamp_grad
 
         # compute the total sample variance
-        local_op_loc_mean = local_op_loc_sum/n_local_samples
-        local_W_var = (n_local_samples-1)*local_op_var + n_local_samples*(local_op_loc_mean - op_expect)**2
+        if n_local_samples > 0:
+            local_op_loc_mean = local_op_loc_sum/n_local_samples
+            local_W_var = (n_local_samples-1)*local_op_var + n_local_samples*(local_op_loc_mean - op_expect)**2
+        else:
+            local_op_loc_mean = 0.
+            local_W_var = 0.
         op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
 
         if RANK == 0:

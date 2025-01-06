@@ -18,7 +18,7 @@ from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_NN_proj_M
 from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked, fTN_backflow_attn_Model_boundary, fTN_backflow_Model_embedding
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model
 from vmc_torch.experiment.tn_model import PureAttention_Model, NeuralBackflow_spinful
-from vmc_torch.experiment.tn_model import init_weights_to_zero
+from vmc_torch.experiment.tn_model import init_weights_to_zero, init_weights_uniform
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPreconditioner, Adam, SGD_momentum, DecayScheduler
@@ -79,14 +79,14 @@ peps = get_psi_from_fTN(model_ftn)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=2, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
-init_std = 5e-2
+init_std = 5e-3
 # seed = 2
 # torch.manual_seed(seed)
-model.apply(lambda x: init_weights_to_zero(x, std=init_std))
-# model.apply(lambda x: init_weights_kaiming(x))
+# model.apply(lambda x: init_weights_to_zero(x, std=init_std))
+model.apply(lambda x: init_weights_uniform(x, a=-5e-3, b=5e-3))
 
 model_names = {
     fTNModel: 'fTN',
@@ -112,8 +112,8 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 # Set VMC step range
-init_step = 0
-final_step = 200
+init_step = 499
+final_step = 800
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
@@ -133,8 +133,8 @@ if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # Set up optimizer and scheduler
-learning_rate = 1e-1
-scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=10, min_lr=5e-3)
+learning_rate = 5e-2
+scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=5e-3)
 optimizer_state = None
 use_prev_opt = True
 if optimizer_state is not None and use_prev_opt:
@@ -154,8 +154,8 @@ if optimizer_state is not None and use_prev_opt:
 else:
     # optimizer = SignedSGD(learning_rate=learning_rate)
     # optimizer = SignedRandomSGD(learning_rate=learning_rate)
-    # optimizer = SGD(learning_rate=learning_rate)
-    optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.9)
+    optimizer = SGD(learning_rate=learning_rate)
+    # optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.9)
     # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
 
 # Set up sampler
@@ -163,8 +163,8 @@ sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner
-# preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, solver='minres', diag_eta=1e-3, iter_step=1e2, dtype=dtype, rtol=1e-4)
-preconditioner = TrivialPreconditioner()
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, solver='minres', diag_eta=1e-3, iter_step=1e2, dtype=dtype, rtol=1e-4)
+# preconditioner = TrivialPreconditioner()
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
 

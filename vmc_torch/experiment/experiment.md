@@ -36,6 +36,19 @@
     --- doped filling
         --- u1
         --- z2
+3. VMC training details:
+    --- For Z2 calculation, must make sure a proper chemical potential \mu is used in SU, so that the initial TNS has major amplitude weight
+    in the target quantum number sector (e.g. particle number in our case). This is very important as we want the tensor values in the TN to
+    mainly contribute to amplitude of configuration with fixed particle number, instead of other unrelavant configuration amplitudes. If we
+    have large amplitude on those unrelavant configurations, the initial expressvity of our ansatz will be weakened and the optimization becomes
+    harder.
+    --- For NN initialization, simply initialize the weights/bias with very small random numbers around zero. E.g. uniform distribution r.v. in
+    [-0.005, 0.005].
+    --- SR iterative solver: use 'minres' instead of 'cg'. 'cg' works for positive definite symmetric/hermitian matrix, while 'minres' works for
+    symmetric/hermitian matrix. In our calculation, the quantum geometric matrix is obtained via MC sampling, thus may not be necessarily positive
+    definite due to statistical errors (theoretically it is PSD). Therefore to stabilize the SR linear equation solution, one should choose 'minres'
+    over 'cg'. And note it is sufficient to set the relative tolerance in these iterative solver to 1e-4 instead of the default 1e-5 in our VMC calculation.
+    If the rtol is set to 1e-5, the SR solver may take a long time to converge (potentially due to the MPI communication issue on Caltech HPC).
 
 # Ideas
 

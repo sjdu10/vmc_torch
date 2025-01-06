@@ -300,7 +300,10 @@ class MetropolisExchangeSampler(Sampler):
         # convert the list to numpy array
         logpsi_sigma_grad_mat = np.asarray(logpsi_sigma_grad_mat).T
         op_loc_vec = np.asarray(op_loc_vec)
-        op_loc_var = np.var(op_loc_vec, ddof=1)
+        if n > 1:
+            op_loc_var = np.var(op_loc_vec, ddof=1)
+        else:
+            op_loc_var = 0
         samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
 
         return samples
