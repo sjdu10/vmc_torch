@@ -2917,7 +2917,7 @@ class HFDS(wavefunctionModel):
         self.M = nn.Parameter(
             kernel_init(torch.empty(self.hilbert.size, self.Nf+self.Nh//2, dtype=self.param_dtype)) 
             if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)
+            else torch.randn(self.hilbert.size, self.Nf+self.Nh//2, dtype=self.param_dtype)
         )
 
         # Initialize Nh neural networks, input is n and output is a row vector of length Nf+Nh
