@@ -94,7 +94,7 @@ variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtyp
 
 
 """Create the VMC object"""
-vmc = VMC(H, variational_state, optimizer, preconditioner)
+vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner)
 
 
 if __name__ == "__main__":
