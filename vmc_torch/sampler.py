@@ -620,6 +620,28 @@ class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
     
 class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
     def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
+        """
+        Parameters
+        ----------
+        hi : Hilbert
+            The Hilbert space.
+        graph : Graph
+            Lattice graph.
+        N_samples : int
+            The number of samples.
+        burn_in_steps : int
+            The number of burn-in steps.
+        reset_chain : bool
+            Whether to reset the chain after each VMC step.
+        random_edge : bool
+            Whether to randomly select the edges in the exchange move.
+        subchain_length : int
+            The number of samples we discard before collecting two samples.
+        equal_partition : bool
+            Whether the number of samples is equal for all MPI processes. If False, we use eager sampling and must have SIZE > 1.
+        dtype : torch.dtype
+
+        """
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
 
     def _sample_next(self, vstate):

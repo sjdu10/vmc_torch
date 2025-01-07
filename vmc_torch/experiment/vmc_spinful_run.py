@@ -51,7 +51,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = -2
+chi = -1
 dtype=torch.float64
 
 # # Load PEPS
@@ -127,13 +127,12 @@ if (N_samples/SIZE)%2 != 0:
 #     dtype=dtype,
 # )
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
-model = HFDS(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly, num_hidden_fermions=N_f)
+model = HFDS(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly, num_hidden_fermions=int(abs(chi))*N_f, jastrow=False)
 init_std = 5e-3
 # seed = 2
 # torch.manual_seed(seed)
 # model.apply(lambda x: init_weights_to_zero(x, std=init_std))
-model.apply(lambda x: init_weights_uniform(x, a=-5e-3, b=5e-3))
-# model.apply(lambda x: init_weights_kaiming(x))
+# model.apply(lambda x: init_weights_uniform(x, a=-5e-3, b=5e-3))
 
 model_names = {
     fTNModel: 'fTN',
@@ -178,7 +177,7 @@ if init_step != 0:
     optimizer_state = saved_model_params.get('optimizer_state', None)
 
 # Set up optimizer and scheduler
-learning_rate = 5e-2
+learning_rate = 1e-1
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=5e-3)
 optimizer_state = None
 use_prev_opt = True

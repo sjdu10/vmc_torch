@@ -39,19 +39,40 @@ class TrivialPreconditioner(Preconditioner):
     
 class SR(Preconditioner):
     """
-    Math: S*dp = g, where S is the QGT and g is the energy gradient. dp is the preconditioned gradient.
-    g = <E_loc(x)*O(x)> - <E_loc(x)>*<O(x)>, where O(x) = \nabla_{\theta} log(psi(x;\theta)) is the gradient of the log amplitude.
-    O(x) has shape of (Np,), where Np is the number of parameters.
+    Math
+    ----------------
 
-    S = <O^\dagger(x)*O(x)> - <O^\dagger(x)>*<O(x)>, which has shape of (Np, Np).
-    S is a positive definite matrix.
-    S can be computed from the amp_grad matrix, which has shape of (Np, Ns), where Ns is the number of samples.
-    S is just the covariance matrix of the amp_grad vectors.
+    S*dp = g, where S is the QGT and g is the energy gradient. dp is the preconditioned gradient.
+
+    g = <E_loc(x)*O(x)> - <E_loc(x)>*<O(x)>, where O(x) = \nabla_{\theta} log(psi(x;\theta)) is the gradient of the log amplitude. O(x) has shape of (Np,), where Np is the number of parameters.
+
+    S = <O^\dagger(x)*O(x)> - <O^\dagger(x)>*<O(x)>, which has shape of (Np, Np). Note S is a positive definite matrix (theoretically).
+
+    S can be computed from the amp_grad matrix, which has shape of (Np, Ns), where Ns is the number of samples. S is just the covariance matrix of the amp_grad vectors.
 
     In practice, one does not need to compute the dense S matrix to solve for dp.
     One can solve the linear equation S*dp = g iteratively using scipy.sparse.linalg.
+
+    Parameters
+    ----------------
+    dense: bool, optional
+        Whether to form the dense S matrix. Default is False.
+    exact: bool, optional
+        Whether to use the exact SR solver. Default is False.
+    iter_step: int, optional
+        Maximum number of iterations for the iterative solver. Default is 1e2.
+    use_MPI4Solver: bool, optional
+        Whether to use the MPI version of the iterative solver, which avoids the step of gathering the logamp_grad_matrix to rank 0. Default is False.
+    solver: str, optional
+        The scipy iterative solver to use. Default is 'minres'.
+    rtol: float, optional
+        Relative tolerance for the iterative solver. Default is 1e-4.
+    diag_eta: float, optional
+        Diagonal shift to the S matrix. Default is 1e-3.
+    dtype: torch.dtype, optional
+        Data type of the gradient. Default is torch.float32.
     """
-    def __init__(self, dense=False, exact=False, iter_step=1e5, use_MPI4Solver=False, diag_eta=1e-2, dtype=torch.float32, rtol=1e-4, solver='cg'):
+    def __init__(self, dense=False, exact=False, iter_step=1e2, use_MPI4Solver=False, solver='minres', rtol=1e-4, diag_eta=1e-3, dtype=torch.float32):
         super().__init__(use_MPI4Solver, dtype=dtype)
         self.dense = dense
         self.iter_step = int(iter_step)

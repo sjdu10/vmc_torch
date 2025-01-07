@@ -1418,8 +1418,8 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
             amp_val = amp.contract()
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
-            jastrow_factor = self.Jastrow(x_i).squeeze()
-            batch_amps.append(amp_val*jastrow_factor)
+            jastrow_factor = sum(self.Jastrow(x_i))
+            batch_amps.append(amp_val*torch.exp(jastrow_factor))
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
@@ -2903,42 +2903,36 @@ class NeuralBackflow_spinful(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
 
-class HFDS(wavefunctionModel):
-    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64, num_hidden_fermions=4):
-        super(HFDS, self).__init__()
+class NNBF(wavefunctionModel):
+    """Assuming total Sz=0."""
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
+        super(NNBF, self).__init__()
         
         self.hilbert = hilbert
-        self.Nf = self.hilbert.n_fermions_per_spin[0]
-        self.Nh = num_hidden_fermions
-        assert self.Nh % 2 == 0, "The number of hidden fermions must be even."
         self.param_dtype = param_dtype
         
-        # Initialize the parameter M ( Nx(Nf+Nh) matrix )
+        # Initialize the parameter M (N x Nf matrix)
         self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.Nf+self.Nh//2, dtype=self.param_dtype)) 
+            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)) 
             if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.Nf+self.Nh//2, dtype=self.param_dtype)
+            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
         )
 
-        # Initialize Nh neural networks, input is n and output is a row vector of length Nf+Nh
-        # Assume the first Nh/2 fermions are spin up and the rest are spin down
-        for i in range(self.Nh):
-            setattr(self, f'nn{i}', nn.Sequential(
-                nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
-                nn.Tanh(),
-                nn.Linear(hidden_dim, self.Nf+self.Nh//2, dtype=self.param_dtype)
-            ))
+        # Initialize the neural network layer, input is n and output a matrix with the same shape as M
+        self.nn = nn.Sequential(
+            nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
 
         # Convert NNs to the appropriate data type
-        for i in range(self.Nh):
-            getattr(self, f'nn{i}').to(self.param_dtype)
+        self.nn.to(self.param_dtype)
 
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'HFDS':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin,
-                    'N_hidden_fermions': self.Nh}
+            'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
         }
 
     def amplitude(self, x):
@@ -2946,33 +2940,17 @@ class HFDS(wavefunctionModel):
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
         def backflow_det(n):
-            # Compute the hidden fermion rows using the neural networks
-            F_u = []
-            for i in range(self.Nh//2):
-                F_u.append(getattr(self, f'nn{i}')(n))
-            F_d = []
-            for i in range(self.Nh//2, self.Nh):
-                F_d.append(getattr(self, f'nn{i}')(n))
-            F_u = torch.stack(F_u)
-            F_d = torch.stack(F_d)
-
-            M  = self.M
+            # Compute the backflow matrix F using the neural network
+            F = self.nn(n)
+            M  = self.M + F.reshape(self.M.shape)
             # Find the positions of the occupied orbitals
             R = torch.nonzero(n, as_tuple=False).squeeze()
 
-            # Extract the 2Nf x (Nf+Nh) submatrix of M corresponding to the occupied orbitals
+            # Extract the 2Nf x Nf submatrix of M corresponding to the occupied orbitals
             A = M[R]
-            Au = A[:self.Nf] # shape (Nf, Nf+Nh//2)
-            Ad = A[self.Nf:]
+            det = torch.linalg.det(A)
+            amp = det
 
-            # Append the hidden fermion rows to corresponding A matrix
-            Au = torch.cat((Au, F_u), dim=0) # shape (Nf+Nh//2, Nf+Nh//2)
-            Ad = torch.cat((Ad, F_d), dim=0)
-
-            det1 = torch.linalg.det(Au)
-            det2 = torch.linalg.det(Ad)
-
-            amp = det1*det2
             return amp
         
         batch_amps = []
@@ -2983,6 +2961,95 @@ class HFDS(wavefunctionModel):
                 n_i = torch.tensor(n_i, dtype=self.param_dtype)
 
             amp_val=backflow_det(n_i)
+            batch_amps.append(amp_val)
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+class HFDS(wavefunctionModel):
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64, num_hidden_fermions=4, jastrow=False):
+        super(HFDS, self).__init__()
+        
+        self.hilbert = hilbert
+        self.Nf = self.hilbert.n_fermions
+        self.Nh = num_hidden_fermions
+        assert self.Nh % 2 == 0, "The number of hidden fermions must be even."
+        self.jastrow = jastrow
+        self.param_dtype = param_dtype
+        
+        # Initialize the parameter M ( Nx(Nf+Nh) matrix )
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.size, self.Nf+self.Nh, dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.size, self.Nf+self.Nh, dtype=self.param_dtype)
+        )
+
+        # Initialize Nh neural networks, input is n and output is a row vector of length Nf+Nh
+        # Assume the first Nh/2 fermions are spin up and the rest are spin down
+        for i in range(self.Nh):
+            setattr(self, f'nn{i}', nn.Sequential(
+                nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, self.Nf+self.Nh, dtype=self.param_dtype)
+            ))
+
+        # Convert NNs to the appropriate data type
+        for i in range(self.Nh):
+            getattr(self, f'nn{i}').to(self.param_dtype)
+        
+        if self.jastrow:
+            self.nn_jastrow = nn.Sequential(
+                nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, 1, dtype=self.param_dtype)
+            )
+            self.nn_jastrow.to(self.param_dtype)
+        else:
+            self.nn_jastrow = None
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'HFDS':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin,
+                    'N_hidden_fermions': self.Nh, 'Jastrow': self.jastrow}
+        }
+
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(n):
+            # Compute the hidden fermion rows using the neural networks
+            F = []
+            for i in range(self.Nh):
+                F.append(getattr(self, f'nn{i}')(n))
+            F = torch.stack(F)
+
+            M  = self.M
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the Nf x (Nf+Nh) submatrix of M corresponding to the occupied orbitals
+            A = M[R]
+
+            # Append the hidden fermion rows to corresponding A matrix
+            Au = torch.cat((A, F), dim=0) # Shape: (Nf+Nh, Nf+Nh)
+            det = torch.linalg.det(Au)
+            amp = det
+
+            return amp
+        
+        batch_amps = []
+        for x_i in x:
+            n_i = from_quimb_config_to_netket_config(x_i)
+            # Check x_i type
+            if not type(n_i) == torch.Tensor:
+                n_i = torch.tensor(n_i, dtype=self.param_dtype)
+
+            amp_val=backflow_det(n_i)
+            if self.jastrow:
+                J = torch.sum(self.nn_jastrow(n_i))
+                amp_val *= torch.exp(J)
             batch_amps.append(amp_val)
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)

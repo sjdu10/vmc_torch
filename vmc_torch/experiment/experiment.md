@@ -49,7 +49,11 @@
     definite due to statistical errors (theoretically it is PSD). Therefore to stabilize the SR linear equation solution, one should choose 'minres'
     over 'cg'. And note it is sufficient to set the relative tolerance in these iterative solver to 1e-4 instead of the default 1e-5 in our VMC calculation.
     If the rtol is set to 1e-5, the SR solver may take a long time to converge (potentially due to the MPI communication issue on Caltech HPC).
-    --- hpc-21-37,hpc-35-[01,14,23,30-31] One of the nodes is definitely problematic. hpc-21-37,hpc-34-10,hpc-52-18,hpc-53-14,hpc-54-12 is good. hpc-35-[02,30],hpc-52-[28-30] is bad.
+    --- hpc-21-37,hpc-35-[01,14,23,30-31] bad. 
+    --- hpc-21-37,hpc-34-10,hpc-52-18,hpc-53-14,hpc-54-12 good. 
+    --- hpc-35-[02,30],hpc-52-[28-30] 
+    --- hpc-35-[02,10,23,33],hpc-52-28 bad.
+    --- hpc-19-28,hpc-20-[26,32],hpc-52-35,hpc-53-04 bad
     hpc-35-30 is bad??
 
 # Ideas
