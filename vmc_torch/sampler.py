@@ -128,6 +128,176 @@ class MetropolisExchangeSampler(Sampler):
             print('Burn-in time:', t_burnin1 - t_burnin0)
 
         op_loc_sum = 0
+
+        # We use Welford's Algorithm to compute the sample variance of op_loc in a single pass.
+        n = 0
+        op_loc_mean = 0
+        op_loc_M2 = 0
+        op_loc_var = 0
+        op_loc_vec = np.zeros(chain_length)
+
+        if RANK == 0:
+            pbar = tqdm(total=chain_length, desc='Sampling starts for rank 0...')
+        
+        for chain_step in range(chain_length):
+            time0 = MPI.Wtime()
+            # sample the next configuration
+            psi_sigma = 0
+            while psi_sigma == 0:
+                # We need to make sure that the amplitude is not zero
+                sigma, psi_sigma = self._sample_next(vstate)
+
+            time1 = MPI.Wtime()
+            n += 1
+            if RANK == 0:
+                pbar.set_postfix({'Time per sample for each rank': (time1 - time0)})
+
+            # compute local energy and amplitude gradient
+            psi_sigma = vstate.amplitude(sigma)
+            # compute the connected non-zero operator matrix elements <eta|O|sigma>
+            eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
+            psi_eta = vstate.amplitude(eta)
+
+            # convert torch tensors to numpy arrays
+            psi_sigma = psi_sigma.detach().numpy()
+            psi_eta = psi_eta.detach().numpy()
+
+            # compute the local operator
+            op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+            op_loc_vec[chain_step] = op_loc
+
+            # accumulate the local operator
+            op_loc_sum += op_loc
+
+            # update the sample variance of op_loc
+            op_loc_mean_prev = op_loc_mean
+            op_loc_mean += (op_loc - op_loc_mean) / n
+            op_loc_M2 += (op_loc - op_loc_mean_prev) * (op_loc - op_loc_mean)
+
+            # update the sample variance
+            if n > 1:
+                op_loc_var = op_loc_M2 / (n - 1)
+
+            # total_n = COMM.reduce(n, op=MPI.SUM, root=0)
+            # add a progress bar if rank == 0
+            if RANK == 0:
+                pbar.update(1)
+        
+        
+        if self.reset_chain:
+            self.reset()
+
+        if RANK == 0:
+            pbar.close()
+        
+        # The following is for computing the Rhat diagnostic using the Gelman-Rubin formula
+
+        # Step 1：split the chain in half and compute the within chain variance
+        split_chains = np.split(op_loc_vec, 2)
+        # Step 2: compute the within chain variance
+        W_loc = np.sum([np.var(split_chain) for split_chain in split_chains])
+        chain_means_loc = [np.mean(split_chain) for split_chain in split_chains]
+
+        samples = (op_loc_sum, op_loc_var, W_loc, chain_means_loc)
+        return samples
+    
+    def sample_eager(self, vstate, op, message_tag=None):
+        """Sample eagerly for the local energy and amplitude gradient for each configuration.
+        return a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)"""
+        assert self.equal_partition == False, 'Must not use equal partition for eager sampling.'
+
+        if RANK == 0:
+            print('Burn-in...')
+            t_burnin0 = time.time()
+        self.burn_in(vstate)
+        if RANK == 0:
+            t_burnin1 = time.time()
+            print('Burn-in time:', t_burnin1 - t_burnin0)
+
+        op_loc_sum = 0
+
+        # We only estimate the variance of op_loc locally
+        n = 0
+        n_total = 0
+        op_loc_vec = []
+        terminate = False
+
+        if RANK == 0:
+            pbar = tqdm(total=self.Ns, desc='Sampling starts...')
+            for _ in range(2):
+                op_loc, _ = self._sample_expect(vstate, op)
+                op_loc_vec.append(op_loc)
+                op_loc_sum += op_loc
+
+                n += 1
+                n_total += 1
+                pbar.update(1)
+            
+            # Discard messages from previous steps
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
+                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
+                del redundant_message
+            
+            while not terminate:
+                # Receive the local sample count from each rank
+                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2))
+                dest_rank = buf[0]
+                n_total += 1
+                pbar.update(1)
+                # Check if we have enough samples
+                if n_total >= self.Ns:
+                    terminate = True
+                    for dest_rank in range(1, SIZE):
+                        COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                # Send the termination signal to the rank
+                COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+            
+            pbar.close()
+        
+        else:
+            while not terminate:
+                op_loc, _ = self._sample_expect(vstate, op)
+                n += 1
+                op_loc_vec.append(op_loc)
+                # accumulate the local energy and amplitude gradient
+                op_loc_sum += op_loc
+
+                buf = (RANK,)
+                # Send the local sample count to rank 0
+                COMM.send(buf, dest=0, tag=message_tag+np.sqrt(2))
+                # Receive the termination signal from rank 0
+                terminate = COMM.recv(source=0, tag=message_tag+1)
+
+        
+        if self.reset_chain:
+            self.reset()
+        
+        if RANK == 0:
+            pbar.close()
+        
+        # convert the list to numpy array
+        op_loc_vec = np.asarray(op_loc_vec)
+        if n > 1:
+            op_loc_var = np.var(op_loc_vec, ddof=1)
+        else:
+            op_loc_var = 0
+        samples = (op_loc_sum, op_loc_var, n)
+
+        return samples
+
+    def sample_w_grad(self, vstate, op, chain_length=1):
+        """Sample the local energy and amplitude gradient for each configuration.
+        return a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)"""
+        assert self.equal_partition, "The number of samples must be equal for all MPI processes."
+        if RANK == 0:
+            print('Burn-in...')
+            t_burnin0 = time.time()
+        self.burn_in(vstate)
+        if RANK == 0:
+            t_burnin1 = time.time()
+            print('Burn-in time:', t_burnin1 - t_burnin0)
+
+        op_loc_sum = 0
         logpsi_sigma_grad_sum = np.zeros(vstate.Np)
         op_logpsi_sigma_grad_product_sum = np.zeros(vstate.Np)
 
@@ -211,7 +381,7 @@ class MetropolisExchangeSampler(Sampler):
         samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         return samples
     
-    def sample_eager(self, vstate, op, message_tag=None):
+    def sample_w_grad_eager(self, vstate, op, message_tag=None):
         """Sample eagerly for the local energy and amplitude gradient for each configuration.
         return a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)"""
         assert self.equal_partition == False, 'Must not use equal partition for eager sampling.'
@@ -333,6 +503,31 @@ class MetropolisExchangeSampler(Sampler):
         op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
 
         return op_loc, logpsi_sigma_grad, time1 - time0
+    
+    def _sample_expect(self, vstate, op):
+        """Get one sample of the local operator."""
+        time0 = MPI.Wtime()
+        # sample the next configuration
+        psi_sigma = 0
+        while psi_sigma == 0:
+            # We need to make sure that the amplitude is not zero
+            sigma, psi_sigma = self._sample_next(vstate)
+        time1 = MPI.Wtime()
+
+        # compute local energy and amplitude gradient
+        psi_sigma = vstate.amplitude(sigma)
+        # compute the connected non-zero operator matrix elements <eta|O|sigma>
+        eta, O_etasigma = op.get_conn(sigma)
+        psi_eta = vstate.amplitude(eta)
+
+        # convert torch tensors to numpy arrays
+        psi_sigma = psi_sigma.detach().numpy()
+        psi_eta = psi_eta.detach().numpy()
+
+        # compute the local operator
+        op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+
+        return op_loc, time1 - time0
     
     def sample_expectation(self, vstate, op, chain_length=1):
         """Sample the expectation value of the operator `op`."""

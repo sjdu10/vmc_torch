@@ -51,10 +51,26 @@
     If the rtol is set to 1e-5, the SR solver may take a long time to converge (potentially due to the MPI communication issue on Caltech HPC).
     --- hpc-21-37,hpc-35-[01,14,23,30-31] bad. 
     --- hpc-21-37,hpc-34-10,hpc-52-18,hpc-53-14,hpc-54-12 good. 
-    --- hpc-35-[02,30],hpc-52-[28-30] 
+    --- hpc-35-[02,30],hpc-52-[28-30] bad
     --- hpc-35-[02,10,23,33],hpc-52-28 bad.
     --- hpc-19-28,hpc-20-[26,32],hpc-52-35,hpc-53-04 bad
-    hpc-35-30 is bad??
+    --- hpc-35-30 is bad??
+    --- hpc-52-08 lose MPI connection
+    --- hpc-35-[07,16,37],hpc-52-31,hpc-53-24 bad
+    --- hpc-52-[01,06,08-09,11] bad MPI connection issue
+    --- hpc-52-[01,06,09,11,14] fPEPSD D=6
+    --- MPI connection error:
+    --------------------------------------------------------------------------
+    WARNING: Open MPI failed to TCP connect to a peer MPI process.  This
+    should not happen.
+
+    Your Open MPI job may now hang or fail.
+
+    Local host: hpc-52-08
+    PID:        120099
+    Message:    connect() to 192.168.29.113:1064 failed
+    Error:      Operation now in progress (115)
+    --------------------------------------------------------------------------
 
 # Ideas
 

@@ -106,9 +106,7 @@ model_name = model_names.get(type(model), 'UnknownModel')
 
 init_step = 0
 final_step = 400
-total_steps = final_step - init_step
 # Load model parameters
-optimizer_state = None
 if init_step != 0:
     saved_model_params = torch.load(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
@@ -121,87 +119,19 @@ if init_step != 0:
         print('Loading model parameters failed, loading model parameters vector instead')
     optimizer_state = saved_model_params.get('optimizer_state', None)
 
-# Set up optimizer and scheduler
-learning_rate = 1e-1
-scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=5e-3)
-use_prev_opt = True
-if optimizer_state is not None and use_prev_opt:
-    optimizer_name = optimizer_state['optimizer']
-    if optimizer_name == 'SGD_momentum':
-        optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.9)
-    elif optimizer_name == 'Adam':
-        optimizer = Adam(learning_rate=learning_rate, weight_decay=1e-5)
-    print('Loading optimizer: ', optimizer)
-    optimizer.lr = learning_rate
-    if isinstance(optimizer, SGD_momentum):
-        optimizer.velocity = optimizer_state['velocity']
-    if isinstance(optimizer, Adam):
-        optimizer.m = optimizer_state['m']
-        optimizer.v = optimizer_state['v']
-        optimizer.t = optimizer_state['t']
-else:
-    # optimizer = SignedSGD(learning_rate=learning_rate)
-    # optimizer = SignedRandomSGD(learning_rate=learning_rate)
-    optimizer = SGD(learning_rate=learning_rate)
-    # optimizer = SGD_momentum(learning_rate=learning_rate, momentum=0.9)
-    # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
 
 # Set up sampler
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+equal_partition = False # Whether to equally partition the samples to each MPI process, on HPC recommended to set to False
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=False, equal_partition=equal_partition, dtype=dtype)
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
-# Set up SR preconditioner
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, solver='minres', diag_eta=1e-3, iter_step=1e3, dtype=dtype, rtol=1e-4)
-# preconditioner = TrivialPreconditioner()
-# Set up VMC
-vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
-# if __name__ == "__main__":
-    
-torch.autograd.set_detect_anomaly(False)
-os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-record_file = open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
-if RANK == 0:
-    # print training information
-    print(f"Running VMC for {model_name}")
-    print(f'model params: {variational_state.num_params}')
-    print(f"Optimizer: {optimizer}")
-    print(f"Preconditioner: {preconditioner}")
-    print(f"Scheduler: {scheduler}")
-    print(f"Sampler: {sampler}")
-    print(f'2D Fermi-Hubbard model on {Lx}x{Ly} lattice with {N_f} fermions, Sz=0, t={t}, U={U}')
-    print(f"Running {total_steps} steps from {init_step} to {final_step}")
-    print(f'Model initialized with mean=0, std={init_std}')
-    print(f'Learning rate: {learning_rate}')
-    print(f'Sample size: {N_samples}')
-    print(f'fPEPS bond dimension: {D}, max bond: {chi}')
-    print(f'fPEPS symmetry: {symmetry}\n')
-    try:
-        print(model.model_structure)
-    except:
-        pass
-    sys.stdout = record_file
 
-if RANK == 0:
-    # print training information
-    print(f"Running VMC for {model_name}")
-    print(f'model params: {variational_state.num_params}')
-    print(f"Optimizer: {optimizer}")
-    print(f"Preconditioner: {preconditioner}")
-    print(f"Scheduler: {scheduler}")
-    print(f"Sampler: {sampler}")
-    print(f'2D Fermi-Hubbard model on {Lx}x{Ly} lattice with {N_f} fermions, Sz=0, t={t}, U={U}')
-    print(f"Running {total_steps} steps from {init_step} to {final_step}")
-    print(f'Model initialized with mean=0, std={init_std}')
-    print(f'Learning rate: {learning_rate}')
-    print(f'Sample size: {N_samples}')
-    print(f'fPEPS bond dimension: {D}, max bond: {chi}')
-    print(f'fPEPS symmetry: {symmetry}\n')
-    try:
-        print(model.model_structure)
-    except:
-        pass
-# with pyinstrument.Profiler() as prof:
-vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
-# if RANK == 0:
-#     prof.print()
+
+
+if __name__ == "__main__":
+    MC_dict = variational_state.expect(op=H)
+    if RANK == 0:
+        print(f"MC_dict: {MC_dict}")
+
+
 
