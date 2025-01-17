@@ -80,6 +80,8 @@ model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
 # model = HFDS(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly, num_hidden_fermions=int(abs(chi))*N_f, jastrow=False)
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# model.to(device)
 init_std = 5e-3
 # seed = 2
 # torch.manual_seed(seed)
@@ -110,7 +112,7 @@ total_steps = final_step - init_step
 # Load model parameters
 optimizer_state = None
 if init_step != 0:
-    saved_model_params = torch.load(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}_gpu/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -147,7 +149,7 @@ else:
     # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
 
 # Set up sampler
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=16, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner
@@ -158,11 +160,11 @@ vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimize
 # if __name__ == "__main__":
     
 torch.autograd.set_detect_anomaly(False)
-os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-record_file = open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
+os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}_gpu/chi={chi}/', exist_ok=True)
+record_file = open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}_gpu/chi={chi}/record{init_step}.txt', 'w')
 if RANK == 0:
     # print training information
-    print(f"Running VMC for {model_name}")
+    print(f"Running VMC for {model_name}_gpu")
     print(f'model params: {variational_state.num_params}')
     print(f"Optimizer: {optimizer}")
     print(f"Preconditioner: {preconditioner}")
@@ -183,7 +185,7 @@ if RANK == 0:
 
 if RANK == 0:
     # print training information
-    print(f"Running VMC for {model_name}")
+    print(f"Running VMC for {model_name}_gpu")
     print(f'model params: {variational_state.num_params}')
     print(f"Optimizer: {optimizer}")
     print(f"Preconditioner: {preconditioner}")
@@ -200,8 +202,7 @@ if RANK == 0:
         print(model.model_structure)
     except:
         pass
-# with pyinstrument.Profiler() as prof:
-vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
-# if RANK == 0:
-#     prof.print()
+
+vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}_gpu/chi={chi}/')
+
 

@@ -159,8 +159,8 @@ class MetropolisExchangeSampler(Sampler):
             psi_eta = vstate.amplitude(eta)
 
             # convert torch tensors to numpy arrays
-            psi_sigma = psi_sigma.detach().numpy()
-            psi_eta = psi_eta.detach().numpy()
+            psi_sigma = psi_sigma.cpu().detach().numpy()
+            psi_eta = psi_eta.cpu().detach().numpy()
 
             # compute the local operator
             op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
@@ -333,9 +333,9 @@ class MetropolisExchangeSampler(Sampler):
             psi_eta = vstate.amplitude(eta)
 
             # convert torch tensors to numpy arrays
-            psi_sigma = psi_sigma.detach().numpy()
-            psi_eta = psi_eta.detach().numpy()
-            logpsi_sigma_grad = logpsi_sigma_grad.detach().numpy()
+            psi_sigma = psi_sigma.cpu().detach().numpy()
+            psi_eta = psi_eta.cpu().detach().numpy()
+            logpsi_sigma_grad = logpsi_sigma_grad.cpu().detach().numpy()
 
             # compute the local operator
             op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
@@ -495,9 +495,9 @@ class MetropolisExchangeSampler(Sampler):
         psi_eta = vstate.amplitude(eta)
 
         # convert torch tensors to numpy arrays
-        psi_sigma = psi_sigma.detach().numpy()
-        psi_eta = psi_eta.detach().numpy()
-        logpsi_sigma_grad = logpsi_sigma_grad.detach().numpy()
+        psi_sigma = psi_sigma.cpu().detach().numpy()
+        psi_eta = psi_eta.cpu().detach().numpy()
+        logpsi_sigma_grad = logpsi_sigma_grad.cpu().detach().numpy()
 
         # compute the local operator
         op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
@@ -521,8 +521,8 @@ class MetropolisExchangeSampler(Sampler):
         psi_eta = vstate.amplitude(eta)
 
         # convert torch tensors to numpy arrays
-        psi_sigma = psi_sigma.detach().numpy()
-        psi_eta = psi_eta.detach().numpy()
+        psi_sigma = psi_sigma.cpu().detach().numpy()
+        psi_eta = psi_eta.cpu().detach().numpy()
 
         # compute the local operator
         op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
@@ -540,8 +540,8 @@ class MetropolisExchangeSampler(Sampler):
             psi_sigma = vstate.amplitude(sigma)
             eta, O_etasigma = op.get_conn(sigma)
             psi_eta = vstate.amplitude(eta)
-            psi_sigma = psi_sigma.detach().numpy()
-            psi_eta = psi_eta.detach().numpy()
+            psi_sigma = psi_sigma.cpu().detach().numpy()
+            psi_eta = psi_eta.cpu().detach().numpy()
             op_loc = O_etasigma @ (psi_eta / psi_sigma)
             op_loc_sum += op_loc
             E_loc_list.append(op_loc)
@@ -597,8 +597,8 @@ class MetropolisExchangeSampler(Sampler):
                 if config not in config_amplitudes_dict:
                     eta, O_etasigma = op.get_conn(config)
                     psi_eta = vstate.amplitude(eta)
-                    psi_eta = psi_eta.detach().numpy()
-                    psi_sigma = psi_sigma.detach().numpy()
+                    psi_eta = psi_eta.cpu().detach().numpy()
+                    psi_sigma = psi_sigma.cpu().detach().numpy()
                     op_psi_eta = np.sum(O_etasigma * psi_eta, axis=-1)
                     config_amplitudes_dict[config] = (psi_sigma, op_psi_eta)
                 else:
@@ -635,8 +635,8 @@ class MetropolisExchangeSampler(Sampler):
                 if config not in config_amplitudes_dict:
                     eta, O_etasigma = op.get_conn(config)
                     psi_eta = vstate.amplitude(eta)
-                    psi_eta = psi_eta.detach().numpy()
-                    psi_sigma = psi_sigma.detach().numpy()
+                    psi_eta = psi_eta.cpu().detach().numpy()
+                    psi_sigma = psi_sigma.cpu().detach().numpy()
                     op_psi_eta = np.sum(O_etasigma * psi_eta, axis=-1)
                     config_amplitudes_dict[config] = (psi_sigma, op_psi_eta)
                 else:
@@ -706,8 +706,8 @@ class MetropolisExchangeSampler(Sampler):
                 if compute_energy:
                     eta, O_etasigma = op.get_conn(config)
                     psi_eta = vstate.amplitude(eta)
-                    psi_eta = psi_eta.detach().numpy()
-                    psi_sigma = psi_sigma.detach().numpy()
+                    psi_eta = psi_eta.cpu().detach().numpy()
+                    psi_sigma = psi_sigma.cpu().detach().numpy()
                     op_loc = np.sum(O_etasigma * psi_eta / psi_sigma, axis=-1)
                     op_expect += op_loc
                     ...#XXX: compute variance
@@ -749,8 +749,8 @@ class MetropolisExchangeSampler(Sampler):
                 if compute_energy:
                     eta, O_etasigma = op.get_conn(config)
                     psi_eta = vstate.amplitude(eta)
-                    psi_eta = psi_eta.detach().numpy()
-                    psi_sigma = psi_sigma.detach().numpy()
+                    psi_eta = psi_eta.cpu().detach().numpy()
+                    psi_sigma = psi_sigma.cpu().detach().numpy()
                     op_loc = np.sum(O_etasigma * psi_eta / psi_sigma, axis=-1)
                     op_expect += op_loc
                     ...#XXX: compute variance
@@ -798,7 +798,7 @@ class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
             temp = proposed_config[i].item()
             proposed_config[i] = proposed_config[j]
             proposed_config[j] = temp
-            proposed_amp = vstate.amplitude(proposed_config)
+            proposed_amp = vstate.amplitude(proposed_config).cpu()
             proposed_prob = abs(proposed_amp)**2
 
             try:
@@ -841,7 +841,7 @@ class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
 
     def _sample_next(self, vstate):
         """Sample the next configuration. Change the current configuration in place."""
-        current_amp = vstate.amplitude(self.current_config)
+        current_amp = vstate.amplitude(self.current_config).cpu()
         current_prob = abs(current_amp)**2
         proposed_config = self.current_config.clone()
         attempts = 0
@@ -867,21 +867,21 @@ class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
             if delta_n == 1:
                 proposed_config[i] = config_j
                 proposed_config[j] = config_i
-                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
                 proposed_prob = abs(proposed_amp)**2
             elif delta_n == 0:
                 choices = [(0, 3), (3, 0), (config_j, config_i)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
                 proposed_prob = abs(proposed_amp)**2
             elif delta_n == 2:
                 choices = [(config_j, config_i), (1,2), (2,1)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
                 proposed_prob = abs(proposed_amp)**2
             else:
                 raise ValueError("Invalid configuration")

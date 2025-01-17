@@ -48,7 +48,8 @@ class fPEPS(qtn.PEPS):
     def product_bra_state(self, config, reverse=1):
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
-        device = config.device
+        device = list(self.tensors[0].data.blocks.values())[0].device
+        # print(device, list(self.tensors[0].data.blocks.values())[0].device)
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
         if type(config) == numpy.ndarray:
             kwargs = {'like':config, 'dtype':dtype}

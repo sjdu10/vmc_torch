@@ -773,7 +773,7 @@ class fTNModel(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'fPEPS (exact contraction)':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+            f'fPEPS (chi={max_bond})':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
         }
         if max_bond is None or max_bond <= 0:
             max_bond = None
@@ -3061,13 +3061,6 @@ class FFNN(wavefunctionModel):
         
         self.hilbert = hilbert
         self.param_dtype = param_dtype
-        
-        # Initialize the parameter M (N x Nf matrix)
-        self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
-            if kernel_init is not None 
-            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
-        )
 
         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
@@ -3075,6 +3068,7 @@ class FFNN(wavefunctionModel):
             nn.Tanh(),
             nn.Linear(hidden_dim, 1, dtype=self.param_dtype)
         )
+        self.nn.to(self.param_dtype)
 
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
@@ -3086,6 +3080,7 @@ class FFNN(wavefunctionModel):
     def forward(self, n):
         if not type(n) == torch.Tensor:
             n = torch.tensor(n, dtype=self.param_dtype)
+        n = n.to(self.param_dtype)
         # Define the slater determinant function manually to loop over inputs
         def ffnn(n):
             # Compute the backflow matrix F using the neural network
