@@ -49,7 +49,6 @@ class fPEPS(qtn.PEPS):
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
         device = list(self.tensors[0].data.blocks.values())[0].device
-        # print(device, list(self.tensors[0].data.blocks.values())[0].device)
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
         if type(config) == numpy.ndarray:
             kwargs = {'like':config, 'dtype':dtype}
@@ -113,12 +112,15 @@ class fPEPS(qtn.PEPS):
         return product_tn
     
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
-    def get_amp(self, config, inplace=False, conj=True, reverse=1):
+    def get_amp(self, config, inplace=False, conj=True, reverse=1, contract=True):
         """Get the amplitude of a configuration in a PEPS."""
         peps = self if inplace else self.copy()
         product_state = self.product_bra_state(config, reverse=reverse).conj() if conj else self.product_bra_state(config, reverse=reverse)
         
         amp = peps|product_state # ---T---<---|n>
+
+        if not contract:
+            return amp
         
         for site in peps.sites:
             site_tag = peps.site_tag_id.format(*site)

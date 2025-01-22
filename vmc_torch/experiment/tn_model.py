@@ -810,8 +810,7 @@ class fTNModel(wavefunctionModel):
                 if self.tree is None:
                     opt = ctg.ReusableHyperOptimizer()
                     self.tree = amp.contraction_tree(optimize=opt)
-                if self.tree is not None:
-                    amp_val = amp.contract(optimize=self.tree)
+                amp_val = amp.contract(optimize=self.tree)
 
             else:
                 amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
@@ -1294,6 +1293,7 @@ class fTN_backflow_attn_Model(wavefunctionModel):
             max_bond = None
         self.max_bond = max_bond
         self.nn_eta = nn_eta
+        self.tree = None
     
     def amplitude(self, x):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
@@ -1323,11 +1323,15 @@ class fTN_backflow_attn_Model(wavefunctionModel):
 
             if self.max_bond is None:
                 amp = amp
+                if self.tree is None:
+                    opt = ctg.ReusableHyperOptimizer()
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
             else:
                 amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
                 amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp_val = amp.contract()
 
-            amp_val = amp.contract()
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
 
@@ -1610,6 +1614,7 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
             max_bond = None
         self.max_bond = max_bond
         self.nn_eta = nn_eta
+        self.tree = None
     
     def amplitude(self, x):
         tn_nn_params = {}
@@ -1655,11 +1660,15 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
 
             if self.max_bond is None:
                 amp = amp
+                if self.tree is None:
+                    opt = ctg.ReusableHyperOptimizer()
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
             else:
                 amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
                 amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
-
-            amp_val = amp.contract()
+                amp_val = amp.contract()
+                
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
             batch_amps.append(amp_val)
