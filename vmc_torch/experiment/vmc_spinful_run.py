@@ -17,7 +17,7 @@ import autoray as ar
 from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_backflow_attn_Model, fTN_backflow_attn_Jastrow_Model
 from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked, fTN_backflow_attn_Model_boundary, fTN_backflow_Model_embedding
 from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model, fTN_NN_proj_Model, fTN_NN_proj_variable_Model
-from vmc_torch.experiment.tn_model import PureAttention_Model, NeuralBackflow_spinful, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow, HFDS
+from vmc_torch.experiment.tn_model import PureAttention_Model, NeuralBackflow_spinful, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow, HFDS, NNBF
 from vmc_torch.experiment.tn_model import init_weights_to_zero, init_weights_uniform
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
@@ -64,7 +64,7 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(2e3)
+N_samples = int(4e4)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -79,6 +79,7 @@ model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_attn_Jastrow_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
+# model = NNBF(H.hi, param_dtype=dtype, hidden_dim=2*Lx*Ly)
 # model = HFDS(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly, num_hidden_fermions=int(abs(chi))*N_f, jastrow=False)
 init_std = 5e-3
 # seed = 2
@@ -99,6 +100,7 @@ model_names = {
     NeuralBackflow_spinful: 'NeuralBackflow_spinful',
     HFDS: 'HFDS',
     FFNN: 'FFNN',
+    NNBF: 'NNBF',
     NeuralJastrow: 'NeuralJastrow',
 }
 model_name = model_names.get(type(model), 'UnknownModel')
@@ -123,7 +125,7 @@ if init_step != 0:
 
 # Set up optimizer and scheduler
 learning_rate = 1e-1
-scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=5e-3)
+scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-3)
 use_prev_opt = True
 if optimizer_state is not None and use_prev_opt:
     optimizer_name = optimizer_state['optimizer']

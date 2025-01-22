@@ -11,6 +11,7 @@ from quimb.tensor.tensor_2d import Rotator2D, pairwise
 import symmray as sr
 import autoray as ar
 from autoray import do
+import cotengra as ctg
 
 from vmc_torch.fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params, insert_compressor
 from vmc_torch.global_var import DEBUG, set_debug
@@ -778,6 +779,7 @@ class fTNModel(wavefunctionModel):
         if max_bond is None or max_bond <= 0:
             max_bond = None
         self.max_bond = max_bond
+        self.tree = None
 
     
     def amplitude(self, x):
@@ -805,10 +807,17 @@ class fTNModel(wavefunctionModel):
             amp = psi.get_amp(x_i, conj=True)
             if self.max_bond is None:
                 amp = amp
+                if self.tree is None:
+                    opt = ctg.ReusableHyperOptimizer()
+                    self.tree = amp.contraction_tree(optimize=opt)
+                if self.tree is not None:
+                    amp_val = amp.contract(optimize=self.tree)
+
             else:
                 amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
                 amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
-            amp_val = amp.contract()
+                amp_val = amp.contract()
+
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
             batch_amps.append(amp_val)
