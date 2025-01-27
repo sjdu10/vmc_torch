@@ -21,7 +21,7 @@ class PositionwiseFeedForward(nn.Module):
     
 
 class SelfAttn_FFNN_block(nn.Module):
-    def __init__(self, n_site, num_classes, embedding_dim, attention_heads, nn_hidden_dim, output_dim):
+    def __init__(self, n_site, num_classes, embedding_dim, attention_heads, nn_hidden_dim, output_dim, dtype=torch.float32):
         super(SelfAttn_FFNN_block, self).__init__()
         self.num_classes = num_classes
         self.embedding_dim = embedding_dim
@@ -38,10 +38,14 @@ class SelfAttn_FFNN_block(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(nn_hidden_dim, output_dim)
         )
+        self.dtype = dtype
+        self.embedding.to(dtype=dtype)
+        self.self_attention.to(dtype=dtype)
+        self.final_ffn.to(dtype=dtype)
 
     def forward(self, input_seq):
         # Step 1: One-hot encode the input sequence
-        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).float()
+        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(self.dtype)
 
         # Step 2: Embed the one-hot encoded sequence
         embedded = self.embedding(one_hot_encoded)
@@ -62,7 +66,7 @@ class SelfAttn_FFNN_block(nn.Module):
 
 
 class StackedSelfAttn_FFNN(nn.Module):
-    def __init__(self, n_site, num_classes, output_dim, num_attention_blocks=1, embedding_dim=8, d_inner=16, nn_hidden_dim=128, attention_heads=2, dropout=0.0):
+    def __init__(self, n_site, num_classes, output_dim, num_attention_blocks=1, embedding_dim=8, d_inner=16, nn_hidden_dim=128, attention_heads=2, dropout=0.0, dtype=torch.float32):
         super(StackedSelfAttn_FFNN, self).__init__()
         self.num_classes = num_classes
         self.embedding_dim = embedding_dim
@@ -86,10 +90,14 @@ class StackedSelfAttn_FFNN(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(nn_hidden_dim, output_dim)
         )
+        self.dtype = dtype
+        self.embedding.to(dtype=dtype)
+        self.transformer_blocks.to(dtype=dtype)
+        self.final_ffn.to(dtype=dtype)
 
     def forward(self, input_seq):
         # Step 1: One-hot encode the input sequence
-        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).float()
+        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(self.dtype)
 
         # Step 2: Embed the one-hot encoded sequence
         embedded = self.embedding(one_hot_encoded)

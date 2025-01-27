@@ -15,6 +15,7 @@ import cotengra as ctg
 
 from vmc_torch.fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params, insert_compressor
 from vmc_torch.global_var import DEBUG, set_debug
+flatten_tn_params = flatten_proj_params
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -686,7 +687,7 @@ class fMPS_backflow_Model(wavefunctionModel):
         })
         # Define the neural network
         input_dim = ftn.L
-        tn_params_vec = flatten_proj_params(params)
+        tn_params_vec = flatten_tn_params(params)
         layers = []
         current_input_dim = input_dim
         for i in range(num_hidden_layer):
@@ -719,7 +720,88 @@ class fMPS_backflow_Model(wavefunctionModel):
             }
             for tid, blk_array in self.torch_tn_params.items()
         }
-        params_vec = flatten_proj_params(params)
+        params_vec = flatten_tn_params(params)
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+            # Get the NN correction to the parameters
+            nn_correction = self.nn(x_i)
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta*nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            amp_val = amp.contract()
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+class fMPS_backflow_attn_Model(wavefunctionModel):
+
+    def __init__(self, ftn, nn_hidden_dim=128, nn_eta=1e-3, num_attention_blocks=1, embedding_dim=16, attention_heads=4, d_inner=16, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+        # Define the neural network
+        input_dim = ftn.L
+        tn_params_vec = flatten_tn_params(params)
+        phys_dim = ftn.phys_dim()
+        self.nn = StackedSelfAttn_FFNN(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            num_attention_blocks=num_attention_blocks,
+            embedding_dim=embedding_dim,
+            d_inner=d_inner,
+            attention_heads=attention_heads,
+            nn_hidden_dim=nn_hidden_dim,
+            output_dim=tn_params_vec.numel(),
+            dtype=self.param_dtype
+        )
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fMPS_backflow_attn (exact contraction)':{'D': ftn.max_bond(), 'L': ftn.L, 'symmetry': self.symmetry, 'num_attention_blocks': num_attention_blocks, 'embedding_dim': embedding_dim, 'attention_heads': attention_heads, 'd_inner': d_inner},
+        }
+
+        self.nn_eta = nn_eta
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -914,7 +996,7 @@ class fTN_backflow_Model(wavefunctionModel):
 
         # Define the neural network
         input_dim = ftn.Lx * ftn.Ly
-        tn_params_vec = flatten_proj_params(params)
+        tn_params_vec = flatten_tn_params(params)
         layers = []
         current_input_dim = input_dim
         for i in range(num_hidden_layer):
@@ -948,7 +1030,7 @@ class fTN_backflow_Model(wavefunctionModel):
             }
             for tid, blk_array in self.torch_tn_params.items()
         }
-        params_vec = flatten_proj_params(params)
+        params_vec = flatten_tn_params(params)
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -1005,7 +1087,7 @@ class fTN_backflow_Model_embedding(wavefunctionModel):
 
         # Define the neural network
         input_dim = ftn.Lx * ftn.Ly * embedding_dim
-        tn_params_vec = flatten_proj_params(params)
+        tn_params_vec = flatten_tn_params(params)
         layers = []
         current_input_dim = input_dim
         for i in range(num_hidden_layer):
@@ -1039,7 +1121,7 @@ class fTN_backflow_Model_embedding(wavefunctionModel):
             }
             for tid, blk_array in self.torch_tn_params.items()
         }
-        params_vec = flatten_proj_params(params)
+        params_vec = flatten_tn_params(params)
 
         # `x` is expected to be batched as (batch_size, input_dim)
         # One-hot encode the input sequence
@@ -1128,7 +1210,7 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
                     tid: params[tid]
                     for tid in tid_list
                 }
-                block_tn_params_vec = flatten_proj_params(block_tn_params)
+                block_tn_params_vec = flatten_tn_params(block_tn_params)
                 input_dim = Lx * Ly
                 layers = []
                 current_input_dim = input_dim
@@ -1180,7 +1262,7 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
                     }
                     for tid in block_tid_list
                 }
-                block_tn_params_vec = flatten_proj_params(block_tn_params)
+                block_tn_params_vec = flatten_tn_params(block_tn_params)
                 nn_correction = nn(x_i)
                 block_tn_params_vec = block_tn_params_vec + self.nn_eta * nn_correction
                 block_tn_params = reconstruct_proj_params(block_tn_params_vec, block_tn_params)
@@ -1269,7 +1351,7 @@ class fTN_backflow_attn_Model(wavefunctionModel):
         # Define the neural network
         input_dim = ftn.Lx * ftn.Ly
         phys_dim = ftn.phys_dim()
-        tn_params_vec = flatten_proj_params(params)
+        tn_params_vec = flatten_tn_params(params)
         
         self.nn = SelfAttn_FFNN_block(
             n_site=input_dim,
@@ -1277,7 +1359,8 @@ class fTN_backflow_attn_Model(wavefunctionModel):
             embedding_dim=embedding_dim,
             attention_heads=attention_heads,
             nn_hidden_dim=nn_hidden_dim,
-            output_dim=tn_params_vec.numel()
+            output_dim=tn_params_vec.numel(),
+            dtype=self.param_dtype
         )
 
         # Get symmetry
@@ -1304,14 +1387,17 @@ class fTN_backflow_attn_Model(wavefunctionModel):
             }
             for tid, blk_array in self.torch_tn_params.items()
         }
-        params_vec = flatten_proj_params(params)
+        params_vec = flatten_tn_params(params)
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i)
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
             # Get the NN correction to the parameters
             nn_correction = self.nn(x_i)
             # Add the correction to the original parameters
@@ -1360,7 +1446,7 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
         # Define the neural network
         input_dim = ftn.Lx * ftn.Ly
         phys_dim = ftn.phys_dim()
-        tn_params_vec = flatten_proj_params(params)
+        tn_params_vec = flatten_tn_params(params)
         
         self.nn = SelfAttn_FFNN_block(
             n_site=input_dim,
@@ -1402,7 +1488,7 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
             }
             for tid, blk_array in self.torch_tn_params.items()
         }
-        params_vec = flatten_proj_params(params)
+        params_vec = flatten_tn_params(params)
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -1444,7 +1530,7 @@ class fTN_backflow_attn_Model_Stacked(wavefunctionModel):
             ftn, 
             max_bond=None, 
             num_attention_blocks=1, 
-            embedding_dim=32, 
+            embedding_dim=16, 
             d_inner=16, 
             attention_heads=4, 
             nn_hidden_dim=128, 
@@ -1469,7 +1555,7 @@ class fTN_backflow_attn_Model_Stacked(wavefunctionModel):
         # Define the neural network
         input_dim = ftn.Lx * ftn.Ly
         phys_dim = ftn.phys_dim()
-        tn_params_vec = flatten_proj_params(params)
+        tn_params_vec = flatten_tn_params(params)
         
         self.nn = StackedSelfAttn_FFNN(
             n_site=input_dim,
@@ -1517,7 +1603,7 @@ class fTN_backflow_attn_Model_Stacked(wavefunctionModel):
             }
             for tid, blk_array in self.torch_tn_params.items()
         }
-        params_vec = flatten_proj_params(params)
+        params_vec = flatten_tn_params(params)
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -1576,7 +1662,7 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
             tid: params[tid]
             for tid in self.boundary_tid_list
         }
-        boundary_tn_params_vec = flatten_proj_params(boundary_tn_params)
+        boundary_tn_params_vec = flatten_tn_params(boundary_tn_params)
 
         # Define the neural network for the backflow transformation to boundary tensors
         input_dim = ftn.Lx * ftn.Ly
@@ -1588,7 +1674,8 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
             embedding_dim=embedding_dim,
             attention_heads=attention_heads,
             nn_hidden_dim=nn_hidden_dim,
-            output_dim=boundary_tn_params_vec.numel()
+            output_dim=boundary_tn_params_vec.numel(),
+            dtype=self.param_dtype
         )
 
         # Get symmetry
@@ -1625,7 +1712,10 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i)
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
             
             # Get the bulk parameters
             bulk_tn_params = {
@@ -1645,7 +1735,7 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
                 }
                 for tid in self.boundary_tid_list
             }
-            boundary_tn_params_vec = flatten_proj_params(boundary_tn_params)
+            boundary_tn_params_vec = flatten_tn_params(boundary_tn_params)
 
             # Get the NN correction to the boundary parameters
             nn_correction = self.nn(x_i)
@@ -1706,7 +1796,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
         dummy_amp_w_proj = insert_proj_peps(dummy_amp, max_bond=max_bond, yrange=[0, ftn.Ly-2])
         dummy_amp_tn, dummy_proj_tn = dummy_amp_w_proj.partition(tags='proj')
         dummy_proj_params, dummy_proj_skeleton = qtn.pack(dummy_proj_tn)
-        dummy_proj_params_vec = flatten_proj_params(dummy_proj_params)
+        dummy_proj_params_vec = flatten_tn_params(dummy_proj_params)
         self.proj_params_vec_len = len(dummy_proj_params_vec)
 
         # Define an MLP layer (or any other neural network layers)
@@ -1784,7 +1874,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
             amp_w_proj = insert_proj_peps(amp, max_bond=self.max_bond, yrange=[0, psi.Ly-2])
             amp_tn, proj_tn = amp_w_proj.partition(tags='proj')
             proj_params, proj_skeleton = qtn.pack(proj_tn)
-            proj_params_vec = flatten_proj_params(proj_params)
+            proj_params_vec = flatten_tn_params(proj_params)
 
             # Check x_i type
             if not type(x_i) == torch.Tensor:
@@ -1838,7 +1928,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
         dummy_amp_w_proj = insert_proj_peps(dummy_amp, max_bond=max_bond, yrange=[0, ftn.Ly-2], lazy=lazy)
         dummy_amp_tn, dummy_proj_tn = dummy_amp_w_proj.partition(tags='proj')
         dummy_proj_params, dummy_proj_skeleton = qtn.pack(dummy_proj_tn)
-        dummy_proj_params_vec = flatten_proj_params(dummy_proj_params)
+        dummy_proj_params_vec = flatten_tn_params(dummy_proj_params)
         self.proj_params_vec_len = len(dummy_proj_params_vec) + padded_length
 
         # Define an MLP layer (or any other neural network layers)
@@ -1923,7 +2013,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
 
             amp_tn, proj_tn = amp_w_proj.partition(tags='proj')
             proj_params, proj_skeleton = qtn.pack(proj_tn)
-            proj_params_vec = flatten_proj_params(proj_params)
+            proj_params_vec = flatten_tn_params(proj_params)
 
             # Check x_i type
             if not type(x_i) == torch.Tensor:
@@ -1985,7 +2075,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
         dummy_amp_2row = dummy_amp.contract_boundary_from_ymin(max_bond=max_bond, cutoff=0.0, yrange=[0, ftn.Ly//2-1])
         dummy_amp_2row = dummy_amp_2row.contract_boundary_from_ymax(max_bond=max_bond, cutoff=0.0, yrange=[ftn.Ly//2, ftn.Ly-1])
         dummy_2row_params, dummy_2row_skeleton = qtn.pack(dummy_amp_2row)
-        dummy_2row_params_vec = flatten_proj_params(dummy_2row_params)
+        dummy_2row_params_vec = flatten_tn_params(dummy_2row_params)
         self.tworow_params_vec_len = len(dummy_2row_params_vec)
 
         # Define an MLP layer (or any other neural network layers)
@@ -2063,7 +2153,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
             amp_2row = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
             amp_2row = amp_2row.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
             amp_2row_params, amp_2row_skeleton = qtn.pack(amp_2row)
-            amp_2row_params_vec = flatten_proj_params(amp_2row_params)
+            amp_2row_params_vec = flatten_tn_params(amp_2row_params)
             
             # Check x_i type
             if not type(x_i) == torch.Tensor:
@@ -2272,7 +2362,7 @@ class fTN_Transformer_Model(torch.nn.Module):
             amp_2row = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
             amp_2row = amp_2row.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
             amp_2row_params, amp_2row_skeleton = qtn.pack(amp_2row)
-            amp_2row_params_vec = flatten_proj_params(amp_2row_params)
+            amp_2row_params_vec = flatten_tn_params(amp_2row_params)
             
             # Check x_i type
             if not type(x_i) == torch.Tensor:
@@ -2431,7 +2521,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
             
             amp_tn, proj_tn = amp_w_proj.partition(tags='proj')
             proj_params, proj_skeleton = qtn.pack(proj_tn)
-            proj_params_vec = flatten_proj_params(proj_params)
+            proj_params_vec = flatten_tn_params(proj_params)
             
             # Check x_i type
             if not type(x_i) == torch.Tensor:
@@ -2581,7 +2671,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
     def add_transformer_values(self, proj_tn, x_i):
         """Obtain the new amplitude with projectors TN by adding the output of the transformer to the projectors."""
         proj_params, proj_skeleton = qtn.pack(proj_tn)
-        proj_params_vec = flatten_proj_params(proj_params)
+        proj_params_vec = flatten_tn_params(proj_params)
 
         # Check x_i type
         if not type(x_i) == torch.Tensor:

@@ -12,9 +12,8 @@ torch.autograd.set_detect_anomaly(False)
 # quimb
 import autoray as ar
 
-from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_TNFModel
-from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model
-from vmc_torch.experiment.tn_model import init_weights_to_zero
+from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_TNFModel, fMPS_backflow_attn_Model
+from vmc_torch.experiment.tn_model import init_weights_to_zero, init_weights_uniform
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SR, Adam, SGD_momentum, DecayScheduler
@@ -36,7 +35,7 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(6)
+L = int(8)
 symmetry = 'Z2'
 U = 8.0
 N_f = int(L)
@@ -49,44 +48,44 @@ quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t_mean, U, mu=0.0, pbc=False, s
 graph = H.graph
 # TN parameters
 D = 4
-chi = 4
+chi = -1
 dtype=torch.float64
 
 # Create random fMPS
-mps, _ = generate_random_fmps(L=L, D=D, seed=seed, Nf=N_f, cyclic=False, spinless=False, symmetry=symmetry)
+mps, _ = generate_random_fmps(L=L, D=D, seed=seed, Nf=N_f, cyclic=True, spinless=False, symmetry=symmetry)
 tnf_depth = 4
 tnf_init_tau = 0.1
-fmps_tnf = form_gated_fmps_tnf(fmps=mps, ham=quimb_ham, depth=tnf_depth, tau=tnf_init_tau)
-fmps_tnf.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
+# fmps_tnf = form_gated_fmps_tnf(fmps=mps, ham=quimb_ham, depth=tnf_depth, tau=tnf_init_tau)
+# fmps_tnf.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 # # randomize the mps tensors
 # mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e4)
+N_samples = int(15000)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 # model = fMPSModel(mps, dtype=dtype)
-model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
+# model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
+model = fMPS_backflow_attn_Model(mps, embedding_dim=16, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*L, dtype=dtype)
 # model = fMPS_TNFModel(fmps_tnf, dtype=dtype, max_bond=chi, direction='y')
-init_std = 5e-2
-model.apply(lambda x: init_weights_to_zero(x, std=init_std))
+init_std = 5e-3
+model.apply(lambda x: init_weights_uniform(x, a=-init_std, b=init_std))
 
 model_names = {
     fMPSModel: 'fMPS',
     fMPS_backflow_Model: 'fMPS_backflow',
-    fTN_backflow_Model: 'fTN_backflow',
-    fTN_backflow_attn_Model: 'fTN_backflow_attn',
+    fMPS_backflow_attn_Model: 'fMPS_backflow_attn',
     fMPS_TNFModel: f'fMPS_TNF_depth{tnf_depth}_tau{tnf_init_tau}',
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 0
-final_step = 50
+init_step = 301
+final_step = 350
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
@@ -100,7 +99,7 @@ if init_step != 0:
     optimizer_state = saved_model_params.get('optimizer_state', None)
 
 # Set up optimizer and scheduler
-learning_rate = 1e-1
+learning_rate = 5e-2
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-3)
 optimizer_state = None
 use_prev_opt = True
@@ -152,7 +151,7 @@ if __name__ == "__main__":
         print(f'Model initialized with mean=0, std={init_std}')
         print(f'Learning rate: {learning_rate}')
         print(f'Sample size: {N_samples}')
-        print(f'fMPS TNF Lx: {tnf_depth+1}, init_tau: {tnf_init_tau}')
+        # print(f'fMPS TNF Lx: {tnf_depth+1}, init_tau: {tnf_init_tau}')
         print(f'Contraction max bond: {chi}')
         print(f'Symmetry: {symmetry}')
         try:
@@ -174,7 +173,7 @@ if __name__ == "__main__":
         print(f'Model initialized with mean=0, std={init_std}')
         print(f'Learning rate: {learning_rate}')
         print(f'Sample size: {N_samples}')
-        print(f'fMPS TNF Lx: {tnf_depth+1}, init_tau: {tnf_init_tau}')
+        # print(f'fMPS TNF Lx: {tnf_depth+1}, init_tau: {tnf_init_tau}')
         print(f'Contraction max bond: {chi}')
         print(f'Symmetry: {symmetry}')
 

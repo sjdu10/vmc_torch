@@ -146,12 +146,9 @@ class MetropolisExchangeSampler(Sampler):
             while psi_sigma == 0:
                 # We need to make sure that the amplitude is not zero
                 sigma, psi_sigma = self._sample_next(vstate)
-
-            time1 = MPI.Wtime()
+                    
             n += 1
-            if RANK == 0:
-                pbar.set_postfix({'Time per sample for each rank': (time1 - time0)})
-
+        
             # compute local energy and amplitude gradient
             psi_sigma = vstate.amplitude(sigma)
             # compute the connected non-zero operator matrix elements <eta|O|sigma>
@@ -173,6 +170,10 @@ class MetropolisExchangeSampler(Sampler):
             op_loc_mean_prev = op_loc_mean
             op_loc_mean += (op_loc - op_loc_mean) / n
             op_loc_M2 += (op_loc - op_loc_mean_prev) * (op_loc - op_loc_mean)
+
+            time1 = MPI.Wtime()
+            if RANK == 0:
+                pbar.set_postfix({'Time per sample for each rank': (time1 - time0)})
 
             # update the sample variance
             if n > 1:

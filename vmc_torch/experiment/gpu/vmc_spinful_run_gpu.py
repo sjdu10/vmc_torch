@@ -42,7 +42,7 @@ RANK = COMM.Get_rank()
 # Hamiltonian parameters
 Lx = int(4)
 Ly = int(16)
-symmetry = 'U1'
+symmetry = 'Z2'
 t = 1.0
 U = 8.0
 N_f = int(Lx*Ly-8)
@@ -51,7 +51,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = 4
+chi = -1
 dtype=torch.float64
 
 # # Load PEPS
