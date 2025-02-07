@@ -19,10 +19,10 @@
     --- fMPS [x]
     --- Netket, quimb Hamiltonian [x]
     --- Fully-connected random hopping Hubbard model (arXiv:2311.05749) that demonstrate volume-law, and expensive for DMRG (MPS). Try fTNF. [? hard to optimize]
-    --- SYK model, hard even for HFDS (arXiv:2411.04527), what about for fMPS+NN+attention? Or for TNF? [ ]
+    --- SYK model, hard even for HFDS (arXiv:2411.04527), what about for fMPS+NN+attention? Or for TNF? [...]
 
 8. Implement NNBF [x]
-9. Implement HFDS [ ]
+9. Implement HFDS [x]
 
 # Numerics TODO:
 1. check 4x2 doped calculation. Compare fPEPS and fPEPS+NN
@@ -30,13 +30,21 @@
     --- z2 [x for D=4]
 2. check 4x4 calculation
     --- half-filling
-        --- u1
-        --- z2
+        --- u1 x
+        --- z2 x
 
     --- doped filling
-        --- u1
-        --- z2
-3. VMC training details:
+        --- u1 x
+        --- z2 x
+
+3. check 6x6 calculation
+    --- doped filling
+        --- z2:
+                1. D=4 (hpc)
+                2. D=6 (hpc)
+                3. D=8 (NERSC)
+
+4. VMC training details:
     --- For Z2 calculation, must make sure a proper chemical potential \mu is used in SU, so that the initial TNS has major amplitude weight
     in the target quantum number sector (e.g. particle number in our case). This is very important as we want the tensor values in the TN to
     mainly contribute to amplitude of configuration with fixed particle number, instead of other unrelavant configuration amplitudes. If we
@@ -80,9 +88,6 @@
 3. Add Jastrow factor. [x] need to test effect
 4. Check SWO fitting for fMPS+backflow  D=4 [x]
 5. Check extended fermionc PEPS ansatz. [ ]
-
-
-
 
 
 # Volume-law TNF: (HFDS and DMRG benchmarks: arXiv:2311.05749 & arXiv:2411.04527)

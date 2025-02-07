@@ -46,7 +46,7 @@ symmetry = 'Z2'
 t = 1.0
 U = 8.0
 # N_f = int(Lx*Ly-8)
-N_f = 12
+N_f = int(Lx*Ly-4)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
@@ -70,13 +70,13 @@ N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fTNModel(peps, max_bond=chi, dtype=dtype)
-# model = fTNModel_test(peps, max_bond=chi, dtype=dtype)
+nn_hidden_dim = Lx*Ly
+# model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
+model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_eta=1.0, nn_hidden_dim=nn_hidden_dim, dtype=dtype)
 # model = fTN_backflow_attn_Jastrow_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
@@ -86,13 +86,13 @@ init_std = 5e-3
 # seed = 2
 # torch.manual_seed(seed)
 # model.apply(lambda x: init_weights_to_zero(x, std=init_std))
-# model.apply(lambda x: init_weights_uniform(x, a=-5e-3, b=5e-3))
+model.apply(lambda x: init_weights_uniform(x, a=-5e-3, b=5e-3))
 
 model_names = {
     fTNModel: 'fTN',
     fTN_backflow_Model: 'fTN_backflow',
     fTN_backflow_Model_embedding: 'fTN_backflow_embedding',
-    fTN_backflow_attn_Model: 'fTN_backflow_attn',
+    fTN_backflow_attn_Model: f'fTN_backflow_attn_Nh={nn_hidden_dim}',
     fTN_backflow_attn_Jastrow_Model: 'fTN_backflow_attn_Jastrow',
     fTN_backflow_attn_Model_boundary: 'fTN_backflow_attn_boundary',
     PureAttention_Model: 'PureAttention',

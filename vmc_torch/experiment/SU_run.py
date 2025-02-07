@@ -1,15 +1,10 @@
-import os
-os.environ["NUMBA_NUM_THREADS"] = "20"
+# import os
+# os.environ["NUMBA_NUM_THREADS"] = "20"
 
 import netket as nk
 import netket.experimental as nkx
-import netket.nn as nknn
 
 from math import pi
-
-from netket.experimental.operator.fermion import destroy as c
-from netket.experimental.operator.fermion import create as cdag
-from netket.experimental.operator.fermion import number as nc
 
 from vmc_torch.fermion_utils import generate_random_fpeps
 import quimb.tensor as qtn
@@ -17,28 +12,30 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-L = 4  # Side of the square
-Lx = int(L)
-Ly = int(L)
+Lx = 6
+Ly = 6
+spinless = False
 # graph = nk.graph.Square(L)
 graph = nk.graph.Grid([Lx,Ly], pbc=False)
 N = graph.n_nodes
 
-
 # Define the fermion filling and the Hilbert space
-N_f = int(Lx*Ly/2)-2
-hi = nkx.hilbert.SpinOrbitalFermions(N, s=None, n_fermions=N_f)
+N_f = int(Lx*Ly-4)
+n_fermions_per_spin = (N_f//2, N_f//2)
+hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_per_spin)
 
 
-# Define the Hubbard Hamiltonian
-t = 1.0
-V = 1.0
-mu = 0.0
+# # Define the Hubbard Hamiltonian
+# t = 1.0
+# U = 8.0
+# mu = 0.0
 
-H = 0.0
-for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
-    H -= t * (cdag(hi,i) * c(hi,j) + cdag(hi,j) * c(hi,i))
-    H += V * nc(hi,i) * nc(hi,j)
+# H = 0.0
+# for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
+#     for spin in (1,-1):
+#         H -= t * (cdag(hi,i,spin) * c(hi,j,spin) + cdag(hi,j,spin) * c(hi,i,spin))
+# for i in graph.nodes():
+#     H += U * nc(hi,i,+1) * nc(hi,i,-1)
 
 
 # # Exact diagonalization of the Hamiltonian for benchmark
@@ -50,23 +47,40 @@ for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
 
 
 # SU in quimb
-D = 4
+D = 6
 seed = 2
 symmetry = 'Z2'
-peps, parity_config = generate_random_fpeps(Lx, Ly, D, seed, symmetry, Nf=N_f)
-
-edges = qtn.edges_2d_square(Lx, Ly)
-site_info = sr.utils.parse_edges_to_site_info(
+spinless = False
+peps = generate_random_fpeps(Lx, Ly, D=D, seed=2, symmetry=symmetry, Nf=N_f, spinless=spinless)[0]
+edges = qtn.edges_2d_square(Lx, Ly, cyclic=False)
+try:
+    parse_edges_to_site_info = sr.utils.parse_edges_to_site_info
+except AttributeError:
+    parse_edges_to_site_info = sr.parse_edges_to_site_info
+site_info = parse_edges_to_site_info(
     edges,
     D,
-    phys_dim=2,
+    phys_dim=4,
     site_ind_id="k{},{}",
     site_tag_id="I{},{}",
 )
 
+t = 1.0
+U = 8.0
+if N_f == int(Lx*Ly-2) or N_f == int(Lx*Ly-8):
+    mu = 0.0 if symmetry == 'U1' else (U*N_f/(2*N)-2.42)#(U*N_f/(2*N)-2.3)
+elif N_f == int(Lx*Ly):
+    mu = 0.0 if symmetry == 'U1' else (U/2)
+elif N_f == int(Lx*Ly-4):
+    mu = 0.0 if symmetry == 'U1' else (U*N_f/(2*N)-2.46)
+else:
+    mu = 0.0
+
+print(mu)
+
 terms = {
-    (sitea, siteb): sr.fermi_hubbard_spinless_local_array(
-        t=t, V=V, mu=mu,
+    (sitea, siteb): sr.fermi_hubbard_local_array(
+        t=t, U=U, mu=mu,
         symmetry=symmetry,
         coordinations=(
             site_info[sitea]['coordination'],
@@ -75,15 +89,24 @@ terms = {
     )
     for (sitea, siteb) in peps.gen_bond_coos()
 }
+N_terms = {
+    site: sr.fermi_number_operator_spinful_local_array(
+        symmetry=symmetry
+    )
+    for site in peps.gen_site_coos()
+}
+occ_fn = lambda su: print(f'N per site:{su.get_state().compute_local_expectation(N_terms, normalized=True, max_bond=64,)/N}') if su.n%50==0 else None
+
 ham = qtn.LocalHam2D(Lx, Ly, terms)
-su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True,D=D, compute_energy_opts={"max_distance":1}, gate_opts={'cutoff':1e-12})
+
+su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True, D=D, compute_energy_opts={"max_distance":1}, gate_opts={'cutoff':1e-12}, callback=occ_fn)
 
 # cluster energies may not be accuracte yet
 su.evolve(50, tau=0.3)
-# su.evolve(50, tau=0.1)
-# su.evolve(100, tau=0.03)
-# su.evolve(100, tau=0.01)
-# su.evolve(100, tau=0.003)
+su.evolve(50, tau=0.1)
+# su.evolve(50, tau=0.03)
+# # su.evolve(50, tau=0.01)
+# # su.evolve(50, tau=0.003)
 
 peps = su.get_state()
 peps.equalize_norms_(value=1)
@@ -92,12 +115,10 @@ peps.equalize_norms_(value=1)
 params, skeleton = qtn.pack(peps)
 
 import os
-os.makedirs(f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
+os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
 
-with open(f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
+with open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
     pickle.dump(skeleton, f)
-with open(f'../data/{Lx}x{Ly}/t={t}_V={V}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
+with open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
     pickle.dump(params, f)
     
-
-

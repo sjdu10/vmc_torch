@@ -12,7 +12,7 @@ torch.autograd.set_detect_anomaly(False)
 # quimb
 import autoray as ar
 
-from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_TNFModel, fMPS_backflow_attn_Model
+from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_TNFModel, fMPS_backflow_attn_Model, HFDS
 from vmc_torch.experiment.tn_model import init_weights_to_zero, init_weights_uniform
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
@@ -42,13 +42,13 @@ N_f = int(L)
 n_fermions_per_spin = (N_f//2, N_f//2)
 t_mean = 0.0
 t_std = 1.0
-seed = 2
+seed = 1
 H = spinful_random_Hubbard_chain(L, t_mean, t_std, U, N_f, n_fermions_per_spin=n_fermions_per_spin, seed=seed)
 quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t_mean, U, mu=0.0, pbc=False, symmetry=symmetry)
 graph = H.graph
 # TN parameters
-D = 4
-chi = -1
+D = 6
+chi = -2
 dtype=torch.float64
 
 # Create random fMPS
@@ -63,7 +63,7 @@ mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(15000)
+N_samples = int(12000)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -71,6 +71,9 @@ if (N_samples/SIZE)%2 != 0:
 # model = fMPSModel(mps, dtype=dtype)
 # model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
 model = fMPS_backflow_attn_Model(mps, embedding_dim=16, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*L, dtype=dtype)
+
+num_hidden_fermions = N_f
+# model = HFDS(hilbert=H.hi, param_dtype=dtype, hidden_dim=2*L, num_hidden_fermions=num_hidden_fermions)
 # model = fMPS_TNFModel(fmps_tnf, dtype=dtype, max_bond=chi, direction='y')
 init_std = 5e-3
 model.apply(lambda x: init_weights_uniform(x, a=-init_std, b=init_std))
@@ -80,12 +83,13 @@ model_names = {
     fMPS_backflow_Model: 'fMPS_backflow',
     fMPS_backflow_attn_Model: 'fMPS_backflow_attn',
     fMPS_TNFModel: f'fMPS_TNF_depth{tnf_depth}_tau{tnf_init_tau}',
+    HFDS: f'HFDS_Nhf={num_hidden_fermions}'
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 301
-final_step = 350
+init_step = 0
+final_step = 500
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:

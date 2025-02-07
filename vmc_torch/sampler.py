@@ -16,7 +16,7 @@ from autoray import do
 import jax
 import random
 
-from .global_var import DEBUG, set_debug, TIME_PROFILING
+from .global_var import DEBUG, set_debug, TIME_PROFILING, TAG_OFFSET
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -235,13 +235,13 @@ class MetropolisExchangeSampler(Sampler):
                 pbar.update(1)
             
             # Discard messages from previous steps
-            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
-                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
+                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
             
             while not terminate:
                 # Receive the local sample count from each rank
-                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2))
+                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
                 dest_rank = buf[0]
                 n_total += 1
                 pbar.update(1)
@@ -265,7 +265,7 @@ class MetropolisExchangeSampler(Sampler):
 
                 buf = (RANK,)
                 # Send the local sample count to rank 0
-                COMM.send(buf, dest=0, tag=message_tag+np.sqrt(2))
+                COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
                 terminate = COMM.recv(source=0, tag=message_tag+1)
 
@@ -422,13 +422,13 @@ class MetropolisExchangeSampler(Sampler):
                 pbar.update(1)
             
             # Discard messages from previous steps
-            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
-                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
+                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
             
             while not terminate:
                 # Receive the local sample count from each rank
-                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2))
+                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
                 dest_rank = buf[0]
                 n_total += 1
                 pbar.update(1)
@@ -457,7 +457,7 @@ class MetropolisExchangeSampler(Sampler):
 
                 buf = (RANK,)
                 # Send the local sample count to rank 0
-                COMM.send(buf, dest=0, tag=message_tag+np.sqrt(2))
+                COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
                 terminate = COMM.recv(source=0, tag=message_tag+1)
 
@@ -609,13 +609,13 @@ class MetropolisExchangeSampler(Sampler):
                 pbar.update(1)
             
             # Discard messages from previous steps
-            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
-                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
+                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
             
             while not terminate:
                 # Receive the local sample count from each rank
-                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2))
+                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
                 dest_rank = buf[0]
                 n_total += 1
                 pbar.update(1)
@@ -646,7 +646,7 @@ class MetropolisExchangeSampler(Sampler):
 
                 buf = (RANK,)
                 # Send the local sample count to rank 0
-                COMM.send(buf, dest=0, tag=message_tag+np.sqrt(2))
+                COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
                 terminate = COMM.recv(source=0, tag=message_tag+1)
             
@@ -718,13 +718,13 @@ class MetropolisExchangeSampler(Sampler):
                 pbar.update(1)
             
             # Discard messages from previous steps
-            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1):
-                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2)-1)
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
+                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
             
             while not terminate:
                 # Receive the local sample count from each rank
-                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+np.sqrt(2))
+                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
                 dest_rank = buf[0]
                 n_total += 1
                 pbar.update(1)
@@ -759,7 +759,7 @@ class MetropolisExchangeSampler(Sampler):
 
                 buf = (RANK,)
                 # Send the local sample count to rank 0
-                COMM.send(buf, dest=0, tag=message_tag+np.sqrt(2))
+                COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
                 terminate = COMM.recv(source=0, tag=message_tag+1)
             
