@@ -15,8 +15,7 @@ import quimb.tensor as qtn
 import autoray as ar
 
 from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_backflow_attn_Model, fTN_backflow_attn_Jastrow_Model
-from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked, fTN_backflow_attn_Model_boundary, fTN_backflow_Model_embedding
-from vmc_torch.experiment.tn_model import fTN_Transformer_Model, fTN_Transformer_Proj_Model, fTN_Transformer_Proj_lazy_Model, fTN_NN_proj_Model, fTN_NN_proj_variable_Model
+from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked, fTN_backflow_attn_Model_boundary, fTN_backflow_Model_embedding, fTN_backflow_attn_Tensorwise_Model
 from vmc_torch.experiment.tn_model import PureAttention_Model, NeuralBackflow_spinful, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow, HFDS, NNBF
 from vmc_torch.experiment.tn_model import init_weights_to_zero, init_weights_uniform
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
@@ -40,18 +39,18 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-Lx = int(6)
-Ly = int(6)
+Lx = int(4)
+Ly = int(2)
 symmetry = 'Z2'
 t = 1.0
 U = 8.0
 # N_f = int(Lx*Ly-8)
-N_f = int(Lx*Ly-4)
+N_f = int(Lx*Ly-2)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 6
+D = 4
 chi = -1
 dtype=torch.float64
 
@@ -65,18 +64,19 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e2)
+N_samples = int(15000)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 nn_hidden_dim = Lx*Ly
 # model = fTNModel(peps, max_bond=chi, dtype=dtype)
+model = fTN_backflow_attn_Tensorwise_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_hidden_dim=int(Lx*Ly), nn_final_dim=4, nn_eta=1.0, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
-model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_eta=1.0, nn_hidden_dim=nn_hidden_dim, dtype=dtype)
+# model = fTN_backflow_attn_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_eta=1.0, nn_hidden_dim=nn_hidden_dim, dtype=dtype)
 # model = fTN_backflow_attn_Jastrow_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
@@ -93,8 +93,10 @@ model_names = {
     fTN_backflow_Model: 'fTN_backflow',
     fTN_backflow_Model_embedding: 'fTN_backflow_embedding',
     fTN_backflow_attn_Model: f'fTN_backflow_attn_Nh={nn_hidden_dim}',
+    fTN_backflow_attn_Tensorwise_Model: 'fTN_backflow_attn_Tensorwise',
     fTN_backflow_attn_Jastrow_Model: 'fTN_backflow_attn_Jastrow',
     fTN_backflow_attn_Model_boundary: 'fTN_backflow_attn_boundary',
+    fTN_backflow_Model_Blockwise: 'fTN_backflow_blockwise',
     PureAttention_Model: 'PureAttention',
     SlaterDeterminant: 'SlaterDeterminant',
     NeuralBackflow: 'NeuralBackflow',

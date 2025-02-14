@@ -80,7 +80,17 @@
     Error:      Operation now in progress (115)
     --------------------------------------------------------------------------
 
-# Ideas
+
+# To-do:
+1. Write the tensor-wise fPEPS+NN ansatz, test for 4x2 on my own pc. [x]
+
+2. Test the MINRES for artificial low-rank matrix A for A|x>=b problem. [x]
+    - assume A=|x><x|. b=|x>, where |x> has dimension N>1, and <x|x>=1.
+    - Obviously the set of solution should be |x>+|othogonal>, where <x|othogonal>=0. 
+    - The minimum-norm solution is |x>. MINRES converges to |x> since we start with |0>.
+    - if A1 = A + \epsilon*I, then the minimum-norm solution would be 1/(1+\epsilon) * |x>, which does not differ much from |x>.
+
+# Ideas:
 
 # TN+NN:
 1. 2D Hubbard model various bond dimension D [...]
