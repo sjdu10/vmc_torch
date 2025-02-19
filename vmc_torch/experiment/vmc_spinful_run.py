@@ -14,10 +14,7 @@ torch.autograd.set_detect_anomaly(False)
 import quimb.tensor as qtn
 import autoray as ar
 
-from vmc_torch.experiment.tn_model import fTNModel, fTNModel_test, fTN_backflow_attn_Model, fTN_backflow_attn_Jastrow_Model
-from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_Model_Blockwise, fTN_backflow_attn_Model_Stacked, fTN_backflow_attn_Model_boundary, fTN_backflow_Model_embedding, fTN_backflow_attn_Tensorwise_Model
-from vmc_torch.experiment.tn_model import PureAttention_Model, NeuralBackflow_spinful, SlaterDeterminant, NeuralBackflow, FFNN, NeuralJastrow, HFDS, NNBF
-from vmc_torch.experiment.tn_model import init_weights_to_zero, init_weights_uniform
+from vmc_torch.experiment.tn_model import *
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPreconditioner, Adam, SGD_momentum, DecayScheduler
@@ -71,7 +68,8 @@ if (N_samples/SIZE)%2 != 0:
 
 nn_hidden_dim = Lx*Ly
 # model = fTNModel(peps, max_bond=chi, dtype=dtype)
-model = fTN_backflow_attn_Tensorwise_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_hidden_dim=int(Lx*Ly), nn_final_dim=4, nn_eta=1.0, dtype=dtype)
+# model = fTN_backflow_attn_Tensorwise_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=dtype)
+# model = fTN_backflow_attn_Tensorwise_Model_v1(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_Model_embedding(peps, max_bond=chi, nn_eta=1.0, embedding_dim=8, num_hidden_layer=1, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = PureAttention_Model(phys_dim=4, n_site=Lx*Ly, num_attention_blocks=1, embedding_dim=8, attention_heads=4, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
@@ -80,7 +78,7 @@ model = fTN_backflow_attn_Tensorwise_Model(peps, max_bond=chi, embedding_dim=16,
 # model = fTN_backflow_attn_Jastrow_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
-# model = NNBF(H.hi, param_dtype=dtype, hidden_dim=2*Lx*Ly)
+model = NNBF(H.hi, param_dtype=dtype, hidden_dim=2*Lx*Ly)
 # model = HFDS(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly, num_hidden_fermions=int(abs(chi))*N_f, jastrow=False)
 init_std = 5e-3
 # seed = 2
@@ -94,6 +92,7 @@ model_names = {
     fTN_backflow_Model_embedding: 'fTN_backflow_embedding',
     fTN_backflow_attn_Model: f'fTN_backflow_attn_Nh={nn_hidden_dim}',
     fTN_backflow_attn_Tensorwise_Model: 'fTN_backflow_attn_Tensorwise',
+    fTN_backflow_attn_Tensorwise_Model_v1: 'fTN_backflow_attn_Tensorwise_v1',
     fTN_backflow_attn_Jastrow_Model: 'fTN_backflow_attn_Jastrow',
     fTN_backflow_attn_Model_boundary: 'fTN_backflow_attn_boundary',
     fTN_backflow_Model_Blockwise: 'fTN_backflow_blockwise',
