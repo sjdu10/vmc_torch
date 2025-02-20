@@ -37,6 +37,39 @@ try:
 except:
     parse_edges_to_site_info = sr.parse_edges_to_site_info
 
+def u1arr_to_z2arr(u1array):
+    """
+    Convert a FermionicArray with U1 symmetry to a FermionicArray with Z2 symmetry
+    """
+    def u1ind_to_z2indmap(u1indices):
+        index_maps = []
+        for blockind in u1indices:
+            index_map = {}
+            indicator = 0 #max value=blocind.size_total-1
+            for c, dim in blockind.chargemap.items():
+                for i in range(indicator, indicator+dim):
+                    index_map[i]=int(c%2)
+                indicator+=dim
+            index_maps.append(index_map)
+        return index_maps
+    
+    u1indices = u1array.indices
+    u1charge = u1array.charge
+    u1oddpos = u1array.oddpos
+    u1duals = u1array.duals
+    index_maps = u1ind_to_z2indmap(u1indices)
+    z2array=sr.Z2FermionicArray.from_dense(u1array.to_dense(), index_maps=index_maps, duals=u1duals, charge=u1charge%2, oddpos=u1oddpos)
+    return z2array
+
+def u1peps_to_z2peps(peps):
+    """
+    Convert a PEPS with U1 symmetry to a PEPS with Z2 symmetry
+    """
+    pepsu1 = peps.copy()
+    for ts in pepsu1.tensors:
+        ts.modify(data=u1arr_to_z2arr(ts.data))
+    return pepsu1.copy()
+
 #------Amplitude Calculation------
 
 class fPEPS(qtn.PEPS):
