@@ -81,11 +81,11 @@ class fPEPS(qtn.PEPS):
     def product_bra_state(self, config, reverse=1):
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
-        device = list(self.tensors[0].data.blocks.values())[0].device
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
         if type(config) == numpy.ndarray:
             kwargs = {'like':config, 'dtype':dtype}
         elif type(config) == torch.Tensor:
+            device = list(self.tensors[0].data.blocks.values())[0].device
             kwargs = {'like':config, 'device':device, 'dtype':dtype}
         if self.spinless:
             index_map = {0: 0, 1: 1}
