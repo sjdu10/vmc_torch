@@ -37,7 +37,7 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 Lx = int(4)
-Ly = int(2)
+Ly = int(4)
 symmetry = 'Z2'
 t = 1.0
 U = 8.0
@@ -48,7 +48,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = -20
 dtype=torch.float64
 
 # # Load PEPS
@@ -67,7 +67,7 @@ if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 nn_hidden_dim = Lx*Ly
-# model = fTNModel(peps, max_bond=chi, dtype=dtype)
+model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_attn_Tensorwise_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=dtype)
 # model = fTN_backflow_attn_Tensorwise_Model_v1(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
@@ -78,7 +78,7 @@ nn_hidden_dim = Lx*Ly
 # model = fTN_backflow_attn_Jastrow_Model(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = fTN_backflow_attn_Model_boundary(peps, max_bond=chi, embedding_dim=8, attention_heads=4, nn_eta=1.0, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
 # model = NeuralBackflow_spinful(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly)
-model = NNBF(H.hi, param_dtype=dtype, hidden_dim=2*Lx*Ly)
+# model = NNBF(H.hi, param_dtype=dtype, hidden_dim=2*Lx*Ly)
 # model = HFDS(H.hi, param_dtype=dtype, hidden_dim=4*Lx*Ly, num_hidden_fermions=int(abs(chi))*N_f, jastrow=False)
 init_std = 5e-3
 # seed = 2

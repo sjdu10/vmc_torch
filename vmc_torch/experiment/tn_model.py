@@ -692,8 +692,7 @@ class fMPS_backflow_Model(wavefunctionModel):
         current_input_dim = input_dim
         for i in range(num_hidden_layer):
             layers.append(nn.Linear(current_input_dim, nn_hidden_dim))
-            # layers.append(nn.LeakyReLU())
-            layers.append(nn.Tanh())
+            layers.append(nn.LeakyReLU())
             current_input_dim = nn_hidden_dim
         layers.append(nn.Linear(current_input_dim, tn_params_vec.numel()))
         self.nn = nn.Sequential(*layers)
@@ -828,7 +827,110 @@ class fMPS_backflow_attn_Model(wavefunctionModel):
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
+
+class fMPS_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
+    def __init__(self, ftn, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
         
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the shared attention block
+        input_dim = ftn.L
+        phys_dim = ftn.phys_dim()
+        self.attention_block = SelfAttn_block(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embedding_dim=embedding_dim,
+            attention_heads=attention_heads,
+            dtype=self.param_dtype
+        )
+
+        # Define site-wise MLPs
+        self.mlp = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            tn_params_dict = {
+                tid: params[int(tid)]
+            }
+            tn_params_vec = flatten_tn_params(tn_params_dict)
+            self.mlp[tid] = nn.Sequential(
+                nn.Linear(input_dim * embedding_dim, nn_final_dim),
+                nn.LeakyReLU(),
+                nn.Linear(nn_final_dim, tn_params_vec.numel()),
+            )
+            self.mlp[tid].to(self.param_dtype)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fMPS_backflow_attn_Tensorwise': {
+                'D': ftn.max_bond(),
+                'L': ftn.L,
+                'symmetry': self.symmetry,
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta,
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+            },
+        }
+        self.nn_eta = nn_eta
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+        
+            # Get the shared attention features
+            nn_features = self.attention_block(x_i)
+            nn_features_vec = nn_features.view(-1)
+            
+            # Get the NN correction to the parameters, concatenate the results for each tensor
+            nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta * nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            amp_val = amp.contract()
+            if amp_val == 0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
 
 #------------ fermionic PEPS based model ------------
 
@@ -1758,7 +1860,7 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
                 if self.tree is None:
                     opt = ctg.ReusableHyperOptimizer()
                     self.tree = amp.contraction_tree(optimize=opt)
-                amp_val = amp.contract(optimize=self.tree)
+                    amp_val = amp.contract(optimize=self.tree)
             else:
                 amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
                 amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
@@ -1931,7 +2033,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             tn_params_vec = flatten_tn_params(tn_params_dict)
             self.mlp[tid] = nn.Sequential(
                 nn.Linear(mlp_input_dim, nn_final_dim),
-                nn.ReLU(),
+                nn.LeakyReLU(),
                 nn.Linear(nn_final_dim, tn_params_vec.numel()),
             )
             self.mlp[tid].to(self.param_dtype)
@@ -2049,7 +2151,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
         # Define an MLP layer (or any other neural network layers)
         self.mlp = nn.Sequential(
             nn.Linear(ftn.nsites, nn_hidden_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(nn_hidden_dim, self.proj_params_vec_len)
         )
 
@@ -2181,7 +2283,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
         # Define an MLP layer (or any other neural network layers)
         self.mlp = nn.Sequential(
             nn.Linear(ftn.nsites, nn_hidden_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(nn_hidden_dim, self.proj_params_vec_len)
         )
         self.mlp.to(self.param_dtype)
@@ -2328,7 +2430,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
         # Define an MLP layer (or any other neural network layers)
         self.mlp = nn.Sequential(
             nn.Linear(ftn.nsites, nn_hidden_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(nn_hidden_dim, self.tworow_params_vec_len)
         )
 
