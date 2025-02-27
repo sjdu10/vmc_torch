@@ -130,7 +130,7 @@ class VMC:
         ): # Now naive implementation
         """Run the VMC optimization loop."""
         self.Einit = 0.
-        MC_energy_stats = {'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
+        MC_energy_stats = {'Np': self._state.Np, 'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
         self.step_count = start
         for step in range(start, stop):
             if RANK == 0:
