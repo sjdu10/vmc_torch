@@ -13,8 +13,7 @@ torch.autograd.set_detect_anomaly(False)
 import quimb.tensor as qtn
 import autoray as ar
 
-from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_TNFModel
-from vmc_torch.experiment.tn_model import fTN_backflow_Model, fTN_backflow_attn_Model
+from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_backflow_attn_Tensorwise_Model_v1
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
@@ -30,18 +29,18 @@ ar.register_function('torch','linalg.qr',QR.apply)
 
 from vmc_torch.global_var import DEBUG
 from vmc_torch.utils import closest_divisible
-
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(8)
-symmetry = 'U1'
+L = int(10)
+symmetry = 'Z2'
 t = 1.0
 U = 8.0
-N_f = int(L)
+N_f = int(L-2)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t, U, mu=0.0, pbc=False, symmetry=symmetry)
@@ -52,8 +51,8 @@ chi = -1
 dtype=torch.float64
 
 # Load mps
-skeleton = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_skeleton.pkl", "rb"))
-mps_params = pickle.load(open(f"../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_su_params.pkl", "rb"))
+skeleton = pickle.load(open(pwd+f"/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_skeleton.pkl", "rb"))
+mps_params = pickle.load(open(pwd+f"/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/mps_su_params.pkl", "rb"))
 mps = qtn.unpack(mps_params, skeleton)
 # fmps_tnf = form_gated_fmps_tnf(fmps=mps, ham=quimb_ham, depth=2)
 mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
@@ -62,12 +61,13 @@ mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1e4)
+N_samples = int(15000)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fMPSModel(mps, dtype=dtype)
+# model = fMPSModel(mps, dtype=dtype)
+model = fMPS_backflow_attn_Tensorwise_Model_v1(mps, embedding_dim=16, attention_heads=4, nn_final_dim=int(L/2), nn_eta=1.0, dtype=dtype)
 # model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
 init_std = 5e-2
 seed = 2
@@ -78,18 +78,17 @@ model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 model_names = {
     fMPSModel: 'fMPS',
     fMPS_backflow_Model: 'fMPS_backflow',
-    fTN_backflow_Model: 'fTN_backflow',
-    fTN_backflow_attn_Model: 'fTN_backflow_attn',
+    fMPS_backflow_attn_Tensorwise_Model_v1: 'fMPS_backflow_attn_Tensorwise_v1'
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 199
+init_step = 63
 final_step = 250
 total_steps = final_step - init_step
 # Load model parameters
 if init_step != 0:
-    saved_model_params = torch.load(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(pwd+f'/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -136,9 +135,9 @@ vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimize
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
-    os.makedirs(f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+    os.makedirs(pwd+f'/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
     # with pyinstrument.Profiler() as prof:
-    vmc.run(init_step, init_step+total_steps, tmpdir=f'../../data/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
+    vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
     # if RANK == 0:
     #     prof.print()
 
