@@ -47,7 +47,7 @@ quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t, U, mu=0.0, pbc=False, symmet
 graph = H.graph
 # TN parameters
 D = 4
-chi = -1
+chi = -2
 dtype=torch.float64
 
 # Load mps
@@ -83,7 +83,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 63
+init_step = 0
 final_step = 250
 total_steps = final_step - init_step
 # Load model parameters
