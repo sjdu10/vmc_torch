@@ -127,7 +127,7 @@ class VMC:
             stop, 
             tmpdir=None, 
             save=True
-        ): # Now naive implementation
+        ):
         """Run the VMC optimization loop."""
         self.Einit = 0.
         MC_energy_stats = {'Np': self._state.Np, 'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
@@ -215,7 +215,6 @@ class VMC:
             self._state.clear_memory() # Clear out the memory
 
             # Broadcast the new parameter vector to all ranks
-            # new_param_vec = np.ascontiguousarray(new_param_vec)
             COMM.Bcast(new_param_vec,root=0)
             # Update the quantum state with the new parameter vector
             self._state.update_state(new_param_vec) # Reload the new parameter vector into the quantum state

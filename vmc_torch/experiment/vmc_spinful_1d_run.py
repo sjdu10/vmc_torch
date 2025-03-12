@@ -2,6 +2,9 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
+# suppress warnings
+import warnings
+warnings.filterwarnings("ignore")
 from mpi4py import MPI
 import pickle
 
@@ -61,7 +64,7 @@ mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(15000)
+N_samples = int(1500)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE

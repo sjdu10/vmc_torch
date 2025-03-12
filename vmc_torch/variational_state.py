@@ -548,3 +548,6 @@ class Variational_State:
 
         return local_dataset
 
+
+class Vairational_State_GPU(Variational_State):
+    ...
