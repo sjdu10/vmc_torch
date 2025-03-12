@@ -147,8 +147,10 @@ class fPEPS(qtn.PEPS):
         return product_tn
     
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
-    def get_amp(self, config, inplace=False, conj=True, reverse=1, contract=True):
+    def get_amp(self, config, inplace=False, conj=True, reverse=1, contract=True, efficient=True):
         """Get the amplitude of a configuration in a PEPS."""
+        if efficient:
+            return self.get_amp_efficient(config, inplace=inplace)
         peps = self if inplace else self.copy()
         product_state = self.product_bra_state(config, reverse=reverse).conj() if conj else self.product_bra_state(config, reverse=reverse)
         
@@ -171,6 +173,77 @@ class fPEPS(qtn.PEPS):
             Ly=peps.Ly,
         )
         return amp
+    
+    def get_amp_efficient(self, config, inplace=False):
+        """Slicing to get the amplitude, faster than contraction with a tensor product state."""
+        peps = self if inplace else self.copy()
+        backend = self.tensors[0].data.backend
+        dtype = eval(backend + '.' + self.tensors[0].data.dtype)
+        if type(config) == numpy.ndarray:
+            kwargs = {'like': config, 'dtype': dtype}
+        elif type(config) == torch.Tensor:
+            device = list(self.tensors[0].data.blocks.values())[0].device
+            kwargs = {'like': config, 'device': device, 'dtype': dtype}
+        
+        
+        if self.spinless:
+            raise NotImplementedError("Efficient amplitude calculation is not implemented for spinless fermions.")
+        else:
+            if self.symmetry == 'Z2':
+                index_map = {0: 0, 1: 1, 2: 1, 3: 0}
+                array_map = {
+                    0: do('array', [1.0, 0.0], **kwargs),
+                    1: do('array', [1.0, 0.0], **kwargs),
+                    2: do('array', [0.0, 1.0], **kwargs),
+                    3: do('array', [0.0, 1.0], **kwargs)
+                }
+            elif self.symmetry == 'U1':
+                index_map = {0: 0, 1: 1, 2: 1, 3: 2}
+                array_map = {
+                    0: do('array', [1.0], **kwargs),
+                    1: do('array', [1.0, 0.0], **kwargs),
+                    2: do('array', [0.0, 1.0], **kwargs),
+                    3: do('array', [1.0], **kwargs)
+                }
+            
+
+            for n, site in zip(config, self.sites):
+                p_ind = peps.site_ind_id.format(*site)
+                tid = peps.sites.index(site)
+                fts = peps.tensors[tid]
+                ftsdata = fts.data
+                phys_ind_order = fts.inds.index(p_ind)
+                charge = index_map[int(n)]
+                input_vec = array_map[int(n)]
+                charge_sec_data_dict = ftsdata.blocks
+                new_fts_inds = fts.inds[:phys_ind_order] + fts.inds[phys_ind_order + 1:]
+                new_charge_sec_data_dict = {}
+                for charge_blk, data in charge_sec_data_dict.items():
+                    if charge_blk[phys_ind_order] == charge:
+                        new_data = data @ input_vec
+                        new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order + 1:]
+                        new_charge_sec_data_dict[new_charge_blk] = new_data
+
+                new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order + 1:]
+
+                if int(n) == 1:
+                    new_oddpos = (3 * tid + 1) * (-1)
+                elif int(n) == 2:
+                    new_oddpos = (3 * tid + 2) * (-1)
+                elif int(n) == 3 or int(n) == 0:
+                    new_oddpos = ()
+
+                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos is not () else ()
+                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
+                oddpos = list(new_oddpos)[::-1]
+
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge + ftsdata.charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
+
+            amp = qtn.PEPS(peps)
+
+            return amp
+
 
 def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=True):
     """Generate a random spinless/spinful fermionic square PEPS of shape (Lx, Ly)."""
@@ -583,7 +656,7 @@ class fMPS(qtn.MatrixProductState):
                 p_ind = mps.site_ind_id.format(site)
                 tid = mps.sites.index(site)
                 fts = mps[tid]
-                ftsdata = mps[tid].data
+                ftsdata = fts.data
                 phys_ind_order = fts.inds.index(p_ind)
                 charge = index_map[int(n)]
                 input_vec = array_map[int(n)]
@@ -609,7 +682,7 @@ class fMPS(qtn.MatrixProductState):
                 new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
                 
-                new_fts_data = sr.Z2FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
             amp = qtn.MatrixProductState(mps)

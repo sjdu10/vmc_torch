@@ -2,6 +2,8 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
+import warnings
+warnings.filterwarnings("ignore")
 import sys
 from mpi4py import MPI
 import pickle
@@ -183,7 +185,7 @@ if RANK == 0:
         print(model.model_structure)
     except:
         pass
-    sys.stdout = record_file
+    # sys.stdout = record_file
 
 if RANK == 0:
     # print training information
