@@ -90,6 +90,12 @@
     - The minimum-norm solution is |x>. MINRES converges to |x> since we start with |0>.
     - if A1 = A + \epsilon*I, then the minimum-norm solution would be 1/(1+\epsilon) * |x>, which does not differ much from |x>.
 
+3. Check the slicing amplitude function for fPEPS.
+
+4. Develope direct sampling function as proposal in MCMC, which should greatly reduce the number of TN contraction in our MCMC steps.
+
+5. Put the code on GPU for parallelization.
+
 # Ideas:
 
 # TN+NN:

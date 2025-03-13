@@ -147,7 +147,7 @@ class fPEPS(qtn.PEPS):
         return product_tn
     
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
-    def get_amp(self, config, inplace=False, conj=True, reverse=1, contract=True, efficient=True):
+    def get_amp(self, config, inplace=False, conj=True, reverse=1, contract=True, efficient=False):
         """Get the amplitude of a configuration in a PEPS."""
         if efficient:
             return self.get_amp_efficient(config, inplace=inplace)
