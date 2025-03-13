@@ -64,7 +64,7 @@ mps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # mps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1500)
+N_samples = int(3000)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE

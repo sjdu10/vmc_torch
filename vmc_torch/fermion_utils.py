@@ -212,6 +212,7 @@ class fPEPS(qtn.PEPS):
                 tid = peps.sites.index(site)
                 fts = peps.tensors[tid]
                 ftsdata = fts.data
+                ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
                 phys_ind_order = fts.inds.index(p_ind)
                 charge = index_map[int(n)]
                 input_vec = array_map[int(n)]
@@ -220,7 +221,8 @@ class fPEPS(qtn.PEPS):
                 new_charge_sec_data_dict = {}
                 for charge_blk, data in charge_sec_data_dict.items():
                     if charge_blk[phys_ind_order] == charge:
-                        new_data = data @ input_vec
+                        # new_data = data @ input_vec #BUG: This is not correct, should contract with the correct tensor index
+                        new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
                         new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order + 1:]
                         new_charge_sec_data_dict[new_charge_blk] = new_data
 
@@ -233,7 +235,7 @@ class fPEPS(qtn.PEPS):
                 elif int(n) == 3 or int(n) == 0:
                     new_oddpos = ()
 
-                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos is not () else ()
+                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos != () else ()
                 new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
 
@@ -657,6 +659,7 @@ class fMPS(qtn.MatrixProductState):
                 tid = mps.sites.index(site)
                 fts = mps[tid]
                 ftsdata = fts.data
+                ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
                 phys_ind_order = fts.inds.index(p_ind)
                 charge = index_map[int(n)]
                 input_vec = array_map[int(n)]
@@ -665,7 +668,7 @@ class fMPS(qtn.MatrixProductState):
                 new_charge_sec_data_dict = {}
                 for charge_blk, data in charge_sec_data_dict.items():
                     if charge_blk[phys_ind_order] == charge:
-                        new_data = data @ input_vec
+                        new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
                         new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order+1:]
                         new_charge_sec_data_dict[new_charge_blk]=new_data
                         
