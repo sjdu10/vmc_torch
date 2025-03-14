@@ -209,8 +209,8 @@ class fPEPS(qtn.PEPS):
 
             for n, site in zip(config, self.sites):
                 p_ind = peps.site_ind_id.format(*site)
-                tid = peps.sites.index(site)
-                fts = peps.tensors[tid]
+                site_id = peps.sites.index(site)
+                fts = peps.tensors[site_id]
                 ftsdata = fts.data
                 ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
                 phys_ind_order = fts.inds.index(p_ind)
@@ -229,9 +229,9 @@ class fPEPS(qtn.PEPS):
                 new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order + 1:]
 
                 if int(n) == 1:
-                    new_oddpos = (3 * tid + 1) * (-1)
+                    new_oddpos = (3 * site_id + 1) * (-1)
                 elif int(n) == 2:
-                    new_oddpos = (3 * tid + 2) * (-1)
+                    new_oddpos = (3 * site_id + 2) * (-1)
                 elif int(n) == 3 or int(n) == 0:
                     new_oddpos = ()
 
