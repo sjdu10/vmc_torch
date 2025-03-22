@@ -477,7 +477,10 @@ class fMPS(qtn.MatrixProductState):
         super().__init__(arrays, sites=sites, L=L, shape=shape, tags=tags, site_ind_id=site_ind_id, site_tag_id=site_tag_id, **tn_opts)
 
         self.symmetry = self.arrays[0].symmetry
-        self.spinless = True if self.phys_dim() == 2 else False
+        try:
+            self.spinless = True if self.phys_dim() == 2 else False
+        except KeyError:
+            self.spinless = True if self.ind_size(self.site_ind_id.format(self.L-1)) == 2 else False
     
     def product_bra_state(self, config, reverse=1):
         """For product state ALWAYS make sure the set of oddposes are different from the set of oddposes in the TNS |psi>.
