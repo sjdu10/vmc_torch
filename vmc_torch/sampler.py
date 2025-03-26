@@ -70,7 +70,7 @@ def from_quimb_config_to_netket_config(quimb_config):
 
 # --- Sampler ---
 
-class Sampler:
+class AbstractSampler:
     def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, equal_partition=True, dtype=torch.float32):
         self.hi = hi
         self.Ns = N_samples
@@ -98,8 +98,8 @@ class Sampler:
         raise NotImplementedError
     
 
-class MetropolisExchangeSampler(Sampler):
-    """Metropolis-Hastings sampler that uses the exchange move as the sampling rule."""
+class Sampler(AbstractSampler):
+    """Markov Chain sampler"""
     def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, equal_partition)
         self.random_edge = random_edge
@@ -775,8 +775,7 @@ class MetropolisExchangeSampler(Sampler):
 
         
 
-
-class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
+class MetropolisExchangeSamplerSpinless(Sampler):
     def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
     
@@ -814,7 +813,7 @@ class MetropolisExchangeSamplerSpinless(MetropolisExchangeSampler):
 
         return self.current_config, current_amp
     
-class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
+class MetropolisExchangeSamplerSpinful(Sampler):
     def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
         """
         Parameters
@@ -901,3 +900,71 @@ class MetropolisExchangeSamplerSpinful(MetropolisExchangeSampler):
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')
         
         return self.current_config, current_amp
+
+
+from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+
+class MetropolisMPSSamplerSpinful(Sampler):
+    def __init__(self, hi, graph, mps_dir='./tmp', mps_n_sample=1, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=False, dtype=torch.float32):
+        """
+        Parameters
+        ----------
+        hi : Hilbert
+            The Hilbert space.
+        graph : Graph
+            Lattice graph.
+        N_samples : int
+            The number of samples.
+        burn_in_steps : int
+            The number of burn-in steps.
+        reset_chain : bool
+            Whether to reset the chain after each VMC step.
+        random_edge : bool
+            Whether to randomly select the edges in the exchange move.
+        subchain_length : int
+            The number of samples we discard before collecting two samples.
+        equal_partition : bool
+            Whether the number of samples is equal for all MPI processes. If False, we use eager sampling and must have SIZE > 1.
+        dtype : torch.dtype
+
+        """
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
+        self.mps_n_sample=mps_n_sample
+        self.driver = DMRGDriver(scratch=mps_dir, symm_type=SymmetryTypes.SZ, stack_mem=24 << 30, n_threads=1)
+        self.ket = self.driver.load_mps(tag="KET", nroots=1)
+        configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=1)
+        self.current_config = configs[0]
+        self.current_mps_prob = abs(coeffs[0])**2
+
+    def _sampler_next(self, vstate):
+        """Sample the next configuration. Change the current configuration in place."""
+        attempts = 0
+        accepts = 0
+        ind_n_map = {0:0, 1:1, 2:1, 3:2}
+        self.current_amp = vstate.amplitude(self.current_config).cpu()
+        self.current_prob = abs(self.current_amp)**2
+
+        for n_sample in [self.mps_n_sample]:
+            attempts += 1
+            configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=n_sample, max_print=20)
+            for proposed_mps_config, proposed_mps_amp in zip(configs, coeffs):
+                proposed_config = proposed_mps_config
+                proposed_mps_prob = abs(proposed_mps_amp)**2
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_prob = abs(proposed_amp)**2
+                try:
+                    acceptance_ratio = min(1, (proposed_prob/self.current_prob)*(self.current_mps_prob/self.proposed_mps_prob))
+                except ZeroDivisionError:
+                    acceptance_ratio = 1 if proposed_prob > 0 else 0
+
+                if random.random() < acceptance_ratio or (self.current_prob == 0):
+                    self.current_config = proposed_config
+                    self.current_amp = proposed_amp
+                    self.current_prob = proposed_prob
+                    self.current_mps_prob = proposed_mps_prob
+                    accepts += 1
+            
+        if self.current_amp == 0 and DEBUG:
+            print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')
+        
+        return self.current_config, self.current_amp
