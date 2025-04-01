@@ -179,7 +179,6 @@ class Sampler(AbstractSampler):
             if n > 1:
                 op_loc_var = op_loc_M2 / (n - 1)
 
-            # total_n = COMM.reduce(n, op=MPI.SUM, root=0)
             # add a progress bar if rank == 0
             if RANK == 0:
                 pbar.update(1)
@@ -221,7 +220,7 @@ class Sampler(AbstractSampler):
         n = 0
         n_total = 0
         op_loc_vec = []
-        terminate = False
+        terminate = np.array([0], dtype=np.int32)
 
         if RANK == 0:
             pbar = tqdm(total=self.Ns, desc='Sampling starts...')
@@ -236,38 +235,43 @@ class Sampler(AbstractSampler):
             
             # Discard messages from previous steps
             while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
-                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
+                redundant_message = np.empty(1, dtype=np.int32)
+                COMM.Recv([redundant_message, MPI.INT], source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
             
-            while not terminate:
+            while not terminate[0]:
                 # Receive the local sample count from each rank
-                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                buf = np.empty(1, dtype=np.int32)
+                COMM.Recv([buf, MPI.INT],source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
                 dest_rank = buf[0]
                 n_total += 1
                 pbar.update(1)
                 # Check if we have enough samples
                 if n_total >= self.Ns:
-                    terminate = True
+                    terminate = np.array([1], dtype=np.int32)
                     for dest_rank in range(1, SIZE):
-                        COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                        COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
                 # Send the termination signal to the rank
-                COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
+
             
             pbar.close()
         
         else:
-            while not terminate:
+            while not terminate[0]:
                 op_loc, _ = self._sample_expect(vstate, op)
                 n += 1
                 op_loc_vec.append(op_loc)
                 # accumulate the local energy and amplitude gradient
                 op_loc_sum += op_loc
 
-                buf = (RANK,)
+                buf = np.array([RANK], dtype=np.int32)
                 # Send the local sample count to rank 0
-                COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                # COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                COMM.Send([buf, MPI.INT], dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
-                terminate = COMM.recv(source=0, tag=message_tag+1)
+                terminate = np.empty(1, dtype=np.int32)
+                COMM.Recv([terminate, MPI.INT], source=0, tag=message_tag+1)
 
         
         if self.reset_chain:
@@ -359,7 +363,6 @@ class Sampler(AbstractSampler):
             if n > 1:
                 op_loc_var = op_loc_M2 / (n - 1)
 
-            # total_n = COMM.reduce(n, op=MPI.SUM, root=0)
             # add a progress bar if rank == 0
             if RANK == 0:
                 pbar.update(1)
@@ -404,7 +407,8 @@ class Sampler(AbstractSampler):
         n = 0
         n_total = 0
         op_loc_vec = []
-        terminate = False
+        # terminate = False
+        terminate = np.array([0], dtype=np.int32)
 
         if RANK == 0:
             pbar = tqdm(total=self.Ns, desc='Sampling starts...')
@@ -423,27 +427,34 @@ class Sampler(AbstractSampler):
             
             # Discard messages from previous steps
             while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
-                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
+                redundant_message = np.empty(1, dtype=np.int32)
+                COMM.Recv([redundant_message, MPI.INT], source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
+                # redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
             
-            while not terminate:
+            while not terminate[0]:
                 # Receive the local sample count from each rank
-                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                buf = np.empty(1, dtype=np.int32)
+                COMM.Recv([buf, MPI.INT],source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
                 dest_rank = buf[0]
+                # buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                # dest_rank = buf[0]
                 n_total += 1
                 pbar.update(1)
                 # Check if we have enough samples
                 if n_total >= self.Ns:
-                    terminate = True
+                    terminate = np.array([1], dtype=np.int32)
                     for dest_rank in range(1, SIZE):
-                        COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                        # COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                        COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
                 # Send the termination signal to the rank
-                COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                # COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
             
             pbar.close()
         
         else:
-            while not terminate:
+            while not terminate[0]:
                 op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
                 n += 1
                 op_loc_vec.append(op_loc)
@@ -455,11 +466,15 @@ class Sampler(AbstractSampler):
                 # collect the log-amplitude gradient
                 logpsi_sigma_grad_mat.append(logpsi_sigma_grad)
 
-                buf = (RANK,)
+                # buf = (RANK,)
+                buf = np.array([RANK], dtype=np.int32)
                 # Send the local sample count to rank 0
-                COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                # COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                COMM.Send([buf, MPI.INT], dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
-                terminate = COMM.recv(source=0, tag=message_tag+1)
+                # terminate = COMM.recv(source=0, tag=message_tag+1)
+                terminate = np.empty(1, dtype=np.int32)
+                COMM.Recv([terminate, MPI.INT], source=0, tag=message_tag+1)
 
         
         if self.reset_chain:
@@ -588,7 +603,7 @@ class Sampler(AbstractSampler):
         n_total = 0
         config_list = []
         config_amplitudes_dict = {}
-        terminate = False
+        terminate = np.array([0], dtype=np.int32)
 
         if RANK == 0:
             pbar = tqdm(total=self.Ns, desc='Sampling starts...')
@@ -610,27 +625,34 @@ class Sampler(AbstractSampler):
             
             # Discard messages from previous steps
             while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
-                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
+                redundant_message = np.empty(1, dtype=np.int32)
+                COMM.Recv([redundant_message, MPI.INT], source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
+                # redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
             
-            while not terminate:
+            while not terminate[0]:
                 # Receive the local sample count from each rank
-                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                buf = np.empty(1, dtype=np.int32)
+                COMM.Recv([buf, MPI.INT],source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                # buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                # dest_rank = buf[0]
                 dest_rank = buf[0]
                 n_total += 1
                 pbar.update(1)
                 # Check if we have enough samples
                 if n_total >= self.Ns:
-                    terminate = True
+                    terminate = np.array([1], dtype=np.int32)
                     for dest_rank in range(1, SIZE):
-                        COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                        # COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                        COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
                 # Send the termination signal to the rank
-                COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                # COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
             
             pbar.close()
         
         else:
-            while not terminate:
+            while not terminate[0]:
                 config, psi_sigma = self._sample_next(vstate)
                 config_list.append(config)
                 if config not in config_amplitudes_dict:
@@ -644,11 +666,14 @@ class Sampler(AbstractSampler):
                     psi_sigma, op_psi_eta = config_amplitudes_dict[config]
                 n += 1
 
-                buf = (RANK,)
+                # buf = (RANK,)
+                buf = np.array([RANK], dtype=np.int32)
                 # Send the local sample count to rank 0
                 COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
-                terminate = COMM.recv(source=0, tag=message_tag+1)
+                # terminate = COMM.recv(source=0, tag=message_tag+1)
+                terminate = np.empty(1, dtype=np.int32)
+                COMM.Recv([terminate, MPI.INT], source=0, tag=message_tag+1)
             
         if self.reset_chain:
             self.reset()
@@ -691,7 +716,7 @@ class Sampler(AbstractSampler):
         n_total = 0
         config_list = []
         config_amplitudes_dict = {}
-        terminate = False
+        terminate = np.array([0], dtype=np.int32)
         op_expect = 0
 
         if RANK == 0:
@@ -719,12 +744,17 @@ class Sampler(AbstractSampler):
             
             # Discard messages from previous steps
             while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
-                redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
+                redundant_message = np.empty(1, dtype=np.int32)
+                COMM.Recv([redundant_message, MPI.INT], source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
+                # redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
             
-            while not terminate:
+            while not terminate[0]:
                 # Receive the local sample count from each rank
-                buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                # buf = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                # dest_rank = buf[0]
+                buf = np.empty(1, dtype=np.int32)
+                COMM.Recv([buf, MPI.INT],source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
                 dest_rank = buf[0]
                 n_total += 1
                 pbar.update(1)
@@ -732,14 +762,16 @@ class Sampler(AbstractSampler):
                 if n_total >= self.Ns:
                     terminate = True
                     for dest_rank in range(1, SIZE):
-                        COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                        # COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                        COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
                 # Send the termination signal to the rank
-                COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                # COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
+                COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
             
             pbar.close()
         
         else:
-            while not terminate:
+            while not terminate[0]:
                 config, psi_sigma = self._sample_next(vstate)
                 config_list.append(config)
                 if config not in config_amplitudes_dict:
@@ -757,11 +789,15 @@ class Sampler(AbstractSampler):
                     ...#XXX: compute variance
                 n += 1
 
-                buf = (RANK,)
+                # buf = (RANK,)
+                buf = np.array([RANK], dtype=np.int32)
                 # Send the local sample count to rank 0
-                COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                # COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                COMM.Send([buf, MPI.INT], dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
-                terminate = COMM.recv(source=0, tag=message_tag+1)
+                # terminate = COMM.recv(source=0, tag=message_tag+1)
+                terminate = np.empty(1, dtype=np.int32)
+                COMM.Recv([terminate, MPI.INT], source=0, tag=message_tag+1)
             
         if self.reset_chain:
             self.reset()
@@ -930,12 +966,12 @@ class MetropolisMPSSamplerSpinful(Sampler):
         """
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
         self.mps_n_sample=mps_n_sample
-        self.driver = DMRGDriver(scratch=mps_dir, symm_type=SymmetryTypes.SZ, n_threads=1)
+        self.driver = DMRGDriver(scratch=mps_dir, symm_type=SymmetryTypes.SZ, n_threads=1, mpi=True)
         COMM.barrier()
         self.ket = self.driver.load_mps(tag="KET")
         print(f'Rank {RANK}: MPS center {self.ket.center}')
         COMM.barrier()
-        configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=1, iprint=1, rand_seed=RANK+time.time_ns())
+        configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=1, iprint=0)#, rand_seed=RANK+time.time_ns())
         self.current_config = configs[0]
         self.current_mps_prob = abs(coeffs[0])**2
 
@@ -948,7 +984,7 @@ class MetropolisMPSSamplerSpinful(Sampler):
 
         for n_sample in [self.mps_n_sample]:
             attempts += 1
-            configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=n_sample, iprint=1, rand_seed=RANK+time.time_ns())
+            configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=n_sample, iprint=0)#, rand_seed=RANK+time.time_ns())
             for proposed_mps_config, proposed_mps_amp in zip(configs, coeffs):
                 proposed_config = proposed_mps_config
                 proposed_mps_prob = abs(proposed_mps_amp)**2
