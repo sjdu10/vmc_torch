@@ -495,8 +495,8 @@ class Sampler(AbstractSampler):
                 acf_vals = acf(samples, nlags=max_lag, fft=True)
                 return 1 + 2 * np.sum(acf_vals[1:])  # Sum over lags ≥ 1
 
-            iat = integrated_autocorr_time(op_loc_vec)
-            print(f"    RANK1 Integrated Autocorrelation Time: {iat:.2f}")
+            iat = integrated_autocorr_time(op_loc_vec, max_lag=int(0.5*len(op_loc_vec)))
+            print(f"    RANK1 sample size: {op_loc_vec.size}, Integrated Autocorrelation Time: {iat:.2f}")
 
         if n > 1:
             op_loc_var = np.var(op_loc_vec, ddof=1)
