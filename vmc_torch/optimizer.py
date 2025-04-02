@@ -160,8 +160,8 @@ class SR(Preconditioner):
                 dp, info = self.solver(A, b, maxiter=self.iter_step, rtol=self.rtol)
                 t1 = time.time()
                 if RANK == 0:
-                    print("Time for solving the linear equation: ", t1-t0)
-                    print("SR solver convergence: ", info)
+                    print("    Time for solving the linear equation: ", t1-t0)
+                    print("    SR solver convergence: ", info)
                 state.clear_memory()
                 return torch.tensor(dp, dtype=self.dtype)
 
@@ -195,7 +195,7 @@ class SR(Preconditioner):
                 t0 = time.time()
                 dp, _ = self.solver(A, b, maxiter=self.iter_step, rtol=self.rtol)
                 t1 = time.time()
-                print("Time for solving the linear equation: ", t1-t0)
+                print("    Time for solving the linear equation: ", t1-t0)
                 return torch.tensor(dp, dtype=self.dtype)
 
 #------------------------------------------------------------

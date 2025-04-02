@@ -5,6 +5,7 @@ import random
 from tqdm import tqdm
 import time
 import pyinstrument
+from statsmodels.tsa.stattools import acf
 
 # torch
 import torch
@@ -486,6 +487,17 @@ class Sampler(AbstractSampler):
         # convert the list to numpy array
         logpsi_sigma_grad_mat = np.asarray(logpsi_sigma_grad_mat).T
         op_loc_vec = np.asarray(op_loc_vec)
+        
+        if RANK == 1:
+            # compute autocorrelation time of op_loc_vec for RANK1
+            # This is a simple implementation of the integrated autocorrelation time
+            def integrated_autocorr_time(samples, max_lag=None):
+                acf_vals = acf(samples, nlags=max_lag, fft=True)
+                return 1 + 2 * np.sum(acf_vals[1:])  # Sum over lags ≥ 1
+
+            iat = integrated_autocorr_time(op_loc_vec)
+            print(f"    RANK1 Integrated Autocorrelation Time: {iat:.2f}")
+
         if n > 1:
             op_loc_var = np.var(op_loc_vec, ddof=1)
         else:
@@ -970,7 +982,8 @@ class MetropolisMPSSamplerSpinful(Sampler):
         self.ket = self.driver.load_mps(tag="KET")
         
         if self.ket.center != 0:
-            print('Aligning MPS center to 0')
+            if RANK == 0:
+                print('Aligning MPS center to 0')
             self.ket = self.driver.copy_mps(self.ket, tag="CSF-TMP")
             self.driver.align_mps_center(self.ket, ref=0)
 

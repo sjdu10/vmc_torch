@@ -17,7 +17,7 @@ RANK = COMM.Get_rank()
 
 class Variational_State:
 
-    def __init__(self, vstate_func, sampler=None, hi=None, dtype=torch.float32):
+    def __init__(self, vstate_func, sampler=None, hi=None, dtype=torch.float32, iprint=0):
         self.vstate_func = vstate_func
         self.sampler = sampler
         self.Np = vstate_func.num_params
@@ -27,6 +27,7 @@ class Variational_State:
         self.logamp_grad_matrix = None
         self.mean_logamp_grad = None
         self.dtype = dtype
+        self.iprint = iprint
         assert self.hi is not None, "Hilbert space must be provided for sampling!"
 
     
@@ -61,7 +62,7 @@ class Variational_State:
     
     def clear_cache(self):
         try:
-            if RANK == 1:
+            if RANK == 1 and self.iprint:
                 print(self.amplitude.cache_info(), self.amplitude_grad.cache_info())
             self.amplitude.cache_clear()
             self.amplitude_grad.cache_clear()
@@ -180,7 +181,7 @@ class Variational_State:
             op_expect, op_grad, op_var, op_err = self.collect_samples_w_grad_eager(op, message_tag=message_tag)
             t1 = MPI.Wtime()
             if RANK == 0:
-                print('Time for eager sampling: {}'.format(t1-t0))
+                print('    Time for eager sampling: {}'.format(t1-t0))
         
         # return statistics of the MC sampling
         stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_err}
@@ -219,7 +220,7 @@ class Variational_State:
             op_expect, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag)
             t1 = MPI.Wtime()
             if RANK == 0:
-                print('Time for eager sampling: {}'.format(t1-t0))
+                print('    Time for eager sampling: {}'.format(t1-t0))
         
         # return statistics of the MC sampling
         stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_err}
@@ -335,8 +336,8 @@ class Variational_State:
         op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
 
         if RANK == 0:
-            print('Total sample size: {}'.format(total_sample_Ns))
-            print('Np = {}'.format(self.num_params))
+            print('    Total sample size: {}'.format(total_sample_Ns))
+            print('    Model Np = {}'.format(self.num_params))
             if DEBUG:
                 print('     Time for op_expect: {}'.format(t01-t0))
 
@@ -496,8 +497,8 @@ class Variational_State:
         op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
 
         if RANK == 0:
-            print('Total sample size: {}'.format(total_sample_Ns))
-            print('Np = {}'.format(self.logamp_grad_matrix.shape[0]))
+            print('    Total sample size: {}'.format(total_sample_Ns))
+            print('    Model Np = {}'.format(self.logamp_grad_matrix.shape[0]))
             if DEBUG:
                 print('     Time for op_expect: {}'.format(t01-t0))
                 print('     Time for op_logamp_grad_product_sum: {}'.format(t02-t01))
