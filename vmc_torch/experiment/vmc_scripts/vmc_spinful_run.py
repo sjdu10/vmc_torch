@@ -118,13 +118,13 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 0
+init_step = 243
 final_step = 400
 total_steps = final_step - init_step
 # Load model parameters
 optimizer_state = None
 if init_step != 0:
-    saved_model_params = torch.load(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth')
+    saved_model_params = torch.load(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/model_params_step{init_step}.pth', weights_only=False)
     saved_model_state_dict = saved_model_params['model_state_dict']
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
     try:
@@ -136,7 +136,7 @@ if init_step != 0:
     optimizer_state = saved_model_params.get('optimizer_state', None)
 
 # Set up optimizer and scheduler
-learning_rate = 1e-1
+learning_rate = 0.0
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-3)
 use_prev_opt = True
 if optimizer_state is not None and use_prev_opt:
