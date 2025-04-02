@@ -4,7 +4,6 @@ os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
 import warnings
 warnings.filterwarnings("ignore")
-import sys
 from mpi4py import MPI
 import pickle
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'
@@ -17,13 +16,12 @@ import quimb.tensor as qtn
 import autoray as ar
 
 from vmc_torch.experiment.tn_model import *
-from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
+from vmc_torch.sampler import MetropolisExchangeSamplerSpinful, MetropolisMPSSamplerSpinful
 from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPreconditioner, Adam, SGD_momentum, DecayScheduler
+from vmc_torch.optimizer import SGD, SR,Adam, SGD_momentum, DecayScheduler
 from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_square_lattice
 from vmc_torch.torch_utils import SVD,QR
-from vmc_torch.fermion_utils import generate_random_fpeps
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)
@@ -39,7 +37,7 @@ RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
 Lx = int(4)
-Ly = int(4)
+Ly = int(2)
 symmetry = 'Z2'
 t = 1.0
 U = 8.0
@@ -50,7 +48,7 @@ H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermion
 graph = H.graph
 # TN parameters
 D = 4
-chi = -20
+chi = -10
 dtype=torch.float64
 
 # # Load PEPS
@@ -63,13 +61,22 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(1500)
+N_samples = int(15000)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
 nn_hidden_dim = Lx*Ly
-model = fTNModel(peps, max_bond=chi, dtype=dtype)
+# model = fTNModel(peps, max_bond=chi, dtype=dtype)
+model = fTN_backflow_attn_Tensorwise_Model_v1(
+    peps,
+    max_bond=chi,
+    embedding_dim=16,
+    attention_heads=4,
+    nn_final_dim=4,
+    nn_eta=1.0,
+    dtype=dtype,
+)
 # model = fTN_backflow_attn_Tensorwise_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=dtype)
 # model = fTN_backflow_attn_Tensorwise_Model_v1(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=dtype)
 # model = fTN_backflow_Model(peps, max_bond=chi, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*Lx*Ly, dtype=dtype)
@@ -98,6 +105,7 @@ model_names = {
     fTN_backflow_attn_Jastrow_Model: 'fTN_backflow_attn_Jastrow',
     fTN_backflow_attn_Model_boundary: 'fTN_backflow_attn_boundary',
     fTN_backflow_Model_Blockwise: 'fTN_backflow_blockwise',
+    fTN_backflow_attn_Tensorwise_Model_v1: 'fTN_BFA_Tensorwise_MPS',
     PureAttention_Model: 'PureAttention',
     SlaterDeterminant: 'SlaterDeterminant',
     NeuralBackflow: 'NeuralBackflow',
@@ -153,7 +161,9 @@ else:
     # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
 
 # Set up sampler
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+# sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+mps_dir = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/tmp'
+sampler = MetropolisMPSSamplerSpinful(H.hilbert, graph, mps_dir=mps_dir, mps_n_sample=4, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner

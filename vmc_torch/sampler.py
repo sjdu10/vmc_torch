@@ -967,11 +967,15 @@ class MetropolisMPSSamplerSpinful(Sampler):
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
         self.mps_n_sample=mps_n_sample
         self.driver = DMRGDriver(scratch=mps_dir, symm_type=SymmetryTypes.SZ, n_threads=1, mpi=True)
-        COMM.barrier()
         self.ket = self.driver.load_mps(tag="KET")
+        
+        if self.ket.center != 0:
+            print('Aligning MPS center to 0')
+            self.ket = self.driver.copy_mps(self.ket, tag="CSF-TMP")
+            self.driver.align_mps_center(self.ket, ref=0)
+
         print(f'Rank {RANK}: MPS center {self.ket.center}')
-        COMM.barrier()
-        configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=1, iprint=0)#, rand_seed=RANK+time.time_ns())
+        configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=1, iprint=0, rand_seed=RANK+np.random.randint(0, 2**30))
         self.current_config = configs[0]
         self.current_mps_prob = abs(coeffs[0])**2
 
@@ -984,7 +988,7 @@ class MetropolisMPSSamplerSpinful(Sampler):
 
         for n_sample in [self.mps_n_sample]:
             attempts += 1
-            configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=n_sample, iprint=0)#, rand_seed=RANK+time.time_ns())
+            configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=n_sample, iprint=0, rand_seed=RANK+np.random.randint(0, 2**30))
             for proposed_mps_config, proposed_mps_amp in zip(configs, coeffs):
                 proposed_config = proposed_mps_config
                 proposed_mps_prob = abs(proposed_mps_amp)**2
@@ -1004,5 +1008,5 @@ class MetropolisMPSSamplerSpinful(Sampler):
             
         if self.current_amp == 0 and DEBUG:
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')
-        
+
         return self.current_config, self.current_amp
