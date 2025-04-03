@@ -18,7 +18,7 @@ import autoray as ar
 from vmc_torch.experiment.tn_model import *
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful, MetropolisMPSSamplerSpinful
 from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import SGD, SR,Adam, SGD_momentum, DecayScheduler
+from vmc_torch.optimizer import SGD, SR,Adam, SGD_momentum, DecayScheduler, TrivialPreconditioner
 from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_square_lattice
 from vmc_torch.torch_utils import SVD,QR
@@ -36,13 +36,13 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-Lx = int(4)
-Ly = int(2)
+Lx = int(6)
+Ly = int(6)
 symmetry = 'Z2'
 t = 1.0
 U = 8.0
 # N_f = int(Lx*Ly-8)
-N_f = int(Lx*Ly-2)
+N_f = int(Lx*Ly)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
@@ -61,7 +61,7 @@ peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 # peps.apply_to_arrays(lambda x: torch.randn_like(torch.tensor(x, dtype=dtype), dtype=dtype))
 
 # VMC sample size
-N_samples = int(15000)
+N_samples = int(2000)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -118,7 +118,7 @@ model_names = {
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 243
+init_step = 0
 final_step = 400
 total_steps = final_step - init_step
 # Load model parameters
@@ -136,7 +136,7 @@ if init_step != 0:
     optimizer_state = saved_model_params.get('optimizer_state', None)
 
 # Set up optimizer and scheduler
-learning_rate = 0.0
+learning_rate = 1e-1
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-3)
 use_prev_opt = True
 if optimizer_state is not None and use_prev_opt:
@@ -161,9 +161,10 @@ else:
     # optimizer = Adam(learning_rate=learning_rate, t_step=init_step, weight_decay=1e-5)
 
 # Set up sampler
-# sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=True, equal_partition=False, dtype=dtype, subchain_length=10)
 mps_dir = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/tmp'
-sampler = MetropolisMPSSamplerSpinful(H.hilbert, graph, mps_dir=mps_dir, mps_n_sample=4, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+# sampler = MetropolisMPSSamplerSpinful(H.hilbert, graph, mps_dir=mps_dir, mps_n_sample=10, N_samples=N_samples, burn_in_steps=20, reset_chain=True, equal_partition=False, dtype=dtype)
+
 # Set up variational state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 # Set up SR preconditioner

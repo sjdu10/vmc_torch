@@ -82,7 +82,10 @@ class AbstractSampler:
         self.initial_config = None
         self.current_config = None
         self.equal_partition = equal_partition
-        self.reset()
+
+        rand_int = random.randint(0, 2**32-1)
+        self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=self.dtype)
+        self.current_config = self.initial_config.clone()
     
     def reset(self):
         """Reset the current sampler configuration to a random config in the Hilbert space."""
@@ -105,6 +108,8 @@ class Sampler(AbstractSampler):
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, equal_partition)
         self.random_edge = random_edge
         self.subchain_length = graph.n_edges if subchain_length is None else subchain_length
+        self.attempts = 0
+        self.accepts = 0
     
     def burn_in(self, vstate):
         """Discard the initial samples. (Burn-in)"""
@@ -200,6 +205,8 @@ class Sampler(AbstractSampler):
         chain_means_loc = [np.mean(split_chain) for split_chain in split_chains]
 
         samples = (op_loc_sum, op_loc_var, W_loc, chain_means_loc)
+        self.attempts = 0
+        self.accepts = 0
         return samples
     
     def sample_eager(self, vstate, op, message_tag=None):
@@ -288,7 +295,8 @@ class Sampler(AbstractSampler):
         else:
             op_loc_var = 0
         samples = (op_loc_sum, op_loc_var, n)
-
+        self.attempts = 0
+        self.accepts = 0
         return samples
 
     def sample_w_grad(self, vstate, op, chain_length=1):
@@ -384,6 +392,8 @@ class Sampler(AbstractSampler):
         chain_means_loc = [np.mean(split_chain) for split_chain in split_chains]
 
         samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
+        self.attempts = 0
+        self.accepts = 0
         return samples
     
     def sample_w_grad_eager(self, vstate, op, message_tag=None):
@@ -495,15 +505,16 @@ class Sampler(AbstractSampler):
                 acf_vals = acf(samples, nlags=max_lag, fft=True)
                 return 1 + 2 * np.sum(acf_vals[1:])  # Sum over lags ≥ 1
 
-            iat = integrated_autocorr_time(op_loc_vec, max_lag=int(0.5*len(op_loc_vec)))
-            print(f"    RANK1 sample size: {op_loc_vec.size}, Integrated Autocorrelation Time: {iat:.2f}")
+            iat = integrated_autocorr_time(op_loc_vec, max_lag=100)
+            print(f"    RANK1 sample size: {op_loc_vec.size}, Local Energy Integrated Autocorrelation Time: {iat}")
 
         if n > 1:
             op_loc_var = np.var(op_loc_vec, ddof=1)
         else:
             op_loc_var = 0
         samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
-
+        self.attempts = 0
+        self.accepts = 0
         return samples
 
     def _sample_expect_grad(self, vstate, op):
@@ -892,8 +903,6 @@ class MetropolisExchangeSamplerSpinful(Sampler):
         current_amp = vstate.amplitude(self.current_config).cpu()
         current_prob = abs(current_amp)**2
         proposed_config = self.current_config.clone()
-        attempts = 0
-        accepts = 0
         ind_n_map = {0:0, 1:1, 2:1, 3:2}
 
         if self.random_edge:
@@ -904,7 +913,7 @@ class MetropolisExchangeSamplerSpinful(Sampler):
         for (i, j) in site_pairs:
             if self.current_config[i] == self.current_config[j]:
                 continue
-            attempts += 1
+            self.attempts += 1
             proposed_config = self.current_config.clone()
             config_i = self.current_config[i].item()
             config_j = self.current_config[j].item()
@@ -934,7 +943,7 @@ class MetropolisExchangeSamplerSpinful(Sampler):
             else:
                 raise ValueError("Invalid configuration")
             try:
-                acceptance_ratio = proposed_prob/current_prob
+                acceptance_ratio = min(1, (proposed_prob/current_prob))
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
 
@@ -942,7 +951,10 @@ class MetropolisExchangeSamplerSpinful(Sampler):
                 self.current_config = proposed_config
                 current_amp = proposed_amp
                 current_prob = proposed_prob
-                accepts += 1
+                self.accepts += 1
+            # if RANK == 1:
+            #     print(f'RANK {RANK}: acceptance ratio {acceptance_ratio}, acceptance rate {self.accepts/self.attempts}')
+            
             
         if current_amp == 0 and DEBUG:
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')
@@ -976,6 +988,7 @@ class MetropolisMPSSamplerSpinful(Sampler):
         dtype : torch.dtype
 
         """
+        #NOTE: if the MPS distribution differs a lot from the current PEPS distribution, the sampling becomes very inefficient. This may happen for systems with degenerate ground states.
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
         self.mps_n_sample=mps_n_sample
         self.driver = DMRGDriver(scratch=mps_dir, symm_type=SymmetryTypes.SZ, n_threads=1, mpi=True)
@@ -988,21 +1001,24 @@ class MetropolisMPSSamplerSpinful(Sampler):
             self.driver.align_mps_center(self.ket, ref=0)
 
         print(f'Rank {RANK}: MPS center {self.ket.center}')
-        configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=1, iprint=0, rand_seed=RANK+np.random.randint(0, 2**30))
+        configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=1, iprint=0, rand_seed=RANK+random.randint(0, 2**30))
+        self.current_config = configs[0]
+        self.current_mps_prob = abs(coeffs[0])**2
+    
+    def reset(self):
+        configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=1, iprint=0, rand_seed=RANK+random.randint(0, 2**30))
         self.current_config = configs[0]
         self.current_mps_prob = abs(coeffs[0])**2
 
     def _sample_next(self, vstate):
         """Sample the next configuration. Change the current configuration in place."""
-        attempts = 0
-        accepts = 0
         self.current_amp = vstate.amplitude(self.current_config).cpu()
         self.current_prob = abs(self.current_amp)**2
 
         for n_sample in [self.mps_n_sample]:
-            attempts += 1
-            configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=n_sample, iprint=0, rand_seed=RANK+np.random.randint(0, 2**30))
+            configs, coeffs = self.driver.sample_csf_coefficients(self.ket, n_sample=n_sample, iprint=0, rand_seed=RANK+random.randint(0, 2**30))
             for proposed_mps_config, proposed_mps_amp in zip(configs, coeffs):
+                self.attempts += 1
                 proposed_config = proposed_mps_config
                 proposed_mps_prob = abs(proposed_mps_amp)**2
                 proposed_amp = vstate.amplitude(proposed_config).cpu()
@@ -1011,13 +1027,17 @@ class MetropolisMPSSamplerSpinful(Sampler):
                     acceptance_ratio = min(1, (proposed_prob/self.current_prob)*(self.current_mps_prob/proposed_mps_prob))
                 except ZeroDivisionError:
                     acceptance_ratio = 1 if proposed_prob > 0 else 0
+                # if RANK == 1:
+                #     print(f'RANK {RANK}: acceptance ratio {acceptance_ratio}, current_prob {self.current_prob}, current_mps_prob {self.current_mps_prob}, proposed_prob {proposed_prob}, proposed_mps_prob {proposed_mps_prob}')
 
                 if random.random() < acceptance_ratio or (self.current_prob == 0):
                     self.current_config = proposed_config
                     self.current_amp = proposed_amp
                     self.current_prob = proposed_prob
                     self.current_mps_prob = proposed_mps_prob
-                    accepts += 1
+                    self.accepts += 1
+                if RANK == 1:
+                    print(f'RANK {RANK}: acceptance ratio {acceptance_ratio}, acceptance rate {self.accepts/self.attempts}')
             
         if self.current_amp == 0 and DEBUG:
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')

@@ -1,15 +1,15 @@
 from pyblock2.driver.core import DMRGDriver, SymmetryTypes, MPOAlgorithmTypes
 import os
 
-bond_dims = [250] * 12 + [500] * 18
+bond_dims = [100] * 12 + [200] * 18
 noises = [1E-7] * 12 + [1E-7] * 12 + [0] * 6
 thrds = [1E-6] * 30
 n_sweeps = 30
 
-nx, ny = 4, 2
+nx, ny = 6, 6
 n = nx * ny
 u = 8.0
-nelec = int(nx*ny-2)
+nelec = int(nx*ny)
 scratch_dir = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'+f'/{nx}x{ny}/t=1.0_U={u}/N={nelec}/tmp'
 os.makedirs(scratch_dir, exist_ok=True)
 driver = DMRGDriver(scratch=scratch_dir, symm_type=SymmetryTypes.SZ, stack_mem=24 << 30, n_threads=12, mpi=True)

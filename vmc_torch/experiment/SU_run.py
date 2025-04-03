@@ -20,7 +20,7 @@ graph = nk.graph.Grid([Lx,Ly], pbc=False)
 N = graph.n_nodes
 
 # Define the fermion filling and the Hilbert space
-N_f = int(Lx*Ly-4)
+N_f = int(Lx*Ly)
 n_fermions_per_spin = (N_f//2, N_f//2)
 hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_per_spin)
 
@@ -47,7 +47,7 @@ hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_pe
 
 
 # SU in quimb
-D = 6
+D = 4
 seed = 2
 symmetry = 'Z2'
 spinless = False
@@ -96,10 +96,10 @@ N_terms = {
     for site in peps.gen_site_coos()
 }
 occ_fn = lambda su: print(f'N per site:{su.get_state().compute_local_expectation(N_terms, normalized=True, max_bond=64,)/N}') if su.n%50==0 else None
-
+density = False
 ham = qtn.LocalHam2D(Lx, Ly, terms)
 
-su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True, D=D, compute_energy_opts={"max_distance":1}, gate_opts={'cutoff':1e-12}, callback=occ_fn)
+su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True, D=D, compute_energy_opts={"max_distance":1}, gate_opts={'cutoff':1e-12}, callback=occ_fn if density else None)
 
 # cluster energies may not be accuracte yet
 su.evolve(50, tau=0.3)
