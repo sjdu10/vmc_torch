@@ -158,8 +158,27 @@ class VMC:
             # Precondition the gradient through SR (optional)
             preconditioned_grad = self.preconditioner(self._state, state_MC_loss_grad)
 
+            # collect rank1 sample time in rank 0
+            if RANK==1:
+                sample_time = np.array(self._state.sampler.sample_time)
+                local_energy_time = np.array(self._state.sampler.local_energy_time)
+                gradient_time = np.array(self._state.sampler.grad_time)
+                COMM.Send(sample_time, dest=0, tag=step+2**29)
+                COMM.Send(local_energy_time, dest=0, tag=step+2**30)
+                COMM.Send(gradient_time, dest=0, tag=step+2**28)
+            elif RANK==0:
+                sample_time = np.empty(1, dtype=float)
+                local_energy_time = np.empty(1, dtype=float)
+                gradient_time = np.empty(1, dtype=float)
+                COMM.Recv(sample_time, source=1, tag=step+2**29)
+                COMM.Recv(local_energy_time, source=1, tag=step+2**30)
+                COMM.Recv(gradient_time, source=1, tag=step+2**28)
+                self._state.sampler.sample_time = sample_time[0]
+                self._state.sampler.local_energy_time = local_energy_time[0]
+                self._state.sampler.grad_time = gradient_time[0]
             COMM.Barrier() # Synchronize all ranks
-            if RANK == 1:
+            
+            if RANK == 0:
                 # For debugging purposes, print out the sampler's sample time and local energy time on rank 1
                 # Note: this is only for debugging purposes, it can be removed in production runs
                 print(f"{'Metric':<30} | {'Time (s)':>12}")
