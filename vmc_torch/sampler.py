@@ -84,15 +84,15 @@ class AbstractSampler:
         self.equal_partition = equal_partition
         self.sample_time = 0
         self.local_energy_time = 0
+        self.grad_time = 0
+        self.burn_in_time = 0
 
-        rand_int = random.randint(0, 2**32-1)
-        self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=self.dtype)
+        self.initial_config = torch.tensor(np.asarray(self.hi.random_state()), dtype=self.dtype)
         self.current_config = self.initial_config.clone()
     
     def reset(self):
         """Reset the current sampler configuration to a random config in the Hilbert space."""
-        rand_int = random.randint(0, 2**32-1)
-        self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=self.dtype)
+        self.initial_config = torch.tensor(np.asarray(self.hi.random_state()), dtype=self.dtype)
         self.current_config = self.initial_config.clone()
 
     def _sample_next(self, vstate_func):
@@ -129,11 +129,12 @@ class Sampler(AbstractSampler):
         assert self.equal_partition, "The number of samples must be equal for all MPI processes."
         if RANK == 0:
             print('Burn-in...')
-            t_burnin0 = time.time()
+        t_burnin0 = MPI.Wtime()
         self.burn_in(vstate)
+        t_burnin1 = MPI.Wtime()
         if RANK == 0:
-            t_burnin1 = time.time()
             print('Burn-in time:', t_burnin1 - t_burnin0)
+        self.burn_in_time = t_burnin1 - t_burnin0
 
         op_loc_sum = 0
 
@@ -218,11 +219,12 @@ class Sampler(AbstractSampler):
 
         if RANK == 0:
             print('Burn-in...')
-            t_burnin0 = time.time()
+        t_burnin0 = MPI.Wtime()
         self.burn_in(vstate)
+        t_burnin1 = MPI.Wtime()
         if RANK == 0:
-            t_burnin1 = time.time()
             print('Burn-in time:', t_burnin1 - t_burnin0)
+        self.burn_in_time = t_burnin1 - t_burnin0
 
         op_loc_sum = 0
 
@@ -307,11 +309,12 @@ class Sampler(AbstractSampler):
         assert self.equal_partition, "The number of samples must be equal for all MPI processes."
         if RANK == 0:
             print('Burn-in...')
-            t_burnin0 = time.time()
+        t_burnin0 = MPI.Wtime()
         self.burn_in(vstate)
+        t_burnin1 = MPI.Wtime()
         if RANK == 0:
-            t_burnin1 = time.time()
             print('Burn-in time:', t_burnin1 - t_burnin0)
+        self.burn_in_time = t_burnin1 - t_burnin0
 
         op_loc_sum = 0
         logpsi_sigma_grad_sum = np.zeros(vstate.Np)
@@ -344,9 +347,16 @@ class Sampler(AbstractSampler):
 
             # compute local energy and amplitude gradient
             psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
+            time2 = MPI.Wtime()
             # compute the connected non-zero operator matrix elements <eta|O|sigma>
             eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
             psi_eta = vstate.amplitude(eta)
+            time3 = MPI.Wtime()
+            # if RANK==1:
+            #     print(f"    RANK1 sample {sigma}, Local Energy size: {len(eta)}, Chain length: {chain_length}")
+
+            self.sample_time += (time1 - time0) # for profiling purposes
+            self.local_energy_time += (time3 - time2)
 
             # convert torch tensors to numpy arrays
             psi_sigma = psi_sigma.cpu().detach().numpy()
@@ -405,11 +415,13 @@ class Sampler(AbstractSampler):
 
         if RANK == 0:
             print('Burn-in...')
-            t_burnin0 = time.time()
+        t_burnin0 = MPI.Wtime()
         self.burn_in(vstate)
+        t_burnin1 = MPI.Wtime()
         if RANK == 0:
-            t_burnin1 = time.time()
             print('Burn-in time:', t_burnin1 - t_burnin0)
+        self.burn_in_time = t_burnin1 - t_burnin0
+
 
         op_loc_sum = 0
         logpsi_sigma_grad_sum = np.zeros(vstate.Np)
@@ -532,9 +544,12 @@ class Sampler(AbstractSampler):
         # compute local energy and amplitude gradient
         psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
+        time2 = MPI.Wtime()
         eta, O_etasigma = op.get_conn(sigma)
         psi_eta = vstate.amplitude(eta)
-        time2 = MPI.Wtime()
+        time3 = MPI.Wtime()
+        # if RANK==1:
+        #     print(f"    RANK1 sample {sigma}, Local Energy size: {len(eta)}")
         # convert torch tensors to numpy arrays
         psi_sigma = psi_sigma.cpu().detach().numpy()
         psi_eta = psi_eta.cpu().detach().numpy()
@@ -544,7 +559,8 @@ class Sampler(AbstractSampler):
         op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
 
         self.sample_time += (time1 - time0) # for profiling purposes
-        self.local_energy_time += (time2 - time1)
+        self.local_energy_time += (time3 - time2)
+        self.grad_time += (time2 - time1)
 
         return op_loc, logpsi_sigma_grad, time1 - time0
     
@@ -560,9 +576,11 @@ class Sampler(AbstractSampler):
 
         # compute local energy and amplitude gradient
         psi_sigma = vstate.amplitude(sigma)
+        time2 = MPI.Wtime()
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
         eta, O_etasigma = op.get_conn(sigma)
         psi_eta = vstate.amplitude(eta)
+        time3 = MPI.Wtime()
 
         # convert torch tensors to numpy arrays
         psi_sigma = psi_sigma.cpu().detach().numpy()
@@ -570,6 +588,10 @@ class Sampler(AbstractSampler):
 
         # compute the local operator
         op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+
+        self.sample_time += (time1 - time0) # for profiling purposes
+        self.local_energy_time += (time3 - time2)
+        self.grad_time += (time2 - time1)
 
         return op_loc, time1 - time0
     
@@ -621,11 +643,12 @@ class Sampler(AbstractSampler):
         """
         if RANK == 0:
             print('Burn-in...')
-            t_burnin0 = time.time()
+        t_burnin0 = MPI.Wtime()
         self.burn_in(vstate)
+        t_burnin1 = MPI.Wtime()
         if RANK == 0:
-            t_burnin1 = time.time()
             print('Burn-in time:', t_burnin1 - t_burnin0)
+        self.burn_in_time = t_burnin1 - t_burnin0
 
         n = 0
         n_total = 0
@@ -734,11 +757,12 @@ class Sampler(AbstractSampler):
         """
         if RANK == 0:
             print('Burn-in...')
-            t_burnin0 = time.time()
+        t_burnin0 = MPI.Wtime()
         self.burn_in(vstate)
+        t_burnin1 = MPI.Wtime()
         if RANK == 0:
-            t_burnin1 = time.time()
             print('Burn-in time:', t_burnin1 - t_burnin0)
+        self.burn_in_time = t_burnin1 - t_burnin0
 
         n = 0
         n_total = 0
@@ -1041,8 +1065,8 @@ class MetropolisMPSSamplerSpinful(Sampler):
                     self.current_prob = proposed_prob
                     self.current_mps_prob = proposed_mps_prob
                     self.accepts += 1
-                if RANK == 1:
-                    print(f'RANK {RANK}: acceptance ratio {acceptance_ratio}, acceptance rate {self.accepts/self.attempts}')
+                # if RANK == 1:
+                #     print(f'RANK {RANK}: acceptance ratio {acceptance_ratio}, acceptance rate {self.accepts/self.attempts}')
             
         if self.current_amp == 0 and DEBUG:
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')

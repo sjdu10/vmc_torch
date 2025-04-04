@@ -6,7 +6,7 @@ noises = [1E-7] * 12 + [1E-7] * 12 + [0] * 6
 thrds = [1E-6] * 30
 n_sweeps = 30
 
-nx, ny = 6, 6
+nx, ny = 4, 4
 n = nx * ny
 u = 8.0
 nelec = int(nx*ny)

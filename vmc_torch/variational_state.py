@@ -28,6 +28,9 @@ class Variational_State:
         self.mean_logamp_grad = None
         self.dtype = dtype
         self.iprint = iprint
+        self.eager_sampling_time = None
+        self.equal_sampling_time = None
+        self.MPI_communication_time = None
         assert self.hi is not None, "Hilbert space must be provided for sampling!"
 
     
@@ -172,7 +175,10 @@ class Variational_State:
         if self.equal_partition:
             chain_length = self.Ns//SIZE # Number of samples per rank
             # use MPI for sampling
+            t0 = MPI.Wtime()
             op_expect, op_grad, op_var, op_err = self.collect_samples_w_grad(op, chain_length=chain_length)
+            t1 = MPI.Wtime()
+            self.equal_sampling_time = t1 - t0
         
         else:
             assert message_tag is not None, "Message tag must be provided for eager sampling!"
@@ -180,8 +186,7 @@ class Variational_State:
             t0 = MPI.Wtime()
             op_expect, op_grad, op_var, op_err = self.collect_samples_w_grad_eager(op, message_tag=message_tag)
             t1 = MPI.Wtime()
-            if RANK == 0:
-                print('    Time for eager sampling: {}'.format(t1-t0))
+            self.eager_sampling_time = t1 - t0
         
         # return statistics of the MC sampling
         stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_err}
@@ -207,7 +212,10 @@ class Variational_State:
         if self.equal_partition:
             chain_length = self.Ns//SIZE # Number of samples per rank
             # use MPI for sampling
+            t0 = MPI.Wtime()
             op_expect, op_var, op_err = self.collect_samples(op, chain_length=chain_length)
+            t1 = MPI.Wtime()
+            self.equal_sampling_time = t1 - t0
         
         else:
             if message_tag is None:
@@ -219,8 +227,9 @@ class Variational_State:
             t0 = MPI.Wtime()
             op_expect, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag)
             t1 = MPI.Wtime()
-            if RANK == 0:
-                print('    Time for eager sampling: {}'.format(t1-t0))
+            self.eager_sampling_time = t1 - t0
+            # if RANK == 0:
+            #     print('    Time for eager sampling: {}'.format(t1-t0))
         
         # return statistics of the MC sampling
         stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_err}
@@ -268,6 +277,7 @@ class Variational_State:
         chain_means = COMM.gather(chain_means_loc, root=0) # [[m_11, m_12], [m_21, m_22], ..., [m_q1, m_q2]] where q is the number of ranks
 
         t1 = MPI.Wtime()
+        self.MPI_communication_time = t1 - t_sample_end
 
         if RANK == 0:
             print('RANK{}, sample size: {}, chain length per rank: {}'.format(RANK, self.Ns, chain_length))
@@ -334,6 +344,7 @@ class Variational_State:
             local_op_loc_mean = 0.
             local_W_var = 0.
         op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
+        self.MPI_communication_time = MPI.Wtime() - t_sample_end
 
         if RANK == 0:
             print('    Total sample size: {}'.format(total_sample_Ns))
@@ -398,8 +409,10 @@ class Variational_State:
         W_sum = COMM.reduce(W_loc, op=MPI.SUM, root=0)
         # between-chain variance (B)
         chain_means = COMM.gather(chain_means_loc, root=0) # [[m_11, m_12], [m_21, m_22], ..., [m_q1, m_q2]] where q is the number of ranks
-
+        COMM.Barrier()
+        
         t1 = MPI.Wtime()
+        self.MPI_communication_time = t1 - t_sample_end
 
         # set the logamp_grad_matrix and mean_logamp_grad for all ranks
         # each rank has their local batch of logamp_grad_matrix, but shares the same mean_logamp_grad
@@ -495,10 +508,10 @@ class Variational_State:
             local_op_loc_mean = 0.
             local_W_var = 0.
         op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
-
+        self.MPI_communication_time = MPI.Wtime() - t_sample_end
         if RANK == 0:
-            print('    Total sample size: {}'.format(total_sample_Ns))
-            print('    Model Np = {}'.format(self.logamp_grad_matrix.shape[0]))
+            print('Total sample size: {}'.format(total_sample_Ns))
+            print('Model Np = {}'.format(self.logamp_grad_matrix.shape[0]))
             if DEBUG:
                 print('     Time for op_expect: {}'.format(t01-t0))
                 print('     Time for op_logamp_grad_product_sum: {}'.format(t02-t01))

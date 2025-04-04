@@ -134,7 +134,7 @@ class VMC:
         self.step_count = start
         for step in range(start, stop):
             if RANK == 0:
-                print('Variational step {}'.format(step))
+                print('\nVariational step {}'.format(step))
             self.step_count += 1
 
             # Update the learning rate if a scheduler is provided
@@ -157,6 +157,31 @@ class VMC:
 
             # Precondition the gradient through SR (optional)
             preconditioned_grad = self.preconditioner(self._state, state_MC_loss_grad)
+
+            COMM.Barrier() # Synchronize all ranks
+            if RANK == 1:
+                # For debugging purposes, print out the sampler's sample time and local energy time on rank 1
+                # Note: this is only for debugging purposes, it can be removed in production runs
+                print(f"{'Metric':<30} | {'Time (s)':>12}")
+                print("-" * 44)
+                print(f"{'Burn-in time':<30} | {self._state.sampler.burn_in_time:>12.4f}")
+                print(f"{'Rank 1: Chain sample time':<30} | {self._state.sampler.sample_time:>12.4f}")
+                print(f"{'Rank 1: Local energy time':<30} | {self._state.sampler.local_energy_time:>12.4f}")
+                print(f"{'Rank 1: Gradient time':<30} | {self._state.sampler.grad_time:>12.4f}")
+                if self._state.MPI_communication_time is not None:
+                    print(f"{'MPI comm time':<30} | {self._state.MPI_communication_time:>12.4f}")
+                print(f"{'=':<30} | {'=':>12.4}")
+                
+                if self._state.eager_sampling_time is not None:
+                    print(f"{'Eager sampling time':<30} | {self._state.eager_sampling_time:>12.4f}")
+                elif self._state.equal_sampling_time is not None:
+                    print(f"{'Equal sampling time':<30} | {self._state.equal_sampling_time:>12.4f}")
+                print(f"{f'SR solver time (conv={self.preconditioner.sr_convergence})':<30} | {self.preconditioner.sr_time:>12.4f}")
+                
+            # print(self._state.sampler.sample_time, self._state.sampler.local_energy_time)
+            self._state.sampler.sample_time = 0
+            self._state.sampler.local_energy_time = 0
+            self._state.sampler.grad_time = 0
 
             if RANK == 0:
                 print('Energy: {}, Err: {}, \nMAX gi: {}, Max SR gi (optional): {}, Max param: {}\n'.format(
@@ -218,14 +243,6 @@ class VMC:
             COMM.Bcast(new_param_vec,root=0)
             # Update the quantum state with the new parameter vector
             self._state.update_state(new_param_vec) # Reload the new parameter vector into the quantum state
-
-            if RANK == 1:
-                # For debugging purposes, print out the sampler's sample time and local energy time on rank 1
-                # Note: this is only for debugging purposes, it can be removed in production runs
-                print('Rank 1 sampler sample time and local energy time:')
-                print(self._state.sampler.sample_time, self._state.sampler.local_energy_time)
-            self._state.sampler.sample_time = 0
-            self._state.sampler.local_energy_time = 0
             
         return MC_energy_stats
     

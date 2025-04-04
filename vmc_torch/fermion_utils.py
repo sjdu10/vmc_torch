@@ -963,8 +963,8 @@ def from_spinful_ind_to_charge(config, symmetry='U1'):
     return np.array([charge_map[n] for n in config])
 
 def from_netket_config_to_quimb_config(netket_configs):
+    """Translate netket spin-1/2 fermion config to tensor network product state config"""
     def func(netket_config):
-        """Translate netket spin-1/2 config to tensor network product state config"""
         total_sites = len(netket_config)//2
         spin_up = netket_config[:total_sites]
         spin_down = netket_config[total_sites:]
@@ -989,23 +989,30 @@ def from_netket_config_to_quimb_config(netket_configs):
 
 def from_quimb_config_to_netket_config(quimb_config):
     """Translate tensor network product state config to netket spin-1/2 config"""
-    total_sites = len(quimb_config)
-    spin_up = np.zeros(total_sites, dtype=int)
-    spin_down = np.zeros(total_sites, dtype=int)
-    for i in range(total_sites):
-        if quimb_config[i] == 0:
-            spin_up[i] = 0
-            spin_down[i] = 0
-        if quimb_config[i] == 1:
-            spin_up[i] = 0
-            spin_down[i] = 1
-        if quimb_config[i] == 2:
-            spin_up[i] = 1
-            spin_down[i] = 0
-        if quimb_config[i] == 3:
-            spin_up[i] = 1
-            spin_down[i] = 1
-    return np.concatenate((spin_up, spin_down))
+
+    def func(quimb_config):
+        total_sites = len(quimb_config)
+        spin_up = np.zeros(total_sites, dtype=int)
+        spin_down = np.zeros(total_sites, dtype=int)
+        for i in range(total_sites):
+            if quimb_config[i] == 0:
+                spin_up[i] = 0
+                spin_down[i] = 0
+            if quimb_config[i] == 1:
+                spin_up[i] = 0
+                spin_down[i] = 1
+            if quimb_config[i] == 2:
+                spin_up[i] = 1
+                spin_down[i] = 0
+            if quimb_config[i] == 3:
+                spin_up[i] = 1
+                spin_down[i] = 1
+        return np.concatenate((spin_up, spin_down))
+    if len(quimb_config.shape) == 1:
+        return func(quimb_config)
+    else:
+        # batched
+        return np.array([func(quimb_config) for quimb_config in quimb_config])
 
 def detect_hopping(configi, configj):
     """Detect the hopping between two configurations"""

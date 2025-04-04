@@ -79,6 +79,8 @@ class SR(Preconditioner):
         self.exact = exact
         self.diag_eta = diag_eta
         self.rtol = rtol
+        self.sr_time = None
+        self.sr_convergence = None
         if solver == 'cg': # Conjugate Gradient, works for hermitian positive definite matrices
             self.solver = spla.cg
         elif solver == 'gmres': # For real or complex N-by-N matrix
@@ -156,12 +158,14 @@ class SR(Preconditioner):
                 matvec = lambda x: R_dot_x(x, self.diag_eta)
                 A = spla.LinearOperator((n, n), matvec=matvec)
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
-                t0 = time.time()
+                t0 = MPI.Wtime()
                 dp, info = self.solver(A, b, maxiter=self.iter_step, rtol=self.rtol)
-                t1 = time.time()
-                if RANK == 0:
-                    print("    Time for solving the linear equation: ", t1-t0)
-                    print("    SR solver convergence: ", info)
+                t1 = MPI.Wtime()
+                # if RANK == 0:
+                #     print("    Time for solving the linear equation: ", t1-t0)
+                #     print("    SR solver convergence: ", info)
+                self.sr_time = t1 - t0
+                self.sr_convergence = info
                 state.clear_memory()
                 return torch.tensor(dp, dtype=self.dtype)
 
@@ -193,9 +197,10 @@ class SR(Preconditioner):
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
                 # Solve the linear equation
                 t0 = time.time()
-                dp, _ = self.solver(A, b, maxiter=self.iter_step, rtol=self.rtol)
+                dp, info = self.solver(A, b, maxiter=self.iter_step, rtol=self.rtol)
                 t1 = time.time()
-                print("    Time for solving the linear equation: ", t1-t0)
+                self.sr_time = t1 - t0
+                self.sr_convergence = info
                 return torch.tensor(dp, dtype=self.dtype)
 
 #------------------------------------------------------------

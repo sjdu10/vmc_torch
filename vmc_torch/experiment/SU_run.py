@@ -12,8 +12,8 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-Lx = 6
-Ly = 6
+Lx = 4
+Ly = 8
 spinless = False
 # graph = nk.graph.Square(L)
 graph = nk.graph.Grid([Lx,Ly], pbc=False)
@@ -103,7 +103,7 @@ su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True, D=D, compute_e
 
 # cluster energies may not be accuracte yet
 su.evolve(50, tau=0.3)
-su.evolve(50, tau=0.1)
+# su.evolve(50, tau=0.1)
 # su.evolve(50, tau=0.03)
 # # su.evolve(50, tau=0.01)
 # # su.evolve(50, tau=0.003)
