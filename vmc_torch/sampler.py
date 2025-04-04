@@ -82,6 +82,8 @@ class AbstractSampler:
         self.initial_config = None
         self.current_config = None
         self.equal_partition = equal_partition
+        self.sample_time = 0
+        self.local_energy_time = 0
 
         rand_int = random.randint(0, 2**32-1)
         self.initial_config = torch.tensor(np.asarray(self.hi.random_state(jax.random.PRNGKey(rand_int))), dtype=self.dtype)
@@ -532,7 +534,7 @@ class Sampler(AbstractSampler):
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
         eta, O_etasigma = op.get_conn(sigma)
         psi_eta = vstate.amplitude(eta)
-
+        time2 = MPI.Wtime()
         # convert torch tensors to numpy arrays
         psi_sigma = psi_sigma.cpu().detach().numpy()
         psi_eta = psi_eta.cpu().detach().numpy()
@@ -540,6 +542,9 @@ class Sampler(AbstractSampler):
 
         # compute the local operator
         op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+
+        self.sample_time += (time1 - time0) # for profiling purposes
+        self.local_energy_time += (time2 - time1)
 
         return op_loc, logpsi_sigma_grad, time1 - time0
     

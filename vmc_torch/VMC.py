@@ -218,6 +218,14 @@ class VMC:
             COMM.Bcast(new_param_vec,root=0)
             # Update the quantum state with the new parameter vector
             self._state.update_state(new_param_vec) # Reload the new parameter vector into the quantum state
+
+            if RANK == 1:
+                # For debugging purposes, print out the sampler's sample time and local energy time on rank 1
+                # Note: this is only for debugging purposes, it can be removed in production runs
+                print('Rank 1 sampler sample time and local energy time:')
+                print(self._state.sampler.sample_time, self._state.sampler.local_energy_time)
+            self._state.sampler.sample_time = 0
+            self._state.sampler.local_energy_time = 0
             
         return MC_energy_stats
     

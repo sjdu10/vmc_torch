@@ -112,6 +112,14 @@ class fPEPS(qtn.PEPS):
                     2: do('array',[0.0, 1.0],**kwargs), 
                     3: do('array',[1.0,],**kwargs)
                 }
+            elif self.symmetry == 'U1U1':
+                index_map = {0:(0,0), 1:(0,1), 2:(1,0), 3:(1,1)}
+                array_map = {
+                    0: do('array',[1.0],**kwargs),
+                    1: do('array',[1.0],**kwargs), 
+                    2: do('array',[1.0],**kwargs),
+                    3: do('array',[1.0],**kwargs)
+                }
 
         for n, site in zip(config, self.sites):
             p_ind = self.site_ind_id.format(*site)
@@ -205,6 +213,14 @@ class fPEPS(qtn.PEPS):
                     2: do('array', [0.0, 1.0], **kwargs),
                     3: do('array', [1.0], **kwargs)
                 }
+            elif self.symmetry == 'U1U1':
+                index_map = {0:(0,0), 1:(0,1), 2:(1,0), 3:(1,1)}
+                array_map = {
+                    0: do('array',[1.0],**kwargs),
+                    1: do('array',[1.0],**kwargs), 
+                    2: do('array',[1.0],**kwargs),
+                    3: do('array',[1.0],**kwargs)
+                }
             
 
             for n, site in zip(config, self.sites):
@@ -217,6 +233,7 @@ class fPEPS(qtn.PEPS):
                 charge = index_map[int(n)]
                 input_vec = array_map[int(n)]
                 charge_sec_data_dict = ftsdata.blocks
+
                 new_fts_inds = fts.inds[:phys_ind_order] + fts.inds[phys_ind_order + 1:]
                 new_charge_sec_data_dict = {}
                 for charge_blk, data in charge_sec_data_dict.items():
@@ -238,8 +255,16 @@ class fPEPS(qtn.PEPS):
                 new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos != () else ()
                 new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
-
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge + ftsdata.charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                try:
+                    if ftsdata.symmetry == 'U1':
+                        new_charge = charge + ftsdata.charge
+                    elif ftsdata.symmetry == 'Z2':
+                        new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
+                    elif ftsdata.symmetry == 'U1U1':
+                        new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
+                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                except:
+                    print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
             amp = qtn.PEPS(peps)
@@ -247,10 +272,10 @@ class fPEPS(qtn.PEPS):
             return amp
 
 
-def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=True):
+def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=False):
     """Generate a random spinless/spinful fermionic square PEPS of shape (Lx, Ly)."""
 
-    assert symmetry == 'Z2' or symmetry == 'U1', "Only Z2 and U1 symmetries are supported."
+    assert symmetry in ['Z2', 'U1', 'U1U1'], "Only Z2 ,U1 and U1U1 symmetries are supported."
     
     edges = qtn.edges_2d_square(Lx, Ly, cyclic=cyclic)
     site_info = parse_edges_to_site_info(
@@ -278,16 +303,45 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
 
     elif symmetry == 'Z2':
         parity_config = charge_config
+    
+    elif symmetry == 'U1U1': # Sz=0
+        nu, nd = int(Nf/2), int(Nf/2)
+        charge_config_netket = from_quimb_config_to_netket_config(charge_config)
+        charge_config_netket_u = charge_config_netket[:len(charge_config_netket)//2]  # up spins
+        charge_config_netket_d = charge_config_netket[len(charge_config_netket)//2:]  # down spins
+        # put nu 1s in the first half of the configuration (up spins) and shuffle
+        charge_config_netket_u[:nu] = 1  # assign nu up spins
+        rng.shuffle(charge_config_netket_u)  # shuffle the up spins to randomize their positions
+        # put nd 1s in the second half of the configuration (down spins) and shuffle
+        charge_config_netket_d[:nd] = 1  # assign nd down spins
+        rng.shuffle(charge_config_netket_d)  # shuffle the down spins to randomize their positions
+        # combine the up and down configurations back into a single netket configuration
+        charge_config_netket = np.concatenate((charge_config_netket_u, charge_config_netket_d))
+        charge_config = from_spinful_ind_to_charge(from_netket_config_to_quimb_config(charge_config_netket), symmetry='U1U1')
 
     for site, info in sorted(site_info.items()):
         tid = site[0] * Ly + site[1]
-        # bond index charge distribution
-        block_indices = [
-            sr.BlockIndex({0: d // 2, 1: d // 2}, dual=dual)
-            for d, dual in zip(info["shape"][:-1], info["duals"][:-1])
-        ]
-        # physical index
+
+        # virtual index charge distribution
+        if symmetry == 'Z2':
+            block_indices = [
+                sr.BlockIndex({0: d // 2, 1: d // 2}, dual=dual)
+                for d, dual in zip(info["shape"][:-1], info["duals"][:-1])
+            ]
+        elif symmetry == 'U1':
+            block_indices = [
+                sr.BlockIndex({0: d // 4, 1: d // 2, 2: d // 4}, dual=dual)
+                for d, dual in zip(info["shape"][:-1], info["duals"][:-1])
+            ]
+        elif symmetry == 'U1U1':
+            block_indices = [
+                sr.BlockIndex({(0, 0): d//4, (0, 1): d//4, (1, 0): d//4, (1, 1): d//4}, dual=dual)
+                for d, dual in zip(info["shape"][:-1], info["duals"][:-1])
+            ]
+
+        # physical index charge distribution
         p = info['shape'][-1]
+
         if symmetry == 'Z2':
             block_indices.append(
                 sr.BlockIndex({0: p // 2, 1: p // 2}, dual=info["duals"][-1])
@@ -301,6 +355,10 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
                 block_indices.append(
                     sr.BlockIndex({0: p // 4, 1: p // 2, 2: p // 4}, dual=info["duals"][-1])
                 )
+        elif symmetry == 'U1U1':
+            block_indices.append(
+                sr.BlockIndex({(0, 0): p//4, (0, 1): p//4, (1, 0): p//4, (1, 1): p//4}, dual=info["duals"][-1])
+            )
         
         # random fermionic array
         if symmetry == 'Z2':
@@ -314,6 +372,13 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
             data = sr.U1FermionicArray.random(
                 block_indices,
                 charge=int(charge_config[tid]),
+                seed=rng,
+                oddpos=3*tid,
+            )
+        elif symmetry == 'U1U1':
+            data = sr.U1U1FermionicArray.random(
+                block_indices,
+                charge=charge_config[tid],
                 seed=rng,
                 oddpos=3*tid,
             )
@@ -344,6 +409,10 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
 
 
 def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
+    #XXX: need to be deleted in the future
+    raise DeprecationWarning(
+        'This function will be deprecated in favor of `fPEPS.product_bra_state` method. Please use `fPEPS` instead.'
+    )
     product_tn = qtn.TensorNetwork()
     backend = psi.tensors[0].data.backend
     device = config.device
@@ -440,6 +509,10 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
 
 def get_amp(peps, config, inplace=False, conj=True):
     """Get the amplitude of a configuration in a PEPS."""
+    #XXX: need to be deleted in the future
+    raise DeprecationWarning(
+        "The function `get_amp` in `fermion_utils` is deprecated, please use `fPEPS.get_amp` instead."
+    )
     if not inplace:
         peps = peps.copy()
     bra = product_bra_state(peps, config, dualness=False).conj() if conj else product_bra_state(peps, config, dualness=False)
@@ -875,11 +948,18 @@ def form_gated_fmps_tnf(
 def get_spinful_parity_map():
     return {0:0, 1:1, 2:1, 3:0}
 
-def get_spinful_charge_map():
-    return {0:0, 1:1, 2:1, 3:2}
+def get_spinful_charge_map(symmetry='U1'):
+    if symmetry == 'Z2':
+        return get_spinful_parity_map()
+    elif symmetry == 'U1':
+        return {0:0, 1:1, 2:1, 3:2}
+    elif symmetry == 'U1U1':
+        return {0:(0,0), 1:(0,1), 2:(1,0), 3:(1,1)}
+    else:
+        raise ValueError(f"Symmetry {symmetry} is not supported for spinful charge mapping.")
 
-def from_spinful_ind_to_charge(config):
-    charge_map = get_spinful_charge_map()
+def from_spinful_ind_to_charge(config, symmetry='U1'):
+    charge_map = get_spinful_charge_map(symmetry)
     return np.array([charge_map[n] for n in config])
 
 def from_netket_config_to_quimb_config(netket_configs):
