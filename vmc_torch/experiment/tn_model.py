@@ -56,6 +56,46 @@ def init_weights_uniform(m, a=-5e-3, b=5e-3):
             nn.init.uniform_(m.bias, a=a, b=b)
 
 
+class wavefunctionModel(torch.nn.Module):
+    """Common class functions for all fermionic VMC models"""
+    def __init__(self, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+    
+    def from_params_to_vec(self):
+        return torch.cat([param.data.flatten() for param in self.parameters()])
+    
+    @property
+    def num_params(self):
+        return len(self.from_params_to_vec())
+    
+    def params_grad_to_vec(self):
+        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        return param_grad_vec
+
+    def clear_grad(self):
+        for param in self.parameters():
+            if param is not None:
+                param.grad = None
+    
+    def load_params(self, new_params):
+        pointer = 0
+        for param, shape in zip(self.parameters(), self.param_shapes):
+            num_param = param.numel()
+            new_param_values = new_params[pointer:pointer+num_param].view(shape)
+            with torch.no_grad():
+                param.copy_(new_param_values)
+            pointer += num_param
+    
+    def amplitude(self, x):
+        raise NotImplementedError
+    
+    def forward(self, x):
+        if x.ndim == 1:
+            # If input is not batched, add a batch dimension
+            x = x.unsqueeze(0)
+        return self.amplitude(x)
+
 #------------ bosonic TN model ------------
 
 
@@ -95,7 +135,7 @@ class PEPS_model(torch.nn.Module):
             pointer += num_param
     
     def from_vec_to_params(self, vec):
-        # XXX: useful at all?
+        # XXX: useful at all? Yes for spin PEPS
         pointer = 0
         new_params = {}
         for tid, param in self.torch_tn_params.items():
@@ -103,6 +143,7 @@ class PEPS_model(torch.nn.Module):
             new_param_values = vec[pointer:pointer+num_param].view(param.shape)
             new_params[tid] = new_param_values
             pointer += num_param
+        return new_params
     
     @property
     def num_params(self):
@@ -145,6 +186,128 @@ class PEPS_model(torch.nn.Module):
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
         return self.amplitude(x)
+
+class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
+    """
+        For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
+        This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
+    """
+    def __init__(self, peps, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(peps)
+
+        self.torch_tn_params = {
+            str(tid): nn.Parameter(data)  # Convert Tensor to Parameter
+            for tid, data in params.items()
+        }
+        # register the torch tensors as parameters
+        for tid, param in self.torch_tn_params.items():
+            self.register_parameter(tid, param)
+
+        # Define the neural network
+        input_dim = peps.Lx * peps.Ly
+        phys_dim = peps.phys_dim()
+        
+        self.nn = SelfAttn_block(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embedding_dim=embedding_dim,
+            attention_heads=attention_heads,
+            dtype=self.param_dtype
+        )
+        # for each tensor (labelled by tid), assign a MLP
+        self.mlp = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            mlp_input_dim = peps.Lx * peps.Ly * embedding_dim
+            tn_params_vec = params[int(tid)].flatten()  # flatten the tensor to get the vector form
+            self.mlp[tid] = nn.Sequential(
+                nn.Linear(mlp_input_dim, nn_final_dim),
+                nn.LeakyReLU(),
+                nn.Linear(nn_final_dim, tn_params_vec.numel()),
+            )
+            self.mlp[tid].to(self.param_dtype)
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'PEPS_backflow_attn_Tensorwise':
+            {
+                'D': peps.max_bond(), 
+                'Lx': peps.Lx, 'Ly': peps.Ly, 
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta, 
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+                'max_bond': max_bond,
+            },
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        self.tree = None
+    
+    def from_vec_to_params(self, vec):
+        # XXX: useful at all? Yes for spin PEPS
+        pointer = 0
+        new_params = {}
+        for tid, param in self.torch_tn_params.items():
+            num_param = param.numel()
+            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
+            new_params[int(tid)] = new_param_values
+            pointer += num_param
+        return new_params
+    
+    def amplitude(self, x):
+        tn_params_vec = torch.cat(
+            [param.flatten() for param in self.torch_tn_params.values()]
+        )
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+        
+            # Get the NN correction to the parameters, concatenate the results for each tensor
+            nn_features = self.nn(x_i)
+            nn_features_vec = nn_features.view(-1)
+            nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
+            # Add the correction to the original parameters
+            tn_nn_params_vec = tn_params_vec + self.nn_eta*nn_correction
+            # Ensure the new parameters are in the correct format for the TN
+            tn_nn_params = self.from_vec_to_params(tn_nn_params_vec)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.isel({psi.site_inds[i]: int(s) for i, s in enumerate(x_i)})
+
+            if self.max_bond is None:
+                amp = amp
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp_val = amp.contract()
+                
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
 
 class PEPS_NN_Model(torch.nn.Module):
     def __init__(self, peps, max_bond=None, nn_hidden_dim=64, nn_eta=1e-3, activation='ReLU', param_dtype=torch.float32):
@@ -495,47 +658,9 @@ class PEPS_delocalized_Model(torch.nn.Module):
             x = x.unsqueeze(0)
         return self.amplitude(x)
 
+
+
 #------------ fermionic TN model ------------
-
-class wavefunctionModel(torch.nn.Module):
-    """Common class functions for all VMC models"""
-    def __init__(self, dtype=torch.float32):
-        super().__init__()
-        self.param_dtype = dtype
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
-        return param_grad_vec
-
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def load_params(self, new_params):
-        pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
-            num_param = param.numel()
-            new_param_values = new_params[pointer:pointer+num_param].view(shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
-    
-    def amplitude(self, x):
-        raise NotImplementedError
-    
-    def forward(self, x):
-        if x.ndim == 1:
-            # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x)
 
 class fMPSModel(wavefunctionModel):
     def __init__(self, ftn, dtype=torch.float32):

@@ -97,23 +97,24 @@ class SpinfulFermion(Hilbert):
 
         # Concatenate spin-up and spin-down states
         return from_netket_config_to_quimb_config(np.concatenate([up_state, down_state]))
-    
-    # def to_quimb_config(self, config):
-    #     return from_netket_config_to_quimb_config(config)
+
 
 class Spin(Hilbert):
     def __init__(self, s, N, total_sz=None):
         """Hilbert space obtained as tensor product of local spin states.
 
         Args:
-           s: Spin at each site. Must be integer or half-integer.
+           s: Spin at each site. Must be integer or half-integer. Currently only supports s=1/2.
            N: Number of sites (default=1)
            total_sz: If given, constrains the total spin of system to a particular
                 value.
         """
         self.s = s
+        assert float(s)==0.5, "Currently only supports s=1/2 for Spin Hilbert space"
         self.N = N
         self.total_sz = total_sz
+        if self.total_sz is not None:
+            assert type(self.total_sz) == int, "total_sz must be an integer for spin-1/2 sites"
         self._size = int(2 * s + 1) ** N
     
     def from_netket_to_quimb_spin_config(self, config):
@@ -133,9 +134,56 @@ class Spin(Hilbert):
             return func(config)
         else:
             return do('array',([func(c) for c in config]))
+        
+    def all_states(self):
+        """
+        Generate all states in the Hilbert space.
+        Each state is a configuration of spins at each site.
+        """
+        # Generate all possible configurations for a single site
+        single_site_states = np.linspace(0, 1, int(2 * self.s + 1))
+        assert len(single_site_states) == 2, 'Currently only supports s=1/2 for Spin Hilbert space, len(single_site_states) should be 2'
+        
+        if self.total_sz is not None:
+            su = int(self.N/2 + self.total_sz/self.s/2)
+            all_states = generate_binary_vectors(self.N, su)
+            return do('array', list(all_states))
+            
+
+        else:
+            # Generate all combinations of single-site states for N sites
+            all_states = itertools.product(single_site_states, repeat=self.N)            
+            # Convert to numpy array
+            return do('array', list(all_states))
+        
+    def random_state(self, key=None):
+        """
+        Generate a random state in the Hilbert space.
+        
+        Args:
+            key (int, optional): Random seed for reproducibility.
+        
+        Returns:
+            np.ndarray: A random configuration of spins in the Hilbert space.
+        """
+        rng = np.random.default_rng(key)
+        # Generate a random state by sampling from the possible spin values
+        single_site_states = np.linspace(-self.s, self.s, int(2 * self.s + 1))
+        assert len(single_site_states) == 2, 'Currently only supports s=1/2 for Spin Hilbert space, len(single_site_states) should be 2'
+
+        if self.total_sz is not None:
+            # If total_sz is specified, we need to sample a state with the correct total spin
+            su = int(self.N/2 + self.total_sz/self.s/2)
+            su_positions = rng.choice(self.N, size=su, replace=False)
+            random_state = np.zeros(self.N, dtype=np.int32)
+            random_state[su_positions] = 1
+
+        else:
+            # Otherwise, just generate a random state from the available single-site states
+            random_state = rng.choice(np.linspace(0, 1, int(2 * self.s + 1)), size=self.N)
+            
+        return do('array', random_state)
     
-    def to_quimb_config(self, config):
-        return self.from_netket_to_quimb_spin_config(config)
 
 class Graph:
     def __init__(self):
@@ -256,4 +304,73 @@ class spinful_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
                     else:
                         connected_config_coeff[eta_quimb] += value
         
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
+    
+
+
+def square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=False, total_sz=None):
+    # Build square lattice with nearest neighbor edges
+    N = Lx * Ly
+    hi = Spin(s=1/2, N=N, total_sz=total_sz)  # Spin-1/2 Hilbert space
+    graph = SquareLatticeGraph(Lx, Ly, pbc)
+    # Heisenberg with coupling J for nearest neighbors
+    H = dict()
+    for i, j in graph.edges():
+        # Add the Heisenberg term for the edge (i, j)
+        # The Heisenberg Hamiltonian is J * (S_i . S_j) = J * (S_i^x S_j^x + S_i^y S_j^y + S_i^z S_j^z)
+        # H = \sum_<i,j> 0.5J * (S_i^+ S_j^- + S_i^- S_j^+) + J * S_i^z S_j^z
+        # Note S = 1/2\sigma
+
+        if type(J) is dict:
+            # If J is a dictionary, use the specific coupling for the edge (i,j)
+            J_value = J.get((i, j), 0)
+            H[(i, j)] = J_value
+        else:
+            H[(i, j)] = J
+    
+    return H, hi, graph
+
+class spin_Heisenberg_square_lattice_torch(Hamiltonian):
+    def __init__(self, Lx, Ly, J, pbc=False, total_sz=None):
+        """
+        Implementation of spin-1/2 Heisenberg model on a square lattice using torch.
+        Args:
+            J: Coupling constant (can be a dict for edge-specific couplings)
+            total_sz: If given, constrains the total spin of system to a particular value.
+        """
+        H, hi, graph = square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=pbc, total_sz=total_sz)
+        super().__init__(H, hi, graph)
+    
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        connected_config_coeff = dict()
+        sigma = np.array(sigma_quimb)
+        for key, value in self._H.items():
+            i, j = key
+            J = value
+            if sigma[i] != sigma[j]:
+                # Hopping term
+
+                # H|sigma> = 0.5J * |eta>
+                eta = sigma.copy()
+                eta[i], eta[j] = sigma[j], sigma[i]
+                if tuple(eta) not in connected_config_coeff:
+                    # Calculate the phase correction (not needed for Heisenberg)
+                    connected_config_coeff[tuple(eta)] = 0.5 * J
+                else:
+                    # Accumulate the coefficients for degenerate states
+                    connected_config_coeff[tuple(eta)] += 0.5 * J
+            
+            eta0 = sigma.copy()
+            if tuple(eta0) not in connected_config_coeff:
+                # Handle the case of on-site term, which is J * S_i^z S_j^z
+                # For Heisenberg, this is already included in the coupling above
+                connected_config_coeff[tuple(eta0)] = 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
+            else:
+                # Accumulate the coefficients for degenerate states
+                connected_config_coeff[tuple(eta0)] += 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
+
         return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))

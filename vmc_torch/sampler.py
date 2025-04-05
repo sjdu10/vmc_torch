@@ -76,6 +76,7 @@ class AbstractSampler:
         self.hi = hi
         self.Ns = N_samples
         self.graph = graph
+        self.burn_in_already = False
         self.burn_in_steps = burn_in_steps
         self.reset_chain = reset_chain
         self.dtype = dtype
@@ -115,8 +116,12 @@ class Sampler(AbstractSampler):
     
     def burn_in(self, vstate):
         """Discard the initial samples. (Burn-in)"""
+        if self.burn_in_already and not self.reset_chain:
+            """Avoid multiple burn-in calls."""
+            return
         for _ in range(self.burn_in_steps):
             self._sample_next(vstate)
+        self.burn_in_already = True
     
     def _sample_next(self, vstate):
         """Sample the next configuration. Change the current configuration in place.
@@ -357,6 +362,7 @@ class Sampler(AbstractSampler):
 
             self.sample_time += (time1 - time0) # for profiling purposes
             self.local_energy_time += (time3 - time2)
+            self.grad_time += (time2 - time1)
 
             # convert torch tensors to numpy arrays
             psi_sigma = psi_sigma.cpu().detach().numpy()

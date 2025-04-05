@@ -1187,7 +1187,7 @@ def insert_proj_peps(amp, max_bond, yrange, xrange=None, from_which='ymin', lazy
 
 
 def flatten_proj_params(params):
-    """Flatten the tensor parameters into a vector.
+    """Flatten the fermionic tensor parameters into a vector.
     
     Parameters
     ----------
@@ -1208,7 +1208,7 @@ def flatten_proj_params(params):
 
 
 def reconstruct_proj_params(vec_params, params):
-    """Reconstruct the tensor parameters from a flattened vector.
+    """Reconstruct the fermionic tensor parameters from a flattened vector.
     
     Parameters
     ----------
