@@ -143,7 +143,9 @@ class SR(Preconditioner):
                 n_local_samples = local_logamp_grad_matrix.shape[1]
                 total_samples = COMM.allreduce(n_local_samples, op=MPI.SUM)
                 if energy_grad is None:
-                    energy_grad = COMM.bcast(energy_grad, root=0)
+                    # XXX: useless as in MPI this won't work, just raise an error
+                    # energy_grad = COMM.bcast(energy_grad, root=0)
+                    raise ValueError('energy_grad cannot be None')
                 def R_dot_x(x, eta=1e-6):
                     x_out_local = np.zeros_like(x)
                     # for i in range(local_logamp_grad_matrix.shape[1]):

@@ -358,7 +358,7 @@ class Sampler(AbstractSampler):
             psi_eta = vstate.amplitude(eta)
             time3 = MPI.Wtime()
             # if RANK==1:
-            #     print(f"    RANK1 sample {sigma}, Local Energy size: {len(eta)}, Chain length: {chain_length}")
+            #     print('Rank1 local energy + gradient time:', time3 - time1, 'Number of contractions:', len(eta))
 
             self.sample_time += (time1 - time0) # for profiling purposes
             self.local_energy_time += (time3 - time2)
@@ -944,7 +944,9 @@ class MetropolisExchangeSamplerSpinful(Sampler):
             site_pairs = random.choices(self.graph.edges(), k=self.subchain_length)
         else:
             site_pairs = self.graph.edges()
-
+        t0 = MPI.Wtime()
+        contraction_time = 0
+        # with pyinstrument.Profiler() as profiler:
         for (i, j) in site_pairs:
             if self.current_config[i] == self.current_config[j]:
                 continue
@@ -956,24 +958,25 @@ class MetropolisExchangeSamplerSpinful(Sampler):
             n_j = ind_n_map[self.current_config[j].item()]
             delta_n = abs(n_i - n_j)
             # delta_n = 1 --> SWAP
+            t00 = MPI.Wtime()
             if delta_n == 1:
                 proposed_config[i] = config_j
                 proposed_config[j] = config_i
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_amp = vstate.amplitude(proposed_config)
                 proposed_prob = abs(proposed_amp)**2
             elif delta_n == 0:
                 choices = [(0, 3), (3, 0), (config_j, config_i)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_amp = vstate.amplitude(proposed_config)
                 proposed_prob = abs(proposed_amp)**2
             elif delta_n == 2:
                 choices = [(config_j, config_i), (1,2), (2,1)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_amp = vstate.amplitude(proposed_config)
                 proposed_prob = abs(proposed_amp)**2
             else:
                 raise ValueError("Invalid configuration")
@@ -981,14 +984,18 @@ class MetropolisExchangeSamplerSpinful(Sampler):
                 acceptance_ratio = min(1, (proposed_prob/current_prob))
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
-
+            t01 = MPI.Wtime()
+            contraction_time += (t01 - t00)
             if random.random() < acceptance_ratio or (current_prob == 0):
                 self.current_config = proposed_config
                 current_amp = proposed_amp
                 current_prob = proposed_prob
                 self.accepts += 1
-            # if RANK == 1:
-            #     print(f'RANK {RANK}: acceptance ratio {acceptance_ratio}, acceptance rate {self.accepts/self.attempts}')
+        
+        t1 = MPI.Wtime()
+        # if RANK == 1:
+        #     print('RANK1: Time per sample:', t1 - t0, 'Contraction time:', contraction_time, 'Number of contraction:', len(site_pairs))
+            # profiler.print()
             
             
         if current_amp == 0 and DEBUG:

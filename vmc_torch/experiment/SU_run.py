@@ -12,8 +12,8 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-Lx = 4
-Ly = 8
+Lx = 6
+Ly = 6
 spinless = False
 # graph = nk.graph.Square(L)
 graph = nk.graph.Grid([Lx,Ly], pbc=False)
@@ -47,7 +47,7 @@ hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_pe
 
 
 # SU in quimb
-D = 4
+D = 8
 seed = 2
 symmetry = 'Z2'
 spinless = False

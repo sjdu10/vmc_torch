@@ -1202,10 +1202,15 @@ def flatten_proj_params(params):
     vec_proj = []
     for tid, ts_values in params.items():
         for blk, data in ts_values.items():
-            vec_proj += list(data.flatten())
-
-    return do('stack', vec_proj)
-
+            # # Ensure data is a tensor and flatten it
+            # if not isinstance(data, torch.Tensor):
+            #     data = torch.tensor(data)
+            vec_proj.append(data.view(-1))  # view(-1) flattens the tensor
+            # vec_proj+= list(data.flatten())
+    if isinstance(data, torch.Tensor):
+        return torch.cat(vec_proj)
+    else:
+        return do('stack', vec_proj)
 
 def reconstruct_proj_params(vec_params, params):
     """Reconstruct the fermionic tensor parameters from a flattened vector.
