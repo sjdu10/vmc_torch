@@ -962,21 +962,21 @@ class MetropolisExchangeSamplerSpinful(Sampler):
             if delta_n == 1:
                 proposed_config[i] = config_j
                 proposed_config[j] = config_i
-                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
                 proposed_prob = abs(proposed_amp)**2
             elif delta_n == 0:
                 choices = [(0, 3), (3, 0), (config_j, config_i)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
                 proposed_prob = abs(proposed_amp)**2
             elif delta_n == 2:
                 choices = [(config_j, config_i), (1,2), (2,1)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config)
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
                 proposed_prob = abs(proposed_amp)**2
             else:
                 raise ValueError("Invalid configuration")

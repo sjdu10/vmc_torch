@@ -1205,14 +1205,16 @@ def flatten_proj_params(params):
             # # Ensure data is a tensor and flatten it
             # if not isinstance(data, torch.Tensor):
             #     data = torch.tensor(data)
-            vec_proj.append(data.view(-1))  # view(-1) flattens the tensor
+            # vec_proj.append(data.view(-1))  # view(-1) flattens the tensor
+            vec_proj.append(data.reshape(-1))  # reshape(-1) flattens the tensor
+            
             # vec_proj+= list(data.flatten())
     if isinstance(data, torch.Tensor):
         return torch.cat(vec_proj)
     else:
         return do('stack', vec_proj)
 
-def reconstruct_proj_params(vec_params, params):
+def reconstruct_proj_params(vec_params, params=None, params_shape=None):
     """Reconstruct the fermionic tensor parameters from a flattened vector.
     
     Parameters
@@ -1229,12 +1231,21 @@ def reconstruct_proj_params(vec_params, params):
     """
     new_proj_params = {}
     idx = 0
-    for tid, ts_values in params.items():
-        new_ts_values = {}
-        for blk, data in ts_values.items():
-            new_ts_values[blk] = vec_params[idx:idx+len(data.flatten())].reshape(data.shape)
-            idx += len(data.flatten())
-        new_proj_params[tid] = new_ts_values
+    if params_shape is None:
+        for tid, ts_values in params.items():
+            new_ts_values = {}
+            for blk, data in ts_values.items():
+                new_ts_values[blk] = vec_params[idx:idx+len(data.reshape(-1))].reshape(data.shape)
+                idx += len(data.reshape(-1))
+            new_proj_params[tid] = new_ts_values
+    else:
+        for tid, ts_values in params_shape.items():
+            new_ts_values = {}
+            for blk, data_shape in ts_values.items():
+                new_ts_values[blk] = vec_params[idx:idx+np.prod(data_shape)].reshape(data_shape)
+                idx += np.prod(data_shape)
+            new_proj_params[tid] = new_ts_values
+
     return new_proj_params
 
 

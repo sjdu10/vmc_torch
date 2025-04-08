@@ -16,6 +16,7 @@ import cotengra as ctg
 from vmc_torch.fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params, insert_compressor
 from vmc_torch.global_var import DEBUG, set_debug
 flatten_tn_params = flatten_proj_params
+reconstruct_tn_params = reconstruct_proj_params
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -2169,6 +2170,15 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
 
+        # Store the shapes of the TN parameters
+        self.tn_params_shapes = params = {
+            int(tid): {
+                ast.literal_eval(sector): data.shape
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+
         self.model_structure = {
             'fPEPS_backflow_attn_Tensorwise':
             {
@@ -2216,7 +2226,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             nn_features_vec = nn_features.view(-1)
             nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
             # Add the correction to the original parameters
-            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta*nn_correction, params)
+            tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params, params_shape=self.tn_params_shapes)
             # Reconstruct the TN with the new parameters
             psi = qtn.unpack(tn_nn_params, self.skeleton)
             # Get the amplitude

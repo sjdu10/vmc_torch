@@ -12,8 +12,8 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-Lx = 6
-Ly = 6
+Lx = 4
+Ly = 2
 spinless = False
 # graph = nk.graph.Square(L)
 graph = nk.graph.Grid([Lx,Ly], pbc=False)
@@ -103,7 +103,7 @@ su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True, D=D, compute_e
 
 # cluster energies may not be accuracte yet
 su.evolve(50, tau=0.3)
-# su.evolve(50, tau=0.1)
+su.evolve(50, tau=0.1)
 # su.evolve(50, tau=0.03)
 # # su.evolve(50, tau=0.01)
 # # su.evolve(50, tau=0.003)
@@ -114,11 +114,11 @@ peps.equalize_norms_(value=1)
 # save the state
 params, skeleton = qtn.pack(peps)
 
-import os
-os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
+# import os
+# os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
 
-with open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
-    pickle.dump(skeleton, f)
-with open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
-    pickle.dump(params, f)
+# with open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
+#     pickle.dump(skeleton, f)
+# with open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
+#     pickle.dump(params, f)
     
