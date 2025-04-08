@@ -223,7 +223,7 @@ class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         self.mlp = nn.ModuleDict()
         for tid in self.torch_tn_params.keys():
             mlp_input_dim = peps.Lx * peps.Ly * embedding_dim
-            tn_params_vec = params[int(tid)].flatten()  # flatten the tensor to get the vector form
+            tn_params_vec = params[int(tid)].reshape(-1)  # flatten the tensor to get the vector form
             self.mlp[tid] = nn.Sequential(
                 nn.Linear(mlp_input_dim, nn_final_dim),
                 nn.LeakyReLU(),
@@ -2170,14 +2170,6 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
 
-        # Store the shapes of the TN parameters
-        self.tn_params_shapes = {
-            int(tid): {
-                ast.literal_eval(sector): data.shape
-                for sector, data in blk_array.items()
-            }
-            for tid, blk_array in self.torch_tn_params.items()
-        }
 
         self.model_structure = {
             'fPEPS_backflow_attn_Tensorwise':
@@ -2226,7 +2218,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             nn_features_vec = nn_features.view(-1)
             nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
             # Add the correction to the original parameters
-            tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params, params_shape=self.tn_params_shapes)
+            tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
             # Reconstruct the TN with the new parameters
             psi = qtn.unpack(tn_nn_params, self.skeleton)
             # Get the amplitude

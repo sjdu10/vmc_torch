@@ -1214,7 +1214,7 @@ def flatten_proj_params(params):
     else:
         return do('stack', vec_proj)
 
-def reconstruct_proj_params(vec_params, params=None, params_shape=None):
+def reconstruct_proj_params(vec_params, params=None):
     """Reconstruct the fermionic tensor parameters from a flattened vector.
     
     Parameters
@@ -1231,20 +1231,12 @@ def reconstruct_proj_params(vec_params, params=None, params_shape=None):
     """
     new_proj_params = {}
     idx = 0
-    if params_shape is None:
-        for tid, ts_values in params.items():
-            new_ts_values = {}
-            for blk, data in ts_values.items():
-                new_ts_values[blk] = vec_params[idx:idx+len(data.reshape(-1))].reshape(data.shape)
-                idx += len(data.reshape(-1))
-            new_proj_params[tid] = new_ts_values
-    else:
-        for tid, ts_values in params_shape.items():
-            new_ts_values = {}
-            for blk, data_shape in ts_values.items():
-                new_ts_values[blk] = vec_params[idx:idx+np.prod(data_shape)].reshape(data_shape)
-                idx += np.prod(data_shape)
-            new_proj_params[tid] = new_ts_values
+    for tid, ts_values in params.items():
+        new_ts_values = {}
+        for blk, data in ts_values.items():
+            new_ts_values[blk] = vec_params[idx:idx+data.numel()].reshape(data.shape)
+            idx += data.numel()
+        new_proj_params[tid] = new_ts_values
 
     return new_proj_params
 
