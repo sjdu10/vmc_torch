@@ -2171,7 +2171,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         # Store the shapes of the TN parameters
-        self.tn_params_shapes = params = {
+        self.tn_params_shapes = {
             int(tid): {
                 ast.literal_eval(sector): data.shape
                 for sector, data in blk_array.items()
