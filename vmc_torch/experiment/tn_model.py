@@ -1055,6 +1055,121 @@ class fMPS_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
 
+# define Receptive field for each site to its neighboring sites within radius r
+# for sites on the boundary, the receptive field is smaller due to open boundary condition
+def get_receptive_field_1d(L, r):
+    receptive_field = {}
+    for i in range(L):
+        neighbors = []
+        for j in range(max(0, i - r), min(L, i + r + 1)):
+            neighbors.append(j)
+        receptive_field[i] = neighbors
+    return receptive_field
+
+class fMPS_BFA_cluster_Model(wavefunctionModel):
+    """fMPS+NN model with a NN receptive field of radius r for each site"""
+    def __init__(self, fmps, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, radius=1, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(fmps)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Get the receptive field for each site
+        self.receptive_field = get_receptive_field_1d(fmps.L, r=radius)
+
+        phys_dim = fmps.phys_dim()
+        # for each tensor (labelled by tid), assign a attention+MLP
+        self.nn = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            # get the receptive field for the current tensor
+            neighbors = self.receptive_field[int(tid)]
+            input_dim = len(neighbors)
+            on_site_ts_params_dict ={
+                tid: params[int(tid)]
+            }
+            on_site_ts_params_vec = flatten_tn_params(on_site_ts_params_dict)
+            self.nn[tid] = SelfAttn_FFNN_block(
+                n_site=input_dim,
+                num_classes=phys_dim,
+                embedding_dim=embedding_dim,
+                attention_heads=attention_heads,
+                nn_hidden_dim=nn_final_dim,
+                output_dim=on_site_ts_params_vec.numel(),
+                dtype=self.param_dtype
+            )
+
+        # Get symmetry
+        self.symmetry = fmps.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fMPS_BFA_cluster': {
+                'D': fmps.max_bond(),
+                'L': fmps.L,
+                'radius': radius,
+                'symmetry': self.symmetry,
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta,
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+                
+            },
+        }
+        self.nn_eta = nn_eta
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+            
+            # For each site get the corresponding input config from x_i and receptive field
+            local_configs = {tid: x_i[neighbors] for tid, neighbors in self.receptive_field.items()}
+            # Get the corresponding NN output for each site and concatenate
+            nn_correction = torch.cat([self.nn[tid](local_configs[int(tid)]) for tid in self.torch_tn_params.keys()])
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta * nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            amp_val = amp.contract()
+            if amp_val == 0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
 #------------ fermionic PEPS based model ------------
 
 class fTNModel(wavefunctionModel):

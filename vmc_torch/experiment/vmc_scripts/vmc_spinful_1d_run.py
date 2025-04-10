@@ -7,6 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 from mpi4py import MPI
 import pickle
+import sys
 
 # torch
 import torch
@@ -16,13 +17,13 @@ torch.autograd.set_detect_anomaly(False)
 import quimb.tensor as qtn
 import autoray as ar
 
-from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_backflow_attn_Tensorwise_Model_v1
+from vmc_torch.experiment.tn_model import fMPSModel, fMPS_backflow_Model, fMPS_backflow_attn_Tensorwise_Model_v1, fMPS_BFA_cluster_Model
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SR, Adam, SGD_momentum, DecayScheduler
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_chain, spinful_Fermi_Hubbard_chain_quimb
+from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_chain_torch
 from vmc_torch.torch_utils import SVD,QR
 from vmc_torch.fermion_utils import generate_random_fmps, form_gated_fmps_tnf
 
@@ -39,18 +40,17 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 # Hamiltonian parameters
-L = int(10)
+L = int(8)
 symmetry = 'Z2'
 t = 1.0
 U = 8.0
 N_f = int(L-2)
 n_fermions_per_spin = (N_f//2, N_f//2)
-H = spinful_Fermi_Hubbard_chain(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
-quimb_ham = spinful_Fermi_Hubbard_chain_quimb(L, t, U, mu=0.0, pbc=False, symmetry=symmetry)
+H = spinful_Fermi_Hubbard_chain_torch(L, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
 D = 4
-chi = -2
+chi = -1
 dtype=torch.float64
 
 # Load mps
@@ -71,6 +71,7 @@ if (N_samples/SIZE)%2 != 0:
 
 # model = fMPSModel(mps, dtype=dtype)
 model = fMPS_backflow_attn_Tensorwise_Model_v1(mps, embedding_dim=16, attention_heads=4, nn_final_dim=int(L/2), nn_eta=1.0, dtype=dtype)
+model = fMPS_BFA_cluster_Model(mps, embedding_dim=16, attention_heads=4, nn_final_dim=int(L/2), nn_eta=1.0, radius=1, dtype=dtype)
 # model = fMPS_backflow_Model(mps, nn_eta=1.0, num_hidden_layer=2, nn_hidden_dim=2*L, dtype=dtype)
 init_std = 5e-2
 seed = 2
@@ -81,12 +82,13 @@ model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 model_names = {
     fMPSModel: 'fMPS',
     fMPS_backflow_Model: 'fMPS_backflow',
-    fMPS_backflow_attn_Tensorwise_Model_v1: 'fMPS_backflow_attn_Tensorwise_v1'
+    fMPS_backflow_attn_Tensorwise_Model_v1: 'fMPS_backflow_attn_Tensorwise_v1',
+    fMPS_BFA_cluster_Model: 'fMPS_BFA_cluster',
 }
 model_name = model_names.get(type(model), 'UnknownModel')
 
 
-init_step = 0
+init_step = 18
 final_step = 250
 total_steps = final_step - init_step
 # Load model parameters
@@ -139,8 +141,50 @@ vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimize
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)
     os.makedirs(pwd+f'/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
-    # with pyinstrument.Profiler() as prof:
-    vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
-    # if RANK == 0:
-    #     prof.print()
+    record_file = open(pwd+f'/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'w')
+    record_file = open(pwd+f'/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/record{init_step}.txt', 'a')
+    if RANK == 0:
+        # print training information
+        print(f"Running VMC for {model_name}")
+        print(f'model params: {variational_state.num_params}')
+        print(f"Optimizer: {optimizer}")
+        print(f"Preconditioner: {preconditioner}")
+        print(f"Scheduler: {scheduler}")
+        print(f"Sampler: {sampler}")
+        print(f'1D Fermi-Hubbard model (L={L}) with {N_f} fermions, Sz=0, t={t}, U={U}')
+        print(f"Running {total_steps} steps from {init_step} to {final_step}")
+        print(f'Model initialized with mean=0, std={init_std}')
+        print(f'Learning rate: {learning_rate}')
+        print(f'Sample size: {N_samples}')
+        print(f'fMPS bond dimension: {D}, max bond: {chi}')
+        print(f'fMPS symmetry: {symmetry}\n')
+        try:
+            print(model.model_structure)
+        except:
+            pass
+    
+    sys.stdout = record_file
 
+    if RANK == 0:
+        # print training information
+        print(f"Running VMC for {model_name}")
+        print(f'model params: {variational_state.num_params}')
+        print(f"Optimizer: {optimizer}")
+        print(f"Preconditioner: {preconditioner}")
+        print(f"Scheduler: {scheduler}")
+        print(f"Sampler: {sampler}")
+        print(f'1D Fermi-Hubbard model (L={L}) with {N_f} fermions, Sz=0, t={t}, U={U}')
+        print(f"Running {total_steps} steps from {init_step} to {final_step}")
+        print(f'Model initialized with mean=0, std={init_std}')
+        print(f'Learning rate: {learning_rate}')
+        print(f'Sample size: {N_samples}')
+        print(f'fMPS bond dimension: {D}, max bond: {chi}')
+        print(f'fMPS symmetry: {symmetry}\n')
+        try:
+            print(model.model_structure)
+        except:
+            pass
+    
+    COMM.Barrier()
+
+    vmc.run(init_step, init_step+total_steps, tmpdir=pwd+f'/L={L}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/')
