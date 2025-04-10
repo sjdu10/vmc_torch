@@ -201,7 +201,7 @@ class Graph:
     def site_index_map(self):
         return self._site_index_map
 
-class SquareLatticeGraph(Graph):
+class SquareLattice(Graph):
     def __init__(self, Lx, Ly, pbc=False, site_index_map=lambda i, j, Lx, Ly: i * Ly + j):
         """Zig-zag ordering"""
         self.Lx = Lx
@@ -210,6 +210,13 @@ class SquareLatticeGraph(Graph):
         edges = qtn.edges_2d_square(self.Lx, self.Ly, cyclic=self.pbc)
         self._edges = [(site_index_map(*site_i, Lx, Ly), site_index_map(*site_j, Lx, Ly)) for site_i, site_j in edges]
         self._site_index_map = site_index_map
+
+class Chain(Graph):
+    def __init__(self, L, pbc=False):
+        self.L = L
+        self.pbc = pbc
+        edges = qtn.edges_1d_chain(L, cyclic=pbc)
+        self._edges = edges
 
 
 class Operator:
@@ -239,6 +246,75 @@ class Hamiltonian(Operator):
     def H(self):
         return self._H
 
+def chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+    """Implementation of spinful Fermi-Hubbard model on a 1D chain"""
+    if pbc:
+        raise NotImplementedError("PBC not implemented yet")
+    N = L
+    if n_fermions_per_spin is None:
+        hi = SpinfulFermion(n_orbitals=N, n_fermions=N_f)
+    else:
+        hi = SpinfulFermion(n_orbitals=N, n_fermions_per_spin=n_fermions_per_spin)
+    
+    graph = Chain(L, pbc)
+
+    H = dict()
+    for i, j in graph.edges():
+        for spin in (1,-1):
+            H[(i, j, spin)] = -t
+
+    for i in range(N):
+        H[(i,)] = U
+    
+    return H, hi, graph
+
+class spinful_Fermi_Hubbard_chain_torch(Hamiltonian):
+    def __init__(self, L, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+        """
+        Implementation of spinful Fermi-Hubbard model on a square lattice using torch.
+        Args:
+            N_f is used to restrict the Hilbert space.
+        """
+        H, hi, graph = chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc, n_fermions_per_spin)
+        super().__init__(H, hi, graph)
+
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        sigma = from_quimb_config_to_netket_config(sigma_quimb)
+        connected_config_coeff = dict()
+        for key, value in self._H.items():
+            if len(key) == 3:
+                # hopping term
+                i0, j0, spin = key
+                i = i0 if spin == 1 else i0 + self.hilbert.n_orbitals // 2
+                j = j0 if spin == 1 else j0 + self.hilbert.n_orbitals // 2
+                # Check if the two sites are different
+                if sigma[i] != sigma[j]:
+                    # H|sigma> = -t * |eta>
+                    eta = sigma.copy()
+                    eta[i], eta[j] = sigma[j], sigma[i]
+                    eta_quimb0 = from_netket_config_to_quimb_config(eta)
+                    eta_quimb = tuple(eta_quimb0)
+                    # Calculate the phase correction
+                    phase = calc_phase_symmray(from_netket_config_to_quimb_config(sigma), eta_quimb0)
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value*phase
+                    else:
+                        connected_config_coeff[eta_quimb] += value*phase
+            elif len(key) == 1:
+                # on-site term
+                i = key[0]
+                if sigma_quimb[i] == 3:
+                    eta_quimb = tuple(sigma_quimb)
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value
+                    else:
+                        connected_config_coeff[eta_quimb] += value
+        
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
 
 
 
@@ -252,7 +328,7 @@ def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermion
     else:
         hi = SpinfulFermion(n_orbitals=N, n_fermions_per_spin=n_fermions_per_spin)
     
-    graph = SquareLatticeGraph(Lx, Ly, pbc)
+    graph = SquareLattice(Lx, Ly, pbc)
 
     H = dict()
     for i, j in graph.edges():
@@ -318,7 +394,7 @@ def square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=False, total_sz=None):
     # Build square lattice with nearest neighbor edges
     N = Lx * Ly
     hi = Spin(s=1/2, N=N, total_sz=total_sz)  # Spin-1/2 Hilbert space
-    graph = SquareLatticeGraph(Lx, Ly, pbc)
+    graph = SquareLattice(Lx, Ly, pbc)
     # Heisenberg with coupling J for nearest neighbors
     H = dict()
     for i, j in graph.edges():
