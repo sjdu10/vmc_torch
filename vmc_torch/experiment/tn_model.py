@@ -8,9 +8,6 @@ import torch.nn.functional as F
 # quimb
 import quimb.tensor as qtn
 from quimb.tensor.tensor_2d import Rotator2D, pairwise
-import symmray as sr
-import autoray as ar
-from autoray import do
 import cotengra as ctg
 
 from vmc_torch.fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params, insert_compressor
@@ -64,14 +61,14 @@ class wavefunctionModel(torch.nn.Module):
         self.param_dtype = dtype
     
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     @property
     def num_params(self):
         return len(self.from_params_to_vec())
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -124,7 +121,7 @@ class PEPS_model(torch.nn.Module):
         # self.load_params(self.from_params_to_vec())
     
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     def load_params(self, vec):
         pointer = 0
@@ -151,7 +148,7 @@ class PEPS_model(torch.nn.Module):
         return len(self.from_params_to_vec())
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -265,7 +262,7 @@ class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
     
     def amplitude(self, x):
         tn_params_vec = torch.cat(
-            [param.flatten() for param in self.torch_tn_params.values()]
+            [param.reshape(-1) for param in self.torch_tn_params.values()]
         )
 
         # `x` is expected to be batched as (batch_size, input_dim)
@@ -351,7 +348,7 @@ class PEPS_NN_Model(torch.nn.Module):
         self.nn_eta = nn_eta
     
     def from_two_row_params_to_vec(self, two_row_params):
-        return torch.cat([param.flatten() for param in two_row_params.values()])
+        return torch.cat([param.reshape(-1) for param in two_row_params.values()])
     
     def from_vec_to_two_row_params(self, vec):
         pointer = 0
@@ -364,7 +361,7 @@ class PEPS_NN_Model(torch.nn.Module):
         return new_two_row_params
     
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     def load_params(self, vec):
         pointer = 0
@@ -380,7 +377,7 @@ class PEPS_NN_Model(torch.nn.Module):
         return len(self.from_params_to_vec())
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -468,7 +465,7 @@ class PEPS_NNproj_Model(torch.nn.Module):
         self.nn_eta = nn_eta
     
     def from_tn_params_to_vec(self, tn_params):
-        return torch.cat([param.flatten() for param in tn_params.values()])
+        return torch.cat([param.reshape(-1) for param in tn_params.values()])
     
     def from_vec_to_tn_params(self, vec, tn_params_example):
         pointer = 0
@@ -481,7 +478,7 @@ class PEPS_NNproj_Model(torch.nn.Module):
         return new_tn_params
     
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     def load_params(self, vec):
         pointer = 0
@@ -497,7 +494,7 @@ class PEPS_NNproj_Model(torch.nn.Module):
         return len(self.from_params_to_vec())
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -598,7 +595,7 @@ class PEPS_delocalized_Model(torch.nn.Module):
         return peps
     
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     def load_params(self, vec):
         pointer = 0
@@ -624,7 +621,7 @@ class PEPS_delocalized_Model(torch.nn.Module):
         return len(self.from_params_to_vec())
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -2147,7 +2144,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             num_classes=phys_dim,
             embedding_dim=embedding_dim,
             attention_heads=attention_heads,
-            dtype=self.param_dtype
+            dtype=self.param_dtype,
         )
         # for each tensor (labelled by tid), assign a MLP
         self.mlp = nn.ModuleDict()
@@ -2297,7 +2294,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
         }
     
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     @property
     def num_params(self):
@@ -2312,7 +2309,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
         return num
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -2429,7 +2426,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
         }
     
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     @property
     def num_params(self):
@@ -2444,7 +2441,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
         return num
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -2577,7 +2574,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
         
     
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     @property
     def num_params(self):
@@ -2592,7 +2589,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
         return num
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -2785,7 +2782,7 @@ class fTN_Transformer_Model(torch.nn.Module):
         }
 
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     @property
     def num_params(self):
@@ -2800,7 +2797,7 @@ class fTN_Transformer_Model(torch.nn.Module):
         return num
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -2938,7 +2935,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
         }
 
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     @property
     def num_params(self):
@@ -2953,7 +2950,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
         return num
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):
@@ -3101,7 +3098,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
         }
 
     def from_params_to_vec(self):
-        return torch.cat([param.data.flatten() for param in self.parameters()])
+        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
     
     @property
     def num_params(self):
@@ -3116,7 +3113,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
         return num
     
     def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.flatten() if param.grad is not None else torch.zeros_like(param).flatten() for param in self.parameters()])
+        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
         return param_grad_vec
 
     def clear_grad(self):

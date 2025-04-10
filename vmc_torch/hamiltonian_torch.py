@@ -212,7 +212,7 @@ class SquareLatticeGraph(Graph):
         self._site_index_map = site_index_map
 
 
-class Hamiltonian:
+class Operator:
     def __init__(self, H, hi, graph):
         self._H = H
         self._graph = graph
@@ -228,12 +228,18 @@ class Hamiltonian:
         """Customized Hilbert space"""
         return self._hilbert
     
+    def get_conn(self, sigma):
+        raise NotImplementedError
+
+class Hamiltonian(Operator):
+    def __init__(self, H, hi, graph):
+        super().__init__(H, hi, graph)
+    
     @property
     def H(self):
         return self._H
-    
-    def get_conn(self, sigma):
-        raise NotImplementedError
+
+
 
 
 def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None):

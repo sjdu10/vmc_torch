@@ -25,7 +25,7 @@ def tensor_aware_lru_cache(maxsize=128):
         def tensor_to_hashable(tensor):
             """Convert torch.Tensor to a hashable representation (shape + data tuple)."""
             if isinstance(tensor, torch.Tensor):
-                return tensor.numpy().tobytes()
+                return tensor.cpu().numpy().tobytes()
             elif isinstance(tensor, numpy.ndarray):
                 return tensor.tobytes()
             return tensor
