@@ -163,16 +163,16 @@ class VMC:
                 sample_time = np.array(self._state.sampler.sample_time)
                 local_energy_time = np.array(self._state.sampler.local_energy_time)
                 gradient_time = np.array(self._state.sampler.grad_time)
-                COMM.Send(sample_time, dest=0, tag=step+2**29)
-                COMM.Send(local_energy_time, dest=0, tag=step+2**30)
-                COMM.Send(gradient_time, dest=0, tag=step+2**28)
+                COMM.Send(sample_time, dest=0, tag=step+10)
+                COMM.Send(local_energy_time, dest=0, tag=step+11)
+                COMM.Send(gradient_time, dest=0, tag=step+12)
             elif RANK==0:
                 sample_time = np.empty(1, dtype=float)
                 local_energy_time = np.empty(1, dtype=float)
                 gradient_time = np.empty(1, dtype=float)
-                COMM.Recv(sample_time, source=1, tag=step+2**29)
-                COMM.Recv(local_energy_time, source=1, tag=step+2**30)
-                COMM.Recv(gradient_time, source=1, tag=step+2**28)
+                COMM.Recv(sample_time, source=1, tag=step+10)
+                COMM.Recv(local_energy_time, source=1, tag=step+11)
+                COMM.Recv(gradient_time, source=1, tag=step+12)
                 self._state.sampler.sample_time = sample_time[0]
                 self._state.sampler.local_energy_time = local_energy_time[0]
                 self._state.sampler.grad_time = gradient_time[0]
