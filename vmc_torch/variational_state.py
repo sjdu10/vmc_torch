@@ -72,6 +72,16 @@ class Variational_State:
         except AttributeError:
             pass
     
+    def clear_env_cache(self):
+        self.vstate_func.clear_wavefunction_env_cache()
+
+    def set_cache_env_mode(self, on=False):
+        """Set the cache env mode for the variational state."""
+        if on:
+            self.vstate_func.cache_env_mode = True
+        else:
+            self.vstate_func.cache_env_mode = False
+    
     def clear_memory(self):
         """Clear the memory of the variational state."""
         self.logamp_grad_matrix = None

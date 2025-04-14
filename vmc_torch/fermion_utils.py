@@ -154,9 +154,67 @@ class fPEPS(qtn.PEPS):
 
         return product_tn
     
+    def product_bra_state_functional(self, config, reverse=1):
+        product_tn = qtn.TensorNetwork()
+        backend = self.tensors[0].data.backend
+        dtype = eval(backend+'.'+self.tensors[0].data.dtype)
+        if type(config) == numpy.ndarray:
+            kwargs = {'like':config, 'dtype':dtype}
+        elif type(config) == torch.Tensor:
+            device = list(self.tensors[0].data.blocks.values())[0].device
+            kwargs = {'like':config, 'device':device, 'dtype':dtype}
+        if self.spinless:
+            raise NotImplementedError("Functional bra state is not implemented for spinless fermions.")
+        else:
+            if self.symmetry == 'Z2':
+                index_map = torch.tensor([0, 1, 1, 0], device=device, dtype=dtype)
+                array_map = {
+                    0: do('array',[1.0, 0.0],**kwargs), 
+                    1: do('array',[1.0, 0.0],**kwargs), 
+                    2: do('array',[0.0, 1.0],**kwargs), 
+                    3: do('array',[0.0, 1.0],**kwargs)
+                }
+                def block0():
+                    return {(0,): do('array',[1.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (0,): do('array',[0.0, 0.0],**kwargs)}
+                def block1():
+                    return {(0,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[1.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (0,): do('array',[0.0, 0.0],**kwargs)}
+                def block2():
+                    return {(0,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 1.0],**kwargs), (0,): do('array',[0.0, 0.0],**kwargs)}
+                def block3():
+                    return {(0,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (0,): do('array',[1.0, 0.0],**kwargs)}
+            else:
+                raise NotImplementedError("Functional bra state is not implemented for spinful fermions.")
+
+        for n, site in zip(config, self.sites):
+            p_ind = self.site_ind_id.format(*site)
+            p_tag = self.site_tag_id.format(*site)
+            tid = self.sites.index(site)
+
+            n_charge = index_map[n.unsqueeze(0).int()]
+
+            oddpos = None
+            if not self.spinless:
+                phase = 1
+            else:
+                raise NotImplementedError("Functional bra state is not implemented for spinless fermions.")
+
+            tsr_data = sr.FermionicArray.from_blocks(
+                blocks=torch.where(n_charge==0, block0(), block1(), block2(), block3()), 
+                duals=(True,),
+                symmetry=self.symmetry, 
+                charge=n_charge, 
+                oddpos=oddpos
+            )
+            tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
+            product_tn |= tsr
+
+        return product_tn
+    
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
-    def get_amp(self, config, inplace=False, conj=True, reverse=1, contract=True, efficient=True):
+    def get_amp(self, config, inplace=False, conj=True, reverse=1, contract=True, efficient=True, functional=False):
         """Get the amplitude of a configuration in a PEPS."""
+        if functional:
+            return self.get_amp_functional(config, inplace=inplace)
         if efficient:
             return self.get_amp_efficient(config, inplace=inplace)
         peps = self if inplace else self.copy()
@@ -270,6 +328,30 @@ class fPEPS(qtn.PEPS):
             amp = qtn.PEPS(peps)
 
             return amp
+    
+    def get_amp_functional(self, config, inplace=False, conj=True, reverse=1, contract=True):
+        peps = self if inplace else self.copy()
+        product_state = self.product_bra_state_functional(config, reverse=reverse).conj() if conj else self.product_bra_state(config, reverse=reverse)
+        
+        amp = peps|product_state # ---T---<---|n>
+
+        if not contract:
+            return amp
+        
+        for site in peps.sites:
+            site_tag = peps.site_tag_id.format(*site)
+            amp.contract_(tags=site_tag)
+
+        amp.view_as_(
+            qtn.PEPS,
+            site_ind_id="k{},{}",
+            site_tag_id="I{},{}",
+            x_tag_id="X{}",
+            y_tag_id="Y{}",
+            Lx=peps.Lx,
+            Ly=peps.Ly,
+        )
+        return amp
 
 
 def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=False):

@@ -203,13 +203,32 @@ class Graph:
 
 class SquareLattice(Graph):
     def __init__(self, Lx, Ly, pbc=False, site_index_map=lambda i, j, Lx, Ly: i * Ly + j):
-        """Zig-zag ordering"""
+        """Zig-zag ordering, nearest neighbor edges"""
         self.Lx = Lx
         self.Ly = Ly
         self.pbc = pbc
         edges = qtn.edges_2d_square(self.Lx, self.Ly, cyclic=self.pbc)
         self._edges = [(site_index_map(*site_i, Lx, Ly), site_index_map(*site_j, Lx, Ly)) for site_i, site_j in edges]
         self._site_index_map = site_index_map
+
+        # used for reusable samplers
+        self.row_edges = {} # edges in the same row
+        self.col_edges = {} # edges in the same column
+        for (i, j) in self.edges():
+            i_coo = self.from_index_to_2dcoo(i)
+            j_coo = self.from_index_to_2dcoo(j)
+            if i_coo[0] == j_coo[0]:
+                if i_coo[0] not in self.row_edges:
+                    self.row_edges[i_coo[0]] = []
+                self.row_edges[i_coo[0]].append((i, j))
+            elif i_coo[1] == j_coo[1]:
+                if i_coo[1] not in self.col_edges:
+                    self.col_edges[i_coo[1]] = []
+                self.col_edges[i_coo[1]].append((i, j))
+                
+    def from_index_to_2dcoo(self, index):
+        """Convert a 1D zig-zag ordering index to 2D coordinates"""
+        return index // self.Ly, index % self.Ly
 
 class Chain(Graph):
     def __init__(self, L, pbc=False):

@@ -351,7 +351,9 @@ class Sampler(AbstractSampler):
                 pbar.set_postfix({'Time per sample for each rank': (time1 - time0)})
 
             # compute local energy and amplitude gradient
+            vstate.set_cache_env_mode(on=True)
             psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
+            vstate.set_cache_env_mode(on=False)
             time2 = MPI.Wtime()
             # compute the connected non-zero operator matrix elements <eta|O|sigma>
             eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
@@ -507,7 +509,8 @@ class Sampler(AbstractSampler):
                 terminate = np.empty(1, dtype=np.int32)
                 COMM.Recv([terminate, MPI.INT], source=0, tag=message_tag+1)
 
-        
+        vstate.clear_env_cache()
+
         if self.reset_chain:
             self.reset()
         
@@ -542,17 +545,22 @@ class Sampler(AbstractSampler):
         time0 = MPI.Wtime()
         # sample the next configuration
         psi_sigma = 0
+        # with torch.no_grad():
         while psi_sigma == 0:
             # We need to make sure that the amplitude is not zero
             sigma, psi_sigma = self._sample_next(vstate)
         time1 = MPI.Wtime()
 
         # compute local energy and amplitude gradient
+        vstate.set_cache_env_mode(on=True)
         psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
+        vstate.set_cache_env_mode(on=False)
+
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
         time2 = MPI.Wtime()
         eta, O_etasigma = op.get_conn(sigma)
         psi_eta = vstate.amplitude(eta)
+        # vstate.clear_env_cache()
         time3 = MPI.Wtime()
         # if RANK==1:
         #     print(f"    RANK1 sample {sigma}, Local Energy size: {len(eta)}")
@@ -1002,6 +1010,103 @@ class MetropolisExchangeSamplerSpinful(Sampler):
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')
         
         return self.current_config, current_amp
+
+
+class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
+        """
+        Parameters
+        ----------
+        hi : Hilbert
+            The Hilbert space.
+        graph : Graph
+            Lattice graph.
+        N_samples : int
+            The number of samples.
+        burn_in_steps : int
+            The number of burn-in steps.
+        reset_chain : bool
+            Whether to reset the chain after each VMC step.
+        random_edge : bool
+            Whether to randomly select the edges in the exchange move.
+        subchain_length : int
+            The number of samples we discard before collecting two samples.
+        equal_partition : bool
+            Whether the number of samples is equal for all MPI processes. If False, we use eager sampling and must have SIZE > 1.
+        dtype : torch.dtype
+
+        """
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
+
+    def _sample_next(self, vstate):
+        """Sample the next configuration. Change the current configuration in place."""
+        # initial cache of env_x and env_y for current configuration
+        self.current_amp = vstate.amplitude(self.current_config).cpu()
+        self.current_prob = abs(self.current_amp)**2
+        proposed_config = self.current_config.clone()
+        ind_n_map = {0:0, 1:1, 2:1, 3:2}
+        def exchange_propose(i, j):
+            if self.current_config[i] == self.current_config[j]:
+                return 
+            self.attempts += 1
+            proposed_config = self.current_config.clone()
+            config_i = self.current_config[i].item()
+            config_j = self.current_config[j].item()
+            n_i = ind_n_map[self.current_config[i].item()]
+            n_j = ind_n_map[self.current_config[j].item()]
+            delta_n = abs(n_i - n_j)
+            # delta_n = 1 --> SWAP
+            if delta_n == 1:
+                proposed_config[i] = config_j
+                proposed_config[j] = config_i
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_prob = abs(proposed_amp)**2
+            elif delta_n == 0:
+                choices = [(0, 3), (3, 0), (config_j, config_i)]
+                choice = random.choice(choices)
+                proposed_config[i] = choice[0]
+                proposed_config[j] = choice[1]
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_prob = abs(proposed_amp)**2
+            elif delta_n == 2:
+                choices = [(config_j, config_i), (1,2), (2,1)]
+                choice = random.choice(choices)
+                proposed_config[i] = choice[0]
+                proposed_config[j] = choice[1]
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_prob = abs(proposed_amp)**2
+            else:
+                raise ValueError("Invalid configuration")
+            try:
+                acceptance_ratio = min(1, (proposed_prob/self.current_prob))
+            except ZeroDivisionError:
+                acceptance_ratio = 1 if proposed_prob > 0 else 0
+            if random.random() < acceptance_ratio or (self.current_prob == 0):
+                self.current_config = proposed_config
+                self.current_amp = proposed_amp
+                self.current_prob = proposed_prob
+                self.accepts += 1
+        
+        vstate.vstate_func.update_env_x_cache(self.current_config)
+        for row_index, row_edges in self.graph.row_edges.items():
+            for (i, j) in row_edges:
+                exchange_propose(i, j)
+            if row_index != self.graph.Lx - 1:
+                # vstate.vstate_func.update_env_x_cache(self.current_config)
+                vstate.vstate_func.update_env_x_cache_to_row(self.current_config, row_index, from_which='xmin')
+        vstate.vstate_func.update_env_y_cache(self.current_config)
+        for col_index, col_edges in self.graph.col_edges.items():
+            for (i, j) in col_edges:
+                exchange_propose(i, j)
+            if col_index != self.graph.Ly - 1:
+                # vstate.vstate_func.update_env_y_cache(self.current_config)
+                vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin')
+        vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
+            
+        if self.current_amp == 0 and DEBUG:
+            print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2')
+        
+        return self.current_config, self.current_amp
 
 
 from pyblock2.driver.core import DMRGDriver, SymmetryTypes
