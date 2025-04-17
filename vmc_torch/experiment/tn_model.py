@@ -2711,7 +2711,7 @@ def get_receptive_field_2d(Lx, Ly, r, site_index_map=lambda i, j, Lx, Ly: i * Ly
                         receptive_field[site_id].append(site_index_map(ix, jx, Lx, Ly))
     return receptive_field
 
-class fpeps_BFA_cluster_Model(wavefunctionModel):
+class fTN_BFA_cluster_Model(wavefunctionModel):
     """
         fPEPS + tensorwise attention backflow NN with finite receptive field
     """
@@ -2841,6 +2841,471 @@ class fpeps_BFA_cluster_Model(wavefunctionModel):
                 amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
                 amp_val = amp.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
             
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
+class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
+    """
+        fPEPS + tensorwise attention backflow NN with finite receptive field
+    """
+    def __init__(self, fpeps, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, radius=1, jastrow=False, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(fpeps)
+        self.skeleton.exponent = 0
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Get the receptive field for each site
+        self.nn_radius = radius
+        self.receptive_field = get_receptive_field_2d(fpeps.Lx, fpeps.Ly, self.nn_radius)
+
+        phys_dim = fpeps.phys_dim()
+        # for each tensor (labelled by tid), assign a attention+MLP
+        self.nn = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            # get the receptive field for the current tensor
+            neighbors = self.receptive_field[int(tid)]
+            input_dim = len(neighbors)
+            on_site_ts_params_dict ={
+                tid: params[int(tid)]
+            }
+            on_site_ts_params_vec = flatten_tn_params(on_site_ts_params_dict)
+            self.nn[tid] = SelfAttn_FFNN_block(
+                n_site=input_dim,
+                num_classes=phys_dim,
+                embedding_dim=embedding_dim,
+                attention_heads=attention_heads,
+                nn_hidden_dim=nn_final_dim,
+                output_dim=on_site_ts_params_vec.numel(),
+                dtype=self.param_dtype
+            )
+        if jastrow:
+            global_jastrow_input_dim = fpeps.Lx * fpeps.Ly
+            self.jastrow = SelfAttn_FFNN_block(
+                    n_site=global_jastrow_input_dim,
+                    num_classes=phys_dim,
+                    embedding_dim=embedding_dim,
+                    attention_heads=attention_heads,
+                    nn_hidden_dim=nn_final_dim,
+                    output_dim=1,
+                    dtype=self.param_dtype
+                )
+        else:
+            self.jastrow = lambda x: torch.zeros(1)
+
+        # Get symmetry
+        self.symmetry = fpeps.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fPEPS_BFA_cluster':
+            {
+                'D': fpeps.max_bond(), 
+                'Lx': fpeps.Lx, 'Ly': fpeps.Ly, 
+                'radius': self.nn_radius,
+                'jastrow': jastrow,
+                'symmetry': self.symmetry, 
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta, 
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+                'max_bond': max_bond,
+            },
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        self.tree = None
+        self.Lx = fpeps.Lx
+        self.Ly = fpeps.Ly
+        self._env_x_cache = None
+        self._env_y_cache = None
+        self.config_ref = None
+    
+    def from_1d_to_2d(self, config, ordering='snake'):
+        if ordering == 'snake':
+            config_2d = config.reshape((self.Lx, self.Ly))
+        return config_2d
+    
+    def transform_quimb_env_x_key_to_config_key(self, env_x, config):
+        """
+            Return a dictionary with the keys of of the config rows
+        """
+        config_2d = self.from_1d_to_2d(config)
+        env_x_row_config = {}
+        for key in env_x.keys():
+            if key[0] == 'xmax': # from bottom to top
+                row_n = key[1]
+                if row_n != self.Lx-1:
+                    rows_config = tuple(torch.cat(tuple(config_2d[row_n+1:].to(torch.int))).tolist())
+                    env_x_row_config[('xmax', rows_config)] = env_x[key]
+            elif key[0] == 'xmin': # from top to bottom
+                row_n = key[1]
+                if row_n != 0:
+                    rows_config = tuple(torch.cat(tuple(config_2d[:row_n].to(torch.int))).tolist())
+                    env_x_row_config[('xmin', rows_config)] = env_x[key]
+        return env_x_row_config
+    
+    def transform_quimb_env_y_key_to_config_key(self, env_y, config):
+        """
+            Return a dictionary with the keys of of the config rows
+        """
+        config_2d = self.from_1d_to_2d(config)
+        env_y_row_config = {}
+        for key in env_y.keys():
+            if key[0] == 'ymax':
+                col_n = key[1]
+                if col_n != self.Ly-1:
+                    cols_config = tuple(torch.cat(tuple(config_2d[:, col_n+1:].to(torch.int))).tolist())
+                    env_y_row_config[('ymax', cols_config)] = env_y[key]
+            elif key[0] == 'ymin':
+                col_n = key[1]
+                if col_n != 0:
+                    cols_config = tuple(torch.cat(tuple(config_2d[:, :col_n].to(torch.int))).tolist())
+                    env_y_row_config[('ymin', cols_config)] = env_y[key]
+        return env_y_row_config
+
+    def cache_env_x(self, amp, config):
+        """
+            Cache the environment x for the given configuration
+        """
+        env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0)
+        env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
+        self._env_x_cache = env_x_cache
+        self.config_ref = config
+    
+    def cache_env_y(self, amp, config):
+        env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0)
+        env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
+        self._env_y_cache = env_y_cache
+        self.config_ref = config
+    
+    def cache_env(self, amp, config):
+        """
+            Cache the environment x and y for the given configuration
+        """
+        self.cache_env_x(amp, config)
+        self.cache_env_y(amp, config)
+        
+    @property
+    def env_x_cache(self):
+        """
+            Return the cached environment x
+        """
+        if hasattr(self, '_env_x_cache'):
+            return self._env_x_cache
+        else:
+            return None
+        
+    @property
+    def env_y_cache(self):
+        """
+            Return the cached environment y
+        """
+        if hasattr(self, '_env_y_cache'):
+            return self._env_y_cache
+        else:
+            return None
+    
+    def clear_env_x_cache(self):
+        """
+            Clear the cached environment x
+        """
+        self._env_x_cache = None
+
+    def clear_env_y_cache(self):
+        """
+            Clear the cached environment y
+        """
+        self._env_y_cache = None
+    
+    def clear_wavefunction_env_cache(self):
+        self.clear_env_x_cache()
+        self.clear_env_y_cache()
+    
+    def detect_effected_rows(self, config_ref, new_config):
+        """
+            Detect the rows that have been effected in the new configuration
+        """
+        config_ref_2d = self.from_1d_to_2d(config_ref)
+        new_config_2d = self.from_1d_to_2d(new_config)
+        effected_rows = set()
+        for i in range(self.Lx):
+            if not torch.equal(config_ref_2d[i], new_config_2d[i]):
+                effected_row_top = i-self.nn_radius if i-self.nn_radius >= 0 else 0
+                effected_row_bottom = i+self.nn_radius if i+self.nn_radius < self.Lx else self.Lx-1
+                effected_rows.update(list(range(effected_row_top, effected_row_bottom+1)))
+        effected_rows = sorted(effected_rows)
+
+        if len(effected_rows) == 0:
+            return [], [], []
+        uneffected_rows_above = list(range(effected_rows[0]))
+        uneffected_rows_below = list(range(effected_rows[-1]+1, self.Lx))
+        return effected_rows, uneffected_rows_above, uneffected_rows_below
+    
+    def detect_effected_cols(self, config_ref, new_config):
+        """
+            Detect the cols that have been effected in the new configuration
+        """
+        config_ref_2d = self.from_1d_to_2d(config_ref)
+        new_config_2d = self.from_1d_to_2d(new_config)
+        effected_cols = set()
+        for j in range(self.Ly):
+            if not torch.equal(config_ref_2d[:, j], new_config_2d[:, j]):
+                effected_col_left = j-self.nn_radius if j-self.nn_radius >= 0 else 0
+                effected_col_right = j+self.nn_radius if j+self.nn_radius < self.Ly else self.Ly-1
+                effected_cols.update(list(range(effected_col_left, effected_col_right+1)))
+        effected_cols = sorted(effected_cols)
+
+        if len(effected_cols) == 0:
+            return [], [], []
+        uneffected_cols_left = list(range(effected_cols[0]))
+        uneffected_cols_right = list(range(effected_cols[-1]+1, self.Ly))
+        return effected_cols, uneffected_cols_left, uneffected_cols_right
+    
+    def detect_changed_rows(self, config_ref, new_config):
+        """
+            Detect the rows that have changed in the new configuration
+        """
+        config_ref_2d = self.from_1d_to_2d(config_ref)
+        new_config_2d = self.from_1d_to_2d(new_config)
+        changed_rows = []
+        for i in range(self.Lx):
+            if not torch.equal(config_ref_2d[i], new_config_2d[i]):
+                changed_rows.append(i)
+        if len(changed_rows) == 0:
+            return [], [], []
+        unchanged_rows_above = list(range(changed_rows[0]))
+        unchanged_rows_below = list(range(changed_rows[-1]+1, self.Lx))
+        return changed_rows, unchanged_rows_above, unchanged_rows_below
+    
+    def detect_changed_cols(self, config_ref, new_config):
+        """
+            Detect the columns that have changed in the new configuration
+        """
+        config_ref_2d = self.from_1d_to_2d(config_ref)
+        new_config_2d = self.from_1d_to_2d(new_config)
+        changed_cols = []
+        for i in range(self.Ly):
+            if not torch.equal(config_ref_2d[:, i], new_config_2d[:, i]):
+                changed_cols.append(i)
+        if len(changed_cols) == 0:
+            return [], [], []
+        unchanged_cols_left = list(range(changed_cols[0]))
+        unchanged_cols_right = list(range(changed_cols[-1]+1, self.Ly))
+        return changed_cols, unchanged_cols_left, unchanged_cols_right
+    
+    def update_env_x_cache(self, config):
+        """
+            Update the cached environment x for the given configuration
+        """
+        if self.env_x_cache is not None:
+            self.clear_env_x_cache()
+        amp_tn = self.get_amp_tn(config)
+        self.cache_env_x(amp_tn, config)
+        self.config_ref = config
+    
+    def update_env_x_cache_to_row(self, config, row_id, from_which='xmin'):
+        config_2d = self.from_1d_to_2d(config)
+        amp_tn = self.get_amp_tn(config)
+        # select the row_tn in the amp_tn that corresponds to the row_id
+        row_tn = amp_tn.select(amp_tn.x_tag_id.format(row_id))
+        # check the whether previous env_x cache already contains the env w.r.t. row with id row_id
+        if from_which == 'xmin':
+            key_prev_rows = ('xmin', tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())) if row_id != 0 else ()
+            new_env_key = ('xmin', tuple(torch.cat(tuple(config_2d[:row_id+1].to(torch.int))).tolist()))
+            xrange = (0, row_id)
+        elif from_which == 'xmax':
+            key_prev_rows = ('xmax', tuple(torch.cat(tuple(config_2d[row_id+1:].to(torch.int))).tolist())) if row_id != self.Lx-1 else ()
+            new_env_key = ('xmax', tuple(torch.cat(tuple(config_2d[row_id:].to(torch.int))).tolist()))
+            xrange = (row_id, self.Lx-1)
+        else:
+            raise ValueError("from_which must be either 'xmin' or 'xmax'")
+
+        if self.env_x_cache is not None: 
+            if key_prev_rows in self.env_x_cache:
+                prev_env_x = self.env_x_cache[key_prev_rows]
+                new_env_tn = prev_env_x | row_tn
+                new_env_tn.contract_boundary_from_(max_bond=self.max_bond, cutoff=0.0, xrange=xrange, from_which=from_which, yrange=(0, self.Ly-1))
+                new_env_x_cache = {new_env_key: new_env_tn}
+            else:
+                new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
+                new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+        else:
+            new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
+            new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+        # add the new env_x to the cache
+        if self.env_x_cache is None:
+            self._env_x_cache = new_env_x_cache
+        else:
+            self._env_x_cache.update(new_env_x_cache)
+        self.config_ref = config
+    
+    def update_env_y_cache(self, config):
+        """
+            Update the cached environment y for the given configuration
+        """
+        if self.env_y_cache is not None:
+            self.clear_env_y_cache()
+        amp_tn = self.get_amp_tn(config)
+        self.cache_env_y(amp_tn, config)
+        self.config_ref = config
+    
+    def update_env_y_cache_to_col(self, config, col_id, from_which='ymin'):
+        config_2d = self.from_1d_to_2d(config)
+        amp_tn = self.get_amp_tn(config)
+        # select the col_tn in the amp_tn that corresponds to the col_id
+        col_tn = amp_tn.select(amp_tn.y_tag_id.format(col_id))
+        # check the whether previous env_y cache already contains the env w.r.t. col with id col_id
+        if from_which == 'ymin':
+            key_prev_cols = ('ymin', tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())) if col_id != 0 else ()
+            new_env_key = ('ymin', tuple(torch.cat(tuple(config_2d[:, :col_id+1].to(torch.int))).tolist()))
+            yrange = (0, col_id)
+        elif from_which == 'ymax':
+            key_prev_cols = ('ymax', tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist())) if col_id != self.Ly-1 else ()
+            new_env_key = ('ymax', tuple(torch.cat(tuple(config_2d[:, col_id:].to(torch.int))).tolist()))
+            yrange = (col_id, self.Ly-1)
+        else:
+            raise ValueError("from_which must be either 'ymin' or 'ymax'")
+        if self.env_y_cache is not None:
+            if key_prev_cols in self.env_y_cache:
+                prev_env_y = self.env_y_cache[key_prev_cols]
+                new_env_tn = prev_env_y | col_tn
+                new_env_tn.contract_boundary_from_(max_bond=self.max_bond, cutoff=0.0, yrange=yrange, from_which=from_which, xrange=(0, self.Lx-1))
+                new_env_y_cache = {new_env_key: new_env_tn}
+            else:
+                new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
+                new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+        else:
+            new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
+            new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+        # add the new env_y to the cache
+        if self.env_y_cache is None:
+            self._env_y_cache = new_env_y_cache
+        else:
+            self._env_y_cache.update(new_env_y_cache)
+        self.config_ref = config
+    
+    def get_amp_tn(self, config):
+        """
+            Get the amplitude tensor network for the given configuration
+        """
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+
+        # Get the NN correction to the parameters, concatenate the results for each tensor
+        nn_correction = torch.cat([self.nn[str(tid)](config[neighbors]) for tid, neighbors in self.receptive_field.items()])
+        # Add the correction to the original parameters
+        tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta*nn_correction, params)
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(tn_nn_params, self.skeleton)
+        
+        # Get the amplitude
+        amp = psi.get_amp(config, conj=True)
+
+        return amp
+    
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+
+            # Get the amplitude
+            amp = self.get_amp_tn(x_i)
+
+            if self.max_bond is None:
+                amp = amp
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree) * torch.sum(torch.exp(self.jastrow(x_i)))
+            else:
+                if self.cache_env_mode:
+                    self.cache_env_x(amp, x_i)
+                    # self.cache_env_y(amp, x_i)
+                    assert (self.config_ref == x_i).all()
+
+                    config_2d = self.from_1d_to_2d(x_i)
+                    key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
+                    key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+                    amp_bot = self.env_x_cache[key_bot]
+                    amp_top = self.env_x_cache[key_top]
+                    amp_val = (amp_bot|amp_top).contract()
+                else:
+                    if self.env_x_cache is None and self.env_y_cache is None:
+                        # check whether we can reuse the cached environment
+                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, self.Ly//2-1])
+                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[self.Ly//2, self.Ly-1])
+                        amp_val = amp.contract()
+                    else:
+                        config_2d = self.from_1d_to_2d(x_i)
+                        # detect the rows that have been effected in the new configuration
+                        effected_rows, uneffected_rows_above, uneffected_rows_below = self.detect_effected_rows(self.config_ref, x_i)
+                        # detect the cols that have been effected in the new configuration
+                        effected_cols, uneffected_cols_left, uneffected_cols_right = self.detect_effected_cols(self.config_ref, x_i)
+
+                        changed_rows, _, _ = self.detect_changed_rows(self.config_ref, x_i)
+                        changed_cols, _, _ = self.detect_changed_cols(self.config_ref, x_i)
+                        if len(changed_rows) == 0:
+                            key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
+                            key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+                            amp_bot = self.env_x_cache[key_bot]
+                            amp_top = self.env_x_cache[key_top]
+                            amp_val = (amp_bot|amp_top).contract()
+                        else:
+                            if len(changed_rows) <= len(changed_cols):
+                                # for bottom envs, until the last effected row, we can reuse the bottom envs
+                                # for top envs, until the first effected row, we can reuse the top envs
+                                amp_effected_rows = qtn.TensorNetwork([amp.select(amp.x_tag_id.format(row_n)) for row_n in effected_rows])
+                                amp_uneffected_bottom_env = qtn.TensorNetwork()
+                                amp_uneffected_top_env = qtn.TensorNetwork()
+                                if len(uneffected_rows_below) != 0:
+                                    amp_uneffected_bottom_env = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[uneffected_rows_below].to(torch.int))).tolist()))]
+                                if len(uneffected_rows_above) != 0:
+                                    amp_uneffected_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[uneffected_rows_above].to(torch.int))).tolist()))]
+                                amp_val = (amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env).contract()
+                            else:
+                                amp_effected_cols = qtn.TensorNetwork([amp.select(amp.y_tag_id.format(col_n)) for col_n in effected_cols])
+                                amp_uneffected_left_env = qtn.TensorNetwork()
+                                amp_uneffected_right_env = qtn.TensorNetwork()
+                                if len(uneffected_cols_left) != 0:
+                                    amp_uneffected_left_env = self.env_y_cache[('ymin', tuple(torch.cat(tuple(config_2d[:, uneffected_cols_left].to(torch.int))).tolist()))]
+                                if len(uneffected_cols_right) != 0:
+                                    amp_uneffected_right_env = self.env_y_cache[('ymax', tuple(torch.cat(tuple(config_2d[:, uneffected_cols_right].to(torch.int))).tolist()))]
+                                amp_val = (amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env).contract()
+
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
             batch_amps.append(amp_val)

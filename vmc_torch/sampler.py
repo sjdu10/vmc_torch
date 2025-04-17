@@ -1087,18 +1087,20 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
                 self.current_prob = proposed_prob
                 self.accepts += 1
         
-        vstate.vstate_func.update_env_x_cache(self.current_config)
+        # vstate.vstate_func.update_env_x_cache(self.current_config)
+        vstate.vstate_func.update_env_x_cache_to_row(self.current_config, 0, from_which='xmax')
         for row_index, row_edges in self.graph.row_edges.items():
             for (i, j) in row_edges:
                 exchange_propose(i, j)
-            if row_index != self.graph.Lx - 1:
+            if row_index < self.graph.Lx - 1:
                 # vstate.vstate_func.update_env_x_cache(self.current_config)
                 vstate.vstate_func.update_env_x_cache_to_row(self.current_config, row_index, from_which='xmin')
-        vstate.vstate_func.update_env_y_cache(self.current_config)
+        # vstate.vstate_func.update_env_y_cache(self.current_config)
+        vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
         for col_index, col_edges in self.graph.col_edges.items():
             for (i, j) in col_edges:
                 exchange_propose(i, j)
-            if col_index != self.graph.Ly - 1:
+            if col_index < self.graph.Ly - 1:
                 # vstate.vstate_func.update_env_y_cache(self.current_config)
                 vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin')
         vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
