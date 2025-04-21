@@ -1523,7 +1523,7 @@ class fTNModel_reuse(wavefunctionModel):
             else:
                 if self.cache_env_mode:
                     self.cache_env_x(amp, x_i)
-                    # self.cache_env_y(amp, x_i)
+                    self.cache_env_y(amp, x_i)
                     self.config_ref = x_i
                     config_2d = self.from_1d_to_2d(x_i)
                     key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
@@ -3288,14 +3288,23 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                             if len(changed_rows) <= len(changed_cols):
                                 # for bottom envs, until the last effected row, we can reuse the bottom envs
                                 # for top envs, until the first effected row, we can reuse the top envs
-                                amp_effected_rows = qtn.TensorNetwork([amp.select(amp.x_tag_id.format(row_n)) for row_n in effected_rows])
+                                amp_effected_rows = qtn.TensorNetwork([amp.select(amp.x_tag_id.format(row_n)) for row_n in effected_rows]) 
                                 amp_uneffected_bottom_env = qtn.TensorNetwork()
                                 amp_uneffected_top_env = qtn.TensorNetwork()
                                 if len(uneffected_rows_below) != 0:
                                     amp_uneffected_bottom_env = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[uneffected_rows_below].to(torch.int))).tolist()))]
                                 if len(uneffected_rows_above) != 0:
                                     amp_uneffected_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[uneffected_rows_above].to(torch.int))).tolist()))]
-                                amp_val = (amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env).contract()
+                                amp_val_tn = amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env
+                                # amp_val_tn = qtn.TensorNetwork2D(amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env)
+                                # amp_val_tn._site_tag_id=amp._site_tag_id
+                                # amp_val_tn._x_tag_id=amp._x_tag_id
+                                # amp_val_tn._y_tag_id=amp._y_tag_id
+                                # amp_val_tn._Lx=self.Lx
+                                # amp_val_tn._Ly=self.Ly
+                                # amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, effected_rows[0]+(effected_rows[-1]-effected_rows[0])//2])
+                                # amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[effected_rows[-1]-(effected_rows[-1]-effected_rows[0])//2, self.Lx-1])
+                                amp_val = amp_val_tn.contract()
                             else:
                                 amp_effected_cols = qtn.TensorNetwork([amp.select(amp.y_tag_id.format(col_n)) for col_n in effected_cols])
                                 amp_uneffected_left_env = qtn.TensorNetwork()
@@ -3304,7 +3313,16 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                     amp_uneffected_left_env = self.env_y_cache[('ymin', tuple(torch.cat(tuple(config_2d[:, uneffected_cols_left].to(torch.int))).tolist()))]
                                 if len(uneffected_cols_right) != 0:
                                     amp_uneffected_right_env = self.env_y_cache[('ymax', tuple(torch.cat(tuple(config_2d[:, uneffected_cols_right].to(torch.int))).tolist()))]
-                                amp_val = (amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env).contract()
+                                amp_val_tn = amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env
+                                # amp_val_tn = qtn.TensorNetwork2D(amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env)
+                                # amp_val_tn._site_tag_id=amp._site_tag_id
+                                # amp_val_tn._x_tag_id=amp._x_tag_id
+                                # amp_val_tn._y_tag_id=amp._y_tag_id
+                                # amp_val_tn._Lx=self.Lx
+                                # amp_val_tn._Ly=self.Ly
+                                # amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, effected_cols[0]+(effected_cols[-1]-effected_cols[0])//2])
+                                # amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[effected_cols[-1]-(effected_cols[-1]-effected_cols[0])//2, self.Ly-1])
+                                amp_val = amp_val_tn.contract()
 
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
