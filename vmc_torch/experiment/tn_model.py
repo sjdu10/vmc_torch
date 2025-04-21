@@ -1523,7 +1523,7 @@ class fTNModel_reuse(wavefunctionModel):
             else:
                 if self.cache_env_mode:
                     self.cache_env_x(amp, x_i)
-                    self.cache_env_y(amp, x_i)
+                    # self.cache_env_y(amp, x_i)
                     self.config_ref = x_i
                     config_2d = self.from_1d_to_2d(x_i)
                     key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
@@ -1531,9 +1531,6 @@ class fTNModel_reuse(wavefunctionModel):
                     amp_bot = self.env_x_cache[key_bot]
                     amp_top = self.env_x_cache[key_top]
                     amp_val = (amp_bot|amp_top).contract()
-                    # amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
-                    # amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
-                    # amp_val = amp.contract()
 
                 else:
                     if self.env_x_cache is None and self.env_y_cache is None:

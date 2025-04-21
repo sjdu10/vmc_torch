@@ -120,10 +120,10 @@ class Sampler(AbstractSampler):
             """Avoid multiple burn-in calls."""
             return
         for _ in range(self.burn_in_steps):
-            self._sample_next(vstate)
+            self._sample_next(vstate, burn_in=True)
         self.burn_in_already = True
     
-    def _sample_next(self, vstate):
+    def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place.
         Must be implemented in the derived class."""
         raise NotImplementedError
@@ -881,7 +881,7 @@ class MetropolisExchangeSamplerSpinless(Sampler):
     def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
     
-    def _sample_next(self, vstate):
+    def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
         current_amp = vstate.amplitude(self.current_config)
         current_prob = abs(current_amp)**2
@@ -941,7 +941,7 @@ class MetropolisExchangeSamplerSpinful(Sampler):
         """
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
 
-    def _sample_next(self, vstate):
+    def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
         current_amp = vstate.amplitude(self.current_config).cpu()
         current_prob = abs(current_amp)**2
@@ -1038,7 +1038,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
         """
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
 
-    def _sample_next(self, vstate):
+    def _sample_next(self, vstate, burn_in=False):
         """Sample the next configuration. Change the current configuration in place."""
         # initial cache of env_x and env_y for current configuration
         self.current_amp = vstate.amplitude(self.current_config).cpu()
@@ -1101,7 +1101,8 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
                 vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin')
         vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
         vstate.vstate_func.clear_env_x_cache()
-        # vstate.clear_env_cache()
+        if burn_in:
+            vstate.vstate_func.clear_env_y_cache()
             
         if self.current_amp == 0 and DEBUG:
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2')
@@ -1157,7 +1158,7 @@ class MetropolisMPSSamplerSpinful(Sampler):
         self.current_config = configs[0]
         self.current_mps_prob = abs(coeffs[0])**2
 
-    def _sample_next(self, vstate):
+    def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
         self.current_amp = vstate.amplitude(self.current_config).cpu()
         self.current_prob = abs(self.current_amp)**2
