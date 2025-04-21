@@ -560,7 +560,7 @@ class Sampler(AbstractSampler):
         time2 = MPI.Wtime()
         eta, O_etasigma = op.get_conn(sigma)
         psi_eta = vstate.amplitude(eta)
-        # vstate.clear_env_cache()
+        vstate.clear_env_cache()
         time3 = MPI.Wtime()
         # if RANK==1:
         #     print(f"    RANK1 sample {sigma}, Local Energy size: {len(eta)}")
