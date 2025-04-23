@@ -155,6 +155,7 @@ class fPEPS(qtn.PEPS):
         return product_tn
     
     def product_bra_state_functional(self, config, reverse=1):
+        #XXX remember to comment out the drop_missing_blocks in tensordot_via_fused in line 2304-2305 in symmray abelian_core.py
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
@@ -167,21 +168,23 @@ class fPEPS(qtn.PEPS):
             raise NotImplementedError("Functional bra state is not implemented for spinless fermions.")
         else:
             if self.symmetry == 'Z2':
-                index_map = torch.tensor([0, 1, 1, 0], device=device, dtype=dtype)
-                array_map = {
-                    0: do('array',[1.0, 0.0],**kwargs), 
-                    1: do('array',[1.0, 0.0],**kwargs), 
-                    2: do('array',[0.0, 1.0],**kwargs), 
-                    3: do('array',[0.0, 1.0],**kwargs)
+                b0 = {(0,): do('array',[1.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs)}
+                b1 = {(0,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[1.0, 0.0],**kwargs)}
+                b2 = {(0,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 1.0],**kwargs)}
+                b3 = {(0,): do('array',[0.0, 1.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs)}
+
+                blocks_stack = {
+                    k: torch.stack([b0[k], b1[k], b2[k], b3[k]])
+                    for k in b0.keys()
                 }
-                def block0():
-                    return {(0,): do('array',[1.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (0,): do('array',[0.0, 0.0],**kwargs)}
-                def block1():
-                    return {(0,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[1.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (0,): do('array',[0.0, 0.0],**kwargs)}
-                def block2():
-                    return {(0,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 1.0],**kwargs), (0,): do('array',[0.0, 0.0],**kwargs)}
-                def block3():
-                    return {(0,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (1,): do('array',[0.0, 0.0],**kwargs), (0,): do('array',[1.0, 0.0],**kwargs)}
+
+                index_map = torch.tensor([0, 1, 1, 0], dtype=torch.int)
+
+                def select_block(n):
+                    # n: scalar ∈ {0,…,3}
+                    return {
+                    k: blocks_stack[k][n.unsqueeze(0).int()].squeeze(0)  for k in blocks_stack
+                    }
             else:
                 raise NotImplementedError("Functional bra state is not implemented for spinful fermions.")
 
@@ -189,21 +192,19 @@ class fPEPS(qtn.PEPS):
             p_ind = self.site_ind_id.format(*site)
             p_tag = self.site_tag_id.format(*site)
             tid = self.sites.index(site)
-
-            n_charge = index_map[n.unsqueeze(0).int()]
-
+            # n_charge = index_map[n.unsqueeze(0).int()].squeeze(0)
+            n_charge = 0
             oddpos = None
             if not self.spinless:
-                phase = 1
+                phase = 1 #...
             else:
                 raise NotImplementedError("Functional bra state is not implemented for spinless fermions.")
-
+            blocks=select_block(n)
             tsr_data = sr.FermionicArray.from_blocks(
-                blocks=torch.where(n_charge==0, block0(), block1(), block2(), block3()), 
+                blocks=blocks, 
                 duals=(True,),
                 symmetry=self.symmetry, 
                 charge=n_charge, 
-                oddpos=oddpos
             )
             tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
             product_tn |= tsr
@@ -331,7 +332,7 @@ class fPEPS(qtn.PEPS):
     
     def get_amp_functional(self, config, inplace=False, conj=True, reverse=1, contract=True):
         peps = self if inplace else self.copy()
-        product_state = self.product_bra_state_functional(config, reverse=reverse).conj() if conj else self.product_bra_state(config, reverse=reverse)
+        product_state = self.product_bra_state_functional(config, reverse=reverse).conj() if conj else self.product_bra_state_functional(config, reverse=reverse)
         
         amp = peps|product_state # ---T---<---|n>
 
@@ -1405,43 +1406,61 @@ def decompose_permutation_into_transpositions(perm, asc=True):
 
 
 
-def calculate_phase_from_adjacent_trans_dict(ampctree, input_config, peps_parity, parities, adjacent_transposition_dict, adjacent_transposition_dict_desc):
+def calculate_phase_from_adjacent_trans_dict(ampctree, input_config_parity, peps_parity, parities, adjacent_transposition_dict, adjacent_transposition_dict_desc, sorted_tree_traverse_path=None):
     """
-    parities: combined parities of config and PEPS
-    input_config: input configuration parity
-    peps_parity: PEPS parity
+    # input_config_parity: input configuration parity
+    # peps_parity: PEPS tensors parity
+    # parities: combined parities of config and PEPS
+    Parameters
+    ----------
+    ampctree : TN contraction tree object
+        The amplitude contraction tree.
+    input_config_parity : list
+        The parity of the input configuration.
+    peps_parity : list
+        The parity of the PEPS tensors.
+    parities : list
+        The combined parities of the input configuration and PEPS tensors.
+    adjacent_transposition_dict : dict
+        The dictionary containing the adjacent transposition from permutation of tensors in the contraction tree (acending order).
+    adjacent_transposition_dict_desc : dict
+        The dictionary containing the adjacent transposition from permutation of tensors in the contraction tree (descending order).
+    sorted_tree_traverse_path : dict
+        The dictionary containing the sorted tree traverse path.
     """
     phase = 1
 
     # compute the phase from moving oddpos indices across odd-parity tensors during contraction
     for i, _ in adjacent_transposition_dict.items():
         gen_phase = 1
-        tids, left_tids, right_tids = list(ampctree.traverse())[int(i)]
+        tids, left_tids, right_tids = list(ampctree.traverse())[i]
         left_parity = sum(parities[tid] for tid in left_tids) % 2
         right_parity = sum(parities[tid] for tid in right_tids) % 2
         gen_phase *= (-1)**(left_parity*right_parity)
         # print(i, left_tids, right_tids, gen_phase)
         phase *= gen_phase
-        # print(phase)
+        # print(gen_phase)
     
     # compute the phase from moving the PEPS odd-parity tensor
     for i, transposition_list in adjacent_transposition_dict.items():
         gen_phase = 1
-        _, left_tids, right_tids = list(ampctree.traverse())[int(i)]
-        tids = tuple(left_tids)+tuple(right_tids)
+        # _, left_tids, right_tids = list(ampctree.traverse())[i]
+        tids = sorted_tree_traverse_path[i]
         peps_parities_selected = [peps_parity[tid] for tid in tids]
         for transposition in transposition_list:
             gen_phase *= (-1)**(peps_parities_selected[transposition[0]]*peps_parities_selected[transposition[1]])
             peps_parities_selected[transposition[0]], peps_parities_selected[transposition[1]] = peps_parities_selected[transposition[1]], peps_parities_selected[transposition[0]]
         phase *= gen_phase
         # print(gen_phase)
-    
-    # compute the phase from moving the input configuration odd-parity tensor
-    for i, transposition_list in adjacent_transposition_dict_desc.items():
+    # print('\n')
+
+    # compute the phase from moving the input configuration parity odd-parity tensor
+    for i, transposition_list in adjacent_transposition_dict.items():
         gen_phase = 1
-        _, left_tids, right_tids = list(ampctree.traverse())[int(i)]
-        tids = tuple(list(left_tids)[::-1])+tuple(list(right_tids)[::-1])
-        input_parities_selected = [input_config[tid]%2 for tid in tids]
+        # _, left_tids, right_tids = list(ampctree.traverse())[int(i)]
+        # tids = tuple(list(left_tids)[::-1])+tuple(list(right_tids)[::-1])
+        tids = sorted_tree_traverse_path[i]
+        input_parities_selected = [input_config_parity[tid]%2 for tid in tids]
         for transposition in transposition_list:
             gen_phase *= (-1)**(input_parities_selected[transposition[0]]*input_parities_selected[transposition[1]])
             input_parities_selected[transposition[0]], input_parities_selected[transposition[1]] = input_parities_selected[transposition[1]], input_parities_selected[transposition[0]]
@@ -1452,7 +1471,7 @@ def calculate_phase_from_adjacent_trans_dict(ampctree, input_config, peps_parity
     gen_phase = 1
     for tids, left_tids, right_tids in list(ampctree.traverse()):
         left_parity = sum(peps_parity[tid] for tid in left_tids) % 2
-        right_parity = sum(input_config[tid] for tid in right_tids) % 2
+        right_parity = sum(input_config_parity[tid] for tid in right_tids) % 2
         gen_phase *= (-1)**(left_parity*right_parity)
     phase *= gen_phase
     # print(gen_phase)

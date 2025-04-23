@@ -4,6 +4,7 @@ import ast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.func import vmap
 
 # quimb
 import quimb.tensor as qtn
@@ -11,6 +12,7 @@ from quimb.tensor.tensor_2d import Rotator2D, pairwise
 import cotengra as ctg
 
 from vmc_torch.fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params, insert_compressor
+from vmc_torch.fermion_utils import calculate_phase_from_adjacent_trans_dict, decompose_permutation_into_transpositions
 from vmc_torch.global_var import DEBUG, set_debug
 flatten_tn_params = flatten_proj_params
 reconstruct_tn_params = reconstruct_proj_params
@@ -1249,6 +1251,128 @@ class fTNModel(wavefunctionModel):
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
+
+
+class fTNModel_vec(wavefunctionModel):
+
+    def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False, tree=None, device=None):
+        super().__init__()
+        self.param_dtype = dtype
+        self.functional = functional
+        self.device = device
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            f'fPEPS (chi={max_bond})':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+
+        opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+        # Get the amplitude
+        random_x = torch.randint(0, 3, (ftn.Lx*ftn.Ly,), dtype=torch.int)
+        amp = ftn.get_amp(random_x, conj=True, functional=self.functional)
+        self.tree = amp.contraction_tree(optimize=opt)
+
+        # Get self parity
+        self.parity_config = torch.tensor([array.parity for array in ftn.arrays], dtype=torch.int, device=self.device)
+
+        # BUG: in tree.traverse(), the tids are not automatically sorted, so we need to sort them manually
+        self.sorted_tree_traverse_path = {i: tuple(sorted(left_tids))+tuple(sorted(right_tids)) for i, (_, left_tids, right_tids) in enumerate(self.tree.traverse())}
+
+        # compute the permutation dict for future global phase computation
+        self.perm_dict = {i: tuple(torch.argsort(torch.tensor(left_right_tids))) for i, left_right_tids in self.sorted_tree_traverse_path.items()}
+        self.perm_dict_desc = {i: tuple(torch.argsort(torch.tensor(tuple(sorted(left_tids))[::-1]+tuple(sorted(right_tids))[::-1]), descending=True)) for i, (_, left_tids, right_tids) in enumerate(self.tree.traverse())}
+        
+        self.adjacent_transposition_dict_asc = {i: decompose_permutation_into_transpositions(perm, asc=False) for i, perm in self.perm_dict.items()}
+        self.adjacent_transposition_dict_desc = {i: decompose_permutation_into_transpositions(perm, asc=False) for i, perm in self.perm_dict_desc.items()}
+
+    
+    def compute_global_phase(self, input_config):
+        """Get the global phase of contracting an amplitude of the fPEPS given computational graph."""
+        on_site_parity_tensor = torch.tensor([0,1,1,0], dtype=torch.int, device=input_config.device)
+        def get_parity(n):
+            return on_site_parity_tensor[n]
+        # input_parity_config = input_config % 2
+        input_config_parity = get_parity(input_config)
+        amp_parity_config = (self.parity_config + input_config_parity) % 2
+
+        phase = 1
+        phase *= calculate_phase_from_adjacent_trans_dict(
+            self.tree, 
+            input_config_parity, 
+            self.parity_config, 
+            amp_parity_config, 
+            self.adjacent_transposition_dict_asc, 
+            self.adjacent_transposition_dict_desc,
+            self.sorted_tree_traverse_path
+            )
+            
+        return phase
+
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(params, self.skeleton)
+        # `x` is expected to be batched as (batch_size, input_dim)
+
+        def amplitude_func(psi, x_i):
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=torch.int if self.functional else self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(torch.int if self.functional else self.param_dtype)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True, functional=self.functional)
+            if self.max_bond is None:
+                amp = amp
+                amp_val = amp.contract(optimize=self.tree)
+                phase = self.compute_global_phase(x_i.int())
+                amp_val = phase * amp_val
+
+            else:
+                amp = amp.contract_boundary_from_xmin(max_bond=self.max_bond, cutoff=0.0, xrange=[0, psi.Lx//2-1])
+                amp = amp.contract_boundary_from_xmax(max_bond=self.max_bond, cutoff=0.0, xrange=[psi.Lx//2, psi.Lx-1])
+                amp_val = amp.contract()
+
+            # if amp_val==0.0:
+            #     amp_val = torch.tensor(0.0)
+
+            # Return the batch of amplitudes stacked as a tensor
+            return amp_val
+        
+        vec_amplitude_func = vmap(amplitude_func, in_dims=(None, 0), randomness='different')
+        # Get the amplitude
+        batch_amps = vec_amplitude_func(psi, x)
+        return batch_amps
+    
+    def forward(self, x):
+        return self.amplitude(x)
 
 class fTNModel_reuse(wavefunctionModel):
     def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False):
@@ -3259,13 +3383,13 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                     key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
                     amp_bot = self.env_x_cache[key_bot]
                     amp_top = self.env_x_cache[key_top]
-                    amp_val = (amp_bot|amp_top).contract()
+                    amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                 else:
                     if self.env_x_cache is None and self.env_y_cache is None:
                         # check whether we can reuse the cached environment
                         amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, self.Ly//2-1])
                         amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[self.Ly//2, self.Ly-1])
-                        amp_val = amp.contract()
+                        amp_val = amp.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                     else:
                         config_2d = self.from_1d_to_2d(x_i)
                         # detect the rows that have been effected in the new configuration
@@ -3280,7 +3404,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                             key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
                             amp_bot = self.env_x_cache[key_bot]
                             amp_top = self.env_x_cache[key_top]
-                            amp_val = (amp_bot|amp_top).contract()
+                            amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                         else:
                             if len(changed_rows) <= len(changed_cols):
                                 # for bottom envs, until the last effected row, we can reuse the bottom envs
@@ -3301,7 +3425,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 # amp_val_tn._Ly=self.Ly
                                 # amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, effected_rows[0]+(effected_rows[-1]-effected_rows[0])//2])
                                 # amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[effected_rows[-1]-(effected_rows[-1]-effected_rows[0])//2, self.Lx-1])
-                                amp_val = amp_val_tn.contract()
+                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                             else:
                                 amp_effected_cols = qtn.TensorNetwork([amp.select(amp.y_tag_id.format(col_n)) for col_n in effected_cols])
                                 amp_uneffected_left_env = qtn.TensorNetwork()
@@ -3319,7 +3443,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 # amp_val_tn._Ly=self.Ly
                                 # amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, effected_cols[0]+(effected_cols[-1]-effected_cols[0])//2])
                                 # amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[effected_cols[-1]-(effected_cols[-1]-effected_cols[0])//2, self.Ly-1])
-                                amp_val = amp_val_tn.contract()
+                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
 
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
