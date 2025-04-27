@@ -324,6 +324,7 @@ class fPEPS(qtn.PEPS):
                     new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
                 except:
                     print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
+                    
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
             amp = qtn.PEPS(peps)

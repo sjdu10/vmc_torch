@@ -1366,19 +1366,21 @@ class fTNModel_vec(wavefunctionModel):
             # Return the batch of amplitudes stacked as a tensor
             return amp_val
         
-        vec_amplitude_func = vmap(amplitude_func, in_dims=(None, 0), randomness='different')
-        # Get the amplitude
-        batch_amps = vec_amplitude_func(psi, x)
-        return batch_amps
+        # vec_amplitude_func = vmap(amplitude_func, in_dims=(None, 0), randomness='different')
+        # # Get the amplitude
+        # batch_amps = vec_amplitude_func(psi, x)
+
+        return amplitude_func(psi, x)
     
     def forward(self, x):
         return self.amplitude(x)
 
 class fTNModel_reuse(wavefunctionModel):
-    def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False):
+    def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False, debug=False):
         super().__init__()
         self.param_dtype = dtype
         self.functional = functional
+        self.debug = debug
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
         self.skeleton.exponent = 0
@@ -1701,6 +1703,10 @@ class fTNModel_reuse(wavefunctionModel):
                                 
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
+            
+            if self.debug:
+                print(f'Reused Amp: {amp_val}, Exact Amp: {self.get_amp_tn(x_i).contract()}')
+            
             
             batch_amps.append(amp_val)
 
@@ -2974,9 +2980,10 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
     """
         fPEPS + tensorwise attention backflow NN with finite receptive field
     """
-    def __init__(self, fpeps, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, radius=1, jastrow=False, dtype=torch.float32):
+    def __init__(self, fpeps, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, radius=1, jastrow=False, dtype=torch.float32, debug=False):
         super().__init__()
         self.param_dtype = dtype
+        self.debug = debug
         
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(fpeps)
@@ -3247,14 +3254,18 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
     def update_env_x_cache_to_row(self, config, row_id, from_which='xmin'):
         config_2d = self.from_1d_to_2d(config)
         amp_tn = self.get_amp_tn(config)
+        upper_effected_row_id = row_id - self.nn_radius if row_id - self.nn_radius >= 0 else 0
+        lower_effected_row_id = row_id + self.nn_radius if row_id + self.nn_radius < self.Lx else self.Lx-1
+        row_id = upper_effected_row_id if from_which == 'xmin' else lower_effected_row_id
         # select the row_tn in the amp_tn that corresponds to the row_id
         row_tn = amp_tn.select(amp_tn.x_tag_id.format(row_id))
-        # check the whether previous env_x cache already contains the env w.r.t. row with id row_id
         if from_which == 'xmin':
+            # check the whether previous env_x cache already contains the env w.r.t. row with id upper_effected_row_id
             key_prev_rows = ('xmin', tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())) if row_id != 0 else ()
             new_env_key = ('xmin', tuple(torch.cat(tuple(config_2d[:row_id+1].to(torch.int))).tolist()))
             xrange = (0, row_id)
         elif from_which == 'xmax':
+            # check the whether previous env_x cache already contains the env w.r.t. row with id lower_effected_row_id
             key_prev_rows = ('xmax', tuple(torch.cat(tuple(config_2d[row_id+1:].to(torch.int))).tolist())) if row_id != self.Lx-1 else ()
             new_env_key = ('xmax', tuple(torch.cat(tuple(config_2d[row_id:].to(torch.int))).tolist()))
             xrange = (row_id, self.Lx-1)
@@ -3293,6 +3304,9 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
     def update_env_y_cache_to_col(self, config, col_id, from_which='ymin'):
         config_2d = self.from_1d_to_2d(config)
         amp_tn = self.get_amp_tn(config)
+        left_effected_col_id = col_id - self.nn_radius if col_id - self.nn_radius >= 0 else 0
+        right_effected_col_id = col_id + self.nn_radius if col_id + self.nn_radius < self.Ly else self.Ly-1
+        col_id = left_effected_col_id if from_which == 'ymin' else right_effected_col_id
         # select the col_tn in the amp_tn that corresponds to the col_id
         col_tn = amp_tn.select(amp_tn.y_tag_id.format(col_id))
         # check the whether previous env_y cache already contains the env w.r.t. col with id col_id
@@ -3394,6 +3408,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                         config_2d = self.from_1d_to_2d(x_i)
                         # detect the rows that have been effected in the new configuration
                         effected_rows, uneffected_rows_above, uneffected_rows_below = self.detect_effected_rows(self.config_ref, x_i)
+                        
                         # detect the cols that have been effected in the new configuration
                         effected_cols, uneffected_cols_left, uneffected_cols_right = self.detect_effected_cols(self.config_ref, x_i)
 
@@ -3417,14 +3432,6 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 if len(uneffected_rows_above) != 0:
                                     amp_uneffected_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[uneffected_rows_above].to(torch.int))).tolist()))]
                                 amp_val_tn = amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env
-                                # amp_val_tn = qtn.TensorNetwork2D(amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env)
-                                # amp_val_tn._site_tag_id=amp._site_tag_id
-                                # amp_val_tn._x_tag_id=amp._x_tag_id
-                                # amp_val_tn._y_tag_id=amp._y_tag_id
-                                # amp_val_tn._Lx=self.Lx
-                                # amp_val_tn._Ly=self.Ly
-                                # amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, effected_rows[0]+(effected_rows[-1]-effected_rows[0])//2])
-                                # amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[effected_rows[-1]-(effected_rows[-1]-effected_rows[0])//2, self.Lx-1])
                                 amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                             else:
                                 amp_effected_cols = qtn.TensorNetwork([amp.select(amp.y_tag_id.format(col_n)) for col_n in effected_cols])
@@ -3435,18 +3442,14 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 if len(uneffected_cols_right) != 0:
                                     amp_uneffected_right_env = self.env_y_cache[('ymax', tuple(torch.cat(tuple(config_2d[:, uneffected_cols_right].to(torch.int))).tolist()))]
                                 amp_val_tn = amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env
-                                # amp_val_tn = qtn.TensorNetwork2D(amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env)
-                                # amp_val_tn._site_tag_id=amp._site_tag_id
-                                # amp_val_tn._x_tag_id=amp._x_tag_id
-                                # amp_val_tn._y_tag_id=amp._y_tag_id
-                                # amp_val_tn._Lx=self.Lx
-                                # amp_val_tn._Ly=self.Ly
-                                # amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, effected_cols[0]+(effected_cols[-1]-effected_cols[0])//2])
-                                # amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[effected_cols[-1]-(effected_cols[-1]-effected_cols[0])//2, self.Ly-1])
                                 amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
 
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
+            
+            if self.debug:
+                print(f"Reused Amp/Exact Amp: {amp_val/(self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i))))}")
+                
             batch_amps.append(amp_val)
 
         # Return the batch of amplitudes stacked as a tensor
