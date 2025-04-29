@@ -247,6 +247,9 @@ class Variational_State:
         return stats_dict
     
     def collect_samples(self, op, chain_length=1):
+        """
+            Rank 0 returns the expectation value, variance, and error of the operator.
+        """
 
         vstate = self
         

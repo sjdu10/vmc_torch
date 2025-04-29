@@ -189,9 +189,15 @@ class Graph:
     def __init__(self):
         self._edges = None
         self._site_index_map = None
+        self.n_nodes = None
     
     def edges(self):
         return self._edges
+    
+    @property
+    def N(self):
+        """Number of nodes in the graph"""
+        return self.n_nodes
     
     @property
     def n_edges(self):
@@ -206,6 +212,7 @@ class SquareLattice(Graph):
         """Zig-zag ordering, nearest neighbor edges"""
         self.Lx = Lx
         self.Ly = Ly
+        self.n_nodes = Lx * Ly
         self.pbc = pbc
         edges = qtn.edges_2d_square(self.Lx, self.Ly, cyclic=self.pbc)
         self._edges = [(site_index_map(*site_i, Lx, Ly), site_index_map(*site_j, Lx, Ly)) for site_i, site_j in edges]
@@ -236,6 +243,7 @@ class Chain(Graph):
         self.pbc = pbc
         edges = qtn.edges_1d_chain(L, cyclic=pbc)
         self._edges = edges
+        self.n_nodes = L
 
 
 class Operator:

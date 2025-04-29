@@ -72,7 +72,7 @@ def from_quimb_config_to_netket_config(quimb_config):
 # --- Sampler ---
 
 class AbstractSampler:
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, equal_partition=True, dtype=torch.float32):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, equal_partition=True, dtype=torch.float32, device=None):
         self.hi = hi
         self.Ns = N_samples
         self.graph = graph
@@ -80,6 +80,7 @@ class AbstractSampler:
         self.burn_in_steps = burn_in_steps
         self.reset_chain = reset_chain
         self.dtype = dtype
+        self.device = device
         self.initial_config = None
         self.current_config = None
         self.equal_partition = equal_partition
@@ -88,12 +89,12 @@ class AbstractSampler:
         self.grad_time = 0
         self.burn_in_time = 0
 
-        self.initial_config = torch.tensor(np.asarray(self.hi.random_state()), dtype=self.dtype)
+        self.initial_config = torch.tensor(np.asarray(self.hi.random_state()), dtype=self.dtype, device=self.device)
         self.current_config = self.initial_config.clone()
     
     def reset(self):
         """Reset the current sampler configuration to a random config in the Hilbert space."""
-        self.initial_config = torch.tensor(np.asarray(self.hi.random_state()), dtype=self.dtype)
+        self.initial_config = torch.tensor(np.asarray(self.hi.random_state()), dtype=self.dtype, device=self.device)
         self.current_config = self.initial_config.clone()
 
     def _sample_next(self, vstate_func):
@@ -107,8 +108,8 @@ class AbstractSampler:
 
 class Sampler(AbstractSampler):
     """Markov Chain sampler"""
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
-        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, equal_partition)
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32, device=None):
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, equal_partition, dtype, device)
         self.random_edge = random_edge
         self.subchain_length = graph.n_edges if subchain_length is None else subchain_length
         self.attempts = 0
@@ -127,10 +128,56 @@ class Sampler(AbstractSampler):
         """Sample the next configuration. Change the current configuration in place.
         Must be implemented in the derived class."""
         raise NotImplementedError
+    
+    def sample_configs(self, vstate, chain_length=1, iprint=0):
+        """
+        Sample configurations.
+        Returns
+        -------
+        configs : list
+            The sampled configurations.
+        amps : list
+            Amplitudes of the sampled configurations.
+        """
+        if iprint:
+            print('Burn-in...')
+            t_burnin0 = MPI.Wtime()
+        self.burn_in(vstate)
+        if iprint:
+            t_burnin1 = MPI.Wtime()
+            print('Burn-in time:', t_burnin1 - t_burnin0)
+        
+        configs = torch.zeros((chain_length, self.graph.N), dtype=self.dtype, device=self.device)
+        amps = torch.zeros((chain_length,), dtype=self.dtype, device=self.device)
+        for _ in range(chain_length):
+            # sample the next configuration
+            psi_sigma = 0
+            while psi_sigma == 0:
+                # We need to make sure that the amplitude is not zero
+                sigma, psi_sigma = self._sample_next(vstate)
+            configs[_] = sigma
+            amps[_] = psi_sigma
+
+        return configs, amps
+
+        
 
     def sample(self, vstate, op, chain_length=1):
-        """Sample the local energy and amplitude gradient for each configuration.
-        return a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)"""
+        """
+        Sample configurations and compute the local operator.
+        
+        Returns
+        -------
+        op_loc_sum : float
+            The sum of the local operator.
+        op_loc_var : float
+            The variance of the local operator.
+        W_loc : float
+            The within chain variance of the local operator.
+        chain_means_loc : list
+            The means of the local operator for each chain.
+        
+        """
         assert self.equal_partition, "The number of samples must be equal for all MPI processes."
         if RANK == 0:
             print('Burn-in...')
@@ -916,7 +963,7 @@ class MetropolisExchangeSamplerSpinless(Sampler):
         return self.current_config, current_amp
     
 class MetropolisExchangeSamplerSpinful(Sampler):
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32, device=None):
         """
         Parameters
         ----------
@@ -939,11 +986,11 @@ class MetropolisExchangeSamplerSpinful(Sampler):
         dtype : torch.dtype
 
         """
-        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype, device=device)
 
     def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
-        current_amp = vstate.amplitude(self.current_config).cpu()
+        current_amp = vstate.amplitude(self.current_config)
         current_prob = abs(current_amp)**2
         proposed_config = self.current_config.clone()
         ind_n_map = {0:0, 1:1, 2:1, 3:2}
@@ -970,21 +1017,21 @@ class MetropolisExchangeSamplerSpinful(Sampler):
             if delta_n == 1:
                 proposed_config[i] = config_j
                 proposed_config[j] = config_i
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_amp = vstate.amplitude(proposed_config)
                 proposed_prob = abs(proposed_amp)**2
             elif delta_n == 0:
                 choices = [(0, 3), (3, 0), (config_j, config_i)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_amp = vstate.amplitude(proposed_config)
                 proposed_prob = abs(proposed_amp)**2
             elif delta_n == 2:
                 choices = [(config_j, config_i), (1,2), (2,1)]
                 choice = random.choice(choices)
                 proposed_config[i] = choice[0]
                 proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_amp = vstate.amplitude(proposed_config)
                 proposed_prob = abs(proposed_amp)**2
             else:
                 raise ValueError("Invalid configuration")
@@ -1160,7 +1207,7 @@ class MetropolisMPSSamplerSpinful(Sampler):
 
     def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
-        self.current_amp = vstate.amplitude(self.current_config).cpu()
+        self.current_amp = vstate.amplitude(self.current_config)
         self.current_prob = abs(self.current_amp)**2
 
         for n_sample in [self.mps_n_sample]:
@@ -1169,7 +1216,7 @@ class MetropolisMPSSamplerSpinful(Sampler):
                 self.attempts += 1
                 proposed_config = proposed_mps_config
                 proposed_mps_prob = abs(proposed_mps_amp)**2
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_amp = vstate.amplitude(proposed_config)
                 proposed_prob = abs(proposed_amp)**2
                 try:
                     acceptance_ratio = min(1, (proposed_prob/self.current_prob)*(self.current_mps_prob/proposed_mps_prob))
