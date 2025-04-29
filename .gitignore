@@ -17,3 +17,5 @@ scripts/
 # local/
 __pycache__/
 vmc_torch.egg-info/
+*.sqlite
+*.nsys-rep
