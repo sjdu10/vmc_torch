@@ -286,21 +286,21 @@ class fPEPS(qtn.PEPS):
                 p_ind = peps.site_ind_id.format(*site)
                 site_id = peps.sites.index(site)
                 fts = peps.tensors[site_id]
-                ftsdata = fts.data
+                ftsdata = fts.data # this is the on-site fermionic tensor (f-tensor) to be contracted
                 ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
                 phys_ind_order = fts.inds.index(p_ind)
-                charge = index_map[int(n)]
-                input_vec = array_map[int(n)]
-                charge_sec_data_dict = ftsdata.blocks
+                charge = index_map[int(n)] # charge of the on-site fermion configuration
+                input_vec = array_map[int(n)] # input vector of the on-site fermion configuration
+                charge_sec_data_dict = ftsdata.blocks # the dictionary of the f-tensor data
 
-                new_fts_inds = fts.inds[:phys_ind_order] + fts.inds[phys_ind_order + 1:]
-                new_charge_sec_data_dict = {}
+                new_fts_inds = fts.inds[:phys_ind_order] + fts.inds[phys_ind_order + 1:] # calculate indices of the contracted f-tensor
+                new_charge_sec_data_dict = {} # new dictionary to store the data of the contracted f-tensor
                 for charge_blk, data in charge_sec_data_dict.items():
                     if charge_blk[phys_ind_order] == charge:
-                        # new_data = data @ input_vec #BUG: This is not correct, should contract with the correct tensor index
-                        new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
-                        new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order + 1:]
-                        new_charge_sec_data_dict[new_charge_blk] = new_data
+                        # new_data = data @ input_vec # BUG: This is not correct, should contract with the correct tensor index
+                        new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0])) # new tensor for this charge block
+                        new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order + 1:] # new charge block
+                        new_charge_sec_data_dict[new_charge_blk] = new_data # new charge block and its corresponding data in a dictionary
 
                 new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order + 1:]
 
@@ -323,6 +323,7 @@ class fPEPS(qtn.PEPS):
                         new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
                     new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
                 except:
+                    # Error when constructing the new f-tensor
                     print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
                     
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)

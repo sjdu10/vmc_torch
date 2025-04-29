@@ -826,7 +826,7 @@ class Sampler(AbstractSampler):
                 pbar.update(1)
                 # Check if we have enough samples
                 if n_total >= self.Ns:
-                    terminate = True
+                    terminate = np.array([1], dtype=np.int32)
                     for dest_rank in range(1, SIZE):
                         # COMM.send(terminate, dest=dest_rank, tag=message_tag+1)
                         COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
