@@ -1,4 +1,5 @@
 import os
+from memory_profiler import profile
 import numpy as np
 from mpi4py import MPI
 from .global_var import DEBUG, set_debug, TIME_PROFILING
@@ -132,6 +133,8 @@ class VMC:
         self.Einit = 0.
         MC_energy_stats = {'Np': self._state.Np, 'sample size:': self._state.Ns, 'mean': [], 'error': [], 'variance': []}
         self.step_count = start
+        if RANK == 0:
+            pbar = tqdm(range(start-stop))
         for step in range(start, stop):
             if RANK == 0:
                 print('\nVariational step {}'.format(step))
@@ -158,24 +161,25 @@ class VMC:
             # Precondition the gradient through SR (optional)
             preconditioned_grad = self.preconditioner(self._state, state_MC_loss_grad)
 
-            # collect rank1 sample time in rank 0
-            if RANK==1:
-                sample_time = np.array(self._state.sampler.sample_time)
-                local_energy_time = np.array(self._state.sampler.local_energy_time)
-                gradient_time = np.array(self._state.sampler.grad_time)
-                COMM.Send(sample_time, dest=0, tag=step+10)
-                COMM.Send(local_energy_time, dest=0, tag=step+11)
-                COMM.Send(gradient_time, dest=0, tag=step+12)
-            elif RANK==0:
-                sample_time = np.empty(1, dtype=float)
-                local_energy_time = np.empty(1, dtype=float)
-                gradient_time = np.empty(1, dtype=float)
-                COMM.Recv(sample_time, source=1, tag=step+10)
-                COMM.Recv(local_energy_time, source=1, tag=step+11)
-                COMM.Recv(gradient_time, source=1, tag=step+12)
-                self._state.sampler.sample_time = sample_time[0]
-                self._state.sampler.local_energy_time = local_energy_time[0]
-                self._state.sampler.grad_time = gradient_time[0]
+            if SIZE > 1:
+                # collect rank1 sample time in rank 0
+                if RANK==1:
+                    sample_time = np.array(self._state.sampler.sample_time)
+                    local_energy_time = np.array(self._state.sampler.local_energy_time)
+                    gradient_time = np.array(self._state.sampler.grad_time)
+                    COMM.Send(sample_time, dest=0, tag=step+10)
+                    COMM.Send(local_energy_time, dest=0, tag=step+11)
+                    COMM.Send(gradient_time, dest=0, tag=step+12)
+                elif RANK==0:
+                    sample_time = np.empty(1, dtype=float)
+                    local_energy_time = np.empty(1, dtype=float)
+                    gradient_time = np.empty(1, dtype=float)
+                    COMM.Recv(sample_time, source=1, tag=step+10)
+                    COMM.Recv(local_energy_time, source=1, tag=step+11)
+                    COMM.Recv(gradient_time, source=1, tag=step+12)
+                    self._state.sampler.sample_time = sample_time[0]
+                    self._state.sampler.local_energy_time = local_energy_time[0]
+                    self._state.sampler.grad_time = gradient_time[0]
             COMM.Barrier() # Synchronize all ranks
             
             if RANK == 0:
@@ -210,12 +214,12 @@ class VMC:
                     np.max(np.abs(preconditioned_grad.detach().numpy())), 
                     np.max(np.abs(self._state.params_vec.detach().numpy())))
                 )
+                pbar.update(1)
                 # Compute the new parameter vector
                 new_param_vec = self._optimizer.compute_update_params(self._state.params_vec, preconditioned_grad) # Subroutine: rank 0 computes new parameter vector based on the gradient
                 new_param_vec = new_param_vec.detach().numpy()
                 
                 self._state.reset() # Clear out the gradient of the state parameters
-                
                 
                 if tmpdir is not None and save:
                     # save the energy statistics and model parameters to local directory

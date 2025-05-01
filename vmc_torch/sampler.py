@@ -266,7 +266,7 @@ class Sampler(AbstractSampler):
     
     def sample_eager(self, vstate, op, message_tag=None):
         """Sample eagerly for the local energy and amplitude gradient for each configuration.
-        return a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)"""
+        return a tuple of (op_loc_sum, op_loc_var, n)"""
         assert self.equal_partition == False, 'Must not use equal partition for eager sampling.'
 
         if RANK == 0:
