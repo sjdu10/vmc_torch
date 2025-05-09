@@ -38,9 +38,9 @@ n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice_torch(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 4
-chi = -1
-dtype=torch.float64
+D = 10
+chi = 40
+dtype=torch.float32
 torch.random.manual_seed(RANK)
 np.random.seed(RANK)
 
@@ -48,7 +48,7 @@ np.random.seed(RANK)
 skeleton = pickle.load(open(pwd+f"/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl", "rb"))
 peps_params = pickle.load(open(pwd+f"/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl", "rb"))
 peps = qtn.unpack(peps_params, skeleton)
-device = torch.device('cuda')
+device = torch.device('cpu')
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype, device=device))
 peps.exponent = torch.tensor(peps.exponent, dtype=dtype, device=device)
 
@@ -80,11 +80,11 @@ t0 = time.time()
 #     x = x.to(device)
 #     model(x)
 
-# model(X)
+model(X)
 
 
 # vmap the model
-vmap(model)(X)
+# vmap(model)(X)
 
 # # choose number of streams to interleave launches (tunable)
 # num_streams = 6

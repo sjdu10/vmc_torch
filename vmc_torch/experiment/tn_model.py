@@ -1245,8 +1245,9 @@ class fTNModel(wavefunctionModel):
                 amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
                 amp_val = amp.contract()
 
-            if amp_val==0.0:
-                amp_val = torch.tensor(0.0)
+            if not self.functional:
+                if amp_val==0.0:
+                    amp_val = torch.tensor(0.0, device=x.device)
             batch_amps.append(amp_val)
 
         # Return the batch of amplitudes stacked as a tensor

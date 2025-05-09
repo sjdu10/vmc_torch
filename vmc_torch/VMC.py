@@ -530,6 +530,10 @@ class VMC:
             # Reset the optimizer
             self._optimizer.reset()
 
+            if self.scheduler is not None:
+                learning_rate = self.scheduler(self.step_count)
+                self._optimizer.lr = learning_rate
+
             for SWO_iter in range(SWO_max_iter):
                 # Compute the amplitude and the gradient of the amplitude for the training wavefunction
                 training_amps_grad_dict = {}
