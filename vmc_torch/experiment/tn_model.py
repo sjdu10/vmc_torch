@@ -14,6 +14,7 @@ import cotengra as ctg
 from vmc_torch.fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params, insert_compressor
 from vmc_torch.fermion_utils import calculate_phase_from_adjacent_trans_dict, decompose_permutation_into_transpositions
 from vmc_torch.global_var import DEBUG, set_debug
+from .nn_sublayers import *
 flatten_tn_params = flatten_proj_params
 reconstruct_tn_params = reconstruct_proj_params
 
@@ -2096,7 +2097,7 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
 
 
 #------------ fermionic TN model with attention mechanism ------------
-from .nn_sublayers import *
+
 
 class PureAttention_Model(wavefunctionModel):
     def __init__(self, phys_dim=4, n_site=None, num_attention_blocks=1, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
@@ -2700,6 +2701,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
     """
         For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
         This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
+        There's no positional encoding in the input of the attention block in this model, so the attention output collapse to a simple average of the embeded features.
     """
     ...
     def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32):
@@ -2798,6 +2800,141 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             nn_features_vec = nn_features.view(-1)
             nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
             # Add the correction to the original parameters
+            tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            if self.max_bond is None:
+                amp = amp
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp_val = amp.contract()
+                
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+    
+class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
+    """
+        For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
+        This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
+        Positional encoding is added to the input of the attention block in this model.
+    """
+    def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32, eps=5e-3):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly
+        phys_dim = ftn.phys_dim()
+        
+        self.nn = SelfAttn_block_pos(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embed_dim=embedding_dim,
+            attention_heads=attention_heads,
+            dtype=self.param_dtype,
+        )
+        # for each tensor (labelled by tid), assign a MLP
+        self.mlp = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            mlp_input_dim = ftn.Lx * ftn.Ly * embedding_dim
+            tn_params_dict = {
+                tid: params[int(tid)]
+            }
+            tn_params_vec = flatten_tn_params(tn_params_dict)
+            self.mlp[tid] = nn.Sequential(
+                nn.Linear(mlp_input_dim, nn_final_dim),
+                nn.Tanh(),
+                nn.Linear(nn_final_dim, tn_params_vec.numel()),
+            )
+            self.mlp[tid].to(self.param_dtype)
+        
+        # Initialize the MLP last layer weights and biases with small values
+        for mlp in self.mlp.values():
+            last_layer = mlp[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.uniform_(last_layer.weight, a=-eps, b=eps)
+                if last_layer.bias is not None:
+                    nn.init.uniform_(last_layer.bias, a=-eps, b=eps)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+
+        self.model_structure = {
+            'fPEPS_backflow_attn_Tensorwise':
+            {
+                'D': ftn.max_bond(), 
+                'Lx': ftn.Lx, 'Ly': ftn.Ly, 
+                'symmetry': self.symmetry, 
+                # 'nn_hidden_dim': nn_hidden_dim, 
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta, 
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+                'max_bond': max_bond,
+            },
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        self.tree = None
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+        
+            # Get the NN correction to the parameters, concatenate the results for each tensor
+            nn_features = self.nn(x_i)
+            nn_features_vec = nn_features.view(-1)
+            nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
+            # Add the correction to the original parameters
+            # tn_nn_params = reconstruct_tn_params(params_vec + (self.nn_eta-10)*nn_correction.detach()+10*nn_correction, params)
             tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
             # Reconstruct the TN with the new parameters
             psi = qtn.unpack(tn_nn_params, self.skeleton)

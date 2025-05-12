@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 class PositionwiseFeedForward(nn.Module):
     ''' A two-feed-forward-layer module '''
@@ -18,6 +19,65 @@ class PositionwiseFeedForward(nn.Module):
         x += residual
         x = self.layer_norm(x)
         return x
+    
+class SelfAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, **mha_kwargs):
+        super().__init__()
+        # instantiate the real MHA
+        self.mha = nn.MultiheadAttention(embed_dim=embed_dim,
+                                         num_heads=num_heads,
+                                         batch_first=True,
+                                         **mha_kwargs)
+
+    def forward(self,
+                x: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None,
+                attn_mask: Optional[torch.Tensor]     = None,
+                need_weights: bool                          = False,
+                average_attn_weights: bool                  = False):
+        # internally use x for (query, key, value)
+        return self.mha(x, x, x,
+                        key_padding_mask=key_padding_mask,
+                        attn_mask=attn_mask,
+                        need_weights=need_weights,
+                        average_attn_weights=average_attn_weights)
+
+
+
+class SelfAttn_block_pos(nn.Module):
+    def __init__(self, n_site, num_classes, embed_dim, attention_heads, dtype=torch.float32):
+        super(SelfAttn_block_pos, self).__init__()
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        # Linear layer to project one-hot vectors to the embedding dimension
+        self.embedding = nn.Linear(num_classes, embed_dim)
+        # Learnable positional embedding
+        self.positional_embedding = nn.Parameter(torch.randn(n_site, embed_dim) / embed_dim ** 0.5)
+        # Self-attention block
+        self.self_attention = SelfAttention(embed_dim=embed_dim, num_heads=attention_heads)
+
+        self.dtype = dtype
+        self.embedding.to(dtype=dtype)
+        self.self_attention.to(dtype=dtype)
+        self.positional_embedding.to(dtype=dtype)
+
+    def forward(self, input_seq):
+        # Step 1: One-hot encode the input sequence
+        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(self.dtype)
+
+        # Step 2: Embed the one-hot encoded sequence
+        embedded = self.embedding(one_hot_encoded)
+        embedded = embedded + self.positional_embedding
+
+        # Step 3: Pass through the self-attention block
+        attn_output, _ = self.self_attention(embedded)
+
+        # Step 4: Residual connection and layer normalization
+        attn_output = F.layer_norm(attn_output + embedded, attn_output.size()[1:])
+
+        return attn_output
+
+
 
 class SelfAttn_block(nn.Module):
     def __init__(self, n_site, num_classes, embedding_dim, attention_heads, dtype=torch.float32):
