@@ -2145,7 +2145,11 @@ class PureAttention_Model(wavefunctionModel):
             # Check x_i type
             if not type(x_i) == torch.Tensor:
                 x_i = torch.tensor(x_i)
-            amp = self.nn(x_i)
+            embed_features = self.nn(x_i)
+            # Concatenate the embedding features for each site
+            embed_features_flat = embed_features.view(-1)  # Flatten the embedding dimensions
+            # Compute the amplitude using the MLP
+            amp = self.mlp(embed_features_flat)
             batch_amps.append(amp.squeeze())
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
@@ -4861,9 +4865,9 @@ class NNBF(wavefunctionModel):
 
         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
-            nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
+            nn.Linear(self.hilbert.size, hidden_dim),
             nn.Tanh(),
-            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions, dtype=self.param_dtype)
+            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions)
         )
 
         # Convert NNs to the appropriate data type

@@ -42,7 +42,7 @@ class Hilbert:
 class SpinfulFermion(Hilbert):
     def __init__(self, n_orbitals, n_fermions=None, n_fermions_per_spin=None):
         """
-        Spinful fermionic Hilbert space with n_orbitals orbitals and n_fermions fermions.
+        Spin-1/2 fermionic Hilbert space with n_orbitals orbitals and n_fermions fermions.
         n_fermions_per_spin is the number of fermions per spin, if not provided, it will be set to n_fermions // 2.
 
         Configuration structure: [nu1,...,nuN, nd1,...,ndN]
@@ -55,6 +55,11 @@ class SpinfulFermion(Hilbert):
         self.n_fermions = n_fermions
         self.n_fermions_spin_up = n_fermions_per_spin[0] if n_fermions_per_spin is not None else n_fermions // 2
         self.n_fermions_spin_down = n_fermions_per_spin[1] if n_fermions_per_spin is not None else n_fermions // 2
+    
+    @property
+    def size(self):
+        """Actually returns the number of orbitals.. TODO: change to a better name"""
+        return self.n_orbitals
 
     
     def _all_states(self):
