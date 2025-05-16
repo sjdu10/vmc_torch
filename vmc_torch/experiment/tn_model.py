@@ -3579,6 +3579,15 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 if len(uneffected_rows_above) != 0:
                                     amp_uneffected_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[uneffected_rows_above].to(torch.int))).tolist()))]
                                 amp_val_tn = amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env
+
+                                middle_row = effected_rows[0] + (effected_rows[-1] - effected_rows[0])//2
+                                if len(uneffected_rows_above) <= len(uneffected_rows_below):
+                                    amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, middle_row])
+                                    amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row+1, self.Lx-1])
+                                else:
+                                    amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, middle_row-1])
+                                    amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row, self.Lx-1])
+
                                 amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                             else:
                                 amp_effected_cols = qtn.TensorNetwork([amp.select(amp.y_tag_id.format(col_n)) for col_n in effected_cols])
@@ -3589,6 +3598,15 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 if len(uneffected_cols_right) != 0:
                                     amp_uneffected_right_env = self.env_y_cache[('ymax', tuple(torch.cat(tuple(config_2d[:, uneffected_cols_right].to(torch.int))).tolist()))]
                                 amp_val_tn = amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env
+
+                                middle_col = effected_cols[0] + (effected_cols[-1] - effected_cols[0])//2
+                                if len(uneffected_cols_left) <= len(uneffected_cols_right):
+                                    amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, middle_col])
+                                    amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col+1, self.Ly-1])
+                                else:
+                                    amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, middle_col-1])
+                                    amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col, self.Ly-1])
+
                                 amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
 
             if amp_val==0.0:
