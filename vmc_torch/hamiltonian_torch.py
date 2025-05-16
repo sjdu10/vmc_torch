@@ -52,9 +52,10 @@ class SpinfulFermion(Hilbert):
         
         """
         self.n_orbitals = n_orbitals*2  # Total number of orbitals (spin up + spin down)
-        self.n_fermions = n_fermions
+        self.n_fermions = n_fermions if n_fermions is not None else n_fermions_per_spin[0] + n_fermions_per_spin[1]
         self.n_fermions_spin_up = n_fermions_per_spin[0] if n_fermions_per_spin is not None else n_fermions // 2
         self.n_fermions_spin_down = n_fermions_per_spin[1] if n_fermions_per_spin is not None else n_fermions // 2
+        self.n_fermions_per_spin = n_fermions_per_spin if n_fermions_per_spin is not None else (self.n_fermions_spin_up, self.n_fermions_spin_down)
     
     @property
     def size(self):
