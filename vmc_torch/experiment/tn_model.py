@@ -2118,8 +2118,8 @@ class PureAttention_Model(wavefunctionModel):
         self.mlp = nn.Sequential(
             nn.Linear(input_dim*embedding_dim, nn_hidden_dim),
             nn.Tanh(),
-            nn.Linear(nn_hidden_dim, nn_hidden_dim),
-            nn.Tanh(),
+            # nn.Linear(nn_hidden_dim, nn_hidden_dim),
+            # nn.Tanh(),
             nn.Linear(nn_hidden_dim, 1),
         )
         self.mlp.to(self.param_dtype)
@@ -4850,7 +4850,7 @@ class NeuralBackflow_spinful(wavefunctionModel):
 
 class NNBF(wavefunctionModel):
     """Assuming total Sz=0."""
-    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64, nn_eta=1):
         super(NNBF, self).__init__()
         
         self.hilbert = hilbert
@@ -4873,11 +4873,13 @@ class NNBF(wavefunctionModel):
         # Convert NNs to the appropriate data type
         self.nn.to(self.param_dtype)
 
+        self.nn_eta = nn_eta
+
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
+            'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin, 'nn_eta': self.nn_eta}
         }
 
     def amplitude(self, x):
@@ -4887,7 +4889,10 @@ class NNBF(wavefunctionModel):
         def backflow_det(n):
             # Compute the backflow matrix F using the neural network
             F = self.nn(n)
-            M  = self.M + F.reshape(self.M.shape)
+            if self.nn_eta != 0:
+                M  = self.M + F.reshape(self.M.shape)*self.nn_eta
+            elif self.nn_eta == 0: # Pure Slater determinant calculation
+                M  = self.M
             # Find the positions of the occupied orbitals
             R = torch.nonzero(n, as_tuple=False).squeeze()
 
