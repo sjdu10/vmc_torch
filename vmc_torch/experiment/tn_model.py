@@ -3571,9 +3571,23 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                             if len(changed_rows) <= len(changed_cols):
                                 # for bottom envs, until the last effected row, we can reuse the bottom envs
                                 # for top envs, until the first effected row, we can reuse the top envs
-                                amp_effected_rows = qtn.TensorNetwork([amp.select(amp.x_tag_id.format(row_n)) for row_n in effected_rows]) 
-                                amp_uneffected_bottom_env = qtn.TensorNetwork()
-                                amp_uneffected_top_env = qtn.TensorNetwork()
+                                row_tag_list = [amp.x_tag_id.format(row_n) for row_n in effected_rows]
+                                amp_effected_rows = amp.select(row_tag_list, which='any')
+
+                                amp_uneffected_bottom_env = qtn.TensorNetwork2D()
+                                amp_uneffected_bottom_env._site_tag_id = amp._site_tag_id
+                                amp_uneffected_bottom_env._x_tag_id = amp._x_tag_id
+                                amp_uneffected_bottom_env._y_tag_id = amp._y_tag_id
+                                amp_uneffected_bottom_env._Lx = self.Lx
+                                amp_uneffected_bottom_env._Ly = self.Ly
+                                amp_uneffected_top_env = qtn.TensorNetwork2D()
+                                amp_uneffected_top_env._site_tag_id = amp._site_tag_id
+                                amp_uneffected_top_env._x_tag_id = amp._x_tag_id
+                                amp_uneffected_top_env._y_tag_id = amp._y_tag_id
+                                amp_uneffected_top_env._Lx = self.Lx
+                                amp_uneffected_top_env._Ly = self.Ly
+
+
                                 if len(uneffected_rows_below) != 0:
                                     amp_uneffected_bottom_env = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[uneffected_rows_below].to(torch.int))).tolist()))]
                                 if len(uneffected_rows_above) != 0:
@@ -3590,9 +3604,22 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
 
                                 amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                             else:
-                                amp_effected_cols = qtn.TensorNetwork([amp.select(amp.y_tag_id.format(col_n)) for col_n in effected_cols])
-                                amp_uneffected_left_env = qtn.TensorNetwork()
-                                amp_uneffected_right_env = qtn.TensorNetwork()
+                                col_tag_list = [amp.y_tag_id.format(col_n) for col_n in effected_cols]
+                                amp_effected_cols = amp.select(col_tag_list, which='any')
+
+                                amp_uneffected_left_env = qtn.TensorNetwork2D()
+                                amp_uneffected_left_env._site_tag_id = amp._site_tag_id
+                                amp_uneffected_left_env._x_tag_id = amp._x_tag_id
+                                amp_uneffected_left_env._y_tag_id = amp._y_tag_id
+                                amp_uneffected_left_env._Lx = self.Lx
+                                amp_uneffected_left_env._Ly = self.Ly
+                                amp_uneffected_right_env = qtn.TensorNetwork2D()
+                                amp_uneffected_right_env._site_tag_id = amp._site_tag_id
+                                amp_uneffected_right_env._x_tag_id = amp._x_tag_id
+                                amp_uneffected_right_env._y_tag_id = amp._y_tag_id
+                                amp_uneffected_right_env._Lx = self.Lx
+                                amp_uneffected_right_env._Ly = self.Ly
+
                                 if len(uneffected_cols_left) != 0:
                                     amp_uneffected_left_env = self.env_y_cache[('ymin', tuple(torch.cat(tuple(config_2d[:, uneffected_cols_left].to(torch.int))).tolist()))]
                                 if len(uneffected_cols_right) != 0:
