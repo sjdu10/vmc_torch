@@ -2100,34 +2100,39 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
 
 
 class PureAttention_Model(wavefunctionModel):
-    def __init__(self, phys_dim=4, n_site=None, num_attention_blocks=1, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
+    def __init__(self, phys_dim=4, n_site=None, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, dtype=torch.float32):
         super().__init__()
         self.param_dtype = dtype
 
         # Define the neural network
         input_dim = n_site
-        self.nn = StackedSelfAttn_FFNN(
+        self.nn = SelfAttn_block_pos(
             n_site=input_dim,
             num_classes=phys_dim,
-            num_attention_blocks=num_attention_blocks,
-            embedding_dim=embedding_dim,
+            embed_dim=embedding_dim,
             attention_heads=attention_heads,
-            nn_hidden_dim=nn_hidden_dim,
-            output_dim=1
+            dtype=self.param_dtype,
         )
+
+        # for each tensor (labelled by tid), assign a MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim*embedding_dim, nn_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(nn_hidden_dim, nn_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(nn_hidden_dim, 1),
+        )
+        self.mlp.to(self.param_dtype)
 
         self.model_structure = {
             'pure attention':
             {'n_site': n_site, 
              'phys_dim': phys_dim, 
-             'num_attention_blocks': num_attention_blocks, 
              'embedding_dim': embedding_dim, 
              'attention_heads': attention_heads, 
              'nn_hidden_dim': nn_hidden_dim, 
-             'nn_eta': nn_eta
             },
         }
-        self.nn_eta = nn_eta
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
     
@@ -2809,7 +2814,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             if self.max_bond is None:
                 amp = amp
                 if self.tree is None:
-                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=100, parallel=True)
                     self.tree = amp.contraction_tree(optimize=opt)
                 amp_val = amp.contract(optimize=self.tree)
             else:
