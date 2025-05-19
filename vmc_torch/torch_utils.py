@@ -16,7 +16,7 @@ RANK = COMM.Get_rank()
 
 be_verbose = True
 epsilon = 1e-12 
-fix_sign = True
+fix_sign = False
 
 ########## Utilities ##########
 
