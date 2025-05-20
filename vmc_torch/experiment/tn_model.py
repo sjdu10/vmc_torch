@@ -1176,6 +1176,344 @@ class fMPS_BFA_cluster_Model(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
 
+
+class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
+    """fMPS+NN model with a NN receptive field of radius r for each site"""
+    def __init__(self, fmps, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, radius=1, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(fmps)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Get the receptive field for each site
+        self.receptive_field = get_receptive_field_1d(fmps.L, r=radius)
+
+        phys_dim = fmps.phys_dim()
+        # for each tensor (labelled by tid), assign a attention+MLP
+        self.nn = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            # get the receptive field for the current tensor
+            neighbors = self.receptive_field[int(tid)]
+            input_dim = len(neighbors)
+            on_site_ts_params_dict ={
+                tid: params[int(tid)]
+            }
+            on_site_ts_params_vec = flatten_tn_params(on_site_ts_params_dict)
+            self.nn[tid] = SelfAttn_FFNN_block(
+                n_site=input_dim,
+                num_classes=phys_dim,
+                embedding_dim=embedding_dim,
+                attention_heads=attention_heads,
+                nn_hidden_dim=nn_final_dim,
+                output_dim=on_site_ts_params_vec.numel(),
+                dtype=self.param_dtype
+            )
+
+        # Get symmetry
+        self.symmetry = fmps.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'fMPS_BFA_cluster': {
+                'D': fmps.max_bond(),
+                'L': fmps.L,
+                'radius': radius,
+                'symmetry': self.symmetry,
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta,
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+            },
+        }
+        self.nn_eta = nn_eta
+        self.config_ref = None
+        self._env_left_cache = None
+        self._env_right_cache = None
+        self.nn_radius = radius
+        self.L = fmps.L
+    
+    def transform_quimb_env_left_key_to_config_key(self, env_left, config):
+        """
+            Return a dictionary with the keys being the configs to the left of site i in quimb env_left.
+            env_left: dict({site: tensor}), where the tensor is the left environment of the site.
+        """
+        env_left_config = {}
+        for site in env_left.keys():
+            if site != 0:
+                config_key = tuple(config[:site].to(torch.int).tolist())
+                env_left_config[config_key] = env_left[site]
+        return env_left_config
+    
+    def transform_quimb_env_right_key_to_config_key(self, env_right, config):
+        """
+            Return a dictionary with the keys being the configs to the right of site i in quimb env_right.
+            env_right: dict({site: tensor}), where the tensor is the right environment of the site.
+        """
+        env_right_config = {}
+        for site in env_right.keys():
+            if site != self.L - 1:
+                config_key = tuple(config[site+1:].to(torch.int).tolist())
+                env_right_config[config_key] = env_right[site]
+        return env_right_config
+    
+    def cache_env_left(self, amp, config):
+        """
+            Cache the left environment of the TN.
+            amp: quimb tensor network object.
+            config: the configuration of the TN.
+        """
+        env_left = amp.compute_left_environments()
+        env_left_config = self.transform_quimb_env_left_key_to_config_key(env_left, config)
+        self._env_left_cache = env_left_config
+        self.config_ref = config
+
+    def cache_env_right(self, amp, config):
+        """
+            Cache the right environment of the TN.
+            amp: quimb tensor network object.
+            config: the configuration of the TN.
+        """
+        env_right = amp.compute_right_environments()
+        env_right_config = self.transform_quimb_env_right_key_to_config_key(env_right, config)
+        self._env_right_cache = env_right_config
+        self.config_ref = config
+    
+    def cache_env(self, amp, config):
+        """
+            Cache the left and right environment of the TN.
+            amp: quimb tensor network object.
+            config: the configuration of the TN.
+        """
+        self.cache_env_left(amp, config)
+        self.cache_env_right(amp, config)
+        assert (self.config_ref == config).all(), "The cached environment does not match the current configuration."
+    
+    @property
+    def env_left_cache(self):
+        """
+            Return the left environment of the TN.
+        """
+        if hasattr(self, '_env_left_cache'):
+            return self._env_left_cache
+        else:
+            raise ValueError("The left environment is not cached. Please call cache_env_left() first.")
+        
+    @property
+    def env_right_cache(self):
+        """
+            Return the right environment of the TN.
+        """
+        if hasattr(self, '_env_right_cache'):
+            return self._env_right_cache
+        else:
+            raise ValueError("The right environment is not cached. Please call cache_env_right() first.")
+        
+    def clear_env_left_cache(self):
+        """
+            Clear the left environment cache.
+        """
+        self._env_left_cache = None
+    def clear_env_right_cache(self):
+        """
+            Clear the right environment cache.
+        """
+        self._env_right_cache = None
+    
+    def clear_wavefunction_env_cache(self):
+        self.clear_env_left_cache()
+        self.clear_env_right_cache()
+    
+    def detect_effected_sites(self, config_ref, new_config):
+        effected_sites = set()
+        for i in range(self.L):
+            if not torch.equal(config_ref[i], new_config[i]):
+                effected_sites_left = max(0, i - self.nn_radius)
+                effected_sites_right = min(self.L - 1, i + self.nn_radius)
+                effected_sites.update(list(range(effected_sites_left, effected_sites_right + 1)))
+        
+        effected_sites = sorted(effected_sites)
+        
+        if len(effected_sites) == 0:
+            return [], [], []
+        
+        uneffected_sites_left = list(range(effected_sites[0]))
+        uneffected_sites_right = list(range(effected_sites[-1] + 1, self.L))
+
+        return effected_sites, uneffected_sites_left, uneffected_sites_right
+
+    def detect_changed_sites(self, config_ref, new_config):
+        """
+            Detect the sites that have changed in the new configuration.
+            config_ref: the reference configuration of the TN.
+            new_config: the new configuration of the TN.
+        """
+        changed_sites = set()
+        for i in range(self.L):
+            if not torch.equal(config_ref[i], new_config[i]):
+                changed_sites.add(i)
+        
+        changed_sites = sorted(changed_sites)
+        if len(changed_sites) == 0:
+            return [], [], []
+        uneffected_sites_left = list(range(changed_sites[0]))
+        uneffected_sites_right = list(range(changed_sites[-1] + 1, self.L))
+        return changed_sites, uneffected_sites_left, uneffected_sites_right
+    
+    def get_amp_tn(self, config):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+        # Get the corresponding NN output for each site and cat
+        nn_correction = torch.cat([self.nn[str(tid)](config[neighbors]) for tid, neighbors in self.receptive_field.items()])
+        # Add the correction to the original parameters
+        tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta * nn_correction, params)
+        # Reconstruct the TN with the new parameters
+        fmps = qtn.unpack(tn_nn_params, self.skeleton)
+        # Get the amplitude
+        amp = fmps.get_amp(config)
+
+        return amp
+    
+    def update_env_left(self, config):
+        if self._env_left_cache is not None:
+            self.clear_env_left_cache()
+        amp_tn = self.get_amp_tn(config)
+        self.cache_env_left(amp_tn, config)
+        assert (self.config_ref == config).all(), "The cached environment does not match the current configuration."
+
+    def update_env_right(self, config):
+        if self._env_right_cache is not None:
+            self.clear_env_right_cache()
+        amp_tn = self.get_amp_tn(config)
+        self.cache_env_right(amp_tn, config)
+        assert (self.config_ref == config).all(), "The cached environment does not match the current configuration."
+    
+    def update_env_to_site(self, config, site_id, from_which='left'):
+        amp_tn = self.get_amp_tn(config)
+
+        left_site_id = max(0, site_id - self.nn_radius)
+        right_site_id = min(self.L - 1, site_id + self.nn_radius)
+
+        # select the site ts
+        site_id = left_site_id if from_which == 'left' else right_site_id
+        site_ts = amp_tn.select(site_id)
+
+        if from_which == 'left':
+            key_prev_sites = tuple(config[:site_id].to(torch.int).tolist()) if site_id > 0 else ()
+            new_env_key = tuple(config[:site_id+1].to(torch.int).tolist())
+        elif from_which == 'right':
+            key_prev_sites = tuple(config[site_id+1:].to(torch.int).tolist()) if site_id < self.L - 1 else ()
+            new_env_key = tuple(config[site_id:].to(torch.int).tolist())
+        else:
+            raise ValueError("from_which must be either 'left' or 'right'.")
+
+        if from_which == 'left':
+            if key_prev_sites in self.env_left_cache:
+                prev_env_left = self.env_left_cache[key_prev_sites]
+                new_env_ts = (site_ts|prev_env_left).contract()
+                new_env_left_cache = {new_env_key: new_env_ts}
+            else:
+                # quimb left env calculation
+                left_envs = {1: amp_tn.select(0).contract()}
+                for i in range(2, site_id + 1):
+                    tll = left_envs[i - 1]
+                    tll.drop_tags()
+                    tnl = amp_tn.select(i - 1) | tll
+                    left_envs[i] = tnl.contract()
+                new_env_left_cache = self.transform_quimb_env_left_key_to_config_key(left_envs, config)
+            
+            if self.env_left_cache is None:
+                self._env_left_cache = new_env_left_cache
+            else:
+                self._env_left_cache.update(new_env_left_cache)
+            
+        elif from_which == 'right':
+            if key_prev_sites in self.env_right_cache:
+                prev_env_right = self.env_right_cache[key_prev_sites]
+                new_env_ts = (site_ts|prev_env_right).contract()
+                new_env_right_cache = {new_env_key: new_env_ts}
+            else:
+                # quimb right env calculation
+                right_envs = {self.L - 2: amp_tn.select(-1).contract()}
+                for i in range(self.L - 3, site_id - 1, -1):
+                    trl = right_envs[i + 1]
+                    trl.drop_tags()
+                    trn = amp_tn.select(i + 1) | trl
+                    right_envs[i] = trn.contract()
+                new_env_right_cache = self.transform_quimb_env_right_key_to_config_key(right_envs, config)
+
+            if self.env_right_cache is None:
+                self._env_right_cache = new_env_right_cache
+            else:
+                self._env_right_cache.update(new_env_right_cache)
+        
+        else:
+            raise ValueError("from_which must be either 'left' or 'right'.")
+        
+        self.config_ref = config
+    
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+            
+            amp = self.get_amp_tn(x_i)
+
+            if self.cache_env_mode:
+                self.cache_env(amp, x_i)
+                key_left = tuple(x_i[:self.L//2].to(torch.int).tolist())
+                key_right = tuple(x_i[self.L//2:].to(torch.int).tolist())
+                amp_left = self.env_left_cache[key_left]
+                amp_right = self.env_right_cache[key_right]
+                amp_val = (amp_left|amp_right).contract()
+                
+            else:
+                if self.env_left_cache is None and self.env_right_cache is None:
+                    amp_val = amp.contract()
+                else:
+                    effected_sites, uneffected_sites_left, uneffected_sites_right = self.detect_effected_sites(self.config_ref, x_i)
+                    changed_sites, _, _ = self.detect_changed_sites(self.config_ref, x_i)
+                    if len(changed_sites) == 0:
+                        # If no sites are changed, use the cached environment
+                        amp_val = (self.env_left_cache[tuple(x_i[:self.L//2].to(torch.int).tolist())]) | self.env_right_cache[tuple(x_i[self.L//2:].to(torch.int).tolist())].contract()
+                    else:
+                        effected_tn = amp.select(effected_sites)
+                        left_env = self.env_left_cache[tuple(x_i[uneffected_sites_left].to(torch.int).tolist())]
+                        right_env = self.env_right_cache[tuple(x_i[uneffected_sites_right].to(torch.int).tolist())]
+                        amp_val = (effected_tn | left_env | right_env).contract()
+
+            if amp_val == 0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
 #------------ fermionic PEPS based model ------------
 
 class fTNModel(wavefunctionModel):
@@ -3222,7 +3560,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
     
     def transform_quimb_env_x_key_to_config_key(self, env_x, config):
         """
-            Return a dictionary with the keys of of the config rows
+            Return a dictionary with the keys being the config rows
         """
         config_2d = self.from_1d_to_2d(config)
         env_x_row_config = {}
@@ -3241,7 +3579,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
     
     def transform_quimb_env_y_key_to_config_key(self, env_y, config):
         """
-            Return a dictionary with the keys of of the config rows
+            Return a dictionary with the keys being the config cols
         """
         config_2d = self.from_1d_to_2d(config)
         env_y_row_config = {}
