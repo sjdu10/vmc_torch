@@ -1,5 +1,6 @@
 from mpi4py import MPI
 import ast
+import time
 # torch
 import torch
 import torch.nn as nn
@@ -92,7 +93,7 @@ class wavefunctionModel(torch.nn.Module):
     def amplitude(self, x):
         raise NotImplementedError
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -186,11 +187,11 @@ class PEPS_model(torch.nn.Module):
         else:
             return torch.stack([func(xi) for xi in x])
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
-        return self.amplitude(x)
+        return self.amplitude(x, **kwargs)
 
 class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
     """
@@ -392,7 +393,7 @@ class PEPS_NN_Model(torch.nn.Module):
             if param is not None:
                 param.grad = None
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -509,7 +510,7 @@ class PEPS_NNproj_Model(torch.nn.Module):
             if param is not None:
                 param.grad = None
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -657,7 +658,7 @@ class PEPS_delocalized_Model(torch.nn.Module):
         else:
             return torch.stack([func(xi) for xi in x])
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -1226,7 +1227,7 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'fMPS_BFA_cluster': {
+            'fMPS_BFA_cluster_reuse': {
                 'D': fmps.max_bond(),
                 'L': fmps.L,
                 'radius': radius,
@@ -1406,9 +1407,8 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         self.cache_env_right(amp_tn, config)
         assert (self.config_ref == config).all(), "The cached environment does not match the current configuration."
     
-    def update_env_to_site(self, config, site_id, from_which='left'):
-        amp_tn = self.get_amp_tn(config)
-
+    def update_env_to_site(self, amp_tn, config, site_id, from_which='left'):
+        # t0 = MPI.Wtime()
         left_site_id = max(0, site_id - self.nn_radius)
         right_site_id = min(self.L - 1, site_id + self.nn_radius)
 
@@ -1426,10 +1426,25 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
             raise ValueError("from_which must be either 'left' or 'right'.")
 
         if from_which == 'left':
-            if key_prev_sites in self.env_left_cache:
-                prev_env_left = self.env_left_cache[key_prev_sites]
-                new_env_ts = (site_ts|prev_env_left).contract()
-                new_env_left_cache = {new_env_key: new_env_ts}
+            if self.env_left_cache is not None:
+                if key_prev_sites in self.env_left_cache:
+                    # print('use cached env to update cache')
+                    prev_env_left = self.env_left_cache[key_prev_sites]
+                    new_env_ts = (site_ts|prev_env_left).contract()
+                    new_env_left_cache = {new_env_key: new_env_ts}
+                    # t1 = MPI.Wtime()
+                    # print(f'Update cache time0={t1-t0}')
+                else:
+                    # raise NotImplementedError("Left environment cache is not implemented yet.")
+                    # quimb left env calculation
+                    left_envs = {1: amp_tn.select(0).contract()}
+                    for i in range(2, site_id + 1):
+                        tll = left_envs[i - 1]
+                        tll.drop_tags()
+                        tnl = amp_tn.select(i - 1) | tll
+                        left_envs[i] = tnl.contract()
+                    new_env_left_cache = self.transform_quimb_env_left_key_to_config_key(left_envs, config)
+                self._env_left_cache.update(new_env_left_cache)
             else:
                 # quimb left env calculation
                 left_envs = {1: amp_tn.select(0).contract()}
@@ -1439,17 +1454,27 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
                     tnl = amp_tn.select(i - 1) | tll
                     left_envs[i] = tnl.contract()
                 new_env_left_cache = self.transform_quimb_env_left_key_to_config_key(left_envs, config)
-            
-            if self.env_left_cache is None:
                 self._env_left_cache = new_env_left_cache
-            else:
-                self._env_left_cache.update(new_env_left_cache)
-            
+
         elif from_which == 'right':
-            if key_prev_sites in self.env_right_cache:
-                prev_env_right = self.env_right_cache[key_prev_sites]
-                new_env_ts = (site_ts|prev_env_right).contract()
-                new_env_right_cache = {new_env_key: new_env_ts}
+            if self.env_right_cache is not None:
+                if key_prev_sites in self.env_right_cache:
+                    prev_env_right = self.env_right_cache[key_prev_sites]
+                    new_env_ts = (site_ts|prev_env_right).contract()
+                    new_env_right_cache = {new_env_key: new_env_ts}
+                else:
+                    # print(config, site_id, key_prev_sites)
+                    # raise NotImplementedError("Right environment cache is not implemented yet.")
+                    # quimb right env calculation
+                    right_envs = {self.L - 2: amp_tn.select(-1).contract()}
+                    for i in range(self.L - 3, site_id - 1, -1):
+                        trl = right_envs[i + 1]
+                        trl.drop_tags()
+                        trn = amp_tn.select(i + 1) | trl
+                        right_envs[i] = trn.contract()
+                    new_env_right_cache = self.transform_quimb_env_right_key_to_config_key(right_envs, config)
+                
+                self._env_right_cache.update(new_env_right_cache)
             else:
                 # quimb right env calculation
                 right_envs = {self.L - 2: amp_tn.select(-1).contract()}
@@ -1459,12 +1484,7 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
                     trn = amp_tn.select(i + 1) | trl
                     right_envs[i] = trn.contract()
                 new_env_right_cache = self.transform_quimb_env_right_key_to_config_key(right_envs, config)
-
-            if self.env_right_cache is None:
                 self._env_right_cache = new_env_right_cache
-            else:
-                self._env_right_cache.update(new_env_right_cache)
-        
         else:
             raise ValueError("from_which must be either 'left' or 'right'.")
         
@@ -1485,34 +1505,126 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
             amp = self.get_amp_tn(x_i)
 
             if self.cache_env_mode:
+                # if self.env_left_cache is None and self.env_right_cache is None:
+                #     print('No cache, computing the environment')
+                    # If no cache, compute the environment
+                self.clear_wavefunction_env_cache()
                 self.cache_env(amp, x_i)
+                # elif self.env_left_cache is None:
+                #     print('Left cache is None, computing the right environment')
+                #     # If only right cache, compute the left environment
+                #     self.cache_env_left(amp, x_i)
+                # elif self.env_right_cache is None:
+                #     print('Right cache is None, computing the left environment')
+                #     # If only left cache, compute the right environment
+                #     self.cache_env_right(amp, x_i)
+                # else:
+                #     # If both caches exist, use them
+                #     print('Both caches exist, using them')
+                #     pass
                 key_left = tuple(x_i[:self.L//2].to(torch.int).tolist())
                 key_right = tuple(x_i[self.L//2:].to(torch.int).tolist())
                 amp_left = self.env_left_cache[key_left]
                 amp_right = self.env_right_cache[key_right]
-                amp_val = (amp_left|amp_right).contract()
+                amp_val = (amp_left | amp_right).contract()
+
+                # t0 = MPI.Wtime()
+                # amp_val.backward(retain_graph=True)
+                # t1 = MPI.Wtime()
+                # amp.contract().backward(retain_graph=True)
+                # t2 = MPI.Wtime()
+                # print(f'Backward time reuse: {t1-t0}, backward time no reuse: {t2-t1}')
                 
             else:
                 if self.env_left_cache is None and self.env_right_cache is None:
+                    print('No cache, exact contraction')
                     amp_val = amp.contract()
                 else:
                     effected_sites, uneffected_sites_left, uneffected_sites_right = self.detect_effected_sites(self.config_ref, x_i)
                     changed_sites, _, _ = self.detect_changed_sites(self.config_ref, x_i)
                     if len(changed_sites) == 0:
                         # If no sites are changed, use the cached environment
-                        amp_val = (self.env_left_cache[tuple(x_i[:self.L//2].to(torch.int).tolist())]) | self.env_right_cache[tuple(x_i[self.L//2:].to(torch.int).tolist())].contract()
+                        amp_val = (self.env_left_cache[tuple(x_i[:self.L//2].to(torch.int).tolist())] | self.env_right_cache[tuple(x_i[self.L//2:].to(torch.int).tolist())]).contract()
                     else:
-                        effected_tn = amp.select(effected_sites)
-                        left_env = self.env_left_cache[tuple(x_i[uneffected_sites_left].to(torch.int).tolist())]
-                        right_env = self.env_right_cache[tuple(x_i[uneffected_sites_right].to(torch.int).tolist())]
+                        effected_sites_tag = [amp.site_tag_id.format(i) for i in effected_sites]
+                        effected_tn = amp.select(effected_sites_tag, which='any')
+                        left_env = qtn.TensorNetwork()
+                        right_env = qtn.TensorNetwork()
+
+                        if len(uneffected_sites_left) > 0:
+                            left_env = self.env_left_cache[tuple(x_i[uneffected_sites_left].to(torch.int).tolist())]
+                        if len(uneffected_sites_right) > 0:
+                            right_env = self.env_right_cache[tuple(x_i[uneffected_sites_right].to(torch.int).tolist())]
                         amp_val = (effected_tn | left_env | right_env).contract()
 
             if amp_val == 0.0:
                 amp_val = torch.tensor(0.0)
+            
             batch_amps.append(amp_val)
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
+    
+    def amplitude_n_tn(self, x, cache=None):
+        if x.ndim == 1:
+            # If input is not batched, add a batch dimension
+            x = x.unsqueeze(0)
+
+        batch_amps = []
+        assert x.size(0) == 1, "x must be a batch of size 1."
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+            
+            amp = self.get_amp_tn(x_i)
+            
+            key_left = tuple(x_i[:self.L-self.nn_radius].to(torch.int).tolist())
+            key_right = tuple(x_i[self.nn_radius:].to(torch.int).tolist())
+
+            if cache == 'left': # change config_ref
+                self.cache_env_left(amp, x_i)
+                uncontracted_right_tag = [amp.site_tag_id.format(i) for i in range(self.L-self.nn_radius, self.L)]
+                amp_uncontracted_right = amp.select(uncontracted_right_tag, which='any')
+                amp_val = (self.env_left_cache[key_left] | amp_uncontracted_right).contract()
+            elif cache == 'right': # change config_ref
+                self.cache_env_right(amp, x_i)
+                uncontracted_left_tag = [amp.site_tag_id.format(i) for i in range(0, self.nn_radius)]
+                amp_uncontracted_left = amp.select(uncontracted_left_tag, which='any')
+                amp_val = (self.env_right_cache[key_right] | amp_uncontracted_left).contract()
+            elif cache == None: # do not change config_ref
+                if self.env_left_cache is None and self.env_right_cache is None:
+                    print('No cache, exact contraction')
+                    amp_val = amp.contract()
+                else:
+                    effected_sites, uneffected_sites_left, uneffected_sites_right = self.detect_effected_sites(self.config_ref, x_i)
+                    changed_sites, _, _ = self.detect_changed_sites(self.config_ref, x_i)
+                    if len(changed_sites) == 0:
+                        # If no sites are changed, use the cached environment
+                        amp_val = (self.env_left_cache[tuple(x_i[:self.L//2].to(torch.int).tolist())] | self.env_right_cache[tuple(x_i[self.L//2:].to(torch.int).tolist())]).contract()
+                    else:
+                        effected_sites_tag = [amp.site_tag_id.format(i) for i in effected_sites]
+                        effected_tn = amp.select(effected_sites_tag, which='any')
+                        left_env = qtn.TensorNetwork()
+                        right_env = qtn.TensorNetwork()
+
+                        if len(uneffected_sites_left) > 0:
+                            left_env = self.env_left_cache[tuple(x_i[uneffected_sites_left].to(torch.int).tolist())]
+                        if len(uneffected_sites_right) > 0:
+                            right_env = self.env_right_cache[tuple(x_i[uneffected_sites_right].to(torch.int).tolist())]
+                        amp_val = (effected_tn | left_env | right_env).contract()
+
+            if amp_val == 0.0:
+                amp_val = torch.tensor(0.0, device=x.device, dtype=self.param_dtype)
+            
+            batch_amps.append(amp_val)
+        
+        return torch.stack(batch_amps), amp
+            
+            
 
 #------------ fermionic PEPS based model ------------
 
@@ -1712,7 +1824,7 @@ class fTNModel_vec(wavefunctionModel):
 
         return amplitude_func(psi, x)
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         return self.amplitude(x)
 
 class fTNModel_reuse(wavefunctionModel):
@@ -4113,7 +4225,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -4261,7 +4373,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -4393,7 +4505,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -4413,7 +4525,7 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0).transpose(0, 1)
         self.register_buffer('pe', pe)
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         return x + self.pe[:x.size(0), :]
 
 
@@ -4611,7 +4723,7 @@ class fTN_Transformer_Model(torch.nn.Module):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -4774,7 +4886,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -5000,7 +5112,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)

@@ -990,105 +990,11 @@ class MetropolisExchangeSamplerSpinful(Sampler):
 
     def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
-        current_amp = vstate.amplitude(self.current_config)
-        current_prob = abs(current_amp)**2
-        proposed_config = self.current_config.clone()
-        ind_n_map = {0:0, 1:1, 2:1, 3:2}
-
-        if self.random_edge:
-            site_pairs = random.choices(self.graph.edges(), k=self.subchain_length)
-        else:
-            site_pairs = self.graph.edges()
-        t0 = MPI.Wtime()
-        contraction_time = 0
-        # with pyinstrument.Profiler() as profiler:
-        for (i, j) in site_pairs:
-            if self.current_config[i] == self.current_config[j]:
-                continue
-            self.attempts += 1
-            proposed_config = self.current_config.clone()
-            config_i = self.current_config[i].item()
-            config_j = self.current_config[j].item()
-            n_i = ind_n_map[self.current_config[i].item()]
-            n_j = ind_n_map[self.current_config[j].item()]
-            delta_n = abs(n_i - n_j)
-            # delta_n = 1 --> SWAP
-            t00 = MPI.Wtime()
-            if delta_n == 1:
-                proposed_config[i] = config_j
-                proposed_config[j] = config_i
-                proposed_amp = vstate.amplitude(proposed_config)
-                proposed_prob = abs(proposed_amp)**2
-            elif delta_n == 0:
-                choices = [(0, 3), (3, 0), (config_j, config_i)]
-                choice = random.choice(choices)
-                proposed_config[i] = choice[0]
-                proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config)
-                proposed_prob = abs(proposed_amp)**2
-            elif delta_n == 2:
-                choices = [(config_j, config_i), (1,2), (2,1)]
-                choice = random.choice(choices)
-                proposed_config[i] = choice[0]
-                proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config)
-                proposed_prob = abs(proposed_amp)**2
-            else:
-                raise ValueError("Invalid configuration")
-            try:
-                acceptance_ratio = min(1, (proposed_prob/current_prob))
-            except ZeroDivisionError:
-                acceptance_ratio = 1 if proposed_prob > 0 else 0
-            t01 = MPI.Wtime()
-            contraction_time += (t01 - t00)
-            if random.random() < acceptance_ratio or (current_prob == 0):
-                self.current_config = proposed_config
-                current_amp = proposed_amp
-                current_prob = proposed_prob
-                self.accepts += 1
-        
-        t1 = MPI.Wtime()
-        # if RANK == 1:
-        #     print('RANK1: Time per sample:', t1 - t0, 'Contraction time:', contraction_time, 'Number of contraction:', len(site_pairs))
-            # profiler.print()
-            
-            
-        if current_amp == 0 and DEBUG:
-            print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {proposed_prob}')
-        
-        return self.current_config, current_amp
-
-class MetropolisExchangeSamplerSpinful_1D_reusable(Sampler):
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
-        """
-        Parameters
-        ----------
-        hi : Hilbert
-            The Hilbert space.
-        graph : Graph
-            Lattice graph.
-        N_samples : int
-            The number of samples.
-        burn_in_steps : int
-            The number of burn-in steps.
-        reset_chain : bool
-            Whether to reset the chain after each VMC step.
-        random_edge : bool
-            Whether to randomly select the edges in the exchange move.
-        subchain_length : int
-            The number of samples we discard before collecting two samples.
-        equal_partition : bool
-            Whether the number of samples is equal for all MPI processes. If False, we use eager sampling and must have SIZE > 1.
-        dtype : torch.dtype
-
-        """
-        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
-
-    def _sample_next(self, vstate, burn_in=False):
-        self.current_amp = vstate.amplitude(self.current_config).cpu()
+        self.current_amp = vstate.amplitude(self.current_config)
         self.current_prob = abs(self.current_amp)**2
         proposed_config = self.current_config.clone()
         ind_n_map = {0:0, 1:1, 2:1, 3:2}
+
         def exchange_propose(i, j):
             if self.current_config[i] == self.current_config[j]:
                 return 
@@ -1130,20 +1036,117 @@ class MetropolisExchangeSamplerSpinful_1D_reusable(Sampler):
                 self.current_amp = proposed_amp
                 self.current_prob = proposed_prob
                 self.accepts += 1
-        
-        site_pairs = self.graph.edges() # edges sorted from left to right
-        vstate.vstate_func.update_env_right(self.current_config) # cache env_right
+
+        if self.random_edge:
+            site_pairs = random.choices(self.graph.edges(), k=self.subchain_length)
+        else:
+            site_pairs = self.graph.edges()
+
         for (i, j) in site_pairs:
             exchange_propose(i, j)
-            if i < self.graph.Lx - 1:
-                vstate.vstate_func.update_env_to_site(self.current_config, i, from_which='left')
-        if burn_in:
-            vstate.clear_env_cache()
-        else: # sampling for local energy calculation
-            vstate.vstate_func.update_env_to_site(self.current_config, 0, from_which='right')
 
         if self.current_amp == 0 and DEBUG:
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2')
+        
+        return self.current_config, self.current_amp
+
+class MetropolisExchangeSamplerSpinful_1D_reusable(Sampler):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
+        """
+        MPS-based ansatz specific sampler. Will need TN-specific operations.
+
+        Parameters
+        ----------
+        hi : Hilbert
+            The Hilbert space.
+        graph : Graph
+            Lattice graph.
+        N_samples : int
+            The number of samples.
+        burn_in_steps : int
+            The number of burn-in steps.
+        reset_chain : bool
+            Whether to reset the chain after each VMC step.
+        random_edge : bool
+            Whether to randomly select the edges in the exchange move.
+        subchain_length : int
+            The number of samples we discard before collecting two samples.
+        equal_partition : bool
+            Whether the number of samples is equal for all MPI processes. If False, we use eager sampling and must have SIZE > 1.
+        dtype : torch.dtype
+
+        """
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
+
+    def _sample_next(self, vstate, burn_in=False):
+        """Sample the next configuration. Change the current configuration in place."""
+        ind_n_map = {0:0, 1:1, 2:1, 3:2}
+        def exchange_propose(i, j):
+            if self.current_config[i] == self.current_config[j]:
+                return 
+            self.attempts += 1
+            proposed_config = self.current_config.clone()
+            config_i = self.current_config[i].item()
+            config_j = self.current_config[j].item()
+            n_i = ind_n_map[self.current_config[i].item()]
+            n_j = ind_n_map[self.current_config[j].item()]
+            delta_n = abs(n_i - n_j)
+            # delta_n = 1 --> SWAP
+            if delta_n == 1:
+                proposed_config[i] = config_j
+                proposed_config[j] = config_i
+                proposed_amp, proposed_amp_tn = vstate.vstate_func.amplitude_n_tn(proposed_config)
+                proposed_prob = abs(proposed_amp)**2
+            elif delta_n == 0:
+                choices = [(0, 3), (3, 0), (config_j, config_i)]
+                choice = random.choice(choices)
+                proposed_config[i] = choice[0]
+                proposed_config[j] = choice[1]
+                proposed_amp, proposed_amp_tn = vstate.vstate_func.amplitude_n_tn(proposed_config)
+                proposed_prob = abs(proposed_amp)**2
+            elif delta_n == 2:
+                choices = [(config_j, config_i), (1,2), (2,1)]
+                choice = random.choice(choices)
+                proposed_config[i] = choice[0]
+                proposed_config[j] = choice[1]
+                proposed_amp, proposed_amp_tn = vstate.vstate_func.amplitude_n_tn(proposed_config)
+                proposed_prob = abs(proposed_amp)**2
+            else:
+                raise ValueError("Invalid configuration")
+            try:
+                acceptance_ratio = min(1, (proposed_prob/self.current_prob))
+            except ZeroDivisionError:
+                acceptance_ratio = 1 if proposed_prob > 0 else 0
+            if random.random() < acceptance_ratio or (self.current_prob == 0):
+                self.current_config = proposed_config
+                self.current_amp = proposed_amp
+                self.current_amp_tn = proposed_amp_tn
+                self.current_prob = proposed_prob
+                self.accepts += 1
+        
+        site_pairs = self.graph.edges() # edges sorted from left to right
+        with torch.no_grad():
+            self.current_amp, self.current_amp_tn = vstate.vstate_func.amplitude_n_tn(self.current_config, cache='right') # cache env_right
+            self.current_prob = abs(self.current_amp)**2
+            for (i, j) in site_pairs:
+                # t0 = MPI.Wtime()
+                exchange_propose(i, j)
+                # t1 = MPI.Wtime()
+                # t_average += t1-t0
+                if i < self.graph.L - 1 and i != 0:
+                    vstate.vstate_func.update_env_to_site(self.current_amp_tn, self.current_config, i, from_which='left')
+                # t2 = MPI.Wtime()
+                # t_cache += t2-t1
+        vstate.vstate_func.clear_env_right_cache()
+        # print(f'time for exchange {t_average}, time for caching {t_cache}, average time for caching {t_cache/len(site_pairs)}')
+
+        if burn_in:
+            vstate.clear_env_cache()
+        else: # sampling for local energy calculation
+            vstate.vstate_func.update_env_to_site(self.current_amp_tn, self.current_config, 0, from_which='right')
+
+        if self.current_amp == 0 and DEBUG:
+            print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}')
 
         return self.current_config, self.current_amp
             
