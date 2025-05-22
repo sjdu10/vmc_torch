@@ -113,6 +113,7 @@ class Variational_State:
         try:
             amp.backward()
         except RuntimeError:
+            print("RuntimeError: amp.backward()")
             # amp is 0
             self.reset()
             return amp, torch.zeros((self.Np,), dtype=self.dtype)

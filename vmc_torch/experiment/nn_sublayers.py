@@ -3,6 +3,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
+class ShiftedSinh(nn.Module):
+    """
+    X-axis shifted sinh activation: f(x) = sinh(x + shift)
+    Here shift is a learnable parameter.
+    """
+    def __init__(self, init_shift: float = 0.0):
+        super().__init__()
+        # shift 作为可学习参数
+        self.shift = nn.Parameter(torch.tensor(init_shift, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sinh(x + self.shift)
+
+class ShiftedSinhY(nn.Module):
+    """
+    Y-axis shifted sinh activation: f(x) = sinh(x) + shift
+    Here shift is a learnable parameter.
+    """
+    def __init__(self, init_shift: float = 0.0):
+        super().__init__()
+        self.shift = nn.Parameter(torch.tensor(init_shift, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sinh(x) + self.shift
+
+class ShiftedSinhYFixed(nn.Module):
+    """
+    Y-axis shifted sinh activation: f(x) = sinh(x) + shift
+    Here shift is a fixed parameter.
+    """
+    def __init__(self, shift: float = 1.0):
+        super().__init__()
+        self.shift = shift
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sinh(x) + self.shift
+
 class PositionwiseFeedForward(nn.Module):
     ''' A two-feed-forward-layer module '''
     def __init__(self, d_in, d_hid, dropout=0.0):

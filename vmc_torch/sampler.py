@@ -1122,11 +1122,16 @@ class MetropolisExchangeSamplerSpinful_1D_reusable(Sampler):
                 self.current_amp = proposed_amp
                 self.current_amp_tn = proposed_amp_tn
                 self.current_prob = proposed_prob
+                vstate.vstate_func.update_cached_cache()
                 self.accepts += 1
         
         site_pairs = self.graph.edges() # edges sorted from left to right
         with torch.no_grad():
-            self.current_amp, self.current_amp_tn = vstate.vstate_func.amplitude_n_tn(self.current_config, cache='right') # cache env_right
+            self.current_amp, self.current_amp_tn = vstate.vstate_func.amplitude_n_tn(
+                self.current_config, cache='right', 
+                cache_nn_output=True, 
+                cache_amp_tn=True,
+                initial_cache=True) # cache env_right
             self.current_prob = abs(self.current_amp)**2
             for (i, j) in site_pairs:
                 # t0 = MPI.Wtime()

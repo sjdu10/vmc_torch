@@ -102,6 +102,9 @@ class wavefunctionModel(torch.nn.Module):
     def clear_wavefunction_env_cache(self):
         pass
 
+    def update_cached_cache(self):
+        pass
+
 #------------ bosonic TN model ------------
 
 
@@ -1240,6 +1243,13 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         }
         self.nn_eta = nn_eta
         self.config_ref = None
+        self.nn_output_cache = {}
+        self.amp_tn_cache = None
+        self.new_nn_output_cache = {}
+        self.new_amp_tn_cache = None
+        self.new_config_ref = None
+        # always make sure the 3 nos are the same, when ever setting one, set the others
+        self.config_ref_no = self.nn_output_cache_no = self.amp_tn_cache_no = 0
         self._env_left_cache = None
         self._env_right_cache = None
         self.nn_radius = radius
@@ -1278,7 +1288,7 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         env_left = amp.compute_left_environments()
         env_left_config = self.transform_quimb_env_left_key_to_config_key(env_left, config)
         self._env_left_cache = env_left_config
-        self.config_ref = config
+        self.set_config_ref(config)
 
     def cache_env_right(self, amp, config):
         """
@@ -1289,7 +1299,7 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         env_right = amp.compute_right_environments()
         env_right_config = self.transform_quimb_env_right_key_to_config_key(env_right, config)
         self._env_right_cache = env_right_config
-        self.config_ref = config
+        self.set_config_ref(config)
     
     def cache_env(self, amp, config):
         """
@@ -1335,6 +1345,46 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
     def clear_wavefunction_env_cache(self):
         self.clear_env_left_cache()
         self.clear_env_right_cache()
+        self.nn_output_cache = {}
+        self.amp_tn_cache = None
+        self.config_ref = None
+        self.amp_tn_cache_no = 0
+        self.nn_output_cache_no = 0
+        self.config_ref_no = 0
+
+        self.new_nn_output_cache = {}
+        self.new_amp_tn_cache = None
+        self.new_config_ref = None
+
+    
+    def set_config_ref(self, config):
+        """
+            Set the reference configuration of the TN.
+            config: the configuration of the TN.
+        """
+        self.config_ref = config
+        self.config_ref_no = hash(tuple(config.to(torch.int).tolist()))
+    
+    def set_nn_output_cache(self, nn_output_cache):
+        """
+            Set the NN output cache.
+            nn_output_cache: the NN output cache.
+        """
+        self.nn_output_cache = nn_output_cache
+        self.nn_output_cache_no = hash(tuple(self.config_ref.to(torch.int).tolist()))
+    
+    def set_amp_tn_cache(self, amp_tn_cache):
+        """
+            Set the amplitude TN cache.
+            amp_tn_cache: the amplitude TN cache.
+        """
+        self.amp_tn_cache = amp_tn_cache
+        self.amp_tn_cache_no = hash(tuple(self.config_ref.to(torch.int).tolist()))
+    
+    def update_cached_cache(self):
+        self.set_config_ref(self.new_config_ref)
+        self.set_nn_output_cache(self.new_nn_output_cache)
+        self.set_amp_tn_cache(self.new_amp_tn_cache)
     
     def detect_effected_sites(self, config_ref, new_config):
         effected_sites = set()
@@ -1372,24 +1422,97 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         uneffected_sites_right = list(range(changed_sites[-1] + 1, self.L))
         return changed_sites, uneffected_sites_left, uneffected_sites_right
     
-    def get_amp_tn(self, config):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        params = {
-            int(tid): {
+    def get_local_amp_tensors(self, tids:list, config:torch.Tensor, nn_output_cache: Optional[dict] = None):
+        """
+            Get the local tensors for the given tensor ids and configuration.
+            tids: a list of tensor ids. list of int.
+            config: the input configuration.
+        """
+        # first pick out the tensor parameters and form the local tn parameters vector
+        local_ts_params = {}
+        for tid in tids:
+            local_ts_params[tid] = {
                 ast.literal_eval(sector): data
-                for sector, data in blk_array.items()
+                for sector, data in self.torch_tn_params[str(tid)].items()
             }
-            for tid, blk_array in self.torch_tn_params.items()
-        }
-        params_vec = flatten_tn_params(params)
-        # Get the corresponding NN output for each site and cat
-        nn_correction = torch.cat([self.nn[str(tid)](config[neighbors]) for tid, neighbors in self.receptive_field.items()])
+        local_ts_params_vec = flatten_tn_params(local_ts_params)
+
+        # then select the corresponding NN outputs for the given tensor ids
+        local_nn_correction = torch.cat([nn_output_cache[tid] for tid in tids])
         # Add the correction to the original parameters
-        tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta * nn_correction, params)
+        local_tn_nn_params = reconstruct_proj_params(local_ts_params_vec + self.nn_eta * local_nn_correction, local_ts_params)
+
+        # Select the corresponding tensor skeleton
+        local_ts_skeleton = self.skeleton.select([self.skeleton.site_tag_id.format(tid) for tid in tids], which='any')
+
         # Reconstruct the TN with the new parameters
-        fmps = qtn.unpack(tn_nn_params, self.skeleton)
-        # Get the amplitude
-        amp = fmps.get_amp(config)
+        local_ts = qtn.unpack(local_tn_nn_params, local_ts_skeleton)
+
+        # Fix the physical indices
+        return local_ts.fix_phys_inds(tids, config[tids])
+
+    def get_amp_tn(self, config, params=None, params_vec=None, cache_nn_output=False, cache_amp_tn=False):
+        if self.nn_output_cache == {}:
+            nn_output_cache = {tid: self.nn[str(tid)](config[neighbors]) for tid, neighbors in self.receptive_field.items()}
+            nn_correction = torch.cat(list(nn_output_cache.values()))
+            if cache_nn_output:
+                self.set_nn_output_cache(nn_output_cache)
+                self.new_nn_output_cache = self.nn_output_cache.copy()
+                assert self.nn_output_cache_no == self.config_ref_no, "The nn_output_cache_no does not match the config_ref_no."
+        # reuse cached NN outputs for config_ref
+        else:
+            effected_sites, _, _ = self.detect_effected_sites(self.config_ref, config)
+            new_nn_output_cache = self.nn_output_cache.copy()
+            for tid in effected_sites:
+                neighbors = self.receptive_field[tid]
+                # get the new input config for the current tensor
+                config[neighbors] = config[neighbors]
+                # get the new NN output for the current tensor
+                new_nn_output_cache[tid] = self.nn[str(tid)](config[neighbors])
+
+            self.new_nn_output_cache = new_nn_output_cache
+
+            # get the new NN output for the current tensor
+            nn_correction = torch.cat(list(new_nn_output_cache.values()))
+        
+        # Get the amplitude tn, potentially using cached amp tensors
+        if self.amp_tn_cache is None:
+            if params is None and params_vec is None:
+                # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+                params = {
+                    int(tid): {
+                        ast.literal_eval(sector): data
+                        for sector, data in blk_array.items()
+                    }
+                    for tid, blk_array in self.torch_tn_params.items()
+                }
+                params_vec = flatten_tn_params(params)
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_proj_params(params_vec + self.nn_eta * nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            fmps = qtn.unpack(tn_nn_params, self.skeleton)
+            amp = fmps.get_amp(config)
+            if cache_amp_tn:
+                self.set_amp_tn_cache(amp)
+                self.new_amp_tn_cache = amp.copy()
+                assert self.amp_tn_cache_no == self.config_ref_no, "The amp_tn_cache_no does not match the config_ref_no."
+        else:
+            if self.nn_output_cache == {}:
+                raise ValueError("The nn_output_cache is empty. Please call get_amp_tn() with cache_nn_output=True first.")
+            effected_sites, uneffected_sites_left, uneffected_sites_right = self.detect_effected_sites(self.config_ref, config)
+            if len(effected_sites) != 0:
+                effected_ts = self.get_local_amp_tensors(effected_sites, config, self.nn_output_cache)
+                uneffected_sites_left_tags = [self.skeleton.site_tag_id.format(tid) for tid in uneffected_sites_left]
+                uneffected_sites_right_tags = [self.skeleton.site_tag_id.format(tid) for tid in uneffected_sites_right]
+                uneffected_tn_left = self.amp_tn_cache.select(uneffected_sites_left_tags, which='any')
+                uneffected_tn_right = self.amp_tn_cache.select(uneffected_sites_right_tags, which='any')
+                amp = uneffected_tn_left | uneffected_tn_right | effected_ts # updated amp tn
+            else:
+                amp = self.amp_tn_cache
+            
+            self.new_amp_tn_cache = amp
+        
+        self.new_config_ref = config
 
         return amp
     
@@ -1488,12 +1611,21 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         else:
             raise ValueError("from_which must be either 'left' or 'right'.")
         
-        self.config_ref = config
+        self.set_config_ref(config)
     
     def amplitude(self, x):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
@@ -1501,33 +1633,18 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
             else:
                 if x_i.dtype != self.param_dtype:
                     x_i = x_i.to(self.param_dtype)
-            
-            amp = self.get_amp_tn(x_i)
 
             if self.cache_env_mode:
-                # if self.env_left_cache is None and self.env_right_cache is None:
-                #     print('No cache, computing the environment')
-                    # If no cache, compute the environment
                 self.clear_wavefunction_env_cache()
+                self.config_ref = x_i
+                self.config_ref_no = hash(tuple(x_i.to(torch.int).tolist()))
+                amp = self.get_amp_tn(x_i, params=params, params_vec=params_vec, cache_nn_output=True, cache_amp_tn=True)
                 self.cache_env(amp, x_i)
-                # elif self.env_left_cache is None:
-                #     print('Left cache is None, computing the right environment')
-                #     # If only right cache, compute the left environment
-                #     self.cache_env_left(amp, x_i)
-                # elif self.env_right_cache is None:
-                #     print('Right cache is None, computing the left environment')
-                #     # If only left cache, compute the right environment
-                #     self.cache_env_right(amp, x_i)
-                # else:
-                #     # If both caches exist, use them
-                #     print('Both caches exist, using them')
-                #     pass
                 key_left = tuple(x_i[:self.L//2].to(torch.int).tolist())
                 key_right = tuple(x_i[self.L//2:].to(torch.int).tolist())
                 amp_left = self.env_left_cache[key_left]
                 amp_right = self.env_right_cache[key_right]
                 amp_val = (amp_left | amp_right).contract()
-
                 # t0 = MPI.Wtime()
                 # amp_val.backward(retain_graph=True)
                 # t1 = MPI.Wtime()
@@ -1536,6 +1653,7 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
                 # print(f'Backward time reuse: {t1-t0}, backward time no reuse: {t2-t1}')
                 
             else:
+                amp = self.get_amp_tn(x_i, params=params, params_vec=params_vec, cache_nn_output=False, cache_amp_tn=False)
                 if self.env_left_cache is None and self.env_right_cache is None:
                     print('No cache, exact contraction')
                     amp_val = amp.contract()
@@ -1565,7 +1683,7 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
-    def amplitude_n_tn(self, x, cache=None):
+    def amplitude_n_tn(self, x, cache=None, cache_nn_output=False, cache_amp_tn=False, initial_cache=False):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
@@ -1580,7 +1698,15 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
                 if x_i.dtype != self.param_dtype:
                     x_i = x_i.to(self.param_dtype)
             
-            amp = self.get_amp_tn(x_i)
+            if initial_cache:
+                self.clear_wavefunction_env_cache()
+                self.set_config_ref(x_i)
+            
+            amp = self.get_amp_tn(
+                x_i, 
+                cache_nn_output=cache_nn_output, 
+                cache_amp_tn=cache_amp_tn, 
+            )
             
             key_left = tuple(x_i[:self.L-self.nn_radius].to(torch.int).tolist())
             key_right = tuple(x_i[self.nn_radius:].to(torch.int).tolist())
@@ -2568,9 +2694,8 @@ class PureAttention_Model(wavefunctionModel):
         self.mlp = nn.Sequential(
             nn.Linear(input_dim*embedding_dim, nn_hidden_dim),
             nn.Tanh(),
-            # nn.Linear(nn_hidden_dim, nn_hidden_dim),
-            # nn.Tanh(),
-            nn.Linear(nn_hidden_dim, 1),
+            nn.Linear(nn_hidden_dim, nn_hidden_dim),
+            ShiftedSinhYFixed(),
         )
         self.mlp.to(self.param_dtype)
 
@@ -2600,9 +2725,64 @@ class PureAttention_Model(wavefunctionModel):
             embed_features_flat = embed_features.view(-1)  # Flatten the embedding dimensions
             # Compute the amplitude using the MLP
             amp = self.mlp(embed_features_flat)
-            batch_amps.append(amp.squeeze())
+            batch_amps.append(torch.mean(amp, dim=0))
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
+
+import torch.nn.functional as F
+class PureNN_Model(wavefunctionModel):
+    def __init__(self, phys_dim=4, n_site=None, embed_dim=4, final_dim=4, nn_hidden_dim=128, dtype=torch.float32):
+        super().__init__()
+        self.param_dtype = dtype
+        self.phys_dim = phys_dim
+        self.embed_dim = embed_dim
+        self.final_dim = final_dim
+
+        # Define the neural network
+        self.embed = nn.Embedding(phys_dim//2, embed_dim)
+        self.nn = nn.Sequential(
+            nn.Linear(2*n_site*embed_dim, nn_hidden_dim),
+            # nn.LeakyReLU(),
+            # ShiftedSinhY(),
+            nn.Tanh(),
+            nn.Linear(nn_hidden_dim, nn_hidden_dim),
+            # nn.LeakyReLU(),
+            ShiftedSinhYFixed(),
+        )
+        self.nn.to(self.param_dtype)
+        self.embed.to(self.param_dtype)
+
+        self.model_structure = {
+            'pure NN':
+            {'n_site': n_site, 
+             'phys_dim': phys_dim, 
+             'nn_hidden_dim': nn_hidden_dim, 
+            },
+        }
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+    
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            
+            netket_xi = torch.tensor(from_quimb_config_to_netket_config(x_i), dtype=torch.int)
+            embedded_xi = self.embed(netket_xi).view(-1)  # Flatten the embedding dimensions
+            # embed_features = F.one_hot(x_i.long(), num_classes=self.phys_dim).to(self.param_dtype)
+            # embed_features_flat = torch.flatten(embed_features)
+            # Compute the amplitude using the MLP
+            # amp = self.nn(embed_features_flat)
+            amp = self.nn(embedded_xi)
+            batch_amps.append(torch.mean(amp, dim=0))
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
 
 class fTN_backflow_attn_Model(wavefunctionModel):
     def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_hidden_dim=128, nn_eta=1e-3, dtype=torch.float32):
@@ -3288,6 +3468,7 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
         For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
         This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
         Positional encoding is added to the input of the attention block in this model.
+        Update from v1: use positional encoding in the attention block.
     """
     def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32, eps=5e-3):
         super().__init__()
@@ -3327,6 +3508,145 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
             self.mlp[tid] = nn.Sequential(
                 nn.Linear(mlp_input_dim, nn_final_dim),
                 nn.Tanh(),
+                nn.Linear(nn_final_dim, tn_params_vec.numel()),
+            )
+            self.mlp[tid].to(self.param_dtype)
+        
+        # Initialize the MLP last layer weights and biases with small values
+        for mlp in self.mlp.values():
+            last_layer = mlp[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.uniform_(last_layer.weight, a=-eps, b=eps)
+                if last_layer.bias is not None:
+                    nn.init.uniform_(last_layer.bias, a=-eps, b=eps)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+
+        self.model_structure = {
+            'fPEPS_backflow_attn_Tensorwise':
+            {
+                'D': ftn.max_bond(), 
+                'Lx': ftn.Lx, 'Ly': ftn.Ly, 
+                'symmetry': self.symmetry, 
+                # 'nn_hidden_dim': nn_hidden_dim, 
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta, 
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+                'max_bond': max_bond,
+            },
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        self.tree = None
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+        
+            # Get the NN correction to the parameters, concatenate the results for each tensor
+            nn_features = self.nn(x_i)
+            nn_features_vec = nn_features.view(-1)
+            nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
+            # Add the correction to the original parameters
+            # tn_nn_params = reconstruct_tn_params(params_vec + (self.nn_eta-10)*nn_correction.detach()+10*nn_correction, params)
+            tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i, conj=True)
+
+            if self.max_bond is None:
+                amp = amp
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp_val = amp.contract()
+                
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+    
+
+class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
+    """
+        For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
+        This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
+        Positional encoding is added to the input of the attention block in this model.
+        Update from v2: use shiftedsinh as activation function.
+    """
+    def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32, eps=5e-3):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly
+        phys_dim = ftn.phys_dim()
+        
+        self.nn = SelfAttn_block_pos(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embed_dim=embedding_dim,
+            attention_heads=attention_heads,
+            dtype=self.param_dtype,
+        )
+        # for each tensor (labelled by tid), assign a MLP
+        self.mlp = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            mlp_input_dim = ftn.Lx * ftn.Ly * embedding_dim
+            tn_params_dict = {
+                tid: params[int(tid)]
+            }
+            tn_params_vec = flatten_tn_params(tn_params_dict)
+            self.mlp[tid] = nn.Sequential(
+                nn.Linear(mlp_input_dim, nn_final_dim),
+                nn.Tanh(),
+                nn.Linear(nn_final_dim, nn_final_dim),
+                ShiftedSinhYFixed(),
                 nn.Linear(nn_final_dim, tn_params_vec.numel()),
             )
             self.mlp[tid].to(self.param_dtype)
@@ -5277,7 +5597,7 @@ class NeuralBackflow(wavefunctionModel):
         batch_size = n.shape[0]
         return torch.stack([backflow_det(n[i]) for i in range(batch_size)])
 
-from vmc_torch.fermion_utils import from_quimb_config_to_netket_config
+from vmc_torch.fermion_utils import from_quimb_config_to_netket_config, from_netket_config_to_quimb_config
 
 class NeuralBackflow_spinful(wavefunctionModel):
     """Assuming total Sz=0."""
@@ -5362,7 +5682,8 @@ class NNBF(wavefunctionModel):
         self.nn = nn.Sequential(
             nn.Linear(self.hilbert.size, hidden_dim),
             nn.Tanh(),
-            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions)
+            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
+            ShiftedSinhYFixed(),
         )
 
         # Convert NNs to the appropriate data type
@@ -5406,6 +5727,121 @@ class NNBF(wavefunctionModel):
                 n_i = torch.tensor(n_i, dtype=self.param_dtype)
 
             amp_val=backflow_det(n_i)
+            batch_amps.append(amp_val)
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+class NNBF_attention(wavefunctionModel):
+    """Assuming total Sz=0."""
+    def __init__(self, nsite, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64, nn_eta=1, embed_dim=16, attention_heads=4, phys_dim=4, spinflip_symmetry=False):
+        super(NNBF_attention, self).__init__()
+        
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        self.spinflip_symmetry = spinflip_symmetry
+        
+        # Initialize the parameter M (N x Nf matrix)
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
+        if self.spinflip_symmetry:
+            self.M_flip = nn.Parameter(
+                kernel_init(torch.empty(self.hilbert.size, self.hilbert.size - self.hilbert.n_fermions, dtype=self.param_dtype)) 
+                if kernel_init is not None 
+                else torch.randn(self.hilbert.size, self.hilbert.size-self.hilbert.n_fermions, dtype=self.param_dtype)
+            )
+
+        self.attn = SelfAttn_block_pos(
+            nsite,
+            num_classes=phys_dim,
+            embed_dim=embed_dim,
+            attention_heads=attention_heads,
+            dtype=self.param_dtype,
+        )
+        self.embed_dim = embed_dim
+        self.attention_heads = attention_heads
+        self.phys_dim = phys_dim
+        self.nsite = nsite
+
+        # Initialize the neural network layer, input is n and output a matrix with the same shape as M
+        self.nn = nn.Sequential(
+            nn.Linear(embed_dim*nsite, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
+            ShiftedSinhYFixed(),
+        )
+        if self.spinflip_symmetry:
+            self.nn_flip = nn.Sequential(
+                nn.Linear(embed_dim*nsite, hidden_dim),
+                ShiftedSinhYFixed(),
+                nn.Linear(hidden_dim, self.hilbert.size*(self.hilbert.size-self.hilbert.n_fermions)),
+                ShiftedSinhYFixed(),
+            )
+
+        # Convert NNs to the appropriate data type
+        self.nn.to(self.param_dtype)
+        if self.spinflip_symmetry:
+            self.nn_flip.to(self.param_dtype)
+        self.nn_eta = nn_eta
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            'NNBF w attention':{
+                'N_site': self.nsite, 
+                'N_fermions': self.hilbert.n_fermions, 
+                'N_fermions_per_spin': self.hilbert.n_fermions_per_spin, 
+                'nn_eta': self.nn_eta,
+                'embed_dim': self.embed_dim,
+                'attention_heads': self.attention_heads,
+                'phys_dim': self.phys_dim,
+                'spinflip_symmetry': self.spinflip_symmetry,
+                }
+        }
+
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(x, spinflip_symmetry=False):
+            n = torch.tensor(from_quimb_config_to_netket_config(x), dtype=self.param_dtype)
+            if spinflip_symmetry:
+                n = torch.abs(1-n) # 0->1, 1->0
+                x = from_netket_config_to_quimb_config(n)
+                x = torch.tensor(x, dtype=torch.int)
+
+            if self.nn_eta != 0:
+                # Compute the attention output
+                attn_features = self.attn(x).view(-1)
+                # Compute the backflow matrix F using the neural network
+                F = self.nn(attn_features) if not spinflip_symmetry else self.nn_flip(attn_features)
+                M  = self.M + F.reshape(self.M.shape)*self.nn_eta if not spinflip_symmetry else self.M_flip + F.reshape(self.M_flip.shape)*self.nn_eta
+            elif self.nn_eta == 0: # Pure Slater determinant calculation
+                M  = self.M if not spinflip_symmetry else self.M_flip
+
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the 2Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = M[R]
+            det = torch.linalg.det(A)
+            amp = det
+
+            return amp
+        
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=torch.int)
+
+            if self.spinflip_symmetry:
+                amp_val  = (backflow_det(x_i, spinflip_symmetry=True) + backflow_det(x_i, spinflip_symmetry=False)) / 2
+            else:
+                amp_val = backflow_det(x_i, spinflip_symmetry=False) 
             batch_amps.append(amp_val)
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)

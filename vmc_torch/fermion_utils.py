@@ -710,7 +710,7 @@ class fMPS(qtn.MatrixProductState):
     
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
     def get_amp(self, config, inplace=False, conj=True, efficient=True):
-        """Get the amplitude of a configuration in a PEPS."""
+        """Get the amplitude of a configuration in a fMPS."""
         if efficient:
             return self.get_amp_efficient(config, inplace=inplace)
         mps = self if inplace else self.copy()
@@ -729,55 +729,6 @@ class fMPS(qtn.MatrixProductState):
             L=mps.L,
             cyclic=mps.cyclic,
         )
-        # if DEBUG:
-        #     index_map = {0:0, 1:1, 2:1, 3:2}
-        #     amp_efficient = self.get_amp_efficient(config)
-        #     # print('State charge:', [ts.data.charge for ts in mps.tensors])
-        #     # print('Config charge:', [index_map[int(n)] for n in config])
-        #     # print('Original oddpos:', [ts.data.oddpos for ts in mps.tensors])
-        #     # print('Correct oddpos:', [ts.data.oddpos for ts in amp.tensors])
-        #     # print('Incorrect oddpos:', [ts.data.oddpos for ts in amp_efficient.tensors])
-        #     print(config, amp.contract(), amp_efficient.contract())
-        #     # for i in range(len(amp.tensors)):
-        #     #     # print(amp.tensors[i].data.blocks,'   ', amp_efficient.tensors[i].data.blocks, '\n')
-        #     #     print(amp.tensors[i].data,'   ', amp_efficient.tensors[i].data, '\n')
-        #     print('------------------------------------')
-        #     print(amp.tensor_map)
-        #     print('------------------------------------')
-        #     print(amp_efficient.tensor_map)
-        #     print('------------------------------------')
-        #     def compare_objects(obj1, obj2):
-        #         # Check if the objects are of the same type
-        #         if type(obj1) != type(obj2):
-        #             return False
-                
-        #         for sec in obj1.blocks.keys():
-        #             if (obj1.blocks[sec] != obj2.blocks[sec]).any():
-        #                 print('Mismatch in blocks:', sec)
-        #                 print(obj1.blocks[sec], obj2.blocks[sec])
-        #                 return False
-        #         if obj1.duals != obj2.duals:
-        #             print('Mismatch in duals')
-        #             print(obj1.duals, obj2.duals)
-        #             return False
-        #         if obj1.charge != obj2.charge:
-        #             print('Mismatch in charge')
-        #             print(obj1.charge, obj2.charge)
-        #             return False
-        #         if obj1.oddpos != obj2.oddpos:
-        #             print('Mismatch in oddpos')
-        #             print(obj1.oddpos, obj2.oddpos)
-        #             return False
-        #         if obj1.symmetry != obj2.symmetry:
-        #             print(obj1.symmetry, obj2.symmetry)
-        #             return False
-        #         return True
-
-        #         # return True
-        #     for i in range(len(amp.tensors)):
-        #         print(compare_objects(amp.tensors[i].data, amp_efficient.tensors[i].data))
-        #         # print(amp.tensors[i].data.__dict__ == amp_efficient.tensors[i].data.__dict__)
-        #         # print(amp.tensors[i].data,'   ', amp_efficient.tensors[i].data, '\n')
         return amp
     
     def get_amp_efficient(self, config, inplace=False):
@@ -792,11 +743,6 @@ class fMPS(qtn.MatrixProductState):
             kwargs = {'like':config, 'device':device, 'dtype':dtype}
         if self.spinless:
             raise NotImplementedError("Efficient amplitude calculation is not implemented for spinless fermions.")
-            # index_map = {0: 0, 1: 1}
-            # array_map = {
-            #     0: do('array',[1.0,],**kwargs), 
-            #     1: do('array',[1.0,],**kwargs)
-            # }
         else:
             if self.symmetry == 'Z2':
                 index_map = {0:0, 1:1, 2:1, 3:0}
@@ -852,6 +798,75 @@ class fMPS(qtn.MatrixProductState):
             amp = qtn.MatrixProductState(mps)
 
             return amp
+    
+    def fix_phys_inds(self, sites, config, inplace=False):
+        """Slicing to get the amplitude locally, faster than contraction with a tensor product state."""
+        mps = self if inplace else self.copy()
+        backend = self.tensors[0].data.backend
+        dtype = eval(backend+'.'+self.tensors[0].data.dtype)
+        if type(config) == numpy.ndarray:
+            kwargs = {'like':config, 'dtype':dtype}
+        elif type(config) == torch.Tensor:
+            device = list(self.tensors[0].data.blocks.values())[0].device
+            kwargs = {'like':config, 'device':device, 'dtype':dtype}
+        if self.spinless:
+            raise NotImplementedError("Efficient amplitude calculation is not implemented for spinless fermions.")
+        else:
+            if self.symmetry == 'Z2':
+                index_map = {0:0, 1:1, 2:1, 3:0}
+                array_map = {
+                    0: do('array',[1.0, 0.0],**kwargs), 
+                    1: do('array',[1.0, 0.0],**kwargs), 
+                    2: do('array',[0.0, 1.0],**kwargs), 
+                    3: do('array',[0.0, 1.0],**kwargs)
+                }
+            elif self.symmetry == 'U1':
+                index_map = {0:0, 1:1, 2:1, 3:2}
+                array_map = {
+                    0: do('array',[1.0,],**kwargs), 
+                    1: do('array',[1.0, 0.0],**kwargs), 
+                    2: do('array',[0.0, 1.0],**kwargs), 
+                    3: do('array',[1.0,],**kwargs)
+                }
+
+            for n, site in zip(config, sites):
+                p_ind = mps.site_ind_id.format(site)
+                tid = mps.sites.index(site)
+                fts = mps[tid]
+                ftsdata = fts.data
+                ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
+                phys_ind_order = fts.inds.index(p_ind)
+                charge = index_map[int(n)]
+                input_vec = array_map[int(n)]
+                charge_sec_data_dict = ftsdata.blocks
+                new_fts_inds = fts.inds[:phys_ind_order] + fts.inds[phys_ind_order+1:]
+                new_charge_sec_data_dict = {}
+                for charge_blk, data in charge_sec_data_dict.items():
+                    if charge_blk[phys_ind_order] == charge:
+                        new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
+                        new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order+1:]
+                        new_charge_sec_data_dict[new_charge_blk]=new_data
+                        
+                new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order+1:]
+
+                if int(n) == 1:
+                    new_oddpos = (3*tid+1)*(-1)
+                elif int(n) == 2:
+                    new_oddpos = (3*tid+2)*(-1)
+                elif int(n) == 3 or int(n) == 0:
+                    new_oddpos = ()
+
+                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos is not () else ()
+                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
+                oddpos = list(new_oddpos)[::-1]
+                
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
+
+            amp = qtn.MatrixProductState(mps)
+
+        return amp
+        
 
 class fMPS_TNF(fMPS):
     def __init__(self, arrays, depth=None, L=None, *args, **kwargs):
