@@ -135,7 +135,7 @@ def QRbackward_deep(Q,R,dQ,dR):
     M = R@dR.t() - dQ.t()@Q
     M = copyltu(M)        
     tmp = dQ + Q@M
-    dA = torch.linalg.solve_triangular(R,tmp.t(),True)
+    dA = torch.linalg.solve_triangular(R,tmp.t(),left=True,upper=True)
     if not torch.all(torch.isfinite(dA)):
         raise ValueError("dA is not finite")
     return dA.t() 
@@ -149,7 +149,7 @@ def QRbackward_wide(A,Q,R,dQ,dR):
     M = U@dU.t() - tmp.t()@Q
     M = copyltu(M)
     tmp = tmp + Q @ M 
-    dX = torch.linalg.solve_triangular(U,tmp.t(),True)
+    dX = torch.linalg.solve_triangular(U,tmp.t(),left=True,upper=True)
     if not torch.all(torch.isfinite(dX)):
         raise ValueError("dX is not finite")
     return torch.cat((dX.t(),Q@dV),dim=1)
@@ -176,12 +176,12 @@ class QR(torch.autograd.Function):
         # if is_one(diag):
         #     print(R)
         #     raise ValueError
-        inds = torch.abs(diag) < epsilon
-        if len(inds) > 0: # rank deficient, revert to svd
-            U,S,Vh = SVDforward(A)
-            SVh = S.reshape((S.size(0),1)) * Vh
-            self.save_for_backward(U, S, Vh)
-            return U, SVh
+        # inds = torch.abs(diag) < epsilon
+        # if len(inds) > 0: # rank deficient, revert to svd
+        #     U,S,Vh = SVDforward(A)
+        #     SVh = S.reshape((S.size(0),1)) * Vh
+        #     self.save_for_backward(U, S, Vh)
+        #     return U, SVh
 
         if fix_sign:
             sign = torch.sign(diag).reshape((1,-1))
