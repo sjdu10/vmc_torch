@@ -135,6 +135,13 @@ class VMC:
         if RANK == 0:
             pbar = tqdm(range(start-stop))
         for step in range(start, stop):
+            if step == 0:
+                # bcast the initial parameter vector to all ranks
+                initial_param_vec = self._state.params_vec.detach().numpy()
+                new_param_vec = np.empty(self._state.Np, dtype=float)
+                COMM.Bcast(initial_param_vec, root=0)
+                self._state.update_state(initial_param_vec) # Reload the initial parameter vector into the quantum state
+
             if RANK == 0:
                 print('\nVariational step {}'.format(step))
             self.step_count += 1
@@ -290,6 +297,12 @@ class VMC:
         beta = self.beta
 
         for t_step in range(start, stop):
+            if t_step == 0:
+                # bcast the initial parameter vector to all ranks
+                initial_param_vec = self._state.params_vec.detach().numpy()
+                new_param_vec = np.empty(self._state.Np, dtype=float)
+                COMM.Bcast(initial_param_vec, root=0)
+                self._state.update_state(initial_param_vec) # Reload the initial parameter vector into the quantum state
             if RANK == 0:
                 print('\n\nVariational step {}'.format(t_step))
             self.step_count += 1
@@ -484,6 +497,12 @@ class VMC:
         self.step_count = 0
 
         for t_step in range(sample_times):
+            if t_step == 0:
+                # bcast the initial parameter vector to all ranks
+                initial_param_vec = self._state.params_vec.detach().numpy()
+                new_param_vec = np.empty(self._state.Np, dtype=float)
+                COMM.Bcast(initial_param_vec, root=0)
+                self._state.update_state(initial_param_vec) # Reload the initial parameter vector into the quantum state
             self.step_count += 1
             # Step 1: Sample the SWO dataset at the current step for current wavefunction. In this step we use MPI for the sampling.
             # -- Dataset format: [[c1,c2,...], {c1:(x_c1,y_c1), c2:(x_c2,y_c2), ...}] where x_c=<c|Psi_(t-1)>, y_c=<c|H|Psi_(t-1)>.

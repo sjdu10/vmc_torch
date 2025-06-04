@@ -41,20 +41,16 @@ class ShiftedSinhYFixed(nn.Module):
         return torch.sinh(x) + self.shift
 
 class PositionwiseFeedForward(nn.Module):
-    ''' A two-feed-forward-layer module '''
-    def __init__(self, d_in, d_hid, dropout=0.0):
+    ''' Position-wise two-layer feed-forward MLP layer.'''
+    def __init__(self, d_in, d_hid):
         super(PositionwiseFeedForward, self).__init__()
         self.w_1 = nn.Linear(d_in, d_hid)  # position-wise
         self.w_2 = nn.Linear(d_hid, d_in)  # position-wise
-        self.layer_norm = nn.LayerNorm(d_in, eps=1e-6)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         residual = x
         x = self.w_2(F.leaky_relu(self.w_1(x)))
-        x = self.dropout(x)
         x += residual
-        x = self.layer_norm(x)
         return x
     
 class SelfAttention(nn.Module):
@@ -111,6 +107,58 @@ class SelfAttn_block_pos(nn.Module):
 
         # Step 4: Residual connection and layer normalization
         attn_output = F.layer_norm(attn_output + embedded, attn_output.size()[1:])
+
+        return attn_output
+    
+
+class SelfAttn_MLP(nn.Module):
+    def __init__(self, n_site, num_classes, embed_dim, attention_heads, dtype=torch.float32, layer_norm=False, position_wise_mlp=True, positional_encoding=True):
+        super(SelfAttn_MLP, self).__init__()
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        # Linear layer to project one-hot vectors to the embedding dimension
+        self.embedding = nn.Linear(num_classes, embed_dim)
+        # Learnable positional embedding
+        self.positional_embedding = nn.Parameter(torch.randn(n_site, embed_dim) / embed_dim ** 0.5) if positional_encoding else None
+        # Self-attention block
+        self.self_attention = SelfAttention(embed_dim=embed_dim, num_heads=attention_heads)
+        # Position-wise feed-forward network
+        self.mlp = PositionwiseFeedForward(d_in=embed_dim, d_hid=embed_dim * 2) if position_wise_mlp else lambda x: x
+
+        self.dtype = dtype
+        self.layer_norm = layer_norm
+        self.position_wise_mlp = position_wise_mlp
+        self.embedding.to(dtype=dtype)
+        self.self_attention.to(dtype=dtype)
+        self.positional_embedding.to(dtype=dtype) if positional_encoding else None
+        self.mlp.to(dtype=dtype) if position_wise_mlp else None
+
+    def forward(self, input_seq):
+        # Step 1: One-hot encode the input sequence
+        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(self.dtype)
+
+        # Step 2: Embed the one-hot encoded sequence
+        embedded = self.embedding(one_hot_encoded)
+        embedded = embedded + self.positional_embedding if self.positional_embedding is not None else embedded
+
+        # Step 3: Pass through the self-attention block
+        attn_output, _ = self.self_attention(embedded)
+
+        # Step 4: Residual connection and layer normalization
+        # If layer_norm is True, apply layer normalization
+        if self.layer_norm:
+            attn_output = F.layer_norm(attn_output + embedded, attn_output.size()[1:])
+        else:
+            attn_output = attn_output + embedded
+
+        # Step 5: Pass through the position-wise feed-forward network with residual connection
+        if self.position_wise_mlp:
+            if self.layer_norm:
+                attn_output = F.layer_norm(self.mlp(attn_output) + attn_output, attn_output.size()[1:])
+            else:
+                attn_output = self.mlp(attn_output) + attn_output
+        else:
+            pass
 
         return attn_output
 
