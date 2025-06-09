@@ -1833,7 +1833,7 @@ class fTNModel(wavefunctionModel):
 
 class fTNModel_Jastrow(wavefunctionModel):
 
-    def __init__(self, ftn, max_bond=None, dtype=torch.float32, nn_jastrow_hidden_dim=64, embedding_dim=16, attention_heads=4):
+    def __init__(self, ftn, max_bond=None, dtype=torch.float32, nn_jastrow_hidden_dim=64, embedding_dim=16, attention_heads=4, exponential=False):
         super().__init__()
         self.param_dtype = dtype
         # extract the raw arrays and a skeleton of the TN
@@ -1858,12 +1858,21 @@ class fTNModel_Jastrow(wavefunctionModel):
         self.embedding_dim = embedding_dim
         self.attention_heads = attention_heads
 
-        self.nn_jastrow = nn.Sequential(
-            nn.Linear(ftn.Lx * ftn.Ly * embedding_dim, nn_jastrow_hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(nn_jastrow_hidden_dim, nn_jastrow_hidden_dim),
-            ShiftedSinhYFixed()
-        )
+        if not exponential:
+            self.nn_jastrow = nn.Sequential(
+                nn.Linear(ftn.Lx * ftn.Ly * embedding_dim, nn_jastrow_hidden_dim),
+                nn.LeakyReLU(),
+                nn.Linear(nn_jastrow_hidden_dim, nn_jastrow_hidden_dim),
+                ShiftedSinhYFixed()
+            )
+        else:
+            self.nn_jastrow = nn.Sequential(
+                nn.Linear(ftn.Lx * ftn.Ly * embedding_dim, nn_jastrow_hidden_dim),
+                nn.GELU(),
+                nn.Linear(nn_jastrow_hidden_dim, nn_jastrow_hidden_dim),
+                nn.GELU(),
+            )
+        self.jastrow_exponential = exponential
 
         self.nn_jastrow = self.nn_jastrow.to(dtype)
         self.nn_jastrow_hidden_dim = nn_jastrow_hidden_dim
@@ -1922,7 +1931,7 @@ class fTNModel_Jastrow(wavefunctionModel):
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0, device=x.device)
             
-            nn_jastrow = torch.mean(self.nn_jastrow(self.attn(x_i).view(-1)))
+            nn_jastrow = torch.mean(self.nn_jastrow(self.attn(x_i).view(-1))) if not self.jastrow_exponential else torch.exp(torch.mean(self.nn_jastrow(self.attn(x_i).view(-1))))
 
             amp_val = amp_val * nn_jastrow
 
@@ -2633,7 +2642,7 @@ class fTN_backflow_Model_embedding(wavefunctionModel):
             # Reconstruct the TN with the new parameters
             psi = qtn.unpack(tn_nn_params, self.skeleton)
             # Get the amplitude
-            amp = psi.get_amp(x_i, conj=True)
+            amp = psi.get_amp(x_i)
 
             if self.max_bond is None:
                 amp = amp
@@ -3804,6 +3813,135 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
             nn_features = self.nn(x_i)
             nn_features_vec = nn_features.view(-1)
             nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
+            # Add the correction to the original parameters
+            tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            # Get the amplitude
+            amp = psi.get_amp(x_i)
+
+            if self.max_bond is None:
+                amp = amp
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp_val = amp.contract()
+                
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
+class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
+    """
+        For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
+        This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
+        Positional encoding is added to the input of the attention block in this model.
+        Update: do not flatten the features from the attention block, instead use them directly in each on-site MLP to generate the tensor correction.
+    """
+    def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32, layer_norm=True, position_wise_mlp=False, positional_encoding=True):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly
+        phys_dim = ftn.phys_dim()
+        
+        self.nn = SelfAttn_MLP(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embed_dim=embedding_dim,
+            attention_heads=attention_heads,
+            dtype=self.param_dtype,
+            layer_norm=layer_norm,
+            position_wise_mlp=position_wise_mlp,
+            positional_encoding=positional_encoding,
+        )
+        # for each tensor (labelled by tid), assign a MLP
+        self.mlp = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            mlp_input_dim = embedding_dim
+            tn_params_dict = {
+                tid: params[int(tid)]
+            }
+            tn_params_vec = flatten_tn_params(tn_params_dict)
+            self.mlp[tid] = nn.Sequential(
+                nn.Linear(mlp_input_dim, nn_final_dim),
+                nn.LeakyReLU(),
+                nn.Linear(nn_final_dim, tn_params_vec.numel()),
+            )
+            self.mlp[tid].to(self.param_dtype)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+
+        self.model_structure = {
+            'fPEPS_backflow_attn_Tensorwise_MLP':
+            {
+                'D': ftn.max_bond(), 
+                'Lx': ftn.Lx, 'Ly': ftn.Ly, 
+                'symmetry': self.symmetry, 
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta, 
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+                'max_bond': max_bond,
+            },
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        self.tree = None
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+        
+            # Get the NN correction to the parameters, concatenate the results for each tensor
+            nn_features = self.nn(x_i)
+            nn_correction = torch.cat([self.mlp[tid](nn_features[tid]) for tid in self.torch_tn_params.keys()])
             # Add the correction to the original parameters
             tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
             # Reconstruct the TN with the new parameters
