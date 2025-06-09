@@ -3941,7 +3941,7 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
         
             # Get the NN correction to the parameters, concatenate the results for each tensor
             nn_features = self.nn(x_i)
-            nn_correction = torch.cat([self.mlp[tid](nn_features[tid]) for tid in self.torch_tn_params.keys()])
+            nn_correction = torch.cat([self.mlp[tid](nn_features[int(tid)]) for tid in self.torch_tn_params.keys()])
             # Add the correction to the original parameters
             tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
             # Reconstruct the TN with the new parameters

@@ -49,7 +49,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(Lx, Ly, t, U, N_f, pbc=False, n_f
 graph = H.graph
 # TN parameters
 D = 4
-chi = -10
+chi = -1
 dtype=torch.float64
 
 # # Load PEPS
@@ -69,7 +69,16 @@ if (N_samples/SIZE)%2 != 0:
 
 nn_hidden_dim = Lx*Ly
 # model = fTNModel(peps, max_bond=chi, dtype=dtype)
-model = fTN_backflow_attn_Tensorwise_Model_v1(
+# model = fTN_backflow_attn_Tensorwise_Model_v1(
+#     peps,
+#     max_bond=chi,
+#     embedding_dim=16,
+#     attention_heads=4,
+#     nn_final_dim=4,
+#     nn_eta=1.0,
+#     dtype=dtype,
+# )
+model = fTN_backflow_attn_Tensorwise_Model_v4(
     peps,
     max_bond=chi,
     embedding_dim=16,
@@ -77,6 +86,9 @@ model = fTN_backflow_attn_Tensorwise_Model_v1(
     nn_final_dim=4,
     nn_eta=1.0,
     dtype=dtype,
+    layer_norm=True,
+    position_wise_mlp=False,
+    positional_encoding=True,
 )
 # model = fTN_backflow_attn_Tensorwise_Model(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=dtype)
 # model = fTN_backflow_attn_Tensorwise_Model_v1(peps, max_bond=chi, embedding_dim=16, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=dtype)
@@ -103,6 +115,7 @@ model_names = {
     fTN_backflow_attn_Model: f'fTN_backflow_attn_Nh={nn_hidden_dim}',
     fTN_backflow_attn_Tensorwise_Model: 'fTN_backflow_attn_Tensorwise',
     fTN_backflow_attn_Tensorwise_Model_v1: 'fTN_backflow_attn_Tensorwise_v1',
+    fTN_backflow_attn_Tensorwise_Model_v4: 'fTN_backflow_attn_Tensorwise_v4',
     fTN_backflow_attn_Jastrow_Model: 'fTN_backflow_attn_Jastrow',
     fTN_backflow_attn_Model_boundary: 'fTN_backflow_attn_boundary',
     fTN_backflow_Model_Blockwise: 'fTN_backflow_blockwise',
