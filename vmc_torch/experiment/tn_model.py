@@ -2100,6 +2100,7 @@ class fTNModel_reuse(wavefunctionModel):
         self._env_x_cache = None
         self._env_y_cache = None
         self.config_ref = None
+        self.amp_ref = None
     
     def from_1d_to_2d(self, config, ordering='snake'):
         if ordering == 'snake':
@@ -2151,11 +2152,15 @@ class fTNModel_reuse(wavefunctionModel):
         env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0)
         env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
         self._env_x_cache = env_x_cache
+        self.config_ref = config
+        self.amp_ref = amp
     
     def cache_env_y(self, amp, config):
         env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0)
         env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
         self._env_y_cache = env_y_cache
+        self.config_ref = config
+        self.amp_ref = amp
     
     def cache_env(self, amp, config):
         """
@@ -2200,6 +2205,23 @@ class fTNModel_reuse(wavefunctionModel):
         self.clear_env_x_cache()
         self.clear_env_y_cache()
     
+    def detect_changed_sites(self, config_ref, new_config):
+        """
+            Detect the sites that have changed in the new configuration,
+            written in 1d coordinate format.
+        """
+        #TODO
+        changed_sites = set()
+        for i in range(self.Lx * self.Ly):
+            if config_ref[i] != new_config[i]:
+                changed_sites.add(i)
+        changed_sites = sorted(changed_sites)
+        if len(changed_sites) == 0:
+            return [], [], []
+        unchanged_sites_left = list(range(changed_sites[0]))
+        unchanged_sites_right = list(range(changed_sites[-1]+1, self.Lx * self.Ly))
+        return changed_sites, unchanged_sites_left, unchanged_sites_right
+    
     def detect_changed_rows(self, config_ref, new_config):
         """
             Detect the rows that have changed in the new configuration
@@ -2241,6 +2263,7 @@ class fTNModel_reuse(wavefunctionModel):
         amp_tn = self.get_amp_tn(config)
         self.cache_env_x(amp_tn, config)
         self.config_ref = config
+        self.amp_ref = amp_tn
     
     def update_env_x_cache_to_row(self, config, row_id, from_which='xmin'):
         amp_tn = self.get_amp_tn(config)
@@ -2252,6 +2275,7 @@ class fTNModel_reuse(wavefunctionModel):
         else:
             self._env_x_cache.update(new_env_x_cache)
         self.config_ref = config
+        self.amp_ref = amp_tn
     
     def update_env_y_cache(self, config):
         """
@@ -2262,6 +2286,7 @@ class fTNModel_reuse(wavefunctionModel):
         amp_tn = self.get_amp_tn(config)
         self.cache_env_y(amp_tn, config)
         self.config_ref = config
+        self.amp_ref = amp_tn
     
     def update_env_y_cache_to_col(self, config, col_id, from_which='ymin'):
         amp_tn = self.get_amp_tn(config)
@@ -2273,6 +2298,7 @@ class fTNModel_reuse(wavefunctionModel):
         else:
             self._env_y_cache.update(new_env_y_cache)
         self.config_ref = config
+        self.amp_ref = amp_tn
     
     def psi(self):
         """
@@ -2289,18 +2315,57 @@ class fTNModel_reuse(wavefunctionModel):
         # Reconstruct the TN with the new parameters
         psi = qtn.unpack(params, self.skeleton)
         return psi
+
+    def get_local_amp_tensors(self, tids:list, config:torch.Tensor):
+        """
+            Get the local tensors for the given tensor ids and configuration.
+            tids: a list of tensor ids. list of int.
+            config: the input configuration.
+        """
+        # first pick out the tensor parameters and form the local tn parameters vector
+        local_ts_params = {}
+        for tid in tids:
+            local_ts_params[tid] = {
+                ast.literal_eval(sector): data
+                for sector, data in self.torch_tn_params[str(tid)].items()
+            }
+        
+        # Get sites corresponding to the tids
+        sites = [self.skeleton.sites[tid] for tid in tids]
+
+        # Select the corresponding tensor skeleton
+        local_ts_skeleton = self.skeleton.select([self.skeleton.site_tag_id.format(*site) for site in sites], which='any')
+
+        # Reconstruct the TN with the new parameters
+        local_ts = qtn.unpack(local_ts_params, local_ts_skeleton)
+
+        # Fix the physical indices
+        return local_ts.fix_phys_inds(sites, config[tids])
     
-    def get_amp_tn(self, config):
-        psi = self.psi()
-        # Check config type
-        if not type(config) == torch.Tensor:
-            config = torch.tensor(config, dtype=torch.int if self.functional else self.param_dtype)
+    def get_amp_tn(self, config, cache_amp_tn=False):
+        # TODO: add a precheck for exisiting cached environment, and add a part to locally obtain the amp row without constrcuting the whole amp TN
+        if self.env_x_cache is None and self.env_y_cache is None:
+            psi = self.psi()
+            # Check config type
+            if not type(config) == torch.Tensor:
+                config = torch.tensor(config, dtype=torch.int if self.functional else self.param_dtype)
+            else:
+                if config.dtype != self.param_dtype:
+                    config = config.to(torch.int if self.functional else self.param_dtype)
+            # Get the amplitude
+            amp = psi.get_amp(config, conj=True, functional=self.functional)
+            return amp
         else:
-            if config.dtype != self.param_dtype:
-                config = config.to(torch.int if self.functional else self.param_dtype)
-        # Get the amplitude
-        amp = psi.get_amp(config, conj=True, functional=self.functional)
-        return amp
+            config_2d = self.from_1d_to_2d(config)
+            # detect the rows that have changed
+            changed_rows, unchanged_rows_above, unchanged_rows_below = self.detect_changed_rows(self.config_ref, config)
+            changed_cols, unchanged_cols_left, unchanged_cols_right = self.detect_changed_cols(self.config_ref, config)
+
+            if len(changed_rows) == 0 and len(changed_cols) == 0:
+                return self.amp_ref
+            # reuse row envs
+            if len(changed_rows) <= len(changed_cols):
+                ... # reuse row envs
         
     
     def amplitude(self, x):
