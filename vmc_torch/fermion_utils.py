@@ -212,7 +212,8 @@ class fPEPS(qtn.PEPS):
         return product_tn
     
     def fix_phys_inds(self, sites, config, inplace=False):
-        """Slicing to get the amplitude locally, faster than contraction with a tensor product state."""
+        """Slicing to get the amplitude locally, faster than contraction with a tensor product state.
+        Note here sites is a list of tuples (x, y) for the sites to be fixed, and config is a 1D array of integers representing the fermion occupation numbers at those sites."""
         peps = self if inplace else self.copy()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
@@ -244,7 +245,7 @@ class fPEPS(qtn.PEPS):
             for n, site in zip(config, sites):
                 p_ind = peps.site_ind_id.format(*site)
                 tid = peps.sites.index(site)
-                fts = peps.tensors[tid]
+                fts = peps.tensor_map[tid]
                 ftsdata = fts.data
                 ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
                 phys_ind_order = fts.inds.index(p_ind)

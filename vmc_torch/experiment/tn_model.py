@@ -2105,7 +2105,19 @@ class fTNModel_reuse(wavefunctionModel):
     def from_1d_to_2d(self, config, ordering='snake'):
         if ordering == 'snake':
             config_2d = config.reshape((self.Lx, self.Ly))
-        return config_2d
+            return config_2d
+        else:
+            raise NotImplementedError(f'Ordering {ordering} is not implemented.')
+        
+    def from_1dsite_to_2dsite(self, site, ordering='snake'):
+        """
+            Convert a 1d site index to a 2d site index.
+            site: 1d site index
+        """
+        if ordering == 'snake':
+            return (site // self.Ly, site % self.Ly)
+        else:
+            raise ValueError(f"Unsupported ordering: {ordering}")
     
     def transform_quimb_env_x_key_to_config_key(self, env_x, config):
         """
@@ -2204,23 +2216,33 @@ class fTNModel_reuse(wavefunctionModel):
     def clear_wavefunction_env_cache(self):
         self.clear_env_x_cache()
         self.clear_env_y_cache()
+        self.config_ref = None
+        self.amp_ref = None
     
     def detect_changed_sites(self, config_ref, new_config):
         """
             Detect the sites that have changed in the new configuration,
             written in 1d coordinate format.
         """
-        #TODO
         changed_sites = set()
+        unchanged_sites = set()
         for i in range(self.Lx * self.Ly):
             if config_ref[i] != new_config[i]:
                 changed_sites.add(i)
+            else:
+                unchanged_sites.add(i)
         changed_sites = sorted(changed_sites)
+        unchanged_sites = sorted(unchanged_sites)
         if len(changed_sites) == 0:
-            return [], [], []
-        unchanged_sites_left = list(range(changed_sites[0]))
-        unchanged_sites_right = list(range(changed_sites[-1]+1, self.Lx * self.Ly))
-        return changed_sites, unchanged_sites_left, unchanged_sites_right
+            return [], []
+        return changed_sites, unchanged_sites
+
+    def from_1d_sites_to_tids(self, sites):
+        """
+            Convert a list of 1d site indices to a list of tensor ids.
+        """
+        tids_list = list(self.skeleton.tensor_map.keys())
+        return [tids_list[site] for site in sites]
     
     def detect_changed_rows(self, config_ref, new_config):
         """
@@ -2316,7 +2338,7 @@ class fTNModel_reuse(wavefunctionModel):
         psi = qtn.unpack(params, self.skeleton)
         return psi
 
-    def get_local_amp_tensors(self, tids:list, config:torch.Tensor):
+    def get_local_amp_tensors(self, sites:list, config:torch.Tensor):
         """
             Get the local tensors for the given tensor ids and configuration.
             tids: a list of tensor ids. list of int.
@@ -2324,6 +2346,7 @@ class fTNModel_reuse(wavefunctionModel):
         """
         # first pick out the tensor parameters and form the local tn parameters vector
         local_ts_params = {}
+        tids = self.from_1d_sites_to_tids(sites)
         for tid in tids:
             local_ts_params[tid] = {
                 ast.literal_eval(sector): data
@@ -2331,20 +2354,20 @@ class fTNModel_reuse(wavefunctionModel):
             }
         
         # Get sites corresponding to the tids
-        sites = [self.skeleton.sites[tid] for tid in tids]
+        sites_2d = [self.from_1dsite_to_2dsite(site) for site in sites]
 
         # Select the corresponding tensor skeleton
-        local_ts_skeleton = self.skeleton.select([self.skeleton.site_tag_id.format(*site) for site in sites], which='any')
+        local_ts_skeleton = self.skeleton.select([self.skeleton.site_tag_id.format(*site) for site in sites_2d], which='any')
 
         # Reconstruct the TN with the new parameters
-        local_ts = qtn.unpack(local_ts_params, local_ts_skeleton)
+        local_ftn = qtn.unpack(local_ts_params, local_ts_skeleton)
 
         # Fix the physical indices
-        return local_ts.fix_phys_inds(sites, config[tids])
+        return local_ftn.fix_phys_inds(sites_2d, config[sites])
     
-    def get_amp_tn(self, config, cache_amp_tn=False):
-        # TODO: add a precheck for exisiting cached environment, and add a part to locally obtain the amp row without constrcuting the whole amp TN
-        if self.env_x_cache is None and self.env_y_cache is None:
+    def get_amp_tn(self, config, reconstruct=False):
+
+        if self.amp_ref is None or reconstruct:
             psi = self.psi()
             # Check config type
             if not type(config) == torch.Tensor:
@@ -2353,20 +2376,24 @@ class fTNModel_reuse(wavefunctionModel):
                 if config.dtype != self.param_dtype:
                     config = config.to(torch.int if self.functional else self.param_dtype)
             # Get the amplitude
-            amp = psi.get_amp(config, conj=True, functional=self.functional)
-            return amp
-        else:
-            config_2d = self.from_1d_to_2d(config)
-            # detect the rows that have changed
-            changed_rows, unchanged_rows_above, unchanged_rows_below = self.detect_changed_rows(self.config_ref, config)
-            changed_cols, unchanged_cols_left, unchanged_cols_right = self.detect_changed_cols(self.config_ref, config)
-
-            if len(changed_rows) == 0 and len(changed_cols) == 0:
-                return self.amp_ref
-            # reuse row envs
-            if len(changed_rows) <= len(changed_cols):
-                ... # reuse row envs
+            amp_tn = psi.get_amp(config, conj=True, functional=self.functional)
+            return amp_tn
         
+        else:
+            # detect the sites that have changed
+            changed_sites, unchanged_sites = self.detect_changed_sites(self.config_ref, config)
+
+            if len(changed_sites) == 0:
+                return self.amp_ref
+            else:
+                # substitute the changed sites tensors
+                local_amp_tn = self.get_local_amp_tensors(changed_sites, config)
+                unchanged_sites_2d = [self.from_1dsite_to_2dsite(site) for site in unchanged_sites]
+                unchanged_sites_tags = [self.skeleton.site_tag_id.format(*site) for site in unchanged_sites_2d]
+                unchanged_amp_tn = self.amp_ref.select(unchanged_sites_tags, which='any')
+                # merge the local_amp_tn and unchanged_amp_tn
+                amp_tn = local_amp_tn | unchanged_amp_tn
+                return amp_tn
     
     def amplitude(self, x):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
@@ -2390,7 +2417,8 @@ class fTNModel_reuse(wavefunctionModel):
                 if x_i.dtype != self.param_dtype:
                     x_i = x_i.to(torch.int if self.functional else self.param_dtype)
             # Get the amplitude
-            amp = psi.get_amp(x_i, conj=True, functional=self.functional)
+            # amp = psi.get_amp(x_i, conj=True, functional=self.functional)
+            amp = self.get_amp_tn(x_i)
 
             if self.max_bond is None:
                 amp = amp
@@ -2410,6 +2438,7 @@ class fTNModel_reuse(wavefunctionModel):
                     amp_bot = self.env_x_cache[key_bot]
                     amp_top = self.env_x_cache[key_top]
                     amp_val = (amp_bot|amp_top).contract()
+                    
 
                 else:
                     if self.env_x_cache is None and self.env_y_cache is None:
@@ -2441,7 +2470,6 @@ class fTNModel_reuse(wavefunctionModel):
                                 if len(unchanged_rows_above) != 0:
                                     amp_unchanged_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[unchanged_rows_above].to(torch.int))).tolist()))]
                                 amp_val = (amp_unchanged_bottom_env|amp_unchanged_top_env|amp_changed_rows).contract()
-                                # print(f'changed rows: {changed_rows}', self.from_1d_to_2d(x_i), self.from_1d_to_2d(self.config_ref))
                             else:
                                 # for left envs, until the first column in the changed columns, we can reuse the env
                                 # for right envs, until the last column in the changed columns, we can reuse the env
@@ -2458,8 +2486,7 @@ class fTNModel_reuse(wavefunctionModel):
                 amp_val = torch.tensor(0.0)
             
             if self.debug:
-                print(f'Reused Amp: {amp_val}, Exact Amp: {self.get_amp_tn(x_i).contract()}')
-            
+                print(f'Reused Amp val: {amp_val}, Exact Amp val: {self.get_amp_tn(x_i).contract()}')
             
             batch_amps.append(amp_val)
 
@@ -4379,6 +4406,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
     def clear_wavefunction_env_cache(self):
         self.clear_env_x_cache()
         self.clear_env_y_cache()
+        self.config_ref = None
     
     def detect_effected_rows(self, config_ref, new_config):
         """

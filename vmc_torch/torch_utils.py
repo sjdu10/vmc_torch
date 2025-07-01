@@ -173,15 +173,15 @@ class QR(torch.autograd.Function):
             R = torch.from_numpy(R)
 
         diag = R.diag()
-        # if is_one(diag):
-        #     print(R)
-        #     raise ValueError
-        # inds = torch.abs(diag) < epsilon
-        # if len(inds) > 0: # rank deficient, revert to svd
-        #     U,S,Vh = SVDforward(A)
-        #     SVh = S.reshape((S.size(0),1)) * Vh
-        #     self.save_for_backward(U, S, Vh)
-        #     return U, SVh
+        if is_one(diag):
+            print(R)
+            raise ValueError
+        inds = torch.abs(diag) < epsilon
+        if len(inds) > 0: # rank deficient, revert to svd
+            U,S,Vh = SVDforward(A)
+            SVh = S.reshape((S.size(0),1)) * Vh
+            self.save_for_backward(U, S, Vh)
+            return U, SVh
 
         if fix_sign:
             sign = torch.sign(diag).reshape((1,-1))

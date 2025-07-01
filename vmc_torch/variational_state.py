@@ -99,7 +99,7 @@ class Variational_State:
         self.vstate_func.load_state_dict(state_dict)
 
     @tensor_aware_lru_cache(maxsize=AMP_CACHE_SIZE)
-    def amplitude(self, x):
+    def amplitude(self, x, _cache=0):
         with torch.no_grad():
             if not type(x) == torch.Tensor:
                 x = torch.tensor(np.asarray(x), dtype=self.dtype)
@@ -239,8 +239,6 @@ class Variational_State:
             op_expect, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag)
             t1 = MPI.Wtime()
             self.eager_sampling_time = t1 - t0
-            # if RANK == 0:
-            #     print('    Time for eager sampling: {}'.format(t1-t0))
         
         # return statistics of the MC sampling
         stats_dict = {'mean': op_expect, 'variance': op_var, 'error': op_err}

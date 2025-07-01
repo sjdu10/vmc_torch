@@ -14,7 +14,7 @@ import torch
 from autoray import do
 
 #jax
-import jax
+# import jax
 import random
 
 from .global_var import DEBUG, set_debug, TIME_PROFILING, TAG_OFFSET
@@ -209,9 +209,11 @@ class Sampler(AbstractSampler):
                 sigma, psi_sigma = self._sample_next(vstate)
                     
             n += 1
-        
+
             # compute local energy and amplitude gradient
-            psi_sigma = vstate.amplitude(sigma)
+            vstate.set_cache_env_mode(on=True)
+            psi_sigma = vstate.amplitude(sigma, _cache=1)
+            vstate.set_cache_env_mode(on=False)
             # compute the connected non-zero operator matrix elements <eta|O|sigma>
             eta, O_etasigma = op.get_conn(sigma) # Non-zero matrix elements and corresponding configurations
             psi_eta = vstate.amplitude(eta)
@@ -244,6 +246,7 @@ class Sampler(AbstractSampler):
             if RANK == 0:
                 pbar.update(1)
         
+        vstate.clear_env_cache()
         
         if self.reset_chain:
             self.reset()
@@ -318,7 +321,6 @@ class Sampler(AbstractSampler):
                 # Send the termination signal to the rank
                 COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
 
-            
             pbar.close()
         
         else:
@@ -337,6 +339,7 @@ class Sampler(AbstractSampler):
                 terminate = np.empty(1, dtype=np.int32)
                 COMM.Recv([terminate, MPI.INT], source=0, tag=message_tag+1)
 
+        vstate.clear_env_cache()
         
         if self.reset_chain:
             self.reset()
@@ -443,6 +446,7 @@ class Sampler(AbstractSampler):
             if RANK == 0:
                 pbar.update(1)
         
+        vstate.clear_env_cache()
         
         if self.reset_chain:
             self.reset()
@@ -636,11 +640,14 @@ class Sampler(AbstractSampler):
         time1 = MPI.Wtime()
 
         # compute local energy and amplitude gradient
-        psi_sigma = vstate.amplitude(sigma)
+        vstate.set_cache_env_mode(on=True)
+        psi_sigma = vstate.amplitude(sigma, _cache=1)
+        vstate.set_cache_env_mode(on=False)
         time2 = MPI.Wtime()
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
         eta, O_etasigma = op.get_conn(sigma)
         psi_eta = vstate.amplitude(eta)
+        vstate.clear_env_cache()
         time3 = MPI.Wtime()
 
         # convert torch tensors to numpy arrays
@@ -657,7 +664,8 @@ class Sampler(AbstractSampler):
         return op_loc, time1 - time0
     
     def sample_expectation(self, vstate, op, chain_length=1):
-        """Sample the expectation value of the operator `op`."""
+        """Sample the expectation value of the operator `op`, using single-chain sampling."""
+
         self.burn_in(vstate)
         E_loc_list = []
         configs = []
