@@ -273,7 +273,7 @@ class fPEPS(qtn.PEPS):
                 new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
                 
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
             amp = qtn.PEPS(peps)
@@ -321,7 +321,6 @@ class fPEPS(qtn.PEPS):
             device = list(self.tensors[0].data.blocks.values())[0].device
             kwargs = {'like': config, 'device': device, 'dtype': dtype}
         
-        
         if self.spinless:
             raise NotImplementedError("Efficient amplitude calculation is not implemented for spinless fermions.")
         else:
@@ -349,7 +348,9 @@ class fPEPS(qtn.PEPS):
                     2: do('array',[1.0],**kwargs),
                     3: do('array',[1.0],**kwargs)
                 }
-            
+            else:
+                raise ValueError(f"symmetry: {self.symmetry} , name: {self.symmetry.__class__.__name__}, type: {type(self.symmetry)}, array: {self.arrays[0].symmetry=='Z2'}")
+
 
             for n, site in zip(config, self.sites):
                 p_ind = peps.site_ind_id.format(*site)
@@ -384,13 +385,13 @@ class fPEPS(qtn.PEPS):
                 new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
                 try:
-                    if ftsdata.symmetry == 'U1':
+                    if self.symmetry == 'U1':
                         new_charge = charge + ftsdata.charge
-                    elif ftsdata.symmetry == 'Z2':
+                    elif self.symmetry == 'Z2':
                         new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
-                    elif ftsdata.symmetry == 'U1U1':
+                    elif self.symmetry == 'U1U1':
                         new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
-                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=self.symmetry)
                 except:
                     # Error when constructing the new f-tensor
                     print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
@@ -862,7 +863,7 @@ class fMPS(qtn.MatrixProductState):
                 new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
                 
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
             amp = qtn.MatrixProductState(mps)
@@ -930,7 +931,7 @@ class fMPS(qtn.MatrixProductState):
                 new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
                 
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=ftsdata.symmetry)
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
             amp = qtn.MatrixProductState(mps)

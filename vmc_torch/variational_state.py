@@ -112,8 +112,9 @@ class Variational_State:
         amp = self.vstate_func(x)
         try:
             amp.backward()
-        except RuntimeError:
-            print("RuntimeError: amp.backward()")
+        except:
+            print(f"Amplitude backward failed, returning zero gradient.")
+            print(f"Rank {RANK} amplitude: {amp}")
             # amp is 0
             self.reset()
             return amp, torch.zeros((self.Np,), dtype=self.dtype)
