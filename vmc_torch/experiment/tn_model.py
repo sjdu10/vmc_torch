@@ -2071,7 +2071,7 @@ class fTNModel_reuse(wavefunctionModel):
         self.debug = debug
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
-        self.skeleton.exponent = 0
+        # self.skeleton.exponent = 0
 
         # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
         self.torch_tn_params = nn.ModuleDict({
@@ -2377,6 +2377,8 @@ class fTNModel_reuse(wavefunctionModel):
                     config = config.to(torch.int if self.functional else self.param_dtype)
             # Get the amplitude
             amp_tn = psi.get_amp(config, conj=True, functional=self.functional)
+            if self.debug:
+                print(f'Efficient amp tn construction (full), amp_tn exponent: {amp_tn.exponent}')
             return amp_tn
         
         else:
@@ -2393,6 +2395,9 @@ class fTNModel_reuse(wavefunctionModel):
                 unchanged_amp_tn = self.amp_ref.select(unchanged_sites_tags, which='any')
                 # merge the local_amp_tn and unchanged_amp_tn
                 amp_tn = local_amp_tn | unchanged_amp_tn
+                amp_tn.exponent = self.skeleton.exponent
+                if self.debug:
+                    print(f'Efficient amp tn construction (local), amp_tn exponent: {amp_tn.exponent}')
                 return amp_tn
     
     def amplitude(self, x):
@@ -2418,18 +2423,18 @@ class fTNModel_reuse(wavefunctionModel):
                     x_i = x_i.to(torch.int if self.functional else self.param_dtype)
             # Get the amplitude
             # amp = psi.get_amp(x_i, conj=True, functional=self.functional)
-            amp = self.get_amp_tn(x_i)
+            amp_tn = self.get_amp_tn(x_i)
 
             if self.max_bond is None:
-                amp = amp
+                amp = amp_tn
                 if self.tree is None:
                     opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
                     self.tree = amp.contraction_tree(optimize=opt)
-                amp_val = amp.contract(optimize=self.tree)
+                amp_val = amp.contract(optimize=self.tree) # quimb will address the cached exponent automatically
 
             else:
                 if self.cache_env_mode:
-                    self.cache_env_x(amp, x_i)
+                    self.cache_env_x(amp_tn, x_i)
                     # self.cache_env_y(amp, x_i)
                     self.config_ref = x_i
                     config_2d = self.from_1d_to_2d(x_i)
@@ -2437,15 +2442,15 @@ class fTNModel_reuse(wavefunctionModel):
                     key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
                     amp_bot = self.env_x_cache[key_bot]
                     amp_top = self.env_x_cache[key_top]
-                    amp_val = (amp_bot|amp_top).contract()
+                    amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
                     
 
                 else:
                     if self.env_x_cache is None and self.env_y_cache is None:
                         # check whether we can reuse the cached environment
-                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
-                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
-                        amp_val = amp.contract()
+                        amp = amp_tn.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                        amp = amp_tn.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                        amp_val = amp.contract() # quimb will address the cached exponent automatically
                     else:
                         config_2d = self.from_1d_to_2d(x_i)
                         # detect the rows that have changed
@@ -2457,37 +2462,37 @@ class fTNModel_reuse(wavefunctionModel):
                             key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
                             amp_bot = self.env_x_cache[key_bot]
                             amp_top = self.env_x_cache[key_top]
-                            amp_val = (amp_bot|amp_top).contract()
+                            amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent)
                         else:
                             if len(changed_rows) <= len(changed_cols):
                                 # for bottom envs, until the last row in the changed rows, we can reuse the env
                                 # for top envs, until the first row in the changed rows, we can reuse the env
-                                amp_changed_rows = qtn.TensorNetwork([amp.select(amp.x_tag_id.format(row_n)) for row_n in changed_rows])
+                                amp_changed_rows = qtn.TensorNetwork([amp_tn.select(amp_tn.x_tag_id.format(row_n)) for row_n in changed_rows])
                                 amp_unchanged_bottom_env = qtn.TensorNetwork()
                                 amp_unchanged_top_env = qtn.TensorNetwork()
                                 if len(unchanged_rows_below) != 0:
                                     amp_unchanged_bottom_env = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[unchanged_rows_below].to(torch.int))).tolist()))]
                                 if len(unchanged_rows_above) != 0:
                                     amp_unchanged_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[unchanged_rows_above].to(torch.int))).tolist()))]
-                                amp_val = (amp_unchanged_bottom_env|amp_unchanged_top_env|amp_changed_rows).contract()
+                                amp_val = (amp_unchanged_bottom_env|amp_unchanged_top_env|amp_changed_rows).contract() * 10**(self.skeleton.exponent)
                             else:
                                 # for left envs, until the first column in the changed columns, we can reuse the env
                                 # for right envs, until the last column in the changed columns, we can reuse the env
-                                amp_changed_cols = qtn.TensorNetwork([amp.select(amp.y_tag_id.format(col_n)) for col_n in changed_cols])
+                                amp_changed_cols = qtn.TensorNetwork([amp_tn.select(amp_tn.y_tag_id.format(col_n)) for col_n in changed_cols])
                                 amp_unchanged_left_env = qtn.TensorNetwork()
                                 amp_unchanged_right_env = qtn.TensorNetwork()
                                 if len(unchanged_cols_left) != 0:
                                     amp_unchanged_left_env = self.env_y_cache[('ymin', tuple(torch.cat(tuple(config_2d[:, unchanged_cols_left].to(torch.int))).tolist()))]
                                 if len(unchanged_cols_right) != 0:
                                     amp_unchanged_right_env = self.env_y_cache[('ymax', tuple(torch.cat(tuple(config_2d[:, unchanged_cols_right].to(torch.int))).tolist()))]
-                                amp_val = (amp_unchanged_left_env|amp_unchanged_right_env|amp_changed_cols).contract()
-                                
+                                amp_val = (amp_unchanged_left_env|amp_unchanged_right_env|amp_changed_cols).contract()*10**(self.skeleton.exponent)
+
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
             
             if self.debug:
-                print(f'Reused Amp val: {amp_val}, Exact Amp val: {self.get_amp_tn(x_i).contract()}')
-            
+                print(f'Reused Amp val: {amp_val}, Exact Amp val: {psi.get_amp(x_i).contract()}')
+
             batch_amps.append(amp_val)
 
         # Return the batch of amplitudes stacked as a tensor

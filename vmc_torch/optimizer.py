@@ -155,11 +155,19 @@ class SR(Preconditioner):
                     # synchronize the result
                     x_out = COMM.allreduce(x_out_local, op=MPI.SUM)/total_samples
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
+                    if RANK == 0 and DEBUG:
+                        print("     mean of x", np.mean(abs(x)))
+                        print("     mean of R_dot_x(x)", np.mean(abs(x_out)))
+                        if np.mean(abs(x_out)) > 1e10:
+                            print("WARNING: R_dot_x(x) contains NaN, need to check the gradient of SVD/QR.")
                     return x_out + eta*x
                 n = state.Np
                 matvec = lambda x: R_dot_x(x, self.diag_eta)
                 A = spla.LinearOperator((n, n), matvec=matvec)
                 b = energy_grad.detach().numpy() if type(energy_grad) is torch.Tensor else energy_grad
+                if RANK == 0 and DEBUG:
+                    print("     mean of energy_grad", np.mean(abs(b)))
+                    print("     mean of mean_logamp_grad", np.mean(abs(mean_logamp_grad)))
                 t0 = MPI.Wtime()
                 dp, info = self.solver(A, b, maxiter=self.iter_step, rtol=self.rtol)
                 t1 = MPI.Wtime()

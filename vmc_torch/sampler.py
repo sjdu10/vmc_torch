@@ -423,6 +423,9 @@ class Sampler(AbstractSampler):
 
             # compute the local operator
             op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+            # if abs(op_loc) > 1e4:
+            #     chain_step -= 1
+            #     continue
             op_loc_vec[chain_step] = op_loc
 
             # accumulate the local energy and amplitude gradient
@@ -540,6 +543,8 @@ class Sampler(AbstractSampler):
         else:
             while not terminate[0]:
                 op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
+                if abs(op_loc) > 1e4: # discard the extreme samples
+                    continue
                 n += 1
                 op_loc_vec.append(op_loc)
                 # accumulate the local energy and amplitude gradient
@@ -622,6 +627,10 @@ class Sampler(AbstractSampler):
 
         # compute the local operator
         op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+
+        if DEBUG:
+            if abs(op_loc) > 1e3:
+                print(f"    RANK{RANK} Local Energy: {op_loc} Amplitude: {psi_sigma.item():.10g} Gradient mean: {np.mean(abs(logpsi_sigma_grad))}")
 
         self.sample_time += (time1 - time0) # for profiling purposes
         self.local_energy_time += (time3 - time2)
@@ -1193,9 +1202,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
 
     def _sample_next(self, vstate, burn_in=False):
         """Sample the next configuration. Change the current configuration in place."""
-        self.current_amp = vstate.amplitude(self.current_config).cpu()
-        self.current_prob = abs(self.current_amp)**2
-        proposed_config = self.current_config.clone()
+        
         ind_n_map = {0:0, 1:1, 2:1, 3:2}
         def exchange_propose(i, j):
             if self.current_config[i] == self.current_config[j]:
@@ -1238,26 +1245,43 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
                 self.current_amp = proposed_amp
                 self.current_prob = proposed_prob
                 self.accepts += 1
-        # initial cache of env_x for current configuration
-        vstate.vstate_func.update_env_x_cache_to_row(self.current_config, 0, from_which='xmax')
-        for row_index, row_edges in self.graph.row_edges.items():
-            for (i, j) in row_edges:
-                exchange_propose(i, j)
-            if row_index < self.graph.Lx - 1:
-                vstate.vstate_func.update_env_x_cache_to_row(self.current_config, row_index, from_which='xmin')
-        vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
-        for col_index, col_edges in self.graph.col_edges.items():
-            for (i, j) in col_edges:
-                exchange_propose(i, j)
-            if col_index < self.graph.Ly - 1:
-                vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin')
-        vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
-        vstate.vstate_func.clear_env_x_cache()
-        if burn_in:
-            vstate.vstate_func.clear_env_y_cache()
+        
+        acceptance_rate = 0
+
+        while acceptance_rate < 0.15:
+            self.current_amp = vstate.amplitude(self.current_config).cpu()
+            self.current_prob = abs(self.current_amp)**2
+            proposed_config = self.current_config.clone()
             
-        if self.current_amp == 0 and DEBUG:
-            print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2')
+            # initial cache of env_x for current configuration
+            vstate.vstate_func.update_env_x_cache_to_row(self.current_config, 0, from_which='xmax')
+            for row_index, row_edges in self.graph.row_edges.items():
+                for (i, j) in row_edges:
+                    exchange_propose(i, j)
+                if row_index < self.graph.Lx - 1:
+                    vstate.vstate_func.update_env_x_cache_to_row(self.current_config, row_index, from_which='xmin')
+            vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
+            for col_index, col_edges in self.graph.col_edges.items():
+                for (i, j) in col_edges:
+                    exchange_propose(i, j)
+                if col_index < self.graph.Ly - 1:
+                    vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin')
+            vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
+            vstate.vstate_func.clear_env_x_cache()
+            if burn_in:
+                vstate.vstate_func.clear_env_y_cache()
+                
+            if self.current_amp == 0 and DEBUG:
+                print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2')
+            
+            acceptance_rate = self.accepts / self.attempts
+
+            if acceptance_rate < 0.15:
+                self.reset()
+
+            if DEBUG:
+                if acceptance_rate < 0.15:
+                    print(f'    Rank {RANK}: acceptance rate {acceptance_rate}')
         
         return self.current_config, self.current_amp
 

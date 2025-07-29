@@ -110,15 +110,19 @@ class Variational_State:
         if not type(x) == torch.Tensor:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
         amp = self.vstate_func(x)
-        try:
-            amp.backward()
-        except:
-            print(f"Amplitude backward failed, returning zero gradient.")
-            print(f"Rank {RANK} amplitude: {amp}")
-            # amp is 0
-            self.reset()
-            return amp, torch.zeros((self.Np,), dtype=self.dtype)
+        # try:
+        amp.backward()
+
+        # except:
+        #     print(f"Amplitude backward failed, returning zero gradient.")
+        #     print(f"Rank {RANK} amplitude: {amp}")
+        #     # amp is 0
+        #     self.reset()
+        #     return amp, torch.zeros((self.Np,), dtype=self.dtype)
         vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+        if DEBUG:
+            if torch.mean(torch.abs(vec_log_grad)) > 1e3:
+                print(f"Rank {RANK} amplitude: {amp}, mean log grad: {torch.mean(torch.abs(vec_log_grad))}")
         # Clear the gradient
         self.reset()
         return amp, vec_log_grad
@@ -260,8 +264,8 @@ class Variational_State:
         local_samples = self.sampler.sample(op=op, vstate=vstate, chain_length=chain_length)
         self.clear_cache()
         t_sample_end = MPI.Wtime()
-        if DEBUG:
-            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
+        # if DEBUG:
+        #     print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
 
         local_op_loc_sum = local_samples[0]
         local_op_var = local_samples[1]
@@ -331,8 +335,8 @@ class Variational_State:
         local_samples = self.sampler.sample_eager(op=op, vstate=vstate, message_tag=message_tag)
         self.clear_cache()
         t_sample_end = MPI.Wtime()
-        if DEBUG:
-            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
+        # if DEBUG:
+        #     print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
 
         local_op_loc_sum = local_samples[0]
         local_op_var = local_samples[1]
@@ -386,8 +390,8 @@ class Variational_State:
         local_samples = self.sampler.sample_w_grad(op=op, vstate=vstate, chain_length=chain_length)
         self.clear_cache()
         t_sample_end = MPI.Wtime()
-        if DEBUG:
-            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
+        # if DEBUG:
+        #     print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
 
         local_op_loc_sum = local_samples[0]
         local_logamp_grad = local_samples[1]
@@ -483,8 +487,8 @@ class Variational_State:
         local_samples = self.sampler.sample_w_grad_eager(op=op, vstate=vstate, message_tag=message_tag)
         self.clear_cache()
         t_sample_end = MPI.Wtime()
-        if DEBUG:
-            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
+        # if DEBUG:
+        #     print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
 
         local_op_loc_sum = local_samples[0]
         local_logamp_grad = local_samples[1]
@@ -554,8 +558,8 @@ class Variational_State:
         self.clear_cache()
         t_sample_end = MPI.Wtime()
 
-        if DEBUG:
-            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
+        # if DEBUG:
+        #     print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
 
         return local_dataset
     
@@ -570,8 +574,8 @@ class Variational_State:
         self.clear_cache()
         t_sample_end = MPI.Wtime()
 
-        if DEBUG:
-            print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
+        # if DEBUG:
+        #     print('Rank {}, sample time: {}'.format(RANK, t_sample_end-t_sample_start))
 
         return local_dataset
 
