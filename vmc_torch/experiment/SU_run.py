@@ -12,8 +12,8 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-Lx = 4
-Ly = 2
+Lx = 8
+Ly = 8
 spinless = False
 # graph = nk.graph.Square(L)
 graph = nk.graph.Grid([Lx,Ly], pbc=False)
@@ -47,9 +47,9 @@ hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_pe
 
 
 # SU in quimb
-D = 8
+D = 4
 seed = 2
-symmetry = 'Z2'
+symmetry = 'U1'
 spinless = False
 peps = generate_random_fpeps(Lx, Ly, D=D, seed=2, symmetry=symmetry, Nf=N_f, spinless=spinless)[0]
 edges = qtn.edges_2d_square(Lx, Ly, cyclic=False)
@@ -113,12 +113,14 @@ peps.equalize_norms_(value=1)
 
 # save the state
 params, skeleton = qtn.pack(peps)
+skeleton.exponent = 1  # Set the exponent to 1 for SU(2) symmetry
 
-# import os
-# os.makedirs(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
+import os
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'
+os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
 
-# with open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
-#     pickle.dump(skeleton, f)
-# with open(f'../../data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
-#     pickle.dump(params, f)
+with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
+    pickle.dump(skeleton, f)
+with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
+    pickle.dump(params, f)
     

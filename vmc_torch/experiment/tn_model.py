@@ -3810,7 +3810,7 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
         For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
         This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
         Positional encoding is added to the input of the attention block in this model.
-        Update from v1: after attention block an position wise MLP is used to add non-linearity to attention output, and potentially remove layer normalization.
+        Update from v1: after attention block an position-wise MLP is used to add non-linearity to attention output, and potentially remove layer normalization.
     """
     def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32, layer_norm=True, position_wise_mlp=True, positional_encoding=True):
         super().__init__()
