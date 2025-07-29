@@ -41,7 +41,7 @@ RANK = COMM.Get_rank()
 # Hamiltonian parameters
 Lx = int(8)
 Ly = int(8)
-symmetry = 'U1'
+symmetry = 'Z2'
 t = 1.0
 U = 8.0
 N_f = int(Lx*Ly)
@@ -50,7 +50,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(Lx, Ly, t, U, N_f, pbc=False, n_f
 graph = H.graph
 # TN parameters
 D = 4
-chi = 16
+chi = 64
 dtype=torch.float64
 
 if symmetry == 'U1_Z2':
@@ -74,8 +74,8 @@ N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fTNModel_reuse(peps, max_bond=chi, dtype=dtype, debug=False)
-# model = fTNModel(peps, max_bond=chi, dtype=dtype)
+# model = fTNModel_reuse(peps, max_bond=chi, dtype=dtype, debug=False)
+model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_attn_Tensorwise_Model(
 #     peps,
 #     max_bond=chi,
@@ -118,12 +118,14 @@ learning_rate = 0.1
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-4)
 optimizer = SGD(learning_rate=learning_rate)
 # sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
-sampler = MetropolisExchangeSamplerSpinful_2D_reusable(H.hilbert, graph, N_samples=N_samples, burn_in_steps=4, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful_2D_reusable(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, solver='minres', diag_eta=1e-3, iter_step=5e2, dtype=dtype, rtol=1e-4)
 # preconditioner = TrivialPreconditioner()
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
+
+# BUG: 1. reusable model reuse algorithms (?) 2. sampler sequence (?)
 
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(False)

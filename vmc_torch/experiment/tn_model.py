@@ -101,6 +101,15 @@ class wavefunctionModel(torch.nn.Module):
     
     def clear_wavefunction_env_cache(self):
         pass
+    
+    def update_env_x_cache_to_row(self, *args, **kwargs):
+        pass
+    def update_env_y_cache_to_col(self, *args, **kwargs):
+        pass
+    def clear_env_x_cache(self):
+        pass
+    def clear_env_y_cache(self):
+        pass
 
     def update_cached_cache(self):
         pass
@@ -2101,6 +2110,7 @@ class fTNModel_reuse(wavefunctionModel):
         self._env_y_cache = None
         self.config_ref = None
         self.amp_ref = None
+        self.debug_amp_cache = []
     
     def from_1d_to_2d(self, config, ordering='snake'):
         if ordering == 'snake':
@@ -2377,8 +2387,8 @@ class fTNModel_reuse(wavefunctionModel):
                     config = config.to(torch.int if self.functional else self.param_dtype)
             # Get the amplitude
             amp_tn = psi.get_amp(config, conj=True, functional=self.functional)
-            if self.debug:
-                print(f'Efficient amp tn construction (full), amp_tn exponent: {amp_tn.exponent}')
+            # if self.debug:
+            #     print(f'Efficient amp tn construction (full), amp_tn exponent: {amp_tn.exponent}')
             return amp_tn
         
         else:
@@ -2396,8 +2406,8 @@ class fTNModel_reuse(wavefunctionModel):
                 # merge the local_amp_tn and unchanged_amp_tn
                 amp_tn = local_amp_tn | unchanged_amp_tn
                 amp_tn.exponent = self.skeleton.exponent
-                if self.debug:
-                    print(f'Efficient amp tn construction (local), amp_tn exponent: {amp_tn.exponent}')
+                # if self.debug:
+                #     print(f'Efficient amp tn construction (local), amp_tn exponent: {amp_tn.exponent}')
                 return amp_tn
     
     def amplitude(self, x):
@@ -2491,7 +2501,9 @@ class fTNModel_reuse(wavefunctionModel):
                 amp_val = torch.tensor(0.0)
             
             if self.debug:
-                print(f'Reused Amp val: {amp_val}, Exact Amp val: {psi.get_amp(x_i).contract()}')
+                amp_val_exact = psi.get_amp(x_i).contract()
+                print(f'Reused Amp val: {amp_val}, Exact Amp val: {amp_val_exact}, Rel error: {torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)}')
+                self.debug_amp_cache.append((amp_val, amp_val_exact, torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)))
 
             batch_amps.append(amp_val)
 

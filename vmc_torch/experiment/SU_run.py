@@ -49,7 +49,7 @@ hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_pe
 # SU in quimb
 D = 4
 seed = 2
-symmetry = 'U1'
+symmetry = 'Z2'
 spinless = False
 peps = generate_random_fpeps(Lx, Ly, D=D, seed=2, symmetry=symmetry, Nf=N_f, spinless=spinless)[0]
 edges = qtn.edges_2d_square(Lx, Ly, cyclic=False)
@@ -104,16 +104,16 @@ su = qtn.SimpleUpdateGen(peps, ham, compute_energy_per_site=True, D=D, compute_e
 # cluster energies may not be accuracte yet
 su.evolve(50, tau=0.3)
 su.evolve(50, tau=0.1)
-# su.evolve(50, tau=0.03)
-# # su.evolve(50, tau=0.01)
-# # su.evolve(50, tau=0.003)
+su.evolve(50, tau=0.03)
+su.evolve(50, tau=0.01)
+su.evolve(50, tau=0.003)
 
 peps = su.get_state()
 peps.equalize_norms_(value=1)
 
 # save the state
 params, skeleton = qtn.pack(peps)
-skeleton.exponent = 1  # Set the exponent to 1 for SU(2) symmetry
+skeleton.exponent = 10  # Set the exponent to 1 for SU(2) symmetry
 
 import os
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'

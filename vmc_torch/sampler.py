@@ -1278,9 +1278,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
 
             if acceptance_rate < 0.15:
                 self.reset()
-
-            if DEBUG:
-                if acceptance_rate < 0.15:
+                if DEBUG:
                     print(f'    Rank {RANK}: acceptance rate {acceptance_rate}')
         
         return self.current_config, self.current_amp
