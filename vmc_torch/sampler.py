@@ -1248,7 +1248,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
         
         acceptance_rate = 0
 
-        while acceptance_rate < 0.15:
+        while acceptance_rate < 0.10:
             self.current_amp = vstate.amplitude(self.current_config).cpu()
             self.current_prob = abs(self.current_amp)**2
             proposed_config = self.current_config.clone()
@@ -1276,7 +1276,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
             
             acceptance_rate = self.accepts / self.attempts
 
-            if acceptance_rate < 0.15:
+            if acceptance_rate < 0.10:
                 self.reset()
                 if DEBUG:
                     print(f'    Rank {RANK}: acceptance rate {acceptance_rate}')

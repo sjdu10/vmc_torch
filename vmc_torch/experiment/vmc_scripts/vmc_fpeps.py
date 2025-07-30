@@ -50,7 +50,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(Lx, Ly, t, U, N_f, pbc=False, n_f
 graph = H.graph
 # TN parameters
 D = 4
-chi = 64
+chi = 256
 dtype=torch.float64
 
 if symmetry == 'U1_Z2':
@@ -69,13 +69,13 @@ scale = 1.0
 peps.apply_to_arrays(lambda x: torch.tensor(scale*x, dtype=dtype))
 
 # VMC sample size
-N_samples = int(20)
+N_samples = int(40)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-# model = fTNModel_reuse(peps, max_bond=chi, dtype=dtype, debug=False)
-model = fTNModel(peps, max_bond=chi, dtype=dtype)
+model = fTNModel_reuse(peps, max_bond=chi, dtype=dtype, debug=False)
+# model = fTNModel(peps, max_bond=chi, dtype=dtype)
 # model = fTN_backflow_attn_Tensorwise_Model(
 #     peps,
 #     max_bond=chi,

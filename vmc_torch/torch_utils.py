@@ -7,6 +7,7 @@ Theories and derivations of differentiable TN computation can be found in Liao e
 
 import numpy as np
 import torch
+from .global_var import DEBUG
 import os, sys, itertools, time
 import scipy.linalg
 from mpi4py import MPI
@@ -15,7 +16,7 @@ SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 
 be_verbose = True
-epsilon = 1e-12 
+epsilon = 1e-12
 fix_sign = True
 
 ########## Utilities ##########
@@ -133,7 +134,7 @@ def copyltu(A):
     return tril0 + tril1.t()
 def QRbackward_deep(Q,R,dQ,dR):
     M = R@dR.t() - dQ.t()@Q
-    M = copyltu(M)        
+    M = copyltu(M)
     tmp = dQ + Q@M
     dA = torch.linalg.solve_triangular(R,tmp.t(),left=True,upper=True)
     if not torch.all(torch.isfinite(dA)):
@@ -176,8 +177,10 @@ class QR(torch.autograd.Function):
         if is_one(diag):
             print(R)
             raise ValueError
-        inds = torch.abs(diag) < epsilon
-        if len(inds) > 0: # rank deficient, revert to svd
+        inds = torch.abs(diag) < 1e-6
+        if sum(inds) > 0: # rank deficient, revert to svd
+            if DEBUG:
+                print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
             U,S,Vh = SVDforward(A)
             SVh = S.reshape((S.size(0),1)) * Vh
             self.save_for_backward(U, S, Vh)
@@ -194,6 +197,8 @@ class QR(torch.autograd.Function):
     def backward(self, dQ, dR):
         M1,M2,M3 = self.saved_tensors
         if len(M2.size())==1: # rank-deficient, do svd
+            if DEBUG:
+                print("QRbackward: rank deficient, using SVD")
             U,S,Vh = M1,M2,M3
             dU,dSVh = dQ,dR
             dS = torch.diag(dSVh @ Vh.t())
@@ -206,10 +211,90 @@ class QR(torch.autograd.Function):
         A,Q,R = M1,M2,M3
         M,N = A.size()
         if M>=N:
+            # print(f"QRbackward: A is deep, M={M}, N={N}")
             return QRbackward_deep(Q,R,dQ,dR)
         else:
+            # print(f"QRbackward: A is wide, M={M}, N={N}")
             return QRbackward_wide(A,Q,R,dQ,dR)
+
+# def copyltu(A):
+#     tril0 = A.tril(diagonal=0)
+#     tril1 = A.tril(diagonal=-1)
+#     return tril0 + tril1.t()
+# def QRbackward_deep(Q,R,dQ,dR):
+#     M = R@dR.t() - dQ.t()@Q
+#     dA = (dQ + Q@copyltu(M))@torch.linalg.inv(R.t())
+#     if not torch.all(torch.isfinite(dA)):
+#         raise ValueError("dA is not finite")
+#     return dA 
+# def QRbackward_wide(A,Q,R,dQ,dR):
+#     M,N = A.size()
+#     X,Y = A.split((M,N-M),dim=1)
+#     U,V = R.split((M,N-M),dim=1)
+#     dU,dV = dR.split((M,N-M),dim=1)
+
+#     tmp = dQ+Y@dV.t()
+#     M = U@dU.t() - tmp.t()@Q
+#     dX = (tmp + Q @ copyltu(M))@torch.linalg.inv(U.t())
+#     if not torch.all(torch.isfinite(dX)):
+#         raise ValueError("dX is not finite")
+#     return torch.cat((dX,Q@dV),dim=1)
+# class QR(torch.autograd.Function):
+#     @staticmethod
+#     def forward(self, A):
+#         M,N = A.size()
+#         if M * N == 0:
+#             raise ValueError(f"input matrix to custom QR is size {(M,N)}")
+#         if not torch.all(torch.isfinite(A)): # A not finite
+#             raise ValueError("input matrix to custom QR is not finite")
+#         try:
+#             Q, R = torch.linalg.qr(A,mode='reduced')
+#         except:
+#             if be_verbose:
+#                 print('trouble in torch gesdd routine, falling back to scipy')
+#             Q, R = scipy.linalg.svd(A.detach().numpy(), mode='economic')
+#             Q = torch.from_numpy(Q)
+#             R = torch.from_numpy(R)
+
+#         diag = R.diag()
+#         if is_one(diag):
+#             print(R)
+#             raise ValueError
+#         inds = torch.abs(diag) < epsilon
+#         if inds.sum().numpy()>0: # rank deficient, revert to svd
+#         #if len(inds)>0: # rank deficient, revert to svd
+#             #print(inds,inds.sum())
+#             U,S,Vh = SVDforward(A)
+#             SVh = S.reshape((S.size(0),1)) * Vh
+#             self.save_for_backward(U, S, Vh)
+#             return U, SVh
+
+#         if fix_sign:
+#             sign = torch.sign(diag).reshape((1,-1))
+#             Q = Q * sign
+#             R = R * sign.t()
+#         self.save_for_backward(A,Q,R)
+#         return Q,R
         
+#     @staticmethod
+#     def backward(self, dQ, dR):
+#         M1,M2,M3 = self.saved_tensors
+#         if len(M2.size())==1: # rank-deficient, do svd
+#             U,S,Vh = M1,M2,M3
+#             dU,dSVh = dQ,dR
+#             dS = torch.diag(dSVh @ Vh.t())
+#             dVh = S.reshape((S.size(0),1)) * dSVh
+#             return SVDbackward(dU,dS,dVh,U,S,Vh)
+#         if not torch.all(torch.isfinite(dQ)):
+#             raise ValueError("dQ is not finite")
+#         if not torch.all(torch.isfinite(dR)):
+#             raise ValueError("dR is not finite")
+#         A,Q,R = M1,M2,M3
+#         M,N = A.size()
+#         if M>=N:
+#             return QRbackward_deep(Q,R,dQ,dR)
+#         else:
+#             return QRbackward_wide(A,Q,R,dQ,dR)
 
 ########## Test ##########
 
@@ -259,7 +344,7 @@ def test_qr():
     print(f"QR Test Pass for {M},{N}! time={time.time()-t0}")
 
 if __name__=='__main__':
-    test_svd()
+    # test_svd()
     test_qr()
 
 

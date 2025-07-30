@@ -1794,6 +1794,22 @@ class fTNModel(wavefunctionModel):
             max_bond = None
         self.max_bond = max_bond
         self.tree = None
+    
+    def get_amp_tn(self, config):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(params, self.skeleton)
+        # Get the amplitude
+        amp = psi.get_amp(config)
+
+        return amp
 
     
     def amplitude(self, x):
@@ -2447,19 +2463,21 @@ class fTNModel_reuse(wavefunctionModel):
                     self.cache_env_x(amp_tn, x_i)
                     # self.cache_env_y(amp, x_i)
                     self.config_ref = x_i
-                    config_2d = self.from_1d_to_2d(x_i)
-                    key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
-                    key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
-                    amp_bot = self.env_x_cache[key_bot]
-                    amp_top = self.env_x_cache[key_top]
-                    amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
+                    # config_2d = self.from_1d_to_2d(x_i)
+                    # key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
+                    # key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+                    # amp_bot = self.env_x_cache[key_bot]
+                    # amp_top = self.env_x_cache[key_top]
+                    amp_val = amp_tn.contract()
+                    # print(f'Rank {RANK}: Exact contraction for gradient backpropagation')
+                    # amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
                     
 
                 else:
                     if self.env_x_cache is None and self.env_y_cache is None:
                         # check whether we can reuse the cached environment
                         amp = amp_tn.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
-                        amp = amp_tn.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
                         amp_val = amp.contract() # quimb will address the cached exponent automatically
                     else:
                         config_2d = self.from_1d_to_2d(x_i)
