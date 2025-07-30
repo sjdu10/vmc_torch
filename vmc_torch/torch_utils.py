@@ -16,7 +16,7 @@ RANK = COMM.Get_rank()
 
 be_verbose = True
 epsilon = 1e-12 
-fix_sign = False
+fix_sign = True
 
 ########## Utilities ##########
 
@@ -52,8 +52,8 @@ def SVDforward(A):
         S = torch.from_numpy(S)
         Vh = torch.from_numpy(Vh)
 
-    # if is_one(S): # A is isometry
-    #     raise ValueError
+    if is_one(S): # A is isometry
+        raise ValueError
 
     if fix_sign:
         # make SVD result sign-consistent across multiple runs

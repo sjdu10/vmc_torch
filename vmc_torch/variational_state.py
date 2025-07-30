@@ -105,13 +105,14 @@ class Variational_State:
                 x = torch.tensor(np.asarray(x), dtype=self.dtype)
             return self.vstate_func(x)
     
-    @tensor_aware_lru_cache(maxsize=GRAD_CACHE_SIZE)
-    def amplitude_grad(self, x):
+    # @tensor_aware_lru_cache(maxsize=GRAD_CACHE_SIZE)
+    def amplitude_grad(self, x, retain_graph=False):
         if not type(x) == torch.Tensor:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
+        self.reset()
         amp = self.vstate_func(x)
         # try:
-        amp.backward()
+        amp.backward(retain_graph=retain_graph)
 
         # except:
         #     print(f"Amplitude backward failed, returning zero gradient.")

@@ -1357,13 +1357,13 @@ def insert_proj_peps(amp, max_bond, yrange, xrange=None, from_which='ymin', lazy
     return tn_calc
 
 
-def flatten_proj_params(params):
+def flatten_proj_params(tn_params):
     """Flatten the fermionic tensor parameters into a vector.
     
     Parameters
     ----------
-    params : dict
-        Dictionary containing the projector tensor parameters.
+    tn_params : dict
+        Fermionic Tensor Network parameters pytree dictionary. Format: tid: fts.
     
     Returns
     ----------
@@ -1371,7 +1371,7 @@ def flatten_proj_params(params):
         Flattened projector tensor parameters.
     """
     vec_proj = []
-    for tid, ts_values in params.items():
+    for tid, ts_values in tn_params.items():
         for blk, data in ts_values.items():
             # # Ensure data is a tensor and flatten it
             # if not isinstance(data, torch.Tensor):
@@ -1385,15 +1385,15 @@ def flatten_proj_params(params):
     else:
         return do('stack', vec_proj)
 
-def reconstruct_proj_params(vec_params, params=None):
+def reconstruct_proj_params(vec_params, tn_params=None):
     """Reconstruct the fermionic tensor parameters from a flattened vector.
     
     Parameters
     ----------
     vec_proj : array
         Flattened projector tensor parameters.
-    params : dict
-        Dictionary containing the projector tensor parameters.
+    tn_params : dict
+        Fermionic Tensor Network parameters pytree dictionary. Format: tid: fts.
     
     Returns
     ----------
@@ -1402,7 +1402,7 @@ def reconstruct_proj_params(vec_params, params=None):
     """
     new_proj_params = {}
     idx = 0
-    for tid, ts_values in params.items():
+    for tid, ts_values in tn_params.items():
         new_ts_values = {}
         for blk, data in ts_values.items():
             new_ts_values[blk] = vec_params[idx:idx+data.numel()].reshape(data.shape)
@@ -1410,6 +1410,42 @@ def reconstruct_proj_params(vec_params, params=None):
         new_proj_params[tid] = new_ts_values
 
     return new_proj_params
+
+def flatten_fts_params(ts_params):
+    vec_params = []
+    for blk, data in ts_params.items():
+        # Ensure data is a tensor and flatten it
+        if not isinstance(data, torch.Tensor):
+            data = torch.tensor(data)
+        vec_params.append(data.reshape(-1))
+
+    if isinstance(data, torch.Tensor):
+        return torch.cat(vec_params)
+    else:
+        return do('stack', vec_params)
+
+def reconstruct_fts_params(vec_params, ts_params=None):
+    """Reconstruct the fermionic tensor parameters from a flattened vector.
+    
+    Parameters
+    ----------
+    vec_params : array
+        Flattened fermionic tensor parameters.
+    ts_params : dict
+        Fermionic Tensor parameters pytree dictionary. Format: block: tensor.
+    
+    Returns
+    ----------
+    new_ts_params : dict
+        Pytree dictionary containing the reconstructed fermionic tensor parameters.
+    """
+    new_ts_params = {}
+    idx = 0
+    for blk, data in ts_params.items():
+        new_ts_params[blk] = vec_params[idx:idx+data.numel()].reshape(data.shape)
+        idx += data.numel()
+
+    return new_ts_params
 
 
 
