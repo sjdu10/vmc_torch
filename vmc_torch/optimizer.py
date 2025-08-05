@@ -156,8 +156,6 @@ class SR(Preconditioner):
                     x_out = COMM.allreduce(x_out_local, op=MPI.SUM)/total_samples
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
                     if RANK == 0 and DEBUG:
-                        print("     mean of x", np.mean(abs(x)))
-                        print("     mean of R_dot_x(x)", np.mean(abs(x_out)))
                         if np.mean(abs(x_out)) > 1e10:
                             print("WARNING: R_dot_x(x) contains NaN, need to check the gradient of SVD/QR.")
                     return x_out + eta*x

@@ -367,8 +367,26 @@ class fPEPS(qtn.PEPS):
                 new_charge_sec_data_dict = {} # new dictionary to store the data of the contracted f-tensor
                 for charge_blk, data in charge_sec_data_dict.items():
                     if charge_blk[phys_ind_order] == charge:
-                        # new_data = data @ input_vec # BUG: This is not correct, should contract with the correct tensor index
-                        new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0])) # new tensor for this charge block
+                        # ------------------------------------------------------------------
+                        # Replacement for: 
+                        # new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
+                        # ------------------------------------------------------------------
+
+                        # 1. Determine which index to select (0 or 1) from the input vector.
+                        #    `argmax` finds the position of the '1.0'.
+                        select_index = torch.argmax(input_vec).item()
+
+                        # 2. Build the slicer tuple dynamically.
+                        #    This creates a list of `slice(None)` (which is equivalent to `:`)
+                        #    and inserts the `select_index` at the correct position.
+                        slicer = [slice(None)] * data.ndim
+                        slicer[phys_ind_order] = select_index
+
+                        # 3. Apply the slice to get the new data.
+                        new_data = data[tuple(slicer)]
+                        # ------------------------------------------------------------------
+                        # new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0])) # new tensor for this charge block
+
                         new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order + 1:] # new charge block
                         new_charge_sec_data_dict[new_charge_blk] = new_data # new charge block and its corresponding data in a dictionary
 

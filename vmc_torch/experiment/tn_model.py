@@ -2099,6 +2099,7 @@ class fTNModel_reuse(wavefunctionModel):
         # self.skeleton.exponent = 0
 
         # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        # NOTE: pytorch nn.ParameterDict automatically sorts the keys (as sorted(dict))
         self.torch_tn_params = nn.ModuleDict({
             str(tid): nn.ParameterDict({
                 str(sector): nn.Parameter(data)
@@ -2106,6 +2107,7 @@ class fTNModel_reuse(wavefunctionModel):
             })
             for tid, blk_array in params.items()
         })
+        self.tn_param_key_id = 'torch_tn_params.{}.{}'
 
         # Get symmetry
         self.symmetry = ftn.arrays[0].symmetry
@@ -2142,6 +2144,16 @@ class fTNModel_reuse(wavefunctionModel):
         """
         if ordering == 'snake':
             return (site // self.Ly, site % self.Ly)
+        else:
+            raise ValueError(f"Unsupported ordering: {ordering}")
+    
+    def from_2dsite_to_1dsite(self, site, ordering='snake'):
+        """
+            Convert a 2d site index to a 1d site index.
+            site: (row, col) tuple
+        """
+        if ordering == 'snake':
+            return site[0] * self.Ly + site[1]
         else:
             raise ValueError(f"Unsupported ordering: {ordering}")
     
@@ -2369,10 +2381,12 @@ class fTNModel_reuse(wavefunctionModel):
             Get the local tensors for the given tensor ids and configuration.
             tids: a list of tensor ids. list of int.
             config: the input configuration.
+            sites: a list of 1d site/2d site indices corresponding to the tids.
         """
         # first pick out the tensor parameters and form the local tn parameters vector
         local_ts_params = {}
-        tids = self.from_1d_sites_to_tids(sites)
+        # tids = self.from_1d_sites_to_tids(sites)
+        tids = self.from_1d_sites_to_tids([self.from_2dsite_to_1dsite(site) for site in sites]) if isinstance(sites[0], tuple) else self.from_1d_sites_to_tids(sites)
         for tid in tids:
             local_ts_params[tid] = {
                 ast.literal_eval(sector): data
@@ -2380,7 +2394,8 @@ class fTNModel_reuse(wavefunctionModel):
             }
         
         # Get sites corresponding to the tids
-        sites_2d = [self.from_1dsite_to_2dsite(site) for site in sites]
+        sites_1d = [self.from_2dsite_to_1dsite(site) for site in sites] if isinstance(sites[0], tuple) else sites
+        sites_2d = sites if isinstance(sites[0], tuple) else [self.from_1dsite_to_2dsite(site) for site in sites]
 
         # Select the corresponding tensor skeleton
         local_ts_skeleton = self.skeleton.select([self.skeleton.site_tag_id.format(*site) for site in sites_2d], which='any')
@@ -2389,7 +2404,7 @@ class fTNModel_reuse(wavefunctionModel):
         local_ftn = qtn.unpack(local_ts_params, local_ts_skeleton)
 
         # Fix the physical indices
-        return local_ftn.fix_phys_inds(sites_2d, config[sites])
+        return local_ftn.fix_phys_inds(sites_2d, config[sites_1d])
     
     def get_amp_tn(self, config, reconstruct=False):
 
@@ -2463,15 +2478,14 @@ class fTNModel_reuse(wavefunctionModel):
                     self.cache_env_x(amp_tn, x_i)
                     # self.cache_env_y(amp, x_i)
                     self.config_ref = x_i
-                    # config_2d = self.from_1d_to_2d(x_i)
-                    # key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
-                    # key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
-                    # amp_bot = self.env_x_cache[key_bot]
-                    # amp_top = self.env_x_cache[key_top]
-                    amp_val = amp_tn.contract()
-                    # print(f'Rank {RANK}: Exact contraction for gradient backpropagation')
-                    # amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
-                    
+                    config_2d = self.from_1d_to_2d(x_i)
+                    key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
+                    key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+                    amp_bot = self.env_x_cache[key_bot]
+                    amp_top = self.env_x_cache[key_top]
+                    amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
+                    if DEBUG:
+                        amp_val = psi.get_amp(x_i).contract()
 
                 else:
                     if self.env_x_cache is None and self.env_y_cache is None:
@@ -2520,13 +2534,85 @@ class fTNModel_reuse(wavefunctionModel):
             
             if self.debug:
                 amp_val_exact = psi.get_amp(x_i).contract()
-                print(f'Reused Amp val: {amp_val}, Exact Amp val: {amp_val_exact}, Rel error: {torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)}')
-                self.debug_amp_cache.append((amp_val, amp_val_exact, torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)))
+                if (amp_val - amp_val_exact).abs() > 1e-4:
+                    print(f'Warning: Reused Amp val and Exact Amp val differ significantly! Reused Amp val: {amp_val}, Exact Amp val: {amp_val_exact}, Rel error: {torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)}')
+                
 
             batch_amps.append(amp_val)
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
+    
+    def get_grad(self):
+        """"Compute the amplitude gradient by contracting TN without the on-site tensor."""
+        if self.debug:
+            print('Computing the amplitude gradient by contracting TN without the on-site tensor.')
+        self.zero_grad()
+        sampled_x = self.config_ref
+        amp_tn = self.amp_ref
+        index_map = {0: 0, 1: 1, 2: 1, 3: 0}
+        array_map = {
+            0: torch.tensor([1.0, 0.0]),
+            1: torch.tensor([1.0, 0.0]),
+            2: torch.tensor([0.0, 1.0]),
+            3: torch.tensor([0.0, 1.0])
+        }
+        config_2d = self.from_1d_to_2d(sampled_x)
+        for tid, model_ts_params in self.torch_tn_params.items():
+            # utils numbers
+            site_2d = self.from_1dsite_to_2dsite(int(tid))
+
+            p_ind = self.skeleton.site_ind_id.format(*site_2d)
+            p_ind_order = self.skeleton.tensor_map[int(tid)].inds.index(p_ind)
+            on_site_config = int(sampled_x[int(tid)])
+            on_site_config_parity = index_map[on_site_config]
+            site_tag = self.skeleton.site_tag_id.format(*site_2d)
+            input_vec = array_map[on_site_config]
+
+            ts0 = amp_tn.select(site_tag).contract()
+            ts_params = ts0.get_params()
+
+            # Reuse cached environment to compute grad_ts
+            row_id = site_2d[0]
+            # select the cached_env on both sides of the site tensor along the row
+            rows_above = list(range(row_id+1, self.Lx))
+            rows_below = list(range(0, row_id))
+            cached_amp_tn_above = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[rows_above].to(torch.int))).tolist()))] if rows_above else qtn.TensorNetwork([])
+            cached_amp_tn_below = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[rows_below].to(torch.int))).tolist()))] if rows_below else qtn.TensorNetwork([])
+            within_row_sites = list((site_2d[0], col_id) for col_id in range(self.Ly) if col_id != site_2d[1])
+            within_row_hole_tn = self.get_local_amp_tensors(within_row_sites, config=sampled_x)
+            grad_ts = (within_row_hole_tn | cached_amp_tn_above | cached_amp_tn_below).contract()
+
+            # # Exact contraction of the TN without the site tensor, naive calculation, expensive baseline.
+            # ts_left = [ts for ts in amp_tn.tensors if site_tag not in ts.tags]
+            # tn_left = qtn.TensorNetwork(ts_left)
+            # grad_ts = tn_left.contract()
+
+            grad_ts.data.phase_sync(inplace=True)
+
+            # Back propagate through the final contraction
+            ts0.apply_to_arrays(lambda x: torch.tensor(x, dtype=self.param_dtype, requires_grad=True))
+            grad_ts.apply_to_arrays(lambda x: torch.tensor(x, dtype=self.param_dtype, requires_grad=False))
+            amp_temp = (ts0|grad_ts).contract()*10**(self.skeleton.exponent)
+            amp_temp.backward()
+
+            grad_ts_backprop_params = ts0.get_params().copy() # correct gradients
+            for blk, ts_temp in ts0.get_params().items():
+                grad_ts_backprop_params[blk] = ts_temp.grad
+
+            # select the remaining sectors in model_ts_params
+            remaining_sliced_sectors = [sector for sector in sorted(ts_params)]
+            remaining_sectors = [sector + (on_site_config_parity,) for sector in sorted(ts_params)]
+
+            for sliced_blk, blk in zip(remaining_sliced_sectors, remaining_sectors):
+                data = model_ts_params[str(blk)]
+                select_index = torch.argmax(input_vec).item()
+                slicer = [slice(None)] * data.ndim
+                slicer[p_ind_order] = select_index
+                reconstructed_grad_tensor = torch.zeros_like(data)
+                reconstructed_grad_tensor[tuple(slicer)] = grad_ts_backprop_params[sliced_blk]
+                data.grad = reconstructed_grad_tensor
+
 
 
 class fTNModel_test(wavefunctionModel):

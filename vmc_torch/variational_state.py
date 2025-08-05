@@ -6,6 +6,8 @@ import torch
 # quimb
 from autoray import do
 
+import vmc_torch
+
 from .global_var import DEBUG, set_debug, AMP_CACHE_SIZE, GRAD_CACHE_SIZE
 from .utils import tensor_aware_lru_cache
 
@@ -111,19 +113,32 @@ class Variational_State:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
         self.reset()
         amp = self.vstate_func(x)
-        # try:
-        amp.backward(retain_graph=retain_graph)
 
+        if type(self.vstate_func) == vmc_torch.experiment.tn_model.fTNModel_reuse:
+            self.vstate_func.get_grad()
+            vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+
+            if DEBUG:
+                self.reset()
+                amp.backward(retain_graph=retain_graph)
+                autodiff_grad = self.vstate_func.params_grad_to_vec()/amp
+                if torch.norm(vec_log_grad - autodiff_grad) / torch.norm(autodiff_grad) > 1e-3:
+                    print(f"Rank {RANK} amplitude: {amp}, rel grad err: {torch.norm(vec_log_grad - autodiff_grad) / torch.norm(autodiff_grad)}")
+                    print(f'autodiff grad norm: {torch.norm(autodiff_grad)}')
+                    print(f'vec_log_grad norm: {torch.norm(vec_log_grad)}')
+        else:
+            # Backpropagate the amplitude to compute the gradient
+            amp.backward(retain_graph=retain_graph)
+            vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+
+        # try:
         # except:
         #     print(f"Amplitude backward failed, returning zero gradient.")
         #     print(f"Rank {RANK} amplitude: {amp}")
         #     # amp is 0
         #     self.reset()
         #     return amp, torch.zeros((self.Np,), dtype=self.dtype)
-        vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
-        if DEBUG:
-            if torch.mean(torch.abs(vec_log_grad)) > 1e3:
-                print(f"Rank {RANK} amplitude: {amp}, mean log grad: {torch.mean(torch.abs(vec_log_grad))}")
+
         # Clear the gradient
         self.reset()
         return amp, vec_log_grad

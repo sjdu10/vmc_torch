@@ -179,8 +179,8 @@ class QR(torch.autograd.Function):
             raise ValueError
         inds = torch.abs(diag) < 1e-6
         if sum(inds) > 0: # rank deficient, revert to svd
-            if DEBUG:
-                print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
+            # if DEBUG:
+            #     print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
             U,S,Vh = SVDforward(A)
             SVh = S.reshape((S.size(0),1)) * Vh
             self.save_for_backward(U, S, Vh)
@@ -197,8 +197,8 @@ class QR(torch.autograd.Function):
     def backward(self, dQ, dR):
         M1,M2,M3 = self.saved_tensors
         if len(M2.size())==1: # rank-deficient, do svd
-            if DEBUG:
-                print("QRbackward: rank deficient, using SVD")
+            # if DEBUG:
+            #     print("QRbackward: rank deficient, using SVD")
             U,S,Vh = M1,M2,M3
             dU,dSVh = dQ,dR
             dS = torch.diag(dSVh @ Vh.t())
