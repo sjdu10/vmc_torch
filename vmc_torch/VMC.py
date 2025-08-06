@@ -205,7 +205,7 @@ class VMC:
                     print(f"{'Eager sampling time':<30} | {self._state.eager_sampling_time:>12.4f}")
                 elif self._state.equal_sampling_time is not None:
                     print(f"{'Equal sampling time':<30} | {self._state.equal_sampling_time:>12.4f}")
-                if self.preconditioner is SR:
+                if type(self.preconditioner) is SR:
                     print(f"{f'SR solver time (conv={self.preconditioner.sr_convergence})':<30} | {self.preconditioner.sr_time:>12.4f}")
                 
             # print(self._state.sampler.sample_time, self._state.sampler.local_energy_time)
