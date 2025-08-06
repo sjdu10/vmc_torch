@@ -100,7 +100,7 @@ class Variational_State:
     def load_state_dict(self, state_dict):
         self.vstate_func.load_state_dict(state_dict)
 
-    @tensor_aware_lru_cache(maxsize=AMP_CACHE_SIZE)
+    # @tensor_aware_lru_cache(maxsize=AMP_CACHE_SIZE)
     def amplitude(self, x, _cache=0):
         with torch.no_grad():
             if not type(x) == torch.Tensor:
@@ -126,6 +126,8 @@ class Variational_State:
                     print(f"Rank {RANK} amplitude: {amp}, rel grad err: {torch.norm(vec_log_grad - autodiff_grad) / torch.norm(autodiff_grad)}")
                     print(f'autodiff grad norm: {torch.norm(autodiff_grad)}')
                     print(f'vec_log_grad norm: {torch.norm(vec_log_grad)}')
+                    print(f'diff norm: {torch.norm(vec_log_grad - autodiff_grad)}')
+                    print(x)
         else:
             # Backpropagate the amplitude to compute the gradient
             amp.backward(retain_graph=retain_graph)

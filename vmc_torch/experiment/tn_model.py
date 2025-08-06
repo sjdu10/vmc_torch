@@ -2485,7 +2485,9 @@ class fTNModel_reuse(wavefunctionModel):
                     amp_top = self.env_x_cache[key_top]
                     amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
                     if DEBUG:
-                        amp_val = psi.get_amp(x_i).contract()
+                        amp_val1 = psi.get_amp(x_i).contract()
+                        print(f'Reused Amp val: {amp_val}, Exact Amp val: {amp_val1}, Rel error: {torch.abs(amp_val1 - amp_val) / torch.abs(amp_val1)}')
+                        amp_val = amp_val1
 
                 else:
                     if self.env_x_cache is None and self.env_y_cache is None:
@@ -2591,8 +2593,8 @@ class fTNModel_reuse(wavefunctionModel):
             grad_ts.data.phase_sync(inplace=True)
 
             # Back propagate through the final contraction
-            ts0.apply_to_arrays(lambda x: torch.tensor(x, dtype=self.param_dtype, requires_grad=True))
-            grad_ts.apply_to_arrays(lambda x: torch.tensor(x, dtype=self.param_dtype, requires_grad=False))
+            ts0.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(True))
+            grad_ts.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(False))
             amp_temp = (ts0|grad_ts).contract()*10**(self.skeleton.exponent)
             amp_temp.backward()
 

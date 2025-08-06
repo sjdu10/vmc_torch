@@ -1248,7 +1248,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
         
         acceptance_rate = 0
 
-        while acceptance_rate < 0.1:
+        while acceptance_rate < 0.05:
             self.current_amp = vstate.amplitude(self.current_config).cpu()
             self.current_prob = abs(self.current_amp)**2
             proposed_config = self.current_config.clone()
@@ -1276,7 +1276,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
             
             acceptance_rate = self.accepts / self.attempts
 
-            if acceptance_rate < 0.1:
+            if acceptance_rate < 0.05:
                 self.reset()
                 vstate.vstate_func.clear_wavefunction_env_cache() # Remember to clear the TN contraction cache if need to resample
                 if DEBUG:
