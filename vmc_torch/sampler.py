@@ -1209,10 +1209,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
         def exchange_propose(i, j):
             if self.current_config[i] == self.current_config[j]:
                 self.attempts += 1
-                if random.random() < 1 - self.hopping_rate:
-                    self.accepts += 1 # exchange must be accepted
-                else:
-                    ... # hopping not accepted, do nothing
+                self.accepts += 1 # exchange must be accepted, no hopping is allowed
                 return 
             self.attempts += 1
             proposed_config = self.current_config.clone()
