@@ -1,13 +1,8 @@
-# import os
-# os.environ["NUMBA_NUM_THREADS"] = "20"
-
-import netket as nk
-import netket.experimental as nkx
-
 from math import pi
 
 from vmc_torch.fermion_utils import generate_random_fpeps
 import quimb.tensor as qtn
+import quimb as qu
 import symmray as sr
 import pickle
 
@@ -15,36 +10,9 @@ import pickle
 Lx = 8
 Ly = 8
 spinless = False
-# graph = nk.graph.Square(L)
-graph = nk.graph.Grid([Lx,Ly], pbc=False)
-N = graph.n_nodes
-
+N = int(Lx * Ly)
 # Define the fermion filling and the Hilbert space
 N_f = int(Lx*Ly)
-n_fermions_per_spin = (N_f//2, N_f//2)
-hi = nkx.hilbert.SpinOrbitalFermions(N, s=1/2, n_fermions_per_spin=n_fermions_per_spin)
-
-
-# # Define the Hubbard Hamiltonian
-# t = 1.0
-# U = 8.0
-# mu = 0.0
-
-# H = 0.0
-# for (i, j) in graph.edges(): # Definition of the Hubbard Hamiltonian
-#     for spin in (1,-1):
-#         H -= t * (cdag(hi,i,spin) * c(hi,j,spin) + cdag(hi,j,spin) * c(hi,i,spin))
-# for i in graph.nodes():
-#     H += U * nc(hi,i,+1) * nc(hi,i,-1)
-
-
-# # Exact diagonalization of the Hamiltonian for benchmark
-# sp_h = H.to_sparse() # Convert the Hamiltonian to a sparse matrix
-# from scipy.sparse.linalg import eigsh
-# eig_vals, eig_vecs = eigsh(sp_h, k=2, which="SA")
-# E_gs = eig_vals[0]
-# print("Exact ground state energy per site:", E_gs/N)
-
 
 # SU in quimb
 D = 4
