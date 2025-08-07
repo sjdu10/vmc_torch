@@ -72,7 +72,7 @@ def from_quimb_config_to_netket_config(quimb_config):
 # --- Sampler ---
 
 class AbstractSampler:
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, equal_partition=True, dtype=torch.float32, device=None):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, equal_partition=True, dtype=torch.float32, device=None, debug=False):
         self.hi = hi
         self.Ns = N_samples
         self.graph = graph
@@ -88,6 +88,7 @@ class AbstractSampler:
         self.local_energy_time = 0
         self.grad_time = 0
         self.burn_in_time = 0
+        self.debug = debug
 
         self.initial_config = torch.tensor(np.asarray(self.hi.random_state()), dtype=self.dtype, device=self.device)
         self.current_config = self.initial_config.clone()
@@ -108,8 +109,8 @@ class AbstractSampler:
 
 class Sampler(AbstractSampler):
     """Markov Chain sampler"""
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32, device=None):
-        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, equal_partition, dtype, device)
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32, device=None,debug=False):
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, equal_partition, dtype, device, debug)
         self.random_edge = random_edge
         self.subchain_length = graph.n_edges if subchain_length is None else subchain_length
         self.attempts = 0
@@ -1175,7 +1176,7 @@ class MetropolisExchangeSamplerSpinful_1D_reusable(Sampler):
 
 
 class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
-    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32, hopping_rate=0.5):
         """
         Parameters
         ----------
@@ -1199,6 +1200,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
 
         """
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
+        self.hopping_rate = hopping_rate  # Probability of hopping instead of exchanging
 
     def _sample_next(self, vstate, burn_in=False):
         """Sample the next configuration. Change the current configuration in place."""
@@ -1206,36 +1208,51 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
         ind_n_map = {0:0, 1:1, 2:1, 3:2}
         def exchange_propose(i, j):
             if self.current_config[i] == self.current_config[j]:
+                self.attempts += 1
+                if random.random() < 1 - self.hopping_rate:
+                    self.accepts += 1 # exchange must be accepted
+                else:
+                    ... # hopping not accepted, do nothing
                 return 
             self.attempts += 1
             proposed_config = self.current_config.clone()
             config_i = self.current_config[i].item()
             config_j = self.current_config[j].item()
-            n_i = ind_n_map[self.current_config[i].item()]
-            n_j = ind_n_map[self.current_config[j].item()]
-            delta_n = abs(n_i - n_j)
-            # delta_n = 1 --> SWAP
-            if delta_n == 1:
+            if random.random() < 1 - self.hopping_rate:
+                # exchange
                 proposed_config[i] = config_j
                 proposed_config[j] = config_i
                 proposed_amp = vstate.amplitude(proposed_config).cpu()
                 proposed_prob = abs(proposed_amp)**2
-            elif delta_n == 0:
-                choices = [(0, 3), (3, 0), (config_j, config_i)]
-                choice = random.choice(choices)
-                proposed_config[i] = choice[0]
-                proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
-                proposed_prob = abs(proposed_amp)**2
-            elif delta_n == 2:
-                choices = [(config_j, config_i), (1,2), (2,1)]
-                choice = random.choice(choices)
-                proposed_config[i] = choice[0]
-                proposed_config[j] = choice[1]
-                proposed_amp = vstate.amplitude(proposed_config).cpu()
-                proposed_prob = abs(proposed_amp)**2
             else:
-                raise ValueError("Invalid configuration")
+                # hopping
+                n_i = ind_n_map[self.current_config[i].item()]
+                n_j = ind_n_map[self.current_config[j].item()]
+                delta_n = abs(n_i - n_j)
+                if delta_n == 1: 
+                    # consider only valid hopping: (0, u) -> (u, 0); (d, ud) -> (ud, d)
+                    proposed_config[i] = config_j
+                    proposed_config[j] = config_i
+                    proposed_amp = vstate.amplitude(proposed_config).cpu()
+                    proposed_prob = abs(proposed_amp)**2
+                elif delta_n == 0:
+                    # consider only valid hopping: (u, d) -> (0, ud) or (ud, 0)
+                    choices = [(0, 3), (3, 0)]
+                    choice = random.choice(choices)
+                    proposed_config[i] = choice[0]
+                    proposed_config[j] = choice[1]
+                    proposed_amp = vstate.amplitude(proposed_config).cpu()
+                    proposed_prob = abs(proposed_amp)**2
+                elif delta_n == 2:
+                    # consider only valid hopping: (0, ud) -> (u, d) or (d, u)
+                    choices = [(1,2), (2,1)]
+                    choice = random.choice(choices)
+                    proposed_config[i] = choice[0]
+                    proposed_config[j] = choice[1]
+                    proposed_amp = vstate.amplitude(proposed_config).cpu()
+                    proposed_prob = abs(proposed_amp)**2
+                else:
+                    raise ValueError("Invalid configuration")
             try:
                 acceptance_ratio = min(1, (proposed_prob/self.current_prob))
             except ZeroDivisionError:
@@ -1275,6 +1292,9 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
                 print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2')
             
             acceptance_rate = self.accepts / self.attempts
+
+            if self.debug:
+                print(f'Rank {RANK}: acceptance rate {acceptance_rate} in one sweep')
 
             if acceptance_rate < 0.05:
                 self.reset()
