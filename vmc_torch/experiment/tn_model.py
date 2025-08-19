@@ -2484,7 +2484,7 @@ class fTNModel_reuse(wavefunctionModel):
                     amp_bot = self.env_x_cache[key_bot]
                     amp_top = self.env_x_cache[key_top]
                     amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
-                    if DEBUG:
+                    if self.debug:
                         amp_val1 = psi.get_amp(x_i).contract()
                         print(f'Reused Amp val: {amp_val}, Exact Amp val: {amp_val1}, Rel error: {torch.abs(amp_val1 - amp_val) / torch.abs(amp_val1)}')
                         amp_val = amp_val1
@@ -2534,10 +2534,10 @@ class fTNModel_reuse(wavefunctionModel):
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
             
-            if self.debug:
-                amp_val_exact = psi.get_amp(x_i).contract()
-                if (amp_val - amp_val_exact).abs() > 1e-4:
-                    print(f'Warning: Reused Amp val and Exact Amp val differ significantly! Reused Amp val: {amp_val}, Exact Amp val: {amp_val_exact}, Rel error: {torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)}')
+            # if self.debug:
+            #     amp_val_exact = psi.get_amp(x_i).contract()
+            #     if (amp_val - amp_val_exact).abs() > 1e-4:
+            #         print(f'Warning: Reused Amp val and Exact Amp val differ significantly! Reused Amp val: {amp_val}, Exact Amp val: {amp_val_exact}, Rel error: {torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)}')
                 
 
             batch_amps.append(amp_val)

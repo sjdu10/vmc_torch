@@ -115,8 +115,15 @@ class Variational_State:
         amp = self.vstate_func(x)
 
         if type(self.vstate_func) == vmc_torch.experiment.tn_model.fTNModel_reuse:
-            self.vstate_func.get_grad()
-            vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+            try:
+                if self.vstate_func.debug:
+                    amp.backward(retain_graph=retain_graph)
+                    vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+                else:
+                    self.vstate_func.get_grad()
+                    vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+            except:
+                raise ValueError(f"model grad debug fail")
 
             if DEBUG:
                 self.reset()
