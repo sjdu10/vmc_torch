@@ -2350,7 +2350,9 @@ class fTNModel_reuse(wavefunctionModel):
             config_2d = self.from_1d_to_2d(config)
             cols_config = tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist()) if from_which=='ymax' else tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())
             return (from_which, cols_config)
-    
+        
+    from memory_profiler import profile
+    @profile
     def update_env_x_cache_to_row(self, config, row_id, from_which='xmin', mode='reuse'):
         amp_tn = self.get_amp_tn(config)
         self.config_ref = config
@@ -2374,8 +2376,8 @@ class fTNModel_reuse(wavefunctionModel):
                 row_tn = amp_tn.select(amp_tn.x_tag(row_id))
                 cache_mps = self.env_x_cache[self.get_cache_key(config, from_which, row_id=row_id)]
                 new_cache_key = self.get_cache_key(config, from_which, row_id=row_id+1 if from_which=='xmin' else row_id-1)
-                mpo_mps_tn = (row_tn | cache_mps)
-                new_cache_mps = mpo_mps_tn.contract_boundary_from(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
+                new_cache_mps = (row_tn | cache_mps)
+                new_cache_mps.contract_boundary_from_(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
                 new_env_x_cache = {new_cache_key: new_cache_mps}
                 self._env_x_cache.update(new_env_x_cache)
                 return
@@ -2413,8 +2415,8 @@ class fTNModel_reuse(wavefunctionModel):
                 col_tn = amp_tn.select(amp_tn.y_tag(col_id))
                 cache_mps = self.env_y_cache[self.get_cache_key(config, from_which, col_id=col_id)]
                 new_cache_key = self.get_cache_key(config, from_which, col_id=col_id+1 if from_which=='ymin' else col_id-1)
-                mpo_mps_tn = (col_tn | cache_mps)
-                new_cache_mps = mpo_mps_tn.contract_boundary_from(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
+                new_cache_mps = (col_tn | cache_mps)
+                new_cache_mps.contract_boundary_from_(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
                 new_env_y_cache = {new_cache_key: new_cache_mps}
                 self._env_y_cache.update(new_env_y_cache)
                 return

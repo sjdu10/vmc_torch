@@ -120,8 +120,9 @@ class Variational_State:
                     amp.backward(retain_graph=retain_graph)
                     vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
                 else:
-                    self.vstate_func.get_grad()
-                    vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+                    with torch.no_grad():
+                        self.vstate_func.get_grad()
+                        vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
             except:
                 raise ValueError(f"model grad debug fail")
 

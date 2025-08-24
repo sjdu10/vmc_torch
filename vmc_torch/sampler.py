@@ -205,9 +205,10 @@ class Sampler(AbstractSampler):
             time0 = MPI.Wtime()
             # sample the next configuration
             psi_sigma = 0
-            while psi_sigma == 0:
-                # We need to make sure that the amplitude is not zero
-                sigma, psi_sigma = self._sample_next(vstate)
+            with torch.no_grad():
+                while psi_sigma == 0:
+                    # We need to make sure that the amplitude is not zero
+                    sigma, psi_sigma = self._sample_next(vstate)
                     
             n += 1
 
@@ -268,6 +269,7 @@ class Sampler(AbstractSampler):
         self.accepts = 0
         return samples
     
+    @torch.no_grad()
     def sample_eager(self, vstate, op, message_tag=None):
         """Sample eagerly for the local energy and amplitude gradient for each configuration.
         return a tuple of (op_loc_sum, op_loc_var, n)"""
@@ -392,9 +394,10 @@ class Sampler(AbstractSampler):
             time0 = MPI.Wtime()
             # sample the next configuration
             psi_sigma = 0
-            while psi_sigma == 0:
-                # We need to make sure that the amplitude is not zero
-                sigma, psi_sigma = self._sample_next(vstate)
+            with torch.no_grad():
+                while psi_sigma == 0:
+                    # We need to make sure that the amplitude is not zero
+                    sigma, psi_sigma = self._sample_next(vstate)
 
             time1 = MPI.Wtime()
             n += 1
@@ -499,7 +502,7 @@ class Sampler(AbstractSampler):
 
         if RANK == 0:
             pbar = tqdm(total=self.Ns, desc='Sampling starts...')
-            for _ in range(2):
+            for _ in range(1):
                 op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
                 op_loc_vec.append(op_loc)
                 op_loc_sum += op_loc
@@ -601,10 +604,10 @@ class Sampler(AbstractSampler):
         time0 = MPI.Wtime()
         # sample the next configuration
         psi_sigma = 0
-        # with torch.no_grad():
-        while psi_sigma == 0:
-            # We need to make sure that the amplitude is not zero
-            sigma, psi_sigma = self._sample_next(vstate)
+        with torch.no_grad():
+            while psi_sigma == 0:
+                # We need to make sure that the amplitude is not zero
+                sigma, psi_sigma = self._sample_next(vstate)
         time1 = MPI.Wtime()
 
         # compute local energy and amplitude gradient
@@ -638,14 +641,16 @@ class Sampler(AbstractSampler):
 
         return op_loc, logpsi_sigma_grad, time1 - time0
     
+    @torch.no_grad()
     def _sample_expect(self, vstate, op):
         """Get one sample of the local operator."""
         time0 = MPI.Wtime()
         # sample the next configuration
         psi_sigma = 0
-        while psi_sigma == 0:
-            # We need to make sure that the amplitude is not zero
-            sigma, psi_sigma = self._sample_next(vstate)
+        with torch.no_grad():
+            while psi_sigma == 0:
+                # We need to make sure that the amplitude is not zero
+                sigma, psi_sigma = self._sample_next(vstate)
         time1 = MPI.Wtime()
 
         # compute local energy and amplitude gradient
@@ -1201,9 +1206,9 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
         self.hopping_rate = hopping_rate  # Probability of hopping instead of exchanging
 
+
     def _sample_next(self, vstate, burn_in=False):
         """Sample the next configuration. Change the current configuration in place."""
-        
         ind_n_map = {0:0, 1:1, 2:1, 3:2}
         def exchange_propose(i, j):
             if self.current_config[i] == self.current_config[j]:
@@ -1270,6 +1275,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
             vstate.vstate_func.update_env_x_cache_to_row(self.current_config, 0, from_which='xmax', mode='force')
             for row_index, row_edges in self.graph.row_edges.items():
                 for (i, j) in row_edges:
+                    print(f'row {row_index}, exchanging sites {i}, {j}')
                     exchange_propose(i, j)
                 if row_index < self.graph.Lx - 1:
                     vstate.vstate_func.update_env_x_cache_to_row(self.current_config, row_index, from_which='xmin', mode='reuse')
@@ -1279,6 +1285,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
             vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 1, from_which='ymax', mode='force')
             for col_index, col_edges in self.graph.col_edges.items():
                 for (i, j) in col_edges:
+                    print(f'col {col_index}, exchanging sites {i}, {j}')
                     exchange_propose(i, j)
                 if col_index < self.graph.Ly - 1:
                     vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin', mode='reuse')
