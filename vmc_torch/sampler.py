@@ -1268,20 +1268,23 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
             proposed_config = self.current_config.clone()
             
             # initial cache of env_x for current configuration
-            vstate.vstate_func.update_env_x_cache_to_row(self.current_config, 0, from_which='xmax')
+            vstate.vstate_func.update_env_x_cache_to_row(self.current_config, 0, from_which='xmax', mode='force')
             for row_index, row_edges in self.graph.row_edges.items():
                 for (i, j) in row_edges:
                     exchange_propose(i, j)
                 if row_index < self.graph.Lx - 1:
-                    vstate.vstate_func.update_env_x_cache_to_row(self.current_config, row_index, from_which='xmin')
-            vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
+                    vstate.vstate_func.update_env_x_cache_to_row(self.current_config, row_index, from_which='xmin', mode='reuse')
+            vstate.vstate_func.clear_env_x_cache()
+
+            vstate.vstate_func.clear_env_y_cache()
+            vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 1, from_which='ymax', mode='force')
             for col_index, col_edges in self.graph.col_edges.items():
                 for (i, j) in col_edges:
                     exchange_propose(i, j)
                 if col_index < self.graph.Ly - 1:
-                    vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin')
-            vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 0, from_which='ymax')
-            vstate.vstate_func.clear_env_x_cache()
+                    vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin', mode='reuse')
+            vstate.vstate_func.clear_env_y_cache(from_which='ymax')
+            vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 1, from_which='ymax', mode='force')
             if burn_in:
                 vstate.vstate_func.clear_env_y_cache()
                 
@@ -1295,6 +1298,8 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
 
             if acceptance_rate < 0.05:
                 self.reset()
+                self.accepts = 0
+                self.attempts = 0
                 vstate.vstate_func.clear_wavefunction_env_cache() # Remember to clear the TN contraction cache if need to resample
                 if DEBUG:
                     print(f'    Rank {RANK}: acceptance rate {acceptance_rate}')

@@ -2124,8 +2124,8 @@ class fTNModel_reuse(wavefunctionModel):
         self.tree = None
         self.Lx = ftn.Lx
         self.Ly = ftn.Ly
-        self._env_x_cache = None
-        self._env_y_cache = None
+        self._env_x_cache = {}
+        self._env_y_cache = {}
         self.config_ref = None
         self.amp_ref = None
         self.debug_amp_cache = []
@@ -2239,18 +2239,30 @@ class fTNModel_reuse(wavefunctionModel):
         else:
             return None
     
-    def clear_env_x_cache(self):
+    def clear_env_x_cache(self, from_which=None):
         """
             Clear the cached environment x
         """
-        self._env_x_cache = None
+        if from_which is None:
+            self._env_x_cache = {}
+        else:
+            assert from_which in ['xmax', 'xmin'], "from_which must be 'xmax' or 'xmin'"
+            for key in list(self._env_x_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_x_cache[key]
 
-    def clear_env_y_cache(self):
+    def clear_env_y_cache(self, from_which=None):
         """
             Clear the cached environment y
         """
-        self._env_y_cache = None
-    
+        if from_which is None:
+            self._env_y_cache = {}
+        else:
+            assert from_which in ['ymax', 'ymin'], "from_which must be 'ymax' or 'ymin'"
+            for key in list(self._env_y_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_y_cache[key]
+
     def clear_wavefunction_env_cache(self):
         self.clear_env_x_cache()
         self.clear_env_y_cache()
@@ -2318,47 +2330,95 @@ class fTNModel_reuse(wavefunctionModel):
         """
             Update the cached environment x for the given configuration
         """
-        if self.env_x_cache is not None:
+        if self.env_x_cache:
             self.clear_env_x_cache()
         amp_tn = self.get_amp_tn(config)
         self.cache_env_x(amp_tn, config)
         self.config_ref = config
         self.amp_ref = amp_tn
+
+    def get_cache_key(self, config, from_which, row_id=None, col_id=None):
+        if row_id is None and col_id is None:
+            raise ValueError("Either row_id or col_id must be provided")
+        if row_id is not None:
+            assert from_which in ['xmax', 'xmin'], "from_which must be 'xmax' or 'xmin' when row_id is provided"
+            config_2d = self.from_1d_to_2d(config)
+            rows_config = tuple(torch.cat(tuple(config_2d[row_id+1:].to(torch.int))).tolist()) if from_which=='xmax' else tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())
+            return (from_which, rows_config)
+        if col_id is not None:
+            assert from_which in ['ymax', 'ymin'], "from_which must be 'ymax' or 'ymin' when col_id is provided"
+            config_2d = self.from_1d_to_2d(config)
+            cols_config = tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist()) if from_which=='ymax' else tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())
+            return (from_which, cols_config)
     
-    def update_env_x_cache_to_row(self, config, row_id, from_which='xmin'):
+    def update_env_x_cache_to_row(self, config, row_id, from_which='xmin', mode='reuse'):
         amp_tn = self.get_amp_tn(config)
-        new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
-        new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
-        # add the new env_x to the cache
-        if self.env_x_cache is None:
-            self._env_x_cache = new_env_x_cache
-        else:
-            self._env_x_cache.update(new_env_x_cache)
         self.config_ref = config
         self.amp_ref = amp_tn
+
+        # add the new env_x to the cache
+        if not self.env_x_cache:
+            new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
+            new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+            self._env_x_cache.update(new_env_x_cache)
+            return
+        else:
+            if (from_which is 'xmin' and row_id == 0) or (from_which is 'xmax' and row_id == self.Lx-1) or mode is 'force':
+                new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
+                new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+                self._env_x_cache.update(new_env_x_cache)
+                return
+                
+            else:
+                assert mode is 'reuse'
+                row_tn = amp_tn.select(amp_tn.x_tag(row_id))
+                cache_mps = self.env_x_cache[self.get_cache_key(config, from_which, row_id=row_id)]
+                new_cache_key = self.get_cache_key(config, from_which, row_id=row_id+1 if from_which=='xmin' else row_id-1)
+                mpo_mps_tn = (row_tn | cache_mps)
+                new_cache_mps = mpo_mps_tn.contract_boundary_from(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
+                new_env_x_cache = {new_cache_key: new_cache_mps}
+                self._env_x_cache.update(new_env_x_cache)
+                return
+        
     
     def update_env_y_cache(self, config):
         """
             Update the cached environment y for the given configuration
         """
-        if self.env_y_cache is not None:
+        if self.env_y_cache:
             self.clear_env_y_cache()
         amp_tn = self.get_amp_tn(config)
         self.cache_env_y(amp_tn, config)
         self.config_ref = config
         self.amp_ref = amp_tn
-    
-    def update_env_y_cache_to_col(self, config, col_id, from_which='ymin'):
+
+    def update_env_y_cache_to_col(self, config, col_id, from_which='ymin', mode='reuse'):
         amp_tn = self.get_amp_tn(config)
-        new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
-        new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
-        # add the new env_y to the cache
-        if self.env_y_cache is None:
-            self._env_y_cache = new_env_y_cache
-        else:
-            self._env_y_cache.update(new_env_y_cache)
         self.config_ref = config
         self.amp_ref = amp_tn
+        # add the new env_y to the cache
+        if not self.env_y_cache:
+            new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
+            new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+            self._env_y_cache.update(new_env_y_cache)
+            return
+        else:
+            if (from_which is 'ymin' and col_id == 0) or (from_which is 'ymax' and col_id == self.Ly-1) or mode is 'force':
+                new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
+                new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+                self._env_y_cache.update(new_env_y_cache)
+                return
+            else:
+                assert mode is 'reuse'
+                col_tn = amp_tn.select(amp_tn.y_tag(col_id))
+                cache_mps = self.env_y_cache[self.get_cache_key(config, from_which, col_id=col_id)]
+                new_cache_key = self.get_cache_key(config, from_which, col_id=col_id+1 if from_which=='ymin' else col_id-1)
+                mpo_mps_tn = (col_tn | cache_mps)
+                new_cache_mps = mpo_mps_tn.contract_boundary_from(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
+                new_env_y_cache = {new_cache_key: new_cache_mps}
+                self._env_y_cache.update(new_env_y_cache)
+                return
+        
     
     def psi(self):
         """
@@ -2379,9 +2439,8 @@ class fTNModel_reuse(wavefunctionModel):
     def get_local_amp_tensors(self, sites:list, config:torch.Tensor):
         """
             Get the local tensors for the given tensor ids and configuration.
-            tids: a list of tensor ids. list of int.
             config: the input configuration.
-            sites: a list of 1d site/2d site indices corresponding to the tids.
+            sites: a list of 1d site/2d site indices.
         """
         # first pick out the tensor parameters and form the local tn parameters vector
         local_ts_params = {}
@@ -2490,7 +2549,7 @@ class fTNModel_reuse(wavefunctionModel):
                         amp_val = amp_val1
 
                 else:
-                    if self.env_x_cache is None and self.env_y_cache is None:
+                    if not self.env_x_cache and not self.env_y_cache:
                         # check whether we can reuse the cached environment
                         amp = amp_tn.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
                         amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
