@@ -485,7 +485,6 @@ class Sampler(AbstractSampler):
             print('Burn-in time:', t_burnin1 - t_burnin0)
         self.burn_in_time = t_burnin1 - t_burnin0
 
-
         op_loc_sum = 0
         logpsi_sigma_grad_sum = np.zeros(vstate.Np)
         op_logpsi_sigma_grad_product_sum = np.zeros(vstate.Np)
@@ -1297,6 +1296,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
                 print(f'Rank {RANK}: acceptance rate {acceptance_rate} in one sweep')
 
             if acceptance_rate < 0.05:
+                print(f'Rank {RANK}: acceptance rate {acceptance_rate} < 0.05')
                 self.reset()
                 self.accepts = 0
                 self.attempts = 0
