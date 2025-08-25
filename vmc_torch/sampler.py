@@ -115,7 +115,8 @@ class Sampler(AbstractSampler):
         self.subchain_length = graph.n_edges if subchain_length is None else subchain_length
         self.attempts = 0
         self.accepts = 0
-    
+
+    @torch.no_grad()
     def burn_in(self, vstate):
         """Discard the initial samples. (Burn-in)"""
         if self.burn_in_already and not self.reset_chain:
@@ -124,7 +125,8 @@ class Sampler(AbstractSampler):
         for _ in range(self.burn_in_steps):
             self._sample_next(vstate, burn_in=True)
         self.burn_in_already = True
-    
+
+    @torch.no_grad()
     def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place.
         Must be implemented in the derived class."""
@@ -1275,7 +1277,6 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
             vstate.vstate_func.update_env_x_cache_to_row(self.current_config, 0, from_which='xmax', mode='force')
             for row_index, row_edges in self.graph.row_edges.items():
                 for (i, j) in row_edges:
-                    print(f'row {row_index}, exchanging sites {i}, {j}')
                     exchange_propose(i, j)
                 if row_index < self.graph.Lx - 1:
                     vstate.vstate_func.update_env_x_cache_to_row(self.current_config, row_index, from_which='xmin', mode='reuse')
@@ -1285,7 +1286,6 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
             vstate.vstate_func.update_env_y_cache_to_col(self.current_config, 1, from_which='ymax', mode='force')
             for col_index, col_edges in self.graph.col_edges.items():
                 for (i, j) in col_edges:
-                    print(f'col {col_index}, exchanging sites {i}, {j}')
                     exchange_propose(i, j)
                 if col_index < self.graph.Ly - 1:
                     vstate.vstate_func.update_env_y_cache_to_col(self.current_config, col_index, from_which='ymin', mode='reuse')

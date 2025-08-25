@@ -2351,8 +2351,6 @@ class fTNModel_reuse(wavefunctionModel):
             cols_config = tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist()) if from_which=='ymax' else tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())
             return (from_which, cols_config)
         
-    from memory_profiler import profile
-    @profile
     def update_env_x_cache_to_row(self, config, row_id, from_which='xmin', mode='reuse'):
         amp_tn = self.get_amp_tn(config)
         self.config_ref = config
