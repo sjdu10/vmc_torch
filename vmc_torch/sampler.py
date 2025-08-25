@@ -1208,7 +1208,7 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype)
         self.hopping_rate = hopping_rate  # Probability of hopping instead of exchanging
 
-
+    @torch.no_grad()
     def _sample_next(self, vstate, burn_in=False):
         """Sample the next configuration. Change the current configuration in place."""
         ind_n_map = {0:0, 1:1, 2:1, 3:2}

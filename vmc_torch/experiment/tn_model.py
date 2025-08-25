@@ -2620,36 +2620,36 @@ class fTNModel_reuse(wavefunctionModel):
         }
         config_2d = self.from_1d_to_2d(sampled_x)
         for tid, model_ts_params in self.torch_tn_params.items():
-            # utils numbers
-            site_2d = self.from_1dsite_to_2dsite(int(tid))
+            with torch.no_grad():
+                # utils numbers
+                site_2d = self.from_1dsite_to_2dsite(int(tid))
 
-            p_ind = self.skeleton.site_ind_id.format(*site_2d)
-            p_ind_order = self.skeleton.tensor_map[int(tid)].inds.index(p_ind)
-            on_site_config = int(sampled_x[int(tid)])
-            on_site_config_parity = index_map[on_site_config]
-            site_tag = self.skeleton.site_tag_id.format(*site_2d)
-            input_vec = array_map[on_site_config]
+                p_ind = self.skeleton.site_ind_id.format(*site_2d)
+                p_ind_order = self.skeleton.tensor_map[int(tid)].inds.index(p_ind)
+                on_site_config = int(sampled_x[int(tid)])
+                on_site_config_parity = index_map[on_site_config]
+                site_tag = self.skeleton.site_tag_id.format(*site_2d)
+                input_vec = array_map[on_site_config]
 
-            ts0 = amp_tn.select(site_tag).contract()
-            ts_params = ts0.get_params()
+                ts0 = amp_tn.select(site_tag).contract()
+                ts_params = ts0.get_params()
 
-            # Reuse cached environment to compute grad_ts
-            row_id = site_2d[0]
-            # select the cached_env on both sides of the site tensor along the row
-            rows_above = list(range(row_id+1, self.Lx))
-            rows_below = list(range(0, row_id))
-            cached_amp_tn_above = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[rows_above].to(torch.int))).tolist()))] if rows_above else qtn.TensorNetwork([])
-            cached_amp_tn_below = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[rows_below].to(torch.int))).tolist()))] if rows_below else qtn.TensorNetwork([])
-            within_row_sites = list((site_2d[0], col_id) for col_id in range(self.Ly) if col_id != site_2d[1])
-            within_row_hole_tn = self.get_local_amp_tensors(within_row_sites, config=sampled_x)
-            grad_ts = (within_row_hole_tn | cached_amp_tn_above | cached_amp_tn_below).contract()
-
+                # Reuse cached environment to compute grad_ts
+                row_id = site_2d[0]
+                # select the cached_env on both sides of the site tensor along the row
+                rows_above = list(range(row_id+1, self.Lx))
+                rows_below = list(range(0, row_id))
+                cached_amp_tn_above = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[rows_above].to(torch.int))).tolist()))] if rows_above else qtn.TensorNetwork([])
+                cached_amp_tn_below = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[rows_below].to(torch.int))).tolist()))] if rows_below else qtn.TensorNetwork([])
+                within_row_sites = list((site_2d[0], col_id) for col_id in range(self.Ly) if col_id != site_2d[1])
+                within_row_hole_tn = self.get_local_amp_tensors(within_row_sites, config=sampled_x)
+                grad_ts = (within_row_hole_tn | cached_amp_tn_above | cached_amp_tn_below).contract()
+                grad_ts.data.phase_sync(inplace=True)
+            
             # # Exact contraction of the TN without the site tensor, naive calculation, expensive baseline.
             # ts_left = [ts for ts in amp_tn.tensors if site_tag not in ts.tags]
             # tn_left = qtn.TensorNetwork(ts_left)
             # grad_ts = tn_left.contract()
-
-            grad_ts.data.phase_sync(inplace=True)
 
             # Back propagate through the final contraction
             ts0.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(True))
