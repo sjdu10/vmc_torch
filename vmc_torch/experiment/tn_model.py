@@ -2195,6 +2195,7 @@ class fTNModel_reuse(wavefunctionModel):
                     env_y_row_config[('ymin', cols_config)] = env_y[key]
         return env_y_row_config
 
+    @torch.no_grad()
     def cache_env_x(self, amp, config):
         """
             Cache the environment x for the given configuration
@@ -2205,6 +2206,7 @@ class fTNModel_reuse(wavefunctionModel):
         self.config_ref = config
         self.amp_ref = amp
     
+    @torch.no_grad()
     def cache_env_y(self, amp, config):
         env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0)
         env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
@@ -2326,6 +2328,7 @@ class fTNModel_reuse(wavefunctionModel):
         unchanged_cols_right = list(range(changed_cols[-1]+1, self.Ly))
         return changed_cols, unchanged_cols_left, unchanged_cols_right
     
+    @torch.no_grad()
     def update_env_x_cache(self, config):
         """
             Update the cached environment x for the given configuration
@@ -2350,7 +2353,8 @@ class fTNModel_reuse(wavefunctionModel):
             config_2d = self.from_1d_to_2d(config)
             cols_config = tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist()) if from_which=='ymax' else tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())
             return (from_which, cols_config)
-        
+    
+    @torch.no_grad()
     def update_env_x_cache_to_row(self, config, row_id, from_which='xmin', mode='reuse'):
         amp_tn = self.get_amp_tn(config)
         self.config_ref = config
@@ -2380,7 +2384,7 @@ class fTNModel_reuse(wavefunctionModel):
                 self._env_x_cache.update(new_env_x_cache)
                 return
         
-    
+    @torch.no_grad()
     def update_env_y_cache(self, config):
         """
             Update the cached environment y for the given configuration
@@ -2392,6 +2396,7 @@ class fTNModel_reuse(wavefunctionModel):
         self.config_ref = config
         self.amp_ref = amp_tn
 
+    @torch.no_grad()
     def update_env_y_cache_to_col(self, config, col_id, from_which='ymin', mode='reuse'):
         amp_tn = self.get_amp_tn(config)
         self.config_ref = config
