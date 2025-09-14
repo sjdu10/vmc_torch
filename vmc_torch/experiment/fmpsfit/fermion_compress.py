@@ -108,8 +108,8 @@ def _tn1d_fit_sum_sweep_2site_fermion(
             lind_id, rind_id = None, None
             lind_id = tfiknew.inds.index(left_env_ind) if left_env_ind is not None else None
             rind_id = tfiknew.inds.index(right_env_ind) if right_env_ind is not None else None
-            print(f'duals of env legs: left {lind_id} right {rind_id}')
-            print(tfiknew.data.duals[lind_id] if lind_id is not None else 'None', tfiknew.data.duals[rind_id] if rind_id is not None else 'None')
+            # print(f'duals of env legs: left {lind_id} right {rind_id}')
+            # print(tfiknew.data.duals[lind_id] if lind_id is not None else 'None', tfiknew.data.duals[rind_id] if rind_id is not None else 'None')
 
             if lind_id is not None and rind_id is not None:
                 if tfiknew.data.duals[lind_id]:
@@ -128,7 +128,6 @@ def _tn1d_fit_sum_sweep_2site_fermion(
                 tfinew = tfiknew
             else:
                 tfinew += tfiknew
-
 
         tfinew0, tfinew1 = tfinew.split(
             max_bond=max_bond,
@@ -155,7 +154,7 @@ def _tn1d_fit_sum_sweep_2site_fermion(
         # Update the tn_overlaps to use the new tn_fit
         tn_fit_conj = tn_fit.conj()
         tn_fit_conj.add_tag("__FIT__")
-        for ts in tn_fit_conj.tensors:
+        for ts in (tn_fit_conj[site0]|tn_fit_conj[site1]).tensors:
             if len(ts.data._oddpos) % 2 == 1:
                 ts.data.phase_global(inplace=True)
         tn_overlaps = [(tn_fit_conj | tn) for tn in tns]

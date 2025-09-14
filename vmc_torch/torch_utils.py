@@ -174,9 +174,9 @@ class QR(torch.autograd.Function):
             R = torch.from_numpy(R)
 
         diag = R.diag()
-        if is_one(diag):
-            print(R)
-            raise ValueError
+        # if is_one(diag):
+        #     print(R)
+        #     raise ValueError
         inds = torch.abs(diag) < 1e-6
         if sum(inds) > 0: # rank deficient, revert to svd
             # if DEBUG:

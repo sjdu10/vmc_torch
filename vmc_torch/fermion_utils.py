@@ -355,7 +355,9 @@ class fPEPS(qtn.PEPS):
             for n, site in zip(config, self.sites):
                 p_ind = peps.site_ind_id.format(*site)
                 site_id = peps.sites.index(site)
-                fts = peps.tensors[site_id]
+                site_tag = peps.site_tag_id.format(*site)
+                # fts = peps.tensors[site_id]
+                fts = peps[site_tag]
                 ftsdata = fts.data # this is the on-site fermionic tensor (f-tensor) to be contracted
                 ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
                 phys_ind_order = fts.inds.index(p_ind)
@@ -385,7 +387,6 @@ class fPEPS(qtn.PEPS):
                         # 3. Apply the slice to get the new data.
                         new_data = data[tuple(slicer)]
                         # ------------------------------------------------------------------
-                        # new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0])) # new tensor for this charge block
 
                         new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order + 1:] # new charge block
                         new_charge_sec_data_dict[new_charge_blk] = new_data # new charge block and its corresponding data in a dictionary
@@ -921,7 +922,9 @@ class fMPS(qtn.MatrixProductState):
             for n, site in zip(config, sites):
                 p_ind = mps.site_ind_id.format(site)
                 tid = mps.sites.index(site)
-                fts = mps[tid]
+                site_tag = mps.site_tag_id.format(site)
+                # fts = mps[tid]
+                fts = mps[site_tag]
                 ftsdata = fts.data
                 ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
                 phys_ind_order = fts.inds.index(p_ind)
@@ -975,7 +978,7 @@ class fMPS_TNF(fMPS):
         self.Ly = Ly
     # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
     def get_amp(self, config, inplace=False, conj=True, reverse=1):
-        """Get the amplitude of a configuration in a PEPS."""
+        """Get the amplitude of a configuration in a fPEPS."""
         tnf = self if inplace else self.copy()
         product_state = self.product_bra_state(config, reverse=reverse).conj() if conj else self.product_bra_state(config, reverse=reverse)
         
