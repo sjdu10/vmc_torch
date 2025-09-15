@@ -421,7 +421,7 @@ class spinful_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
         
         return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
     
-
+# ---- Spin Heisenberg model ----
 
 def square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=False, total_sz=None):
     # Build square lattice with nearest neighbor edges
@@ -454,6 +454,73 @@ class spin_Heisenberg_square_lattice_torch(Hamiltonian):
             total_sz: If given, constrains the total spin of system to a particular value.
         """
         H, hi, graph = square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=pbc, total_sz=total_sz)
+        super().__init__(H, hi, graph)
+    
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        connected_config_coeff = dict()
+        sigma = np.array(sigma_quimb)
+        for key, value in self._H.items():
+            i, j = key
+            J = value
+            if sigma[i] != sigma[j]:
+                # Hopping term
+
+                # H|sigma> = 0.5J * |eta>
+                eta = sigma.copy()
+                eta[i], eta[j] = sigma[j], sigma[i]
+                if tuple(eta) not in connected_config_coeff:
+                    # Calculate the phase correction (not needed for Heisenberg)
+                    connected_config_coeff[tuple(eta)] = 0.5 * J
+                else:
+                    # Accumulate the coefficients for degenerate states
+                    connected_config_coeff[tuple(eta)] += 0.5 * J
+            
+            eta0 = sigma.copy()
+            if tuple(eta0) not in connected_config_coeff:
+                # Handle the case of on-site term, which is J * S_i^z S_j^z
+                # For Heisenberg, this is already included in the coupling above
+                connected_config_coeff[tuple(eta0)] = 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
+            else:
+                # Accumulate the coefficients for degenerate states
+                connected_config_coeff[tuple(eta0)] += 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
+
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
+
+
+def chain_spin_Heisenberg(L, J, pbc=False, total_sz=None):
+    # Build chain with nearest neighbor edges
+    N = L
+    hi = Spin(s=1/2, N=N, total_sz=total_sz)  # Spin-1/2 Hilbert space
+    graph = Chain(L, pbc)
+    # Heisenberg with coupling J for nearest neighbors
+    H = dict()
+    for i, j in graph.edges():
+        # Add the Heisenberg term for the edge (i, j)
+        # The Heisenberg Hamiltonian is J * (S_i . S_j) = J * (S_i^x S_j^x + S_i^y S_j^y + S_i^z S_j^z)
+        # H = \sum_<i,j> 0.5J * (S_i^+ S_j^- + S_i^- S_j^+) + J * S_i^z S_j^z
+        # Note S = 1/2\sigma
+        if type(J) is dict:
+            # If J is a dictionary, use the specific coupling for the edge (i,j)
+            J_value = J.get((i, j), 0)
+            H[(i, j)] = J_value
+        else:
+            H[(i, j)] = J
+    
+    return H, hi, graph
+
+class spin_Heisenberg_chain_torch(Hamiltonian):
+    def __init__(self, L, J, pbc=False, total_sz=None):
+        """
+        Implementation of spin-1/2 Heisenberg model on a chain using torch.
+        Args:
+            J: Coupling constant (can be a dict for edge-specific couplings)
+            total_sz: If given, constrains the total spin of system to a particular value.
+        """
+        H, hi, graph = chain_spin_Heisenberg(L, J, pbc=pbc, total_sz=total_sz)
         super().__init__(H, hi, graph)
     
     def get_conn(self, sigma_quimb):

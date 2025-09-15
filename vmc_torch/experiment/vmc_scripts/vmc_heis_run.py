@@ -7,7 +7,6 @@ import pickle
 
 # torch
 import torch
-torch.autograd.set_detect_anomaly(False)
 
 # quimb
 import quimb.tensor as qtn
