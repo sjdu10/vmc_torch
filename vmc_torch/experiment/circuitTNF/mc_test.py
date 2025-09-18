@@ -21,6 +21,7 @@ import quimb.tensor as qtn
 import pickle
 
 L = 10
+D = 4
 H = spin_Heisenberg_chain_torch(L, J=1.0, pbc=False, total_sz=0)
 ham_quimb = qtn.ham_1d_heis(L, j=1.0, cyclic=False)
 ham_quimb.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float64))
@@ -29,15 +30,16 @@ hilbert = H.hilbert
 dtype = torch.float64
 
 
-su_params, su_skeleton = pickle.load(open("circuitTNF_heis_L10_D6_su_state.pkl", "rb"))
+su_params, su_skeleton = pickle.load(open(f"circuitTNF_heis_L{L}_D{D}_su_state.pkl", "rb"))
 su_mps = qtn.unpack(su_params, su_skeleton)
 
 model = circuit_TNF(
     su_mps,
     ham_quimb,
     trotter_tau=0.01,
-    depth=4,
+    depth=3,
     max_bond=-1,
+    from_which='yboth',
     dtype=torch.float64
 )
 
@@ -51,12 +53,20 @@ if (N_samples/SIZE)%2 != 0:
 learning_rate = 1e-1
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-4)
 optimizer = SGD(learning_rate=learning_rate)
-sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=1, reset_chain=False, random_edge=True, dtype=dtype, equal_partition=True)
+sampler = MetropolisExchangeSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=10, reset_chain=False, random_edge=False, dtype=dtype, equal_partition=False)
+sampler.current_config = torch.tensor([0,1,0,1,0,1,0,1,0,1], dtype=torch.int8) # Neel initial state
 variational_state = Variational_State(model, hi=H.hilbert, sampler=sampler, dtype=dtype)
 preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=0.05, iter_step=1e5, dtype=dtype)
 # Set up VMC
 vmc = VMC(hamiltonian=H, variational_state=variational_state, optimizer=optimizer, preconditioner=preconditioner, scheduler=scheduler)
 
 if __name__ == "__main__":
-    energy_dict = variational_state.expect(H)
-    pickle.dump(energy_dict, open("circuitTNF_heis_L10_D6_MC_energy_dict.pkl", "wb"))
+    data_dict = variational_state.expect(H)
+    if RANK == 0:
+        data_dict['max_bond'] = model.max_bond
+        data_dict['trotter_tau'] = model.trotter_tau
+        data_dict['depth'] = model.depth
+        data_dict['L'] = L
+        data_dict['from_which'] = model.from_which
+        print(data_dict)
+    # pickle.dump(energy_dict, open("circuitTNF_heis_L10_D6_MC_energy_dict.pkl", "wb"))

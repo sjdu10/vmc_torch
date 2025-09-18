@@ -267,6 +267,7 @@ class circuit_TNF(wavefunctionModel):
                 elif self.from_which == 'ymax':
                     amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-1])
                 elif self.from_which == 'yboth':
+                    # print('Using MPS contraction scheme from yboth')
                     amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
                     amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
                 elif self.from_which == 'xmax':
