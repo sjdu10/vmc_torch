@@ -1,5 +1,15 @@
-from quimb.tensor.tensor_1d_compress import *
-from quimb.tensor.tensor_1d_compress import _tn1d_fit_sum_sweep_1site
+import itertools
+import warnings
+
+from quimb.tensor import Tensor, TensorNetwork
+from quimb.tensor.tensor_1d_compress import (
+    TN_matching,
+    _tn1d_fit_sum_sweep_1site,
+    enforce_1d_like,
+    possibly_permute_,
+    tensor_network_1d_compress,
+)
+
 
 def _tn1d_fit_sum_sweep_2site_fermion(
     tn_fit,
@@ -103,11 +113,15 @@ def _tn1d_fit_sum_sweep_2site_fermion(
             # contract its new value, maintaining index order
             tfiknew = tnik.contract(
                 all, optimize=optimize, output_inds=left_inds + right_inds
-            )#XXX: insert the parity tensor for fermion TN legs? 
+            )  # XXX: insert the parity tensor for fermion TN legs?
 
             lind_id, rind_id = None, None
-            lind_id = tfiknew.inds.index(left_env_ind) if left_env_ind is not None else None
-            rind_id = tfiknew.inds.index(right_env_ind) if right_env_ind is not None else None
+            lind_id = (
+                tfiknew.inds.index(left_env_ind) if left_env_ind is not None else None
+            )
+            rind_id = (
+                tfiknew.inds.index(right_env_ind) if right_env_ind is not None else None
+            )
             # print(f'duals of env legs: left {lind_id} right {rind_id}')
             # print(tfiknew.data.duals[lind_id] if lind_id is not None else 'None', tfiknew.data.duals[rind_id] if rind_id is not None else 'None')
 
@@ -142,8 +156,21 @@ def _tn1d_fit_sum_sweep_2site_fermion(
 
         if compute_tdiff:
             # track change in tensor norm
-            dt = (tfi0 | tfi1).distance_normalized(tfinew0 | tfinew1)
+            dt = (tfi0 | tfi1).distance_normalized(
+                tfinew0 | tfinew1
+            )  # NOTE: in computing distance, might need to manually flip dual indices for small fTN that is first contracted to form fts
             max_tdiff = max(max_tdiff, dt)
+
+        # psi_psit = ((tfi0 | tfi1)|(tfinew0 | tfinew1).conj()).contract()
+        # n1 = ((tfinew0 | tfinew1)|(tfinew0 | tfinew1).conj()).contract()
+        # n1_quimb = (tfinew0 | tfinew1).norm(squared=True)
+        # n2 = ((tfi0 | tfi1)|(tfi0 | tfi1).conj()).contract()
+        # n2_quimb = (tfi0 | tfi1).norm(squared=True)
+        # print(f'Infidelity: {1 - abs(psi_psit)**2/(n1*n2)}, n1 {n1}, n2 {n2}, <1|2> {psi_psit}')
+        # print(f'quimb norm n1 {n1_quimb}, n2 {n2_quimb}')
+        # frob_norm = abs(n1.abs() + n2.abs() - 2*abs(psi_psit)).sqrt()
+        # normalized_dist = 2*frob_norm/(n1.abs().sqrt() + n2.abs().sqrt())
+        # print(f'Normalized distance: {normalized_dist}')
 
         # reinsert into all viewing tensor networks
         tfinew0.transpose_like_(tfi0)
@@ -154,12 +181,13 @@ def _tn1d_fit_sum_sweep_2site_fermion(
         # Update the tn_overlaps to use the new tn_fit
         tn_fit_conj = tn_fit.conj()
         tn_fit_conj.add_tag("__FIT__")
-        for ts in (tn_fit_conj[site0]|tn_fit_conj[site1]).tensors:
+        for ts in (tn_fit_conj[site0] | tn_fit_conj[site1]).tensors:
             if len(ts.data._oddpos) % 2 == 1:
                 ts.data.phase_global(inplace=True)
         tn_overlaps = [(tn_fit_conj | tn) for tn in tns]
 
     return max_tdiff
+
 
 def tensor_network_1d_compress_fit_fermion(
     tns,
@@ -298,13 +326,9 @@ def tensor_network_1d_compress_fit_fermion(
 
     # how to partition the tensor network(s)
     if site_tags is None:
-        site_tags = next(
-            tn.site_tags for tn in tns if hasattr(tn, "site_tags")
-        )
+        site_tags = next(tn.site_tags for tn in tns if hasattr(tn, "site_tags"))
 
-    tns = tuple(
-        enforce_1d_like(tn, site_tags=site_tags, inplace=inplace) for tn in tns
-    )
+    tns = tuple(enforce_1d_like(tn, site_tags=site_tags, inplace=inplace) for tn in tns)
 
     # choose the block size of the sweeping function
     if bsz == "auto":
@@ -346,13 +370,13 @@ def tensor_network_1d_compress_fit_fermion(
             current_bond_dim = initial_bond_dim
         else:
             # don't start larger than the target bond dimension
-            current_bond_dim = max(initial_bond_dim, max_bond) #XXX: should be min in final code
+            current_bond_dim = max(
+                initial_bond_dim, max_bond
+            )  # XXX: should be min in final code
 
         if tn_fit is None:
             # random initial guess
-            tn_fit = TN_matching(
-                tns[0], max_bond=current_bond_dim, site_tags=site_tags
-            )
+            tn_fit = TN_matching(tns[0], max_bond=current_bond_dim, site_tags=site_tags)
         else:
             if isinstance(tn_fit, str):
                 tn_fit = {"method": tn_fit}
@@ -383,7 +407,6 @@ def tensor_network_1d_compress_fit_fermion(
 
     # this is not views of `tn_fit` and thus will NOT update as it does
     tn_overlaps = [(tn_fit_conj | tn) for tn in tns]
-    
 
     if any(tn_overlap.outer_inds() for tn_overlap in tn_overlaps):
         raise ValueError(
@@ -457,13 +480,11 @@ def tensor_network_1d_compress_fit_fermion(
             tn_fit[site_tags[0]].normalize_()
         else:
             tn_fit[site_tags[-1]].normalize_()
-        
+
     if inplace:
         tn0 = tns[0]
         tn0.remove_all_tensors()
-        tn0.add_tensor_network(
-            tn_fit, virtual=not inplace_fit, check_collisions=False
-        )
+        tn0.add_tensor_network(tn_fit, virtual=not inplace_fit, check_collisions=False)
         tn_fit = tn0
 
     # possibly put the array indices in canonical order (e.g. when MPS or MPO)

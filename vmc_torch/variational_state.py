@@ -114,7 +114,7 @@ class Variational_State:
         self.reset()
         amp = self.vstate_func(x)
 
-        if type(self.vstate_func) == vmc_torch.experiment.tn_model.fTNModel_reuse:
+        if isinstance(self.vstate_func, vmc_torch.experiment.tn_model.fTNModel_reuse) or isinstance(self.vstate_func, vmc_torch.experiment.tn_model.fTNModel_reuse1):
             try:
                 if self.vstate_func.debug:
                     amp.backward(retain_graph=retain_graph)

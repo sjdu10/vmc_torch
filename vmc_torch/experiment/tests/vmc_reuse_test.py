@@ -1,28 +1,31 @@
 import os
+
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
-import sys
-from mpi4py import MPI
 import pickle
+import sys
+
+from mpi4py import MPI
+
 # pwd = os.getcwd()
-pwd = '/pscratch/sd/s/sijingdu/VMC/fermion/data'
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'
 
 # torch
 import torch
+
 torch.autograd.set_detect_anomaly(False)
 
 # quimb
-import quimb.tensor as qtn
 import autoray as ar
-
+import quimb.tensor as qtn
 from vmc_torch.experiment.tn_model import *
-from vmc_torch.sampler import MetropolisExchangeSamplerSpinful_2D_reusable
-from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import SGD, SR, DecayScheduler
-from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
-from vmc_torch.torch_utils import SVD,QR
+from vmc_torch.optimizer import SGD, SR, DecayScheduler
+from vmc_torch.sampler import MetropolisExchangeSamplerSpinful_2D_reusable
+from vmc_torch.torch_utils import QR, SVD
+from vmc_torch.variational_state import Variational_State
+from vmc_torch.VMC import VMC
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)
@@ -30,7 +33,6 @@ ar.register_function('torch','linalg.qr',QR.apply)
 
 from vmc_torch.global_var import DEBUG
 from vmc_torch.utils import closest_divisible
-
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -48,7 +50,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(Lx, Ly, t, U, N_f, pbc=False, n_f
 graph = H.graph
 # TN parameters
 D = 4
-chi = 256
+chi = 4*D
 dtype=torch.float64
 
 if symmetry == 'U1_Z2':
@@ -80,7 +82,16 @@ N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
 
-model = fTNModel_reuse(peps, max_bond=chi, dtype=dtype, debug=False)
+# Set up variational model
+contraction_kawrgs = {
+    "mode": "fit",
+    "bsz": 2,
+    "max_iterations": 50,
+    "tn_fit": "zipup",
+    "progbar": True,
+    "tol": 1e-5,
+}
+model = fTNModel_reuse(peps, max_bond=chi, dtype=dtype, debug=False, contraction_kwargs=contraction_kawrgs)
 init_std = 5e-3
 
 model_names = {
