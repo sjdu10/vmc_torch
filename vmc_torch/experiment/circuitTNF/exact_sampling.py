@@ -36,7 +36,7 @@ projected_states_tuple = [tuple(state.tolist()) for state in projected_states]
 
 
 su_params, su_skeleton = pickle.load(
-    open(f"circuitTNF_heis_L{L}_D{D}_su_state.pkl", "rb")
+    open(f"./1D/circuitTNF_heis_L{L}_D{D}_su_state.pkl", "rb")
 )
 su_mps = qtn.unpack(su_params, su_skeleton)
 su_energy = su_mps.compute_local_expectation_exact(ham_quimb.terms, normalized=True)

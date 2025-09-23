@@ -1,23 +1,16 @@
-import os
-import numpy as np
-from mpi4py import MPI
 import random
-from tqdm import tqdm
-import time
-import pyinstrument
-from statsmodels.tsa.stattools import acf
+
+import numpy as np
 
 # torch
 import torch
 
 # quimb
-from autoray import do
+from mpi4py import MPI
+from statsmodels.tsa.stattools import acf
+from tqdm import tqdm
 
-#jax
-# import jax
-import random
-
-from .global_var import DEBUG, set_debug, TIME_PROFILING, TAG_OFFSET
+from .global_var import DEBUG, TAG_OFFSET
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -275,7 +268,7 @@ class Sampler(AbstractSampler):
     def sample_eager(self, vstate, op, message_tag=None):
         """Sample eagerly for the local energy and amplitude gradient for each configuration.
         return a tuple of (op_loc_sum, op_loc_var, n)"""
-        assert self.equal_partition == False, 'Must not use equal partition for eager sampling.'
+        assert not self.equal_partition, 'Must not use equal partition for eager sampling.'
 
         if RANK == 0:
             print('Burn-in...')
@@ -479,7 +472,7 @@ class Sampler(AbstractSampler):
     def sample_w_grad_eager(self, vstate, op, message_tag=None):
         """Sample eagerly for the local energy and amplitude gradient for each configuration.
         return a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)"""
-        assert self.equal_partition == False, 'Must not use equal partition for eager sampling.'
+        assert not self.equal_partition, 'Must not use equal partition for eager sampling.'
 
         if RANK == 0:
             print('Burn-in...')
@@ -1318,7 +1311,8 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
         return self.current_config, self.current_amp
 
 
-from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+from pyblock2.driver.core import DMRGDriver, SymmetryTypes  # noqa: E402
+
 
 class MetropolisMPSSamplerSpinful(Sampler):
     def __init__(self, hi, graph, mps_dir='./tmp', mps_n_sample=1, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=False, dtype=torch.float32):

@@ -5509,27 +5509,47 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
     """
         fPEPS + tensorwise attention backflow NN with finite receptive field
     """
-    def __init__(self, fpeps, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, radius=1, jastrow=False, dtype=torch.float32, debug=False):
+    def __init__(
+        self,
+        fpeps,
+        max_bond=None,
+        embedding_dim=32,
+        attention_heads=4,
+        nn_final_dim=4,
+        nn_eta=1.0,
+        radius=1,
+        jastrow=False,
+        dtype=torch.float32,
+        debug=False,
+        contraction_kwargs={"mode": "mps"},
+    ):
         super().__init__()
         self.param_dtype = dtype
         self.debug = debug
-        
+        self.contraction_kwargs = contraction_kwargs
+
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(fpeps)
         self.skeleton.exponent = 0
 
         # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
-        self.torch_tn_params = nn.ModuleDict({
-            str(tid): nn.ParameterDict({
-                str(sector): nn.Parameter(data)
-                for sector, data in blk_array.items()
-            })
-            for tid, blk_array in params.items()
-        })
+        self.torch_tn_params = nn.ModuleDict(
+            {
+                str(tid): nn.ParameterDict(
+                    {
+                        str(sector): nn.Parameter(data)
+                        for sector, data in blk_array.items()
+                    }
+                )
+                for tid, blk_array in params.items()
+            }
+        )
 
         # Get the receptive field for each site
         self.nn_radius = radius
-        self.receptive_field = get_receptive_field_2d(fpeps.Lx, fpeps.Ly, self.nn_radius)
+        self.receptive_field = get_receptive_field_2d(
+            fpeps.Lx, fpeps.Ly, self.nn_radius
+        )
 
         phys_dim = fpeps.phys_dim()
         # for each tensor (labelled by tid), assign a attention+MLP
@@ -5538,9 +5558,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
             # get the receptive field for the current tensor
             neighbors = self.receptive_field[int(tid)]
             input_dim = len(neighbors)
-            on_site_ts_params_dict ={
-                tid: params[int(tid)]
-            }
+            on_site_ts_params_dict = {tid: params[int(tid)]}
             on_site_ts_params_vec = flatten_tn_params(on_site_ts_params_dict)
             self.nn[tid] = SelfAttn_FFNN_block(
                 n_site=input_dim,
@@ -5549,19 +5567,19 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                 attention_heads=attention_heads,
                 nn_hidden_dim=nn_final_dim,
                 output_dim=on_site_ts_params_vec.numel(),
-                dtype=self.param_dtype
+                dtype=self.param_dtype,
             )
         if jastrow:
             global_jastrow_input_dim = fpeps.Lx * fpeps.Ly
             self.jastrow = SelfAttn_FFNN_block(
-                    n_site=global_jastrow_input_dim,
-                    num_classes=phys_dim,
-                    embedding_dim=embedding_dim,
-                    attention_heads=attention_heads,
-                    nn_hidden_dim=nn_final_dim,
-                    output_dim=1,
-                    dtype=self.param_dtype
-                )
+                n_site=global_jastrow_input_dim,
+                num_classes=phys_dim,
+                embedding_dim=embedding_dim,
+                attention_heads=attention_heads,
+                nn_hidden_dim=nn_final_dim,
+                output_dim=1,
+                dtype=self.param_dtype,
+            )
         else:
             self.jastrow = lambda x: torch.zeros(1)
 
@@ -5572,18 +5590,18 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'fPEPS_BFA_cluster':
-            {
-                'D': fpeps.max_bond(), 
-                'Lx': fpeps.Lx, 'Ly': fpeps.Ly, 
-                'radius': self.nn_radius,
-                'jastrow': jastrow,
-                'symmetry': self.symmetry, 
-                'nn_final_dim': nn_final_dim,
-                'nn_eta': nn_eta, 
-                'embedding_dim': embedding_dim,
-                'attention_heads': attention_heads,
-                'max_bond': max_bond,
+            "fPEPS_BFA_cluster": {
+                "D": fpeps.max_bond(),
+                "Lx": fpeps.Lx,
+                "Ly": fpeps.Ly,
+                "radius": self.nn_radius,
+                "jastrow": jastrow,
+                "symmetry": self.symmetry,
+                "nn_final_dim": nn_final_dim,
+                "nn_eta": nn_eta,
+                "embedding_dim": embedding_dim,
+                "attention_heads": attention_heads,
+                "max_bond": max_bond,
             },
         }
         if max_bond is None or max_bond <= 0:
@@ -5593,8 +5611,8 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         self.tree = None
         self.Lx = fpeps.Lx
         self.Ly = fpeps.Ly
-        self._env_x_cache = None
-        self._env_y_cache = None
+        self._env_x_cache = {}
+        self._env_y_cache = {}
         self.config_ref = None
     
     def from_1d_to_2d(self, config, ordering='snake'):
@@ -5644,13 +5662,13 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         """
             Cache the environment x for the given configuration
         """
-        env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0)
+        env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0, **self.contraction_kwargs)
         env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
         self._env_x_cache = env_x_cache
         self.config_ref = config
     
     def cache_env_y(self, amp, config):
-        env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0)
+        env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0, **self.contraction_kwargs)
         env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
         self._env_y_cache = env_y_cache
         self.config_ref = config
@@ -5682,17 +5700,40 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         else:
             return None
     
-    def clear_env_x_cache(self):
-        """
-            Clear the cached environment x
-        """
-        self._env_x_cache = None
+    # def clear_env_x_cache(self):
+    #     """
+    #         Clear the cached environment x
+    #     """
+    #     self._env_x_cache = None
 
-    def clear_env_y_cache(self):
+    # def clear_env_y_cache(self):
+    #     """
+    #         Clear the cached environment y
+    #     """
+    #     self._env_y_cache = None
+    def clear_env_x_cache(self, from_which=None):
         """
-            Clear the cached environment y
+        Clear the cached environment x
         """
-        self._env_y_cache = None
+        if from_which is None:
+            self._env_x_cache = {}
+        else:
+            assert from_which in ["xmax", "xmin"], "from_which must be 'xmax' or 'xmin'"
+            for key in list(self._env_x_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_x_cache[key]
+
+    def clear_env_y_cache(self, from_which=None):
+        """
+        Clear the cached environment y
+        """
+        if from_which is None:
+            self._env_y_cache = {}
+        else:
+            assert from_which in ["ymax", "ymin"], "from_which must be 'ymax' or 'ymin'"
+            for key in list(self._env_y_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_y_cache[key]
     
     def clear_wavefunction_env_cache(self):
         self.clear_env_x_cache()
@@ -5775,47 +5816,104 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         """
             Update the cached environment x for the given configuration
         """
-        if self.env_x_cache is not None:
+        if self.env_x_cache:
             self.clear_env_x_cache()
         amp_tn = self.get_amp_tn(config)
         self.cache_env_x(amp_tn, config)
         self.config_ref = config
     
-    def update_env_x_cache_to_row(self, config, row_id, from_which='xmin'):
+    def update_env_x_cache_to_row(self, config, row_id, from_which="xmin", **kwargs):
         config_2d = self.from_1d_to_2d(config)
         amp_tn = self.get_amp_tn(config)
-        upper_effected_row_id = row_id - self.nn_radius if row_id - self.nn_radius >= 0 else 0
-        lower_effected_row_id = row_id + self.nn_radius if row_id + self.nn_radius < self.Lx else self.Lx-1
-        row_id = upper_effected_row_id if from_which == 'xmin' else lower_effected_row_id
+        upper_effected_row_id = (
+            row_id - self.nn_radius if row_id - self.nn_radius >= 0 else 0
+        )
+        lower_effected_row_id = (
+            row_id + self.nn_radius
+            if row_id + self.nn_radius < self.Lx
+            else self.Lx - 1
+        )
+        row_id = (
+            upper_effected_row_id if from_which == "xmin" else lower_effected_row_id
+        )
         # select the row_tn in the amp_tn that corresponds to the row_id
         row_tn = amp_tn.select(amp_tn.x_tag_id.format(row_id))
-        if from_which == 'xmin':
+        if from_which == "xmin":
             # check the whether previous env_x cache already contains the env w.r.t. row with id upper_effected_row_id
-            key_prev_rows = ('xmin', tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())) if row_id != 0 else ()
-            new_env_key = ('xmin', tuple(torch.cat(tuple(config_2d[:row_id+1].to(torch.int))).tolist()))
+            key_prev_rows = (
+                (
+                    "xmin",
+                    tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist()),
+                )
+                if row_id != 0
+                else ()
+            )
+            new_env_key = (
+                "xmin",
+                tuple(torch.cat(tuple(config_2d[: row_id + 1].to(torch.int))).tolist()),
+            )
             xrange = (0, row_id)
-        elif from_which == 'xmax':
+        elif from_which == "xmax":
             # check the whether previous env_x cache already contains the env w.r.t. row with id lower_effected_row_id
-            key_prev_rows = ('xmax', tuple(torch.cat(tuple(config_2d[row_id+1:].to(torch.int))).tolist())) if row_id != self.Lx-1 else ()
-            new_env_key = ('xmax', tuple(torch.cat(tuple(config_2d[row_id:].to(torch.int))).tolist()))
-            xrange = (row_id, self.Lx-1)
+            key_prev_rows = (
+                (
+                    "xmax",
+                    tuple(
+                        torch.cat(tuple(config_2d[row_id + 1 :].to(torch.int))).tolist()
+                    ),
+                )
+                if row_id != self.Lx - 1
+                else ()
+            )
+            new_env_key = (
+                "xmax",
+                tuple(torch.cat(tuple(config_2d[row_id:].to(torch.int))).tolist()),
+            )
+            xrange = (row_id, self.Lx - 1)
         else:
             raise ValueError("from_which must be either 'xmin' or 'xmax'")
 
-        if self.env_x_cache is not None: 
+        if self.env_x_cache:
             if key_prev_rows in self.env_x_cache:
                 prev_env_x = self.env_x_cache[key_prev_rows]
                 new_env_tn = prev_env_x | row_tn
-                new_env_tn.contract_boundary_from_(max_bond=self.max_bond, cutoff=0.0, xrange=xrange, from_which=from_which, yrange=(0, self.Ly-1))
+                new_env_tn.contract_boundary_from_(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    xrange=xrange,
+                    from_which=from_which,
+                    yrange=(0, self.Ly - 1),
+                    **self.contraction_kwargs,
+                )
                 new_env_x_cache = {new_env_key: new_env_tn}
             else:
-                new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
-                new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+                new_env_x = amp_tn.compute_environments(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    xrange=(0, row_id + 1)
+                    if from_which == "xmin"
+                    else (row_id - 1, self.Lx - 1),
+                    from_which=from_which,
+                    **self.contraction_kwargs,
+                )
+                new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(
+                    new_env_x, config
+                )
         else:
-            new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
-            new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+            new_env_x = amp_tn.compute_environments(
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                xrange=(0, row_id + 1)
+                if from_which == "xmin"
+                else (row_id - 1, self.Lx - 1),
+                from_which=from_which,
+                **self.contraction_kwargs,
+            )
+            new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(
+                new_env_x, config
+            )
         # add the new env_x to the cache
-        if self.env_x_cache is None:
+        if not self.env_x_cache:
             self._env_x_cache = new_env_x_cache
         else:
             self._env_x_cache.update(new_env_x_cache)
@@ -5825,45 +5923,106 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         """
             Update the cached environment y for the given configuration
         """
-        if self.env_y_cache is not None:
+        if self.env_y_cache:
             self.clear_env_y_cache()
         amp_tn = self.get_amp_tn(config)
         self.cache_env_y(amp_tn, config)
         self.config_ref = config
     
-    def update_env_y_cache_to_col(self, config, col_id, from_which='ymin'):
+    def update_env_y_cache_to_col(self, config, col_id, from_which="ymin", **kwargs):
         config_2d = self.from_1d_to_2d(config)
         amp_tn = self.get_amp_tn(config)
-        left_effected_col_id = col_id - self.nn_radius if col_id - self.nn_radius >= 0 else 0
-        right_effected_col_id = col_id + self.nn_radius if col_id + self.nn_radius < self.Ly else self.Ly-1
-        col_id = left_effected_col_id if from_which == 'ymin' else right_effected_col_id
+        left_effected_col_id = (
+            col_id - self.nn_radius if col_id - self.nn_radius >= 0 else 0
+        )
+        right_effected_col_id = (
+            col_id + self.nn_radius
+            if col_id + self.nn_radius < self.Ly
+            else self.Ly - 1
+        )
+        col_id = left_effected_col_id if from_which == "ymin" else right_effected_col_id
         # select the col_tn in the amp_tn that corresponds to the col_id
         col_tn = amp_tn.select(amp_tn.y_tag_id.format(col_id))
         # check the whether previous env_y cache already contains the env w.r.t. col with id col_id
-        if from_which == 'ymin':
-            key_prev_cols = ('ymin', tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())) if col_id != 0 else ()
-            new_env_key = ('ymin', tuple(torch.cat(tuple(config_2d[:, :col_id+1].to(torch.int))).tolist()))
+        if from_which == "ymin":
+            key_prev_cols = (
+                (
+                    "ymin",
+                    tuple(
+                        torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist()
+                    ),
+                )
+                if col_id != 0
+                else ()
+            )
+            new_env_key = (
+                "ymin",
+                tuple(
+                    torch.cat(tuple(config_2d[:, : col_id + 1].to(torch.int))).tolist()
+                ),
+            )
             yrange = (0, col_id)
-        elif from_which == 'ymax':
-            key_prev_cols = ('ymax', tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist())) if col_id != self.Ly-1 else ()
-            new_env_key = ('ymax', tuple(torch.cat(tuple(config_2d[:, col_id:].to(torch.int))).tolist()))
-            yrange = (col_id, self.Ly-1)
+        elif from_which == "ymax":
+            key_prev_cols = (
+                (
+                    "ymax",
+                    tuple(
+                        torch.cat(
+                            tuple(config_2d[:, col_id + 1 :].to(torch.int))
+                        ).tolist()
+                    ),
+                )
+                if col_id != self.Ly - 1
+                else ()
+            )
+            new_env_key = (
+                "ymax",
+                tuple(torch.cat(tuple(config_2d[:, col_id:].to(torch.int))).tolist()),
+            )
+            yrange = (col_id, self.Ly - 1)
         else:
             raise ValueError("from_which must be either 'ymin' or 'ymax'")
-        if self.env_y_cache is not None:
+        if self.env_y_cache:
             if key_prev_cols in self.env_y_cache:
                 prev_env_y = self.env_y_cache[key_prev_cols]
                 new_env_tn = prev_env_y | col_tn
-                new_env_tn.contract_boundary_from_(max_bond=self.max_bond, cutoff=0.0, yrange=yrange, from_which=from_which, xrange=(0, self.Lx-1))
+                new_env_tn.contract_boundary_from_(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    yrange=yrange,
+                    from_which=from_which,
+                    xrange=(0, self.Lx - 1),
+                    **self.contraction_kwargs,
+                )
                 new_env_y_cache = {new_env_key: new_env_tn}
             else:
-                new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
-                new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+                new_env_y = amp_tn.compute_environments(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    yrange=(0, col_id + 1)
+                    if from_which == "ymin"
+                    else (col_id - 1, self.Ly - 1),
+                    from_which=from_which,
+                    **self.contraction_kwargs,
+                )
+                new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(
+                    new_env_y, config
+                )
         else:
-            new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
-            new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+            new_env_y = amp_tn.compute_environments(
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                yrange=(0, col_id + 1)
+                if from_which == "ymin"
+                else (col_id - 1, self.Ly - 1),
+                from_which=from_which,
+                **self.contraction_kwargs,
+            )
+            new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(
+                new_env_y, config
+            )
         # add the new env_y to the cache
-        if self.env_y_cache is None:
+        if not self.env_y_cache:
             self._env_y_cache = new_env_y_cache
         else:
             self._env_y_cache.update(new_env_y_cache)
@@ -5895,13 +6054,27 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
 
         return amp
     
+    def _get_pure_tns(self):
+        # get the pure TNS without backflow
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+        tn_params = reconstruct_proj_params(params_vec, params)
+        psi = qtn.unpack(tn_params, self.skeleton)
+        return psi
+    
     def amplitude(self, x):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
@@ -5927,12 +6100,12 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                     key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
                     amp_bot = self.env_x_cache[key_bot]
                     amp_top = self.env_x_cache[key_top]
-                    amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                    amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
                 else:
-                    if self.env_x_cache is None and self.env_y_cache is None:
+                    if not self.env_x_cache and not self.env_y_cache:
                         # check whether we can reuse the cached environment
-                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, self.Ly//2-1])
-                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[self.Ly//2, self.Ly-1])
+                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, self.Ly//2-1], **self.contraction_kwargs)
+                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[self.Ly//2, self.Ly-1], **self.contraction_kwargs)
                         amp_val = amp.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                     else:
                         config_2d = self.from_1d_to_2d(x_i)
@@ -5949,7 +6122,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                             key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
                             amp_bot = self.env_x_cache[key_bot]
                             amp_top = self.env_x_cache[key_top]
-                            amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                            amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
                         else:
                             if len(changed_rows) <= len(changed_cols):
                                 # for bottom envs, until the last effected row, we can reuse the bottom envs
@@ -5978,14 +6151,25 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 amp_val_tn = amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env
 
                                 middle_row = effected_rows[0] + (effected_rows[-1] - effected_rows[0])//2
-                                if len(uneffected_rows_above) <= len(uneffected_rows_below):
-                                    amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, middle_row])
-                                    amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row+1, self.Lx-1])
-                                else:
-                                    amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, middle_row-1])
-                                    amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row, self.Lx-1])
 
-                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                                # hit the boundary
+                                if middle_row == effected_rows[0]:
+                                    middle_row += 1
+                                elif middle_row == effected_rows[-1]:
+                                    middle_row -= 1
+
+                                if len(uneffected_rows_above) <= len(uneffected_rows_below):
+                                    if effected_rows[0] < middle_row:
+                                        amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[effected_rows[0], middle_row], **self.contraction_kwargs)
+                                    if effected_rows[-1] > middle_row+1:
+                                        amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row+1, effected_rows[-1]], **self.contraction_kwargs)
+                                else:
+                                    if effected_rows[0] < middle_row-1:
+                                        amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[effected_rows[0], middle_row-1], **self.contraction_kwargs)
+                                    if effected_rows[-1] > middle_row:
+                                        amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row, effected_rows[-1]], **self.contraction_kwargs)
+
+                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
                             else:
                                 col_tag_list = [amp.y_tag_id.format(col_n) for col_n in effected_cols]
                                 amp_effected_cols = amp.select(col_tag_list, which='any')
@@ -6010,20 +6194,41 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 amp_val_tn = amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env
 
                                 middle_col = effected_cols[0] + (effected_cols[-1] - effected_cols[0])//2
+                                # hit the boundary
+                                if middle_col == effected_cols[0]:
+                                    middle_col += 1
+                                elif middle_col == effected_cols[-1]:
+                                    middle_col -= 1
+                                    
                                 if len(uneffected_cols_left) <= len(uneffected_cols_right):
-                                    amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, middle_col])
-                                    amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col+1, self.Ly-1])
+                                    if effected_cols[0] < middle_col:
+                                        amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[effected_cols[0], middle_col], **self.contraction_kwargs)
+                                    if effected_cols[-1] > middle_col+1:
+                                        amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col+1, effected_cols[-1]], **self.contraction_kwargs)
                                 else:
-                                    amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, middle_col-1])
-                                    amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col, self.Ly-1])
+                                    if effected_cols[0] < middle_col-1:
+                                        amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[effected_cols[0], middle_col-1], **self.contraction_kwargs)
+                                    if effected_cols[-1] > middle_col:
+                                        amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col, effected_cols[-1]], **self.contraction_kwargs)
 
-                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
 
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
             
             if self.debug:
-                print(f"Reused Amp/Exact Amp: {amp_val/(self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i))))}")
+                exact_amp = self.get_amp_tn(x_i).contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                pure_tns = self._get_pure_tns()
+                pure_fpeps_amp = pure_tns.get_amp(x_i).contract()
+                if not torch.isclose(amp_val, exact_amp, atol=1e-3, rtol=1e-3):
+                    print(f"Amplitude mismatch: {amp_val} vs {exact_amp}")
+                    raise ValueError(f"Amplitude mismatch: {amp_val} vs {exact_amp}")
+                print(f"Exact/approximate relative error: {abs(amp_val-exact_amp)/abs(exact_amp)}, Pure fPEPS amp relative error: {abs(amp_val-pure_fpeps_amp)/abs(pure_fpeps_amp)}")
+                assert torch.isclose(amp_val, exact_amp, atol=1e-3, rtol=1e-3), f"Amplitude mismatch: {amp_val} vs {exact_amp}"
+                if self.nn_eta == 0.0 and self.jastrow(x_i)==1.0:
+                    assert torch.isclose(amp_val, pure_fpeps_amp, atol=1e-3, rtol=1e-3), f"Amplitude mismatch: {amp_val} vs {pure_fpeps_amp}"
+                # print(f"Reused Amp/Exact Amp: {amp_val/(self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i))))}")
+                # assert torch.isclose(amp_val, self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i)))), f"Amplitude mismatch: {amp_val} vs {self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i)))}"
                 
             batch_amps.append(amp_val)
 
