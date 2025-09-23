@@ -7,7 +7,7 @@ Theories and derivations of differentiable TN computation can be found in Liao e
 
 import numpy as np
 import torch
-from .global_var import DEBUG
+# from .global_var import DEBUG
 import os, sys, itertools, time
 import scipy.linalg
 from mpi4py import MPI
@@ -217,6 +217,52 @@ class QR(torch.autograd.Function):
             # print(f"QRbackward: A is wide, M={M}, N={N}")
             return QRbackward_wide(A,Q,R,dQ,dR)
 
+class QR_tao(torch.autograd.Function):
+    @staticmethod
+    def forward(self, A):
+        Q, R = torch.linalg.qr(A)
+        diag = R.diag()
+        if fix_sign:
+            sign = torch.sign(diag).reshape((1,-1))
+            Q = Q * sign
+            R = R * sign.t()
+        self.save_for_backward(A, Q, R)
+        return Q, R
+
+    @staticmethod
+    def backward(self, dq, dr):
+        A, q, r = self.saved_tensors
+        if r.shape[0] == r.shape[1]:
+            return _simple_qr_backward(q, r, dq ,dr)
+        M, N = r.shape
+        B = A[:,M:]
+        dU = dr[:,:M]
+        dD = dr[:,M:]
+        U = r[:,:M]
+        da = _simple_qr_backward(q, U, dq+B@dD.t(), dU)
+        db = q@dD
+        return torch.cat([da, db], 1)
+
+def _simple_qr_backward(q, r, dq, dr):
+    if r.shape[-2] != r.shape[-1]:
+        raise NotImplementedError("QrGrad not implemented when ncols > nrows "
+                          "or full_matrices is true and ncols != nrows.")
+
+    qdq = q.t() @ dq
+    qdq_ = qdq - qdq.t()
+    rdr = r @ dr.t()
+    rdr_ = rdr - rdr.t()
+    tril = torch.tril(qdq_ + rdr_)
+
+    def _TriangularSolve(x, r):
+        """Equiv to x @ torch.inverse(r).t() if r is upper-tri."""
+        res = torch.linalg.solve_triangular(r, x.t(), upper=True).t()
+        return res
+
+    grad_a = q @ (dr + _TriangularSolve(tril, r))
+    grad_b = _TriangularSolve(dq - q @ qdq, r)
+    return grad_a + grad_b
+
 # def copyltu(A):
 #     tril0 = A.tril(diagonal=0)
 #     tril1 = A.tril(diagonal=-1)
@@ -343,9 +389,32 @@ def test_qr():
     assert(torch.autograd.gradcheck(QR.apply, (input), eps=1e-6, atol=1e-4))
     print(f"QR Test Pass for {M},{N}! time={time.time()-t0}")
 
+def test_qr_tao():
+    M, N = 50, 20
+    torch.manual_seed(2)
+    input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
+    t0 = time.time()
+    assert(torch.autograd.gradcheck(QR_tao.apply, (input), eps=1e-6, atol=1e-4))
+    print(f"QR_tao Test Pass for {M},{N}! time={time.time()-t0}")
+
+    M, N = 20, 50
+    torch.manual_seed(2)
+    input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
+    t0 = time.time()
+    assert(torch.autograd.gradcheck(QR_tao.apply, (input), eps=1e-6, atol=1e-4))
+    print(f"QR_tao Test Pass for {M},{N}! time={time.time()-t0}")
+
+    M, N = 20, 20
+    torch.manual_seed(2)
+    input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
+    t0 = time.time()
+    assert(torch.autograd.gradcheck(QR_tao.apply, (input), eps=1e-6, atol=1e-4))
+    print(f"QR_tao Test Pass for {M},{N}! time={time.time()-t0}")
+
 if __name__=='__main__':
     # test_svd()
     test_qr()
+    test_qr_tao()
 
 
 

@@ -115,9 +115,9 @@ class wavefunctionModel(torch.nn.Module):
         pass
     def update_env_y_cache_to_col(self, *args, **kwargs):
         pass
-    def clear_env_x_cache(self):
+    def clear_env_x_cache(self,**kwargs):
         pass
-    def clear_env_y_cache(self):
+    def clear_env_y_cache(self,**kwargs):
         pass
 
     def update_cached_cache(self):
