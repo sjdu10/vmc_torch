@@ -120,6 +120,20 @@ class wavefunctionModel(torch.nn.Module):
     def clear_env_y_cache(self,**kwargs):
         pass
 
+    def get_tn_params_vec(self):
+        if not hasattr(self, 'torch_tn_params'):
+            pass
+        # get the current TN parameters as a flattened vector
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+        return params_vec
+
     def update_cached_cache(self):
         pass
 

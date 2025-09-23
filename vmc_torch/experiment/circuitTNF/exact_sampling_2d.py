@@ -50,12 +50,12 @@ exact_energy = qu.groundenergy(ham_ed)
 print(f"Exact ground state energy: {exact_energy}")
 ham_matrix = ham_ed.toarray()
 
-max_bonds = [10]
-depths = [5]
+max_bonds = [8]
+depths = [10]
 
 
 for max_bond in max_bonds:
-    for tau in [0.0, 0.01, 0.02, 0.03, 0.04, 0.05]:
+    for tau in [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.1]:
         for depth in depths:
             model = circuit_TNF_2d(
                 su_peps,
