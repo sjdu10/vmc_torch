@@ -12,20 +12,23 @@ from quimb.tensor.tensor_2d import Rotator2D, pairwise
 from vmc_torch.global_var import DEBUG
 import ast
 
-#------Read PEPS from fTN model------
+# ------Read fPEPS from fTN model------
 def get_psi_from_fTN(fTN_model):
     """
+    Read quimb fTNS from fTN based wavefunction torch model.
+
     Parameters
     ----------
     fTN_model : fTNModel
-        fTN model to extract the wavefunction from.
+        fTN based wavefunction torch model to extract the quimb fTNS from.
+        
+    Returns
+    ----------
+    psi : quimb fTNS
     """
     # Reconstruct the original parameter structure (by unpacking from the flattened dict)
     params = {
-        int(tid): {
-            ast.literal_eval(sector): data
-            for sector, data in blk_array.items()
-        }
+        int(tid): {ast.literal_eval(sector): data for sector, data in blk_array.items()}
         for tid, blk_array in fTN_model.torch_tn_params.items()
     }
     # Reconstruct the TN with the new parameters
@@ -33,10 +36,10 @@ def get_psi_from_fTN(fTN_model):
     return psi
 
 
-#------Symmray function utils------
+# ------Symmray function utils------
 try:
     parse_edges_to_site_info = sr.utils.parse_edges_to_site_info
-except:
+except Exception:
     parse_edges_to_site_info = sr.parse_edges_to_site_info
 
 def u1arr_to_z2arr(u1array):
