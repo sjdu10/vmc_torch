@@ -1,6 +1,4 @@
 import ast
-import time
-
 import cotengra as ctg
 
 # quimb
@@ -5330,7 +5328,7 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
@@ -5483,7 +5481,7 @@ class fTN_BFA_cluster_Model(wavefunctionModel):
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
@@ -7571,26 +7569,55 @@ class NNBF(wavefunctionModel):
 
 class NNBF_attention(wavefunctionModel):
     """Assuming total Sz=0."""
-    def __init__(self, nsite, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64, nn_eta=1, embed_dim=16, attention_heads=4, phys_dim=4, spinflip_symmetry=False):
+
+    def __init__(
+        self,
+        nsite,
+        hilbert,
+        kernel_init=None,
+        param_dtype=torch.float32,
+        hidden_dim=64,
+        nn_eta=1,
+        embed_dim=16,
+        attention_heads=4,
+        phys_dim=4,
+        spinflip_symmetry=False,
+    ):
         super(NNBF_attention, self).__init__()
-        
+
         self.hilbert = hilbert
         self.param_dtype = param_dtype
         self.spinflip_symmetry = spinflip_symmetry
-        
+
         # Initialize the parameter M (N x Nf matrix)
         self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)) 
-            if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            kernel_init(
+                torch.empty(
+                    self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype
+                )
+            )
+            if kernel_init is not None
+            else torch.randn(
+                self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype
+            )
         )
         if self.spinflip_symmetry:
             self.M_flip = nn.Parameter(
-                kernel_init(torch.empty(self.hilbert.size, self.hilbert.size - self.hilbert.n_fermions, dtype=self.param_dtype)) 
-                if kernel_init is not None 
-                else torch.randn(self.hilbert.size, self.hilbert.size-self.hilbert.n_fermions, dtype=self.param_dtype)
+                kernel_init(
+                    torch.empty(
+                        self.hilbert.size,
+                        self.hilbert.size - self.hilbert.n_fermions,
+                        dtype=self.param_dtype,
+                    )
+                )
+                if kernel_init is not None
+                else torch.randn(
+                    self.hilbert.size,
+                    self.hilbert.size - self.hilbert.n_fermions,
+                    dtype=self.param_dtype,
+                )
             )
-        
+
         self.attn = SelfAttn_block_pos(
             nsite,
             num_classes=phys_dim,
@@ -7598,23 +7625,23 @@ class NNBF_attention(wavefunctionModel):
             attention_heads=attention_heads,
             dtype=self.param_dtype,
         )
-        
+
         self.embed_dim = embed_dim
         self.attention_heads = attention_heads
         self.phys_dim = phys_dim
         self.nsite = nsite
 
-         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
+        # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
-            nn.Linear(embed_dim*nsite, hidden_dim),
+            nn.Linear(embed_dim * nsite, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
+            nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions),
         )
         if self.spinflip_symmetry:
             self.nn_flip = nn.Sequential(
-                nn.Linear(embed_dim*nsite, hidden_dim),
+                nn.Linear(embed_dim * nsite, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
+                nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions),
             )
 
         # Convert NNs to the appropriate data type
@@ -7627,16 +7654,16 @@ class NNBF_attention(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'NNBF w attention':{
-                'N_site': self.nsite, 
-                'N_fermions': self.hilbert.n_fermions, 
-                'N_fermions_per_spin': self.hilbert.n_fermions_per_spin, 
-                'nn_eta': self.nn_eta,
-                'embed_dim': self.embed_dim,
-                'attention_heads': self.attention_heads,
-                'phys_dim': self.phys_dim,
-                'spinflip_symmetry': self.spinflip_symmetry,
-                }
+            "NNBF w attention": {
+                "N_site": self.nsite,
+                "N_fermions": self.hilbert.n_fermions,
+                "N_fermions_per_spin": self.hilbert.n_fermions_per_spin,
+                "nn_eta": self.nn_eta,
+                "embed_dim": self.embed_dim,
+                "attention_heads": self.attention_heads,
+                "phys_dim": self.phys_dim,
+                "spinflip_symmetry": self.spinflip_symmetry,
+            }
         }
 
     def amplitude(self, x):
@@ -7644,9 +7671,11 @@ class NNBF_attention(wavefunctionModel):
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
         def backflow_det(x, spinflip_symmetry=False):
-            n = torch.tensor(from_quimb_config_to_netket_config(x), dtype=self.param_dtype)
+            n = torch.tensor(
+                from_quimb_config_to_netket_config(x), dtype=self.param_dtype
+            )
             if spinflip_symmetry:
-                n = torch.abs(1-n) # 0->1, 1->0
+                n = torch.abs(1 - n)  # 0->1, 1->0
                 x = from_netket_config_to_quimb_config(n)
                 x = torch.tensor(x, dtype=torch.int)
 
@@ -7654,10 +7683,18 @@ class NNBF_attention(wavefunctionModel):
                 # Compute the attention output
                 attn_features = self.attn(x).view(-1)
                 # Compute the backflow matrix F using the neural network
-                F = self.nn(attn_features) if not spinflip_symmetry else self.nn_flip(attn_features)
-                M  = self.M + F.reshape(self.M.shape)*self.nn_eta if not spinflip_symmetry else self.M_flip + F.reshape(self.M_flip.shape)*self.nn_eta
-            elif self.nn_eta == 0: # Pure Slater determinant calculation
-                M  = self.M if not spinflip_symmetry else self.M_flip
+                F = (
+                    self.nn(attn_features)
+                    if not spinflip_symmetry
+                    else self.nn_flip(attn_features)
+                )
+                M = (
+                    self.M + F.reshape(self.M.shape) * self.nn_eta
+                    if not spinflip_symmetry
+                    else self.M_flip + F.reshape(self.M_flip.shape) * self.nn_eta
+                )
+            elif self.nn_eta == 0:  # Pure Slater determinant calculation
+                M = self.M if not spinflip_symmetry else self.M_flip
 
             # Find the positions of the occupied orbitals
             R = torch.nonzero(n, as_tuple=False).squeeze()
@@ -7668,17 +7705,151 @@ class NNBF_attention(wavefunctionModel):
             amp = det
 
             return amp
-        
+
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=torch.int)
 
             if self.spinflip_symmetry:
-                amp_val  = (backflow_det(x_i, spinflip_symmetry=True) + backflow_det(x_i, spinflip_symmetry=False)) / 2
+                amp_val = (
+                    backflow_det(x_i, spinflip_symmetry=True)
+                    + backflow_det(x_i, spinflip_symmetry=False)
+                ) / 2
             else:
-                amp_val = backflow_det(x_i, spinflip_symmetry=False) 
+                amp_val = backflow_det(x_i, spinflip_symmetry=False)
+            batch_amps.append(amp_val)
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+class NNBF_attention_Nsd(wavefunctionModel):
+    """Assuming total Sz=0."""
+
+    def __init__(
+        self,
+        nsite,
+        hilbert,
+        kernel_init=None,
+        param_dtype=torch.float32,
+        hidden_dim=64,
+        nn_eta=1,
+        embed_dim=16,
+        attention_heads=4,
+        phys_dim=4,
+        Nsd=1,
+    ):
+        super(NNBF_attention_Nsd, self).__init__()
+
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        self.Nsd = Nsd
+
+        # Initialize the parameter M (N x Nf matrix) for each Slater determinant
+        self.Ms = nn.ParameterList([
+            nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype))
+            if kernel_init is not None
+            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            )
+            for _ in range(self.Nsd)
+        ])
+        
+        self.embed_dim = embed_dim
+        self.attention_heads = attention_heads
+        self.phys_dim = phys_dim
+        self.nsite = nsite
+
+        # Initialize Nsd NN models, where each has input n and outputs a matrix with the same shape as M
+        self.backflow_transformers = nn.ModuleList()
+        for _ in range(self.Nsd):
+            # 1. Attention Block (SelfAttn_block_pos)
+            attn = SelfAttn_block_pos(
+                self.nsite,
+                num_classes=self.phys_dim,
+                embed_dim=self.embed_dim,
+                attention_heads=self.attention_heads,
+                dtype=self.param_dtype,
+            )
+            
+            # 2. MLP for final output (maps to N * Nf dimensions)
+            mlp = nn.Sequential(
+                nn.Linear(self.embed_dim * self.nsite, hidden_dim),
+                nn.GELU(),
+                # The output size must match the size of M: N * Nf (self.hilbert.size * self.hilbert.n_fermions)
+                nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions),
+            )
+
+            # Combine attn and mlp into a single nn.ModuleList representing one transformer block
+            # This block transforms the input state (n) into a backflow matrix (delta_M)
+            transformer_block = nn.ModuleList([attn, mlp])
+
+            # Convert NNs to the appropriate data type
+            transformer_block.to(self.param_dtype)
+            
+            # Add the block to the main list
+            self.backflow_transformers.append(transformer_block)
+        
+        self.backflow_transformers.to(self.param_dtype)
+
+        self.nn_eta = nn_eta
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            "NNBF w attention": {
+                "N_site": self.nsite,
+                "N_fermions": self.hilbert.n_fermions,
+                "N_fermions_per_spin": self.hilbert.n_fermions_per_spin,
+                "nn_eta": self.nn_eta,
+                "embed_dim": self.embed_dim,
+                "attention_heads": self.attention_heads,
+                "phys_dim": self.phys_dim,
+                "Nsd": self.Nsd,
+            }
+        }
+
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(x, sd_index=0):
+            n = torch.tensor(
+                from_quimb_config_to_netket_config(x), dtype=self.param_dtype
+            )
+            attn_layer, mlp_layer = self.backflow_transformers[sd_index]
+            if self.nn_eta != 0:
+                # Compute the attention output
+                attn_features = attn_layer(x).view(-1)
+                # Compute the backflow matrix F using the neural network
+                F = (
+                    mlp_layer(attn_features)
+                )
+                M = (
+                    self.Ms[sd_index] + F.reshape(self.Ms[sd_index].shape) * self.nn_eta
+                )
+            elif self.nn_eta == 0:  # Pure Slater determinant calculation
+                M = self.Ms[sd_index] 
+
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the 2Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = M[R]
+            det = torch.linalg.det(A)
+            amp = det
+
+            return amp
+
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=torch.int)
+
+            amp_val = sum([backflow_det(x_i, sd_index=sd) for sd in range(self.Nsd)]) / self.Nsd
+
             batch_amps.append(amp_val)
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)

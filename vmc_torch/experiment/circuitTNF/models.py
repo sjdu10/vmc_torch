@@ -1,6 +1,7 @@
 import quimb.tensor as qtn
 import torch
 import torch.nn as nn
+import cotengra as ctg
 
 from vmc_torch.experiment.tn_model import wavefunctionModel
 
@@ -241,6 +242,7 @@ class circuit_TNF_2d(wavefunctionModel):
         trotter_tau,
         depth,
         # second_order_reflect=False,
+        mode='projector3d',
         from_which="zmax",
         max_bond=None,
         dtype=torch.float32,
@@ -251,7 +253,10 @@ class circuit_TNF_2d(wavefunctionModel):
         self.depth = depth
         # self.second_order_reflect = second_order_reflect
         self.max_bond = max_bond if (type(max_bond) is int and max_bond > 0) else None
+        if self.max_bond is None:
+            self.tree = None
         self.from_which = from_which
+        self.mode = mode
 
         self.ham = ham
         circuit_tnf = self.form_gated_tns_tnf(
@@ -272,12 +277,10 @@ class circuit_TNF_2d(wavefunctionModel):
         for tid, param in self.torch_tn_params.items():
             self.register_parameter(tid, param)
 
-
     def get_state(self):
         params = {int(tid): data for tid, data in self.torch_tn_params.items()}
         peps = qtn.unpack(params, self.skeleton)
         return peps
-
 
     def form_gated_tns_tnf(
         self,
@@ -331,6 +334,7 @@ class circuit_TNF_2d(wavefunctionModel):
                     which="all",
                 )
         import itertools
+
         # Add site tags
         for d in range(0, depth + 1):
             for x, y in itertools.product(range(tns1.Lx), range(tns1.Ly)):
@@ -340,14 +344,14 @@ class circuit_TNF_2d(wavefunctionModel):
                 ts.add_tag(y_tag_id.format(y))
                 ts.add_tag(z_tag_id.format(d))
                 ts.add_tag(site_tag_id_3d.format(x, y, d))
-        
+
         # return tns1
 
         circuit_tnf = PEPS_TNF.from_TN(tns1)
         circuit_tnf.set_depth(depth)
 
         return circuit_tnf
-    
+
     def amplitude(self, x):
         psi = self.get_state()
         batch_amps = []
@@ -358,23 +362,71 @@ class circuit_TNF_2d(wavefunctionModel):
             amp = psi.get_amp(x_i)
 
             if self.max_bond is None:
-                amp_val = amp.contract()
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
             else:
                 if self.from_which == "zmin":
-                    amp = amp.contract_boundary_from(
-                        from_which='zmin', max_bond=self.max_bond, cutoff=0.0, zrange=(0, psi.Lz-1), yrange=[0, psi.Ly - 1], xrange=(0, psi.Lx-1), mode='peps'
-                    )
-                elif self.from_which == "zmax":
-                    amp = amp.contract_boundary_from(
-                        from_which='zmax', max_bond=self.max_bond, cutoff=0.0, zrange=(0, psi.Lz-1), yrange=[0, psi.Ly - 1], xrange=(0, psi.Lx-1), mode='peps'
-                    )
+                    if self.mode == 'peps':
+                        amp = amp.contract_boundary_from(
+                            from_which="zmin",
+                            max_bond=self.max_bond,
+                            cutoff=0.0,
+                            zrange=(0, psi.Lz - 1),
+                            yrange=[0, psi.Ly - 1],
+                            xrange=(0, psi.Lx - 1),
+                            mode="peps",
+                        )
+                        amp_val = amp.contract()
+                    elif self.mode == 'projector3d':
+                        amp = amp.contract_boundary(
+                            max_bond=self.max_bond,
+                            cutoff=0.0,
+                            canonize=False,
+                            mode="projector3d",
+                            equalize_norms=1.0,
+                            sequence=["zmin"] * amp.Lz + ["ymax"] * amp.Ly,
+                            max_separation=0,
+                            final_contract_opts=dict(strip_exponent=True),
+                            progbar=False,
+                        )
+                        mantissa, exponent = amp
+                        amp_val = mantissa * 10**exponent
+                        
 
+                elif self.from_which == "zmax":
+                    if self.mode == 'peps':
+                        amp = amp.contract_boundary_from(
+                            from_which="zmax",
+                            max_bond=self.max_bond,
+                            cutoff=0.0,
+                            zrange=(0, psi.Lz - 1),
+                            yrange=[0, psi.Ly - 1],
+                            xrange=(0, psi.Lx - 1),
+                            mode="peps",
+                        )
+                        amp_val = amp.contract()
+                    elif self.mode == 'projector3d':
+                        amp = amp.contract_boundary(
+                            max_bond=self.max_bond,
+                            cutoff=0.0,
+                            canonize=False,
+                            mode="projector3d",
+                            equalize_norms=1.0,
+                            sequence=["zmax"] * amp.Lz + ["ymax"] * amp.Ly,
+                            max_separation=0,
+                            final_contract_opts=dict(strip_exponent=True),
+                            progbar=False,
+                        )
+                        mantissa, exponent = amp
+                        amp_val = mantissa * 10**exponent
                 else:
                     raise ValueError(
-                        "from_which should be one of ymin, ymax, xboth, xmax, xmin"
+                        "from_which should be one of zmin, zmax"
                     )
-
-                amp_val = amp.contract()
+                
+                
             if amp_val == 0.0:
                 amp_val = torch.tensor(0.0)
             batch_amps.append(amp_val)
