@@ -5,17 +5,13 @@ import pickle
 import quimb.tensor as qtn
 import torch
 from funcs import enumerate_bitstrings, state_vector_from_amps
-from models import circuit_TNF_2d
+from models import circuit_TNF_2d_SU
 from vmc_torch.hamiltonian_torch import spin_Heisenberg_square_lattice_torch
-import tqdm
+
 import quimb as qu
-from vmc_torch.torch_utils import SVD,QR_tao
-import autoray as ar
-# Register safe SVD and QR functions to torch
-# ar.register_function('torch','linalg.svd',SVD.apply)
 
 # os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "10"
 # os.environ["OMP_NUM_THREADS"] = "1"
 import numpy as np
 # from quimb.core import isreal, issparse
@@ -28,8 +24,8 @@ RANK = COMM.Get_rank()
 
 
 Lx = 4
-Ly = 4
-D = 4
+Ly = 2
+D = 2
 H = spin_Heisenberg_square_lattice_torch(Lx, Ly, J=1.0, pbc=False, total_sz=0)
 ham_quimb = qtn.ham_2d_heis(Lx, Ly, j=1.0, cyclic=False)
 ham_quimb.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float64))
@@ -46,8 +42,8 @@ su_params, su_skeleton = pickle.load(
     open(f"./2D/circuitTNF_heis2D_Lx{Lx}_Ly{Ly}_D{D}_su_state.pkl", "rb")
 )
 su_peps = qtn.unpack(su_params, su_skeleton)
-# su_energy = su_peps.compute_local_expectation_exact(ham_quimb.terms, normalized=True)
-su_energy=0.0
+su_energy = su_peps.compute_local_expectation(ham_quimb.terms, normalized=True, max_bond=D**2)
+# su_energy=0.0
 print(f"SU state energy: {su_energy}")
 
 
@@ -57,32 +53,24 @@ exact_energy = qu.groundenergy(ham_ed)
 print(f"Exact ground state energy: {exact_energy}")
 ham_matrix = csr_matrix(ham_ed.toarray())
 
-max_bonds = [8]
-depths = [2,]
+max_bonds = [4, 8]
+depths = [4,]
 
 with torch.no_grad():
     for max_bond in max_bonds:
-        for tau in [ 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]:
+        for tau in [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]:
             for depth in depths:
-                model = circuit_TNF_2d(
+                model = circuit_TNF_2d_SU(
                     su_peps,
                     ham_quimb,
                     trotter_tau=tau,
                     depth=depth,
                     max_bond=max_bond,
+                    second_order_reflect=True,
                     dtype=torch.float64,
-                    from_which="zmax",
-                    mode='projector3d',
                 )
-                amps = []
-                pbar = tqdm.tqdm(total=len(projected_states), disable=RANK != 0)
-                for state in projected_states:
-                    amp = model(state.unsqueeze(0))
-                    amps.append(amp)
-                    pbar.update(1)
-                pbar.close()
-                amps = torch.cat(amps, dim=0)
-                # amps = model(projected_states)
+
+                amps = model(projected_states)
                 amp_dict = dict(zip(projected_states_tuple, amps.detach().numpy()))
                 state_vec = state_vector_from_amps(amp_dict, Lx*Ly)
 
@@ -99,7 +87,7 @@ with torch.no_grad():
                     )
                 }
                 # add to existing data file or create a new one
-                data_file = f"./data/circuitTNF2d_heis_Lx{Lx}_Ly{Ly}_D{D}_exact_sampling_results_{model.from_which}.json"
+                data_file = f"./data/circuitTNF2d_su_heis_Lx{Lx}_Ly{Ly}_D{D}_exact_sampling_results_inverse_su.json"
 
                 if os.path.exists(data_file):
                     with open(data_file, "r") as f:

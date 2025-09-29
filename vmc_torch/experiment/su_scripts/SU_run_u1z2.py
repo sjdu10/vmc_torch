@@ -4,15 +4,15 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-Lx = 4
-Ly = 4
+Lx = 8
+Ly = 8
 spinless = False
 N = int(Lx * Ly)
 # Define the fermion filling and the Hilbert space
-N_f = int(Lx*Ly-2)
+N_f = int(Lx*Ly-8)
 
 # SU in quimb
-D = 4
+D = 6
 symmetry = 'Z2'
 spinless = False
 # Define model parameters
@@ -87,11 +87,11 @@ su = qtn.SimpleUpdateGen(
 )
 
 # cluster energies may not be accuracte yet
-su.evolve(50, tau=0.3)
+# su.evolve(50, tau=0.3)
 su.evolve(50, tau=0.1)
-su.evolve(50, tau=0.03)
-su.evolve(50, tau=0.01)
-su.evolve(50, tau=0.005)
+# su.evolve(50, tau=0.03)
+# su.evolve(50, tau=0.01)
+# su.evolve(50, tau=0.005)
 
 peps = su.get_state()
 peps.equalize_norms_(value=1)
@@ -106,8 +106,8 @@ import os
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/data'
 os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
 
-with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
+with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton_U1SU.pkl', 'wb') as f:
     pickle.dump(skeleton, f)
-with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params.pkl', 'wb') as f:
+with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_su_params_U1SU.pkl', 'wb') as f:
     pickle.dump(params, f)
     

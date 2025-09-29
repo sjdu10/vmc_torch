@@ -7736,6 +7736,8 @@ class NNBF_attention_Nsd(wavefunctionModel):
         nn_eta=1,
         embed_dim=16,
         attention_heads=4,
+        attention_layers=1,
+        positiona_wise_mlp_hidden_dim=64,
         phys_dim=4,
         Nsd=1,
     ):
@@ -7757,32 +7759,31 @@ class NNBF_attention_Nsd(wavefunctionModel):
         
         self.embed_dim = embed_dim
         self.attention_heads = attention_heads
+        self.attention_layers = attention_layers
+        self.positiona_wise_mlp_hidden_dim = positiona_wise_mlp_hidden_dim
         self.phys_dim = phys_dim
         self.nsite = nsite
 
         # Initialize Nsd NN models, where each has input n and outputs a matrix with the same shape as M
         self.backflow_transformers = nn.ModuleList()
         for _ in range(self.Nsd):
-            # 1. Attention Block (SelfAttn_block_pos)
-            attn = SelfAttn_block_pos(
-                self.nsite,
+            # Transformer self-attention block (ViT style)
+            attn = StackedSelfAttn_FFNN(
+                nsite,
                 num_classes=self.phys_dim,
-                embed_dim=self.embed_dim,
+                output_dim=self.hilbert.size * self.hilbert.n_fermions,
+                nn_hidden_dim=hidden_dim,
+                embedding_dim=self.embed_dim,
                 attention_heads=self.attention_heads,
                 dtype=self.param_dtype,
-            )
-            
-            # 2. MLP for final output (maps to N * Nf dimensions)
-            mlp = nn.Sequential(
-                nn.Linear(self.embed_dim * self.nsite, hidden_dim),
-                nn.GELU(),
-                # The output size must match the size of M: N * Nf (self.hilbert.size * self.hilbert.n_fermions)
-                nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions),
+                num_layers=self.attention_layers,
+                d_inner=self.positiona_wise_mlp_hidden_dim,
+                use_positional_encoding=True,
             )
 
             # Combine attn and mlp into a single nn.ModuleList representing one transformer block
             # This block transforms the input state (n) into a backflow matrix (delta_M)
-            transformer_block = nn.ModuleList([attn, mlp])
+            transformer_block = attn
 
             # Convert NNs to the appropriate data type
             transformer_block.to(self.param_dtype)
@@ -7818,14 +7819,10 @@ class NNBF_attention_Nsd(wavefunctionModel):
             n = torch.tensor(
                 from_quimb_config_to_netket_config(x), dtype=self.param_dtype
             )
-            attn_layer, mlp_layer = self.backflow_transformers[sd_index]
+            
             if self.nn_eta != 0:
-                # Compute the attention output
-                attn_features = attn_layer(x).view(-1)
                 # Compute the backflow matrix F using the neural network
-                F = (
-                    mlp_layer(attn_features)
-                )
+                F = self.backflow_transformers[sd_index](x)
                 M = (
                     self.Ms[sd_index] + F.reshape(self.Ms[sd_index].shape) * self.nn_eta
                 )
