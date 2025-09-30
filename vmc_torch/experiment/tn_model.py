@@ -7930,7 +7930,7 @@ class HFDS(wavefunctionModel):
         for x_i in x:
             n_i = from_quimb_config_to_netket_config(x_i)
             # Check x_i type
-            if not type(n_i) == torch.Tensor:
+            if not isinstance(n_i, torch.Tensor):
                 n_i = torch.tensor(n_i, dtype=self.param_dtype)
 
             amp_val=backflow_det(n_i)
