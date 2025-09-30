@@ -1,6 +1,9 @@
-import json
 import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
 import pickle
+import json
 
 import quimb.tensor as qtn
 import torch
@@ -11,16 +14,15 @@ import tqdm
 import quimb as qu
 from vmc_torch.torch_utils import SVD,QR_tao
 import autoray as ar
-# Register safe SVD and QR functions to torch
-# ar.register_function('torch','linalg.svd',SVD.apply)
 
-# os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-# os.environ["OMP_NUM_THREADS"] = "1"
 import numpy as np
 # from quimb.core import isreal, issparse
 from scipy.sparse import csr_matrix
 from mpi4py import MPI
+
+# # Register safe SVD and QR functions to torch
+# ar.register_function('torch','linalg.svd',SVD.apply)
+# ar.register_function('torch','linalg.qr',QR_tao.apply)
 
 COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
@@ -40,29 +42,33 @@ dtype = torch.float64
 exp_all_states = list(enumerate_bitstrings(Lx*Ly))  # noqa: F405
 projected_states = torch.tensor(hilbert.all_states())
 projected_states_tuple = [tuple(state.tolist()) for state in projected_states]
+# distribute the work to different ranks, take care of the last few states if SIZE does not divide the total number of states
+projected_states_local = projected_states[RANK::SIZE]
+print(f"Rank {RANK} has {len(projected_states_local)} states to process.")
+projected_states_local_tuple = [tuple(state.tolist()) for state in projected_states_local]
 
 
 su_params, su_skeleton = pickle.load(
     open(f"./2D/circuitTNF_heis2D_Lx{Lx}_Ly{Ly}_D{D}_su_state.pkl", "rb")
 )
 su_peps = qtn.unpack(su_params, su_skeleton)
-# su_energy = su_peps.compute_local_expectation_exact(ham_quimb.terms, normalized=True)
-su_energy=0.0
-print(f"SU state energy: {su_energy}")
+if RANK == 0:
+    su_energy = su_peps.compute_local_expectation_exact(ham_quimb.terms, normalized=True)
+    print(f"SU state energy: {su_energy}")
 
 
 ham_ed = qu.ham_heis_2D(Lx, Ly, j=1.0, cyclic=False)
-
-exact_energy = qu.groundenergy(ham_ed)
-print(f"Exact ground state energy: {exact_energy}")
+if RANK == 0:
+    exact_energy = -9.189207065192965 if (Lx, Ly) == (4, 4) else qu.groundenergy(ham_ed)
+    print(f"Exact ground state energy: {exact_energy}")
 ham_matrix = csr_matrix(ham_ed.toarray())
 
-max_bonds = [8]
-depths = [2,]
+max_bonds = [10]
+depths = [6,]
 
 with torch.no_grad():
     for max_bond in max_bonds:
-        for tau in [ 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]:
+        for tau in [ 0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]:
             for depth in depths:
                 model = circuit_TNF_2d(
                     su_peps,
@@ -74,17 +80,28 @@ with torch.no_grad():
                     from_which="zmax",
                     mode='projector3d',
                 )
+                if RANK == 0:
+                    pbar = tqdm.tqdm(total=len(projected_states_local))
+                # equally distribute the work to different ranks
                 amps = []
-                pbar = tqdm.tqdm(total=len(projected_states), disable=RANK != 0)
-                for state in projected_states:
+                for state in projected_states_local:
                     amp = model(state.unsqueeze(0))
                     amps.append(amp)
-                    pbar.update(1)
-                pbar.close()
+                    if RANK == 0:
+                        pbar.update(1)
+                if RANK == 0:
+                    pbar.close()
                 amps = torch.cat(amps, dim=0)
                 # amps = model(projected_states)
-                amp_dict = dict(zip(projected_states_tuple, amps.detach().numpy()))
-                state_vec = state_vector_from_amps(amp_dict, Lx*Ly)
+                amp_dict = dict(zip(projected_states_local_tuple, amps.detach().numpy()))
+                COMM.Barrier()
+
+                all_amp_dict = COMM.gather(amp_dict, root=0)
+                if RANK != 0:
+                    continue
+                # combine the list of dicts to a single dict
+                all_amp_dict = {k: v for d in all_amp_dict for k, v in d.items()}
+                state_vec = state_vector_from_amps(all_amp_dict, Lx*Ly)
 
                 E = (
                     (state_vec @ (ham_matrix @ state_vec)) / (state_vec @ state_vec)

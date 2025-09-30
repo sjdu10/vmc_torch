@@ -360,104 +360,107 @@ class circuit_TNF_2d(wavefunctionModel):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
 
             amp = psi.get_amp(x_i)
-
-            if self.max_bond is None:
-                if self.tree is None:
-                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
-                    self.tree = amp.contraction_tree(optimize=opt)
-                amp_val = amp.contract(optimize=self.tree)
-            else:
-                if self.from_which == "zmin":
-                    if self.mode == 'peps':
-                        amp = amp.contract_boundary_from(
-                            from_which="zmin",
-                            max_bond=self.max_bond,
-                            cutoff=0.0,
-                            zrange=(0, psi.Lz - 1),
-                            yrange=[0, psi.Ly - 1],
-                            xrange=(0, psi.Lx - 1),
-                            mode="peps",
-                        )
-                        amp_val = amp.contract()
-                    elif self.mode == 'projector3d':
-                        amp = amp.contract_boundary(
-                            max_bond=self.max_bond,
-                            cutoff=0.0,
-                            canonize=False,
-                            mode="projector3d",
-                            equalize_norms=1.0,
-                            sequence=["zmin"] * amp.Lz + ["ymax"] * amp.Ly,
-                            max_separation=0,
-                            final_contract_opts=dict(strip_exponent=True),
-                            progbar=False,
-                        )
-                        mantissa, exponent = amp
-                        amp_val = mantissa * 10**exponent
-                        
-
-                elif self.from_which == "zmax":
-                    if self.mode == 'peps':
-                        amp = amp.contract_boundary_from(
-                            from_which="zmax",
-                            max_bond=self.max_bond,
-                            cutoff=0.0,
-                            zrange=(0, psi.Lz - 1),
-                            yrange=[0, psi.Ly - 1],
-                            xrange=(0, psi.Lx - 1),
-                            mode="peps",
-                        )
-                        amp_val = amp.contract()
-                    elif self.mode == 'projector3d':
-                        amp = amp.contract_boundary(
-                            max_bond=self.max_bond,
-                            cutoff=0.0,
-                            canonize=False,
-                            mode="projector3d",
-                            equalize_norms=1.0,
-                            sequence=["zmax"] * amp.Lz + ["ymax"] * amp.Ly,
-                            max_separation=0,
-                            final_contract_opts=dict(strip_exponent=True),
-                            progbar=False,
-                        )
-                        mantissa, exponent = amp
-                        amp_val = mantissa * 10**exponent
+            try:
+                if self.max_bond is None:
+                    if self.tree is None:
+                        opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                        self.tree = amp.contraction_tree(optimize=opt)
+                    amp_val = amp.contract(optimize=self.tree)
                 else:
-                    if self.mode == 'peps':
-                        amp = amp.contract_boundary_from(
-                            from_which=self.from_which,
-                            max_bond=self.max_bond,
-                            cutoff=0.0,
-                            zrange=(0, psi.Lz - 1),
-                            yrange=[0, psi.Ly - 1],
-                            xrange=(0, psi.Lx - 1),
-                            mode="peps",
-                        )
-                        amp_val = amp.contract()
-                    elif self.mode == 'projector3d':
-                        axis_set = ['x','y','z']
-                        axis_map = {'x':psi.Lx, 'y':psi.Ly, 'z':psi.Lz}
-                        axis = self.from_which[0]
-                        axis_set.remove(axis)
-                        final_contraction_axis = axis_set[0]
+                    if self.from_which == "zmin":
+                        if self.mode == 'peps':
+                            amp = amp.contract_boundary_from(
+                                from_which="zmin",
+                                max_bond=self.max_bond,
+                                cutoff=0.0,
+                                zrange=(0, psi.Lz - 1),
+                                yrange=[0, psi.Ly - 1],
+                                xrange=(0, psi.Lx - 1),
+                                mode="peps",
+                            )
+                            amp_val = amp.contract()
+                        elif self.mode == 'projector3d':
+                            amp = amp.contract_boundary(
+                                max_bond=self.max_bond,
+                                cutoff=0.0,
+                                canonize=False,
+                                mode="projector3d",
+                                equalize_norms=1.0,
+                                sequence=["zmin"] * amp.Lz + ["ymax"] * amp.Ly,
+                                max_separation=0,
+                                final_contract_opts=dict(strip_exponent=True),
+                                progbar=False,
+                            )
+                            mantissa, exponent = amp
+                            amp_val = mantissa * 10**exponent
+                            
 
-                        sequence0 = [self.from_which]*axis_map[axis]
-                        sequence1 = [final_contraction_axis+"max"]*axis_map[final_contraction_axis]
+                    elif self.from_which == "zmax":
+                        if self.mode == 'peps':
+                            amp = amp.contract_boundary_from(
+                                from_which="zmax",
+                                max_bond=self.max_bond,
+                                cutoff=0.0,
+                                zrange=(0, psi.Lz - 1),
+                                yrange=[0, psi.Ly - 1],
+                                xrange=(0, psi.Lx - 1),
+                                mode="peps",
+                            )
+                            amp_val = amp.contract()
+                        elif self.mode == 'projector3d':
+                            amp = amp.contract_boundary(
+                                max_bond=self.max_bond,
+                                cutoff=0.0,
+                                canonize=False,
+                                mode="projector3d",
+                                equalize_norms=1.0,
+                                sequence=["zmax"] * amp.Lz + ["ymax"] * amp.Ly,
+                                max_separation=0,
+                                final_contract_opts=dict(strip_exponent=True),
+                                progbar=False,
+                            )
+                            mantissa, exponent = amp
+                            amp_val = mantissa * 10**exponent
+                    else:
+                        if self.mode == 'peps':
+                            amp = amp.contract_boundary_from(
+                                from_which=self.from_which,
+                                max_bond=self.max_bond,
+                                cutoff=0.0,
+                                zrange=(0, psi.Lz - 1),
+                                yrange=[0, psi.Ly - 1],
+                                xrange=(0, psi.Lx - 1),
+                                mode="peps",
+                            )
+                            amp_val = amp.contract()
+                        elif self.mode == 'projector3d':
+                            axis_set = ['x','y','z']
+                            axis_map = {'x':psi.Lx, 'y':psi.Ly, 'z':psi.Lz}
+                            axis = self.from_which[0]
+                            axis_set.remove(axis)
+                            final_contraction_axis = axis_set[0]
 
-                        sequence = sequence0 + sequence1
-                        
-                        amp = amp.contract_boundary(
-                            max_bond=self.max_bond,
-                            cutoff=0.0,
-                            canonize=False,
-                            mode="projector3d",
-                            equalize_norms=1.0,
-                            sequence=sequence,
-                            max_separation=0,
-                            final_contract_opts=dict(strip_exponent=True),
-                            progbar=False,
-                        )
-                        mantissa, exponent = amp
-                        amp_val = mantissa * 10**exponent
+                            sequence0 = [self.from_which]*axis_map[axis]
+                            sequence1 = [final_contraction_axis+"max"]*axis_map[final_contraction_axis]
+
+                            sequence = sequence0 + sequence1
+                            
+                            amp = amp.contract_boundary(
+                                max_bond=self.max_bond,
+                                cutoff=0.0,
+                                canonize=False,
+                                mode="projector3d",
+                                equalize_norms=1.0,
+                                sequence=sequence,
+                                max_separation=0,
+                                final_contract_opts=dict(strip_exponent=True),
+                                progbar=False,
+                            )
+                            mantissa, exponent = amp
+                            amp_val = mantissa * 10**exponent
+            except Exception:
+                amp_val = amp.contract()
+                print("Contraction failed, using exact contraction instead")
                 
                 
             if amp_val == 0.0:
@@ -516,18 +519,34 @@ class circuit_TNF_2d_SU(wavefunctionModel):
             site_maps = dict((psi.sites[i], torch.tensor([1,0] if config == 0 else torch.tensor([0,1]))) for i, config in enumerate(x_i))
             config_product_state = qtn.PEPS.product_state(site_maps)
             config_product_state.apply_to_arrays(lambda x: x.type(self.param_dtype))
-            product_su = qtn.SimpleUpdateGen(
-                config_product_state,
-                self.ham,
-                D=self.max_bond,
-                second_order_reflect=self.second_order_reflect,
-                compute_energy_every=None,
-                compute_energy_final=False,
-                progbar=False,
-            )
-            product_su.evolve(self.depth, tau=self.trotter_tau)
-            evolved_product_state = product_su.get_state()
-            amp_val = (evolved_product_state & psi).contract()
+            # Manual update 
+            gauges = {}
+            for _ in range(self.depth):
+                for where in self.ham.get_auto_ordering()[::-1]:
+                    G = self.ham.get_gate_expm(where, -1 * self.trotter_tau)
+                    config_product_state.gate_simple_(
+                        G,
+                        where,
+                        max_bond=self.max_bond,
+                        gauges=gauges,
+                        cutoff=0.0,
+                        renorm=False,
+                    )
+            config_product_state.gauge_simple_insert(gauges)
+            amp_val = (config_product_state | psi).contract()
+            # product_su = qtn.SimpleUpdateGen(
+            #     config_product_state,
+            #     self.ham,
+            #     D=self.max_bond,
+            #     cutoff=0.0,
+            #     second_order_reflect=self.second_order_reflect,
+            #     compute_energy_every=None,
+            #     compute_energy_final=False,
+            #     progbar=False,
+            # )
+            # product_su.evolve(self.depth, tau=self.trotter_tau)
+            # evolved_product_state = product_su.get_state()
+            # amp_val = (evolved_product_state & psi).contract()
 
             if amp_val == 0.0:
                 amp_val = torch.tensor(0.0)

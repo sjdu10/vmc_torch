@@ -1,6 +1,10 @@
-import json
 import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "1"
+import json
 import pickle
+import tqdm
 
 import quimb.tensor as qtn
 import torch
@@ -10,9 +14,7 @@ from vmc_torch.hamiltonian_torch import spin_Heisenberg_square_lattice_torch
 
 import quimb as qu
 
-# os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "10"
-# os.environ["OMP_NUM_THREADS"] = "1"
+
 import numpy as np
 # from quimb.core import isreal, issparse
 from scipy.sparse import csr_matrix
@@ -24,8 +26,8 @@ RANK = COMM.Get_rank()
 
 
 Lx = 4
-Ly = 2
-D = 2
+Ly = 4
+D = 4
 H = spin_Heisenberg_square_lattice_torch(Lx, Ly, J=1.0, pbc=False, total_sz=0)
 ham_quimb = qtn.ham_2d_heis(Lx, Ly, j=1.0, cyclic=False)
 ham_quimb.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.float64))
@@ -43,17 +45,19 @@ su_params, su_skeleton = pickle.load(
 )
 su_peps = qtn.unpack(su_params, su_skeleton)
 su_energy = su_peps.compute_local_expectation(ham_quimb.terms, normalized=True, max_bond=D**2)
-# su_energy=0.0
+# su_energy=-9.004657636145344
 print(f"SU state energy: {su_energy}")
 
 
 ham_ed = qu.ham_heis_2D(Lx, Ly, j=1.0, cyclic=False)
 
-exact_energy = qu.groundenergy(ham_ed)
-print(f"Exact ground state energy: {exact_energy}")
+# exact_energy = qu.groundenergy(ham_ed)
+exact_energy = -9.189207065192965 if (Lx, Ly) == (4, 4) else qu.groundenergy(ham_ed)
+# print(f"Exact ground state energy: {exact_energy}")
+
 ham_matrix = csr_matrix(ham_ed.toarray())
 
-max_bonds = [4, 8]
+max_bonds = [10]
 depths = [4,]
 
 with torch.no_grad():
@@ -66,11 +70,19 @@ with torch.no_grad():
                     trotter_tau=tau,
                     depth=depth,
                     max_bond=max_bond,
-                    second_order_reflect=True,
+                    second_order_reflect=False,
                     dtype=torch.float64,
                 )
 
-                amps = model(projected_states)
+                # amps = model(projected_states)
+                amps = []
+                pbar = tqdm.tqdm(total=len(projected_states), disable=RANK != 0)
+                for state in projected_states:
+                    amp = model(state.unsqueeze(0))
+                    amps.append(amp)
+                    pbar.update(1)
+                pbar.close()
+                amps = torch.cat(amps, dim=0)
                 amp_dict = dict(zip(projected_states_tuple, amps.detach().numpy()))
                 state_vec = state_vector_from_amps(amp_dict, Lx*Ly)
 
