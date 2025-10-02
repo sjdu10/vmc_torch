@@ -7517,9 +7517,8 @@ class NNBF(wavefunctionModel):
         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
             nn.Linear(self.hilbert.size, hidden_dim),
-            nn.Tanh(),
+            nn.GELU(),
             nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
-            ShiftedSinhYFixed(),
         )
 
         # Convert NNs to the appropriate data type
@@ -7559,7 +7558,7 @@ class NNBF(wavefunctionModel):
         for x_i in x:
             n_i = from_quimb_config_to_netket_config(x_i)
             # Check x_i type
-            if not type(n_i) == torch.Tensor:
+            if not isinstance(n_i, torch.Tensor):
                 n_i = torch.tensor(n_i, dtype=self.param_dtype)
 
             amp_val=backflow_det(n_i)
