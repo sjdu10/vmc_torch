@@ -7916,7 +7916,10 @@ class HFDS(wavefunctionModel):
             F = []
             for i in range(self.Nh):
                 F.append(getattr(self, f'nn{i}')(n))
-            F = torch.stack(F)
+            if self.Nh > 0:
+                F = torch.stack(F)
+            if not isinstance(F, torch.Tensor):
+                F = torch.tensor(F, dtype=self.param_dtype)
 
             M  = self.M
             # Find the positions of the occupied orbitals
