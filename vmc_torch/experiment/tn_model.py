@@ -7292,28 +7292,24 @@ class SlaterDeterminant(wavefunctionModel):
         self.model_structure = {
             'SlaterDeterminant':{'N_orbitals': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions}
         }
-    
-    def _determinant(self, A):
-        # Compute the determinant of matrix A
-        det = torch.linalg.det(A)
-        return det
 
-    def forward(self, x):
+    def amplitude(self, x):
         # Define the slater determinant function manually to loop over inputs
         def slater_det(n):
             # Find the positions of the occupied orbitals
             R = torch.nonzero(n, as_tuple=False).squeeze()
             # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
             A = self.M[R]
-            return self._determinant(A)
+            return torch.linalg.det(A)
         
         # Apply slater_det to each element in the batch
         batch_amps = []
         for x_i in x:
+            n_i = from_quimb_config_to_netket_config(x_i)
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=torch.int)
-            n_i = torch.Tensor(from_quimb_config_to_netket_config(x_i), dtype=torch.int)
+            if not isinstance(n_i, torch.Tensor):
+                n_i = torch.tensor(n_i, dtype=torch.int32)
+
             amp_val=slater_det(n_i)
             batch_amps.append(amp_val)
         # Return the batch of amplitudes stacked as a tensor
