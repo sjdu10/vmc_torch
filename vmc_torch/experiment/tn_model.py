@@ -7885,7 +7885,7 @@ class HFDS(wavefunctionModel):
         for i in range(self.Nh):
             setattr(self, f'nn{i}', nn.Sequential(
                 nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
-                nn.Tanh(),
+                nn.GELU(),
                 nn.Linear(hidden_dim, self.Nf+self.Nh, dtype=self.param_dtype)
             ))
 
@@ -7896,7 +7896,7 @@ class HFDS(wavefunctionModel):
         if self.jastrow:
             self.nn_jastrow = nn.Sequential(
                 nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
-                nn.Tanh(),
+                nn.GELU(),
                 nn.Linear(hidden_dim, 1, dtype=self.param_dtype)
             )
             self.nn_jastrow.to(self.param_dtype)

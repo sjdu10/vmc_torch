@@ -281,11 +281,11 @@ class StackedSelfAttn(nn.Module):
                         "attention": SelfAttention(
                             embed_dim=self.embedding_dim, num_heads=attention_heads
                         ),
-                        "layer_norm1": nn.LayerNorm([n_site, self.embedding_dim]),
+                        "layer_norm1": nn.LayerNorm([self.embedding_dim], elementwise_affine=False),
                         "ffn": PositionwiseFeedForward(
                             d_in=self.embedding_dim, d_hid=d_inner
                         ),
-                        "layer_norm2": nn.LayerNorm([n_site, self.embedding_dim]),
+                        "layer_norm2": nn.LayerNorm([self.embedding_dim], elementwise_affine=False),
                     }
                 )
                 for _ in range(num_layers)
@@ -304,29 +304,26 @@ class StackedSelfAttn(nn.Module):
 
     def forward(self, input_seq):
         # Step 1: One-hot encode the input sequence
-        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(
+        x = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(
             self.dtype
         )
 
         # Step 2: Embed the one-hot encoded sequence
-        embedded = self.embedding(one_hot_encoded)
+        x = self.embedding(x)
 
         if self.use_positional_encoding:
-            embedded = embedded + self.positional_embedding
+            x = x + self.positional_embedding
 
         # Step 3: Pass through the stacked transformer blocks
-        x = embedded # shape (n_site, embedding_dim)
+        # x shape (n_site, embedding_dim)
         for block in self.transformer_blocks:
-            # Self-attention block
-            attn_output, _ = block["attention"](x.unsqueeze(0))
-            x = block["layer_norm1"](
-                x + attn_output[0]
-            )  # Residual connection and normalization
-
-            # Position-wise feed-forward block and residual connection and normalization
-            x = block["layer_norm2"](x + block["ffn"](x))  
+            # Self-attention block, input shape should be (batch_size, seq_length, embed_dim)
+            y, _ = block["attention"](x)
+            x = block["layer_norm1"](x + y)
+            x = block["layer_norm2"](x + block["ffn"](x))
 
         return x
+
 
 class SelfAttn_FFNN_block(nn.Module):
     """ Self-attention block followed by a final feed-forward network to get fixed-length output"""
@@ -530,7 +527,7 @@ class StackedSelfAttn_FFNN(nn.Module):
         x = embedded
         for block in self.transformer_blocks:
             # Self-attention block
-            attn_output, _ = block["attention"](x.unsqueeze(0))
+            attn_output, _ = block["attention"](x)
             x = block["layer_norm1"](
                 x + attn_output[0]
             )  # Residual connection and normalization
