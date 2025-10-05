@@ -77,6 +77,7 @@ class SelfAttention(nn.Module):
         average_attn_weights: bool = False,
     ):
         # internally use x for (query, key, value)
+        # x should be of shape (batch_size, seq_length, embed_dim)
         return self.mha(
             x,
             x,
@@ -159,9 +160,9 @@ class SelfAttn_block(nn.Module):
         )
 
         # Step 2: Embed the one-hot encoded sequence
-        embedded = self.embedding(one_hot_encoded)
+        embedded = self.embedding(one_hot_encoded) 
 
-        # Step 3: Pass through the self-attention block
+        # Step 3: Pass through the self-attention block XXX: should unsqueeze batch dim
         attn_output, _ = self.self_attention(
             embedded, embedded, embedded, need_weights=False
         )
@@ -252,6 +253,80 @@ class SelfAttn_MLP(nn.Module):
 
         return attn_output
 
+class StackedSelfAttn(nn.Module):
+    """ Stacked self-attention blocks"""
+    def __init__(
+        self,
+        n_site,
+        num_classes,
+        num_layers=1,
+        embedding_dim=8,
+        d_inner=16,
+        attention_heads=2,
+        use_positional_encoding=True,
+        dtype=torch.float32,
+    ):
+        super(StackedSelfAttn, self).__init__()
+        self.num_classes = num_classes
+        self.embedding_dim = embedding_dim
+
+        # Linear layer to project one-hot vectors to the embedding dimension
+        self.embedding = nn.Linear(num_classes, self.embedding_dim)
+
+        # Stacking transformer blocks (Self-attention + FFNN) (Nonlinearities in softmax and 2-layer MLP)
+        self.transformer_blocks = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "attention": SelfAttention(
+                            embed_dim=self.embedding_dim, num_heads=attention_heads
+                        ),
+                        "layer_norm1": nn.LayerNorm([n_site, self.embedding_dim]),
+                        "ffn": PositionwiseFeedForward(
+                            d_in=self.embedding_dim, d_hid=d_inner
+                        ),
+                        "layer_norm2": nn.LayerNorm([n_site, self.embedding_dim]),
+                    }
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        # Learnable positional embedding
+        self.positional_embedding = nn.Parameter(
+            torch.randn(n_site, self.embedding_dim) / self.embedding_dim**0.5
+        )
+        self.use_positional_encoding = use_positional_encoding
+
+        self.dtype = dtype
+        self.embedding.to(dtype=dtype)
+        self.transformer_blocks.to(dtype=dtype)
+
+    def forward(self, input_seq):
+        # Step 1: One-hot encode the input sequence
+        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(
+            self.dtype
+        )
+
+        # Step 2: Embed the one-hot encoded sequence
+        embedded = self.embedding(one_hot_encoded)
+
+        if self.use_positional_encoding:
+            embedded = embedded + self.positional_embedding
+
+        # Step 3: Pass through the stacked transformer blocks
+        x = embedded # shape (n_site, embedding_dim)
+        for block in self.transformer_blocks:
+            # Self-attention block
+            attn_output, _ = block["attention"](x.unsqueeze(0))
+            x = block["layer_norm1"](
+                x + attn_output[0]
+            )  # Residual connection and normalization
+
+            # Position-wise feed-forward block and residual connection and normalization
+            x = block["layer_norm2"](x + block["ffn"](x))  
+
+        return x
 
 class SelfAttn_FFNN_block(nn.Module):
     """ Self-attention block followed by a final feed-forward network to get fixed-length output"""
@@ -408,10 +483,8 @@ class StackedSelfAttn_FFNN(nn.Module):
             [
                 nn.ModuleDict(
                     {
-                        "attention": nn.MultiheadAttention(
-                            embed_dim=self.embedding_dim,
-                            num_heads=attention_heads,
-                            batch_first=True,
+                        "attention": SelfAttention(
+                            embed_dim=self.embedding_dim, num_heads=attention_heads
                         ),
                         "layer_norm1": nn.LayerNorm(self.embedding_dim),
                         "ffn": PositionwiseFeedForward(
@@ -457,9 +530,9 @@ class StackedSelfAttn_FFNN(nn.Module):
         x = embedded
         for block in self.transformer_blocks:
             # Self-attention block
-            attn_output, _ = block["attention"](x, x, x)
+            attn_output, _ = block["attention"](x.unsqueeze(0))
             x = block["layer_norm1"](
-                x + attn_output
+                x + attn_output[0]
             )  # Residual connection and normalization
 
             # Position-wise feed-forward block and residual connection and normalization
@@ -472,3 +545,4 @@ class StackedSelfAttn_FFNN(nn.Module):
         final_output = self.final_ffn(flattened_output)
 
         return final_output
+

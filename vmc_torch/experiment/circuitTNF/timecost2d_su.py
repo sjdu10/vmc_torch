@@ -4,11 +4,12 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 import pickle
 import json
+import time
 
 import quimb.tensor as qtn
 import torch
 from funcs import enumerate_bitstrings, state_vector_from_amps
-from models import circuit_TNF_2d
+from models import circuit_TNF_2d, circuit_TNF_2d_SU
 from vmc_torch.hamiltonian_torch import spin_Heisenberg_square_lattice_torch
 import tqdm
 import quimb as qu
@@ -52,32 +53,32 @@ su_params, su_skeleton = pickle.load(
     open(f"./2D/circuitTNF_heis2D_Lx{Lx}_Ly{Ly}_D{D}_su_state.pkl", "rb")
 )
 su_peps = qtn.unpack(su_params, su_skeleton)
-if RANK == 0:
-    su_energy = su_peps.compute_local_expectation_exact(ham_quimb.terms, normalized=True)
-    print(f"SU state energy: {su_energy}")
+# if RANK == 0:
+#     su_energy = su_peps.compute_local_expectation_exact(ham_quimb.terms, normalized=True)
+#     print(f"SU state energy: {su_energy}")
 
 
-ham_ed = qu.ham_heis_2D(Lx, Ly, j=1.0, cyclic=False)
-if RANK == 0:
-    exact_energy = -9.189207065192965 if (Lx, Ly) == (4, 4) else qu.groundenergy(ham_ed)
-    print(f"Exact ground state energy: {exact_energy}")
-ham_matrix = csr_matrix(ham_ed.toarray())
+# ham_ed = qu.ham_heis_2D(Lx, Ly, j=1.0, cyclic=False)
+# if RANK == 0:
+#     exact_energy = -9.189207065192965 if (Lx, Ly) == (4, 4) else qu.groundenergy(ham_ed)
+#     print(f"Exact ground state energy: {exact_energy}")
+# ham_matrix = csr_matrix(ham_ed.toarray())
 
-max_bonds = [4]
-depths = [4,6,8,10]
+max_bonds = [2, 4, 6, 8, 10]
+depths = [4, 6, 8, 10, 12, 14, 16, 18]
 from_which = "zmax"
 with torch.no_grad():
     for max_bond in max_bonds:
-        for tau in [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]:
+        for tau in [0.04]:
             for depth in depths:
                 # collect_data_dict = {(depth, tau, max_bond): E}
                 collect_data_dict = {
-                    f"Lx{Lx}_Ly{Ly}_D{D}_depth={depth}_tau={tau}_maxbond={max_bond}": (
+                    f"Lx{Lx}_Ly{Ly}_D{D}_depth={depth}_tau={tau}_maxbond={max_bond}_su": (
                         None,
                     )
                 }
                 # check if this piece of data already exists
-                data_file = f"./data/circuitTNF2d_heis_Lx{Lx}_Ly{Ly}_D{D}_exact_sampling_results_{from_which}.json"
+                data_file = f"./data/circuitTNF2d_heis_Lx{Lx}_Ly{Ly}_D{D}_exact_sampling_time_cost.json"
 
                 if os.path.exists(data_file):
                     with open(data_file, "r") as f:
@@ -88,53 +89,41 @@ with torch.no_grad():
                         continue
                 COMM.Barrier()
 
-                model = circuit_TNF_2d(
+                model = circuit_TNF_2d_SU(
                     su_peps,
                     ham_quimb,
                     trotter_tau=tau,
                     depth=depth,
                     max_bond=max_bond,
                     dtype=torch.float64,
-                    from_which=from_which,
-                    mode='projector3d',
+                    profile_time=True,
                 )
                 if RANK == 0:
                     pbar = tqdm.tqdm(total=len(projected_states_local))
                 # equally distribute the work to different ranks
                 amps = []
-                for state in projected_states_local:
+                t0 = time.time()
+                N_sample = 5
+                for state in projected_states_local[:N_sample]:  # for recording time cost only
                     amp = model(state.unsqueeze(0))
                     amps.append(amp)
                     if RANK == 0:
                         pbar.update(1)
                 if RANK == 0:
                     pbar.close()
-                amps = torch.cat(amps, dim=0)
-                # amps = model(projected_states)
-                amp_dict = dict(zip(projected_states_local_tuple, amps.detach().numpy()))
-                COMM.Barrier()
+                t1 = time.time()
 
-                all_amp_dict = COMM.gather(amp_dict, root=0)
-                if RANK != 0:
-                    continue
-                # combine the list of dicts to a single dict
-                all_amp_dict = {k: v for d in all_amp_dict for k, v in d.items()}
-                state_vec = state_vector_from_amps(all_amp_dict, Lx*Ly)
+                average_time = (t1 - t0) / N_sample
+                if RANK == 0:
+                    print(f"Depth={depth}, tau={tau}, max_bond={max_bond}, average time per state: {average_time:.4f} seconds")
 
-                E = (
-                    (state_vec @ (ham_matrix @ state_vec)) / (state_vec @ state_vec)
-                ).real
-                print(f"Variational state energy: {E}, tau={tau}, max_bond={max_bond}")
-                # collect_data_dict = {(depth, tau, max_bond): E}
                 collect_data_dict = {
-                    f"Lx{Lx}_Ly{Ly}_D{D}_depth={depth}_tau={tau}_maxbond={max_bond}": (
-                        E,
-                        np.float64(su_energy),
-                        np.float64(exact_energy),
-                    )
+                    f"Lx{Lx}_Ly{Ly}_D{D}_depth={depth}_tau={tau}_maxbond={max_bond}_su": average_time
                 }
+                
+                
                 # add to existing data file or create a new one
-                data_file = f"./data/circuitTNF2d_heis_Lx{Lx}_Ly{Ly}_D{D}_exact_sampling_results_{model.from_which}.json"
+                data_file = f"./data/circuitTNF2d_heis_Lx{Lx}_Ly{Ly}_D{D}_exact_sampling_time_cost.json"
 
                 if os.path.exists(data_file):
                     with open(data_file, "r") as f:

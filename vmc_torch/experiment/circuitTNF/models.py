@@ -2,6 +2,7 @@ import quimb.tensor as qtn
 import torch
 import torch.nn as nn
 import cotengra as ctg
+import time
 
 from vmc_torch.experiment.tn_model import wavefunctionModel
 
@@ -479,6 +480,7 @@ class circuit_TNF_2d_SU(wavefunctionModel):
         depth,
         second_order_reflect=False,
         max_bond=None,
+        profile_time=False,
         dtype=torch.float32,
     ):
         super().__init__(dtype)
@@ -486,6 +488,7 @@ class circuit_TNF_2d_SU(wavefunctionModel):
         self.trotter_tau = trotter_tau
         self.second_order_reflect = second_order_reflect
         self.depth = depth
+        self.profile_time = profile_time
         # self.second_order_reflect = second_order_reflect
         self.max_bond = max_bond if (type(max_bond) is int and max_bond > 0) else None
         if self.max_bond is None:
@@ -509,6 +512,76 @@ class circuit_TNF_2d_SU(wavefunctionModel):
         peps = qtn.unpack(params, self.skeleton)
         return peps
 
+    def form_gated_tns_tnf(
+        self,
+        tns,
+        ham,
+        depth,
+        tau=0.5,
+        nn_where_list=None,
+        d_tag_id="ROUND_{}",
+        x_tag_id="X{}",
+        y_tag_id="Y{}",
+        z_tag_id="ROUND_{}",
+        site_tag_id_2d="I{},{}",
+        site_tag_id_3d="I{},{},{}",
+    ):
+        tns1 = tns.copy()
+
+        if not isinstance(nn_where_list, list) and not isinstance(nn_where_list, tuple):
+            Warning(
+                "nn_where_list is not a list of tuples, using auto ordering from the Hamiltonian"
+            )
+            nn_where_list = ham.get_auto_ordering()
+
+        # Change tags for the initial tns
+        for ts in tns1.tensors:
+            ts.modify(tags=["ROUND_0"] + list(ts.tags))
+
+        # Apply the gates and add corresponding tags
+        for i in range(depth):
+            for where in nn_where_list:
+                gate = ham.get_gate_expm(where, -1 * tau)
+                site_inds = [tns1.site_ind_id.format(*site) for site in where]
+                extra_tags = ["ROUND_{}".format(i + 1)]
+                ltag = tns1.site_tag_id.format(*where[0])
+                rtag = tns1.site_tag_id.format(*where[1])
+                tns1 = tns1.gate_inds(
+                    gate,
+                    inds=site_inds,
+                    contract="split-gate",
+                    tags=extra_tags,
+                    ltags=ltag,
+                    rtags=rtag,
+                )
+
+        # Contract the gates in each round to a MPO
+        for i in range(1, depth + 1):
+            for site in tns1.sites:
+                tns1.contract_tags_(
+                    [tns1.site_tag_id.format(*site), f"ROUND_{i}"],
+                    inplace=True,
+                    which="all",
+                )
+        import itertools
+
+        # Add site tags
+        for d in range(0, depth + 1):
+            for x, y in itertools.product(range(tns1.Lx), range(tns1.Ly)):
+                # print(x,y)
+                ts = tns1[[site_tag_id_2d.format(x, y), d_tag_id.format(d)]]
+                ts.add_tag(x_tag_id.format(x))
+                ts.add_tag(y_tag_id.format(y))
+                ts.add_tag(z_tag_id.format(d))
+                ts.add_tag(site_tag_id_3d.format(x, y, d))
+
+        # return tns1
+
+        circuit_tnf = PEPS_TNF.from_TN(tns1)
+        circuit_tnf.set_depth(depth)
+
+        return circuit_tnf
+
 
     def amplitude(self, x):
         psi = self.get_state()
@@ -519,9 +592,12 @@ class circuit_TNF_2d_SU(wavefunctionModel):
             site_maps = dict((psi.sites[i], torch.tensor([1,0] if config == 0 else torch.tensor([0,1]))) for i, config in enumerate(x_i))
             config_product_state = qtn.PEPS.product_state(site_maps)
             config_product_state.apply_to_arrays(lambda x: x.type(self.param_dtype))
+            # try:
             # Manual update 
             gauges = {}
+            config_product_state.gauge_all_simple_(max_iterations=1, gauges=gauges)
             for _ in range(self.depth):
+                t0 = time.time()
                 for where in self.ham.get_auto_ordering()[::-1]:
                     G = self.ham.get_gate_expm(where, -1 * self.trotter_tau)
                     config_product_state.gate_simple_(
@@ -532,21 +608,55 @@ class circuit_TNF_2d_SU(wavefunctionModel):
                         cutoff=0.0,
                         renorm=False,
                     )
+                t1 = time.time()
+                config_product_state.gauge_all_simple_(max_iterations=1, gauges=gauges)
+                t2 = time.time()
+                if self.profile_time:
+                    print(f"One layer gate time: {t1-t0}, gauge time: {t2-t1}")
+
             config_product_state.gauge_simple_insert(gauges)
-            amp_val = (config_product_state | psi).contract()
-            # product_su = qtn.SimpleUpdateGen(
-            #     config_product_state,
-            #     self.ham,
-            #     D=self.max_bond,
-            #     cutoff=0.0,
-            #     second_order_reflect=self.second_order_reflect,
-            #     compute_energy_every=None,
-            #     compute_energy_final=False,
-            #     progbar=False,
-            # )
-            # product_su.evolve(self.depth, tau=self.trotter_tau)
-            # evolved_product_state = product_su.get_state()
-            # amp_val = (evolved_product_state & psi).contract()
+            two_layer_tn = (config_product_state | psi)
+            t0 = time.time()
+            two_layer_tn.contract_boundary_from_xmax_(xrange=[0, psi.Lx-1], yrange=[0, psi.Ly-1], max_bond=self.max_bond, canonize=False, mode="projector",equalize_norms=1.0,)
+            amp_val = two_layer_tn.contract()
+            t1 = time.time()
+            if self.profile_time:
+                print(f"2-layer TN contraction time: {t1-t0}")
+
+                        
+                        # config_product_state.gate_simple_(
+                        #     G,
+                        #     where,
+                        #     max_bond=self.max_bond,
+                        #     gauges=gauges,
+                        #     cutoff=0.0,
+                        #     renorm=False,
+                        # )
+            # except Exception as e:
+            #     print(e)
+            #     circuit_tnf = self.form_gated_tns_tnf(
+            #         psi,
+            #         self.ham,
+            #         self.depth,
+            #         tau=self.trotter_tau,
+            #         nn_where_list=self.ham.get_auto_ordering(),
+            #     )
+            #     amp = circuit_tnf.get_amp(x_i)
+            #     amp = amp.contract_boundary(
+            #         max_bond=self.max_bond,
+            #         cutoff=0.0,
+            #         canonize=False,
+            #         mode="projector3d",
+            #         equalize_norms=1.0,
+            #         sequence=["zmax"] * amp.Lz + ["ymax"] * amp.Ly,
+            #         max_separation=0,
+            #         final_contract_opts=dict(strip_exponent=True),
+            #         progbar=False,
+            #     )
+            #     mantissa, exponent = amp
+            #     amp_val = mantissa * 10**exponent
+            #     print("Contraction failed, using projector3d contraction instead")
+
 
             if amp_val == 0.0:
                 amp_val = torch.tensor(0.0)

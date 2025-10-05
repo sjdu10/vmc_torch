@@ -7737,7 +7737,7 @@ class NNBF_attention_Nsd(wavefunctionModel):
         embed_dim=16,
         attention_heads=4,
         attention_layers=1,
-        positiona_wise_mlp_hidden_dim=64,
+        position_wise_mlp_hidden_dim=64,
         phys_dim=4,
         Nsd=1,
     ):
@@ -7760,7 +7760,7 @@ class NNBF_attention_Nsd(wavefunctionModel):
         self.embed_dim = embed_dim
         self.attention_heads = attention_heads
         self.attention_layers = attention_layers
-        self.positiona_wise_mlp_hidden_dim = positiona_wise_mlp_hidden_dim
+        self.position_wise_mlp_hidden_dim = position_wise_mlp_hidden_dim
         self.phys_dim = phys_dim
         self.nsite = nsite
 
@@ -7768,22 +7768,26 @@ class NNBF_attention_Nsd(wavefunctionModel):
         self.backflow_transformers = nn.ModuleList()
         for _ in range(self.Nsd):
             # Transformer self-attention block (ViT style)
-            attn = StackedSelfAttn_FFNN(
+            attn = StackedSelfAttn(
                 nsite,
                 num_classes=self.phys_dim,
-                output_dim=self.hilbert.size * self.hilbert.n_fermions,
-                nn_hidden_dim=hidden_dim,
                 embedding_dim=self.embed_dim,
                 attention_heads=self.attention_heads,
                 dtype=self.param_dtype,
                 num_layers=self.attention_layers,
-                d_inner=self.positiona_wise_mlp_hidden_dim,
+                d_inner=self.position_wise_mlp_hidden_dim,
                 use_positional_encoding=True,
             )
 
-            # Combine attn and mlp into a single nn.ModuleList representing one transformer block
+            fnn = nn.Sequential(
+                nn.Linear(self.embed_dim * nsite, hidden_dim, dtype=self.param_dtype),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions, dtype=self.param_dtype),
+            )
+
+            # Combine attn and fnn into a single nn.ModuleList representing one transformer block
             # This block transforms the input state (n) into a backflow matrix (delta_M)
-            transformer_block = attn
+            transformer_block = nn.ModuleList([attn, fnn])
 
             # Convert NNs to the appropriate data type
             transformer_block.to(self.param_dtype)
@@ -7804,11 +7808,11 @@ class NNBF_attention_Nsd(wavefunctionModel):
                 "N_fermions": self.hilbert.n_fermions,
                 "N_fermions_per_spin": self.hilbert.n_fermions_per_spin,
                 "nn_eta": self.nn_eta,
-                "hidden_dim": hidden_dim,
+                "final_nn_hidden_dim": hidden_dim,
                 "embed_dim": self.embed_dim,
                 "attention_heads": self.attention_heads,
                 "attention_layers": self.attention_layers,
-                "positiona_wise_mlp_hidden_dim": self.positiona_wise_mlp_hidden_dim,
+                "position_wise_mlp_hidden_dim": self.position_wise_mlp_hidden_dim,
                 "phys_dim": self.phys_dim,
                 "Nsd": self.Nsd,
             }
@@ -7825,7 +7829,10 @@ class NNBF_attention_Nsd(wavefunctionModel):
             
             if self.nn_eta != 0:
                 # Compute the backflow matrix F using the neural network
-                F = self.backflow_transformers[sd_index](x)
+                transformed_x = self.backflow_transformers[sd_index][0](x)
+                F = self.backflow_transformers[sd_index][1](
+                    transformed_x.view(-1)
+                )
                 M = (
                     self.Ms[sd_index] + F.reshape(self.Ms[sd_index].shape) * self.nn_eta
                 )
