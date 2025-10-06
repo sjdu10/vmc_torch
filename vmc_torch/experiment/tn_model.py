@@ -311,7 +311,7 @@ class circuit_TNF(wavefunctionModel):
 
         
 
-class PEPS_model(torch.nn.Module):
+class PEPS_model(wavefunctionModel):
     def __init__(self, peps, max_bond=None):
         super().__init__()
         self.peps = peps
@@ -331,45 +331,7 @@ class PEPS_model(torch.nn.Module):
         # register the torch tensors as parameters
         for tid, param in self.torch_tn_params.items():
             self.register_parameter(tid, param)
-        
-        # self.load_params(self.from_params_to_vec())
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
-    
-    def load_params(self, vec):
-        pointer = 0
-        for param in self.parameters():
-            num_param = param.numel()
-            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
-    
-    def from_vec_to_params(self, vec):
-        # XXX: useful at all? Yes for spin PEPS
-        pointer = 0
-        new_params = {}
-        for tid, param in self.torch_tn_params.items():
-            num_param = param.numel()
-            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
-            new_params[tid] = new_param_values
-            pointer += num_param
-        return new_params
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
-        return param_grad_vec
 
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
     def amplitude(self, x):
         # update self.PEPS
         params ={
@@ -392,12 +354,6 @@ class PEPS_model(torch.nn.Module):
             return func(x)
         else:
             return torch.stack([func(xi) for xi in x])
-    
-    def forward(self, x, **kwargs):
-        if x.ndim == 1:
-            # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x, **kwargs)
 
 class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
     """
