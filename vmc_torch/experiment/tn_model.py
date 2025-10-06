@@ -90,7 +90,8 @@ class wavefunctionModel(torch.nn.Module):
     
     def load_params(self, new_params):
         pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
+        for param in self.parameters():
+            shape = param.shape
             num_param = param.numel()
             new_param_values = new_params[pointer:pointer+num_param].view(shape)
             with torch.no_grad():
@@ -331,6 +332,8 @@ class PEPS_model(wavefunctionModel):
         # register the torch tensors as parameters
         for tid, param in self.torch_tn_params.items():
             self.register_parameter(tid, param)
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
 
     def amplitude(self, x):
         # update self.PEPS
