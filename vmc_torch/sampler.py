@@ -108,6 +108,7 @@ class Sampler(AbstractSampler):
         self.subchain_length = graph.n_edges if subchain_length is None else subchain_length
         self.attempts = 0
         self.accepts = 0
+        self.hopping_rate = 0.0
 
     @torch.no_grad()
     def burn_in(self, vstate):
@@ -1065,6 +1066,111 @@ class MetropolisExchangeSamplerSpinful(Sampler):
 
         for (i, j) in site_pairs:
             exchange_propose(i, j)
+
+        if self.current_amp == 0 and DEBUG:
+            print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2')
+        
+        return self.current_config, self.current_amp
+
+
+class MetropolisExchangeSamplerSpinful_hopping(Sampler):
+    def __init__(self, hi, graph, N_samples=2**8, burn_in_steps=100, reset_chain=False, random_edge=False, subchain_length=None, equal_partition=True, dtype=torch.float32, device=None, hopping_rate=0.5):
+        """
+        Parameters
+        ----------
+        hi : Hilbert
+            The Hilbert space.
+        graph : Graph
+            Lattice graph.
+        N_samples : int
+            The number of samples.
+        burn_in_steps : int
+            The number of burn-in steps.
+        reset_chain : bool
+            Whether to reset the chain after each VMC step.
+        random_edge : bool
+            Whether to randomly select the edges in the exchange move.
+        subchain_length : int
+            The number of samples we discard before collecting two samples.
+        equal_partition : bool
+            Whether the number of samples is equal for all MPI processes. If False, we use eager sampling and must have SIZE > 1.
+        dtype : torch.dtype
+
+        """
+        self.hopping_rate = hopping_rate
+        super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype, device=device)
+
+    def _sample_next(self, vstate, **kwargs):
+        """Sample the next configuration. Change the current configuration in place."""
+        self.current_amp = vstate.amplitude(self.current_config)
+        self.current_prob = abs(self.current_amp)**2
+        proposed_config = self.current_config.clone()
+        ind_n_map = {0:0, 1:1, 2:1, 3:2}
+        def exchange_propose(i, j):
+            if self.current_config[i] == self.current_config[j]:
+                self.attempts += 1
+                self.accepts += 1 # exchange must be accepted, no hopping is allowed
+                return 
+            self.attempts += 1
+            proposed_config = self.current_config.clone()
+            config_i = self.current_config[i].item()
+            config_j = self.current_config[j].item()
+            if random.random() < 1 - self.hopping_rate:
+                # exchange
+                proposed_config[i] = config_j
+                proposed_config[j] = config_i
+                proposed_amp = vstate.amplitude(proposed_config).cpu()
+                proposed_prob = abs(proposed_amp)**2
+            else:
+                # hopping
+                n_i = ind_n_map[self.current_config[i].item()]
+                n_j = ind_n_map[self.current_config[j].item()]
+                delta_n = abs(n_i - n_j)
+                if delta_n == 1: 
+                    # consider only valid hopping: (0, u) -> (u, 0); (d, ud) -> (ud, d)
+                    proposed_config[i] = config_j
+                    proposed_config[j] = config_i
+                    proposed_amp = vstate.amplitude(proposed_config).cpu()
+                    proposed_prob = abs(proposed_amp)**2
+                elif delta_n == 0:
+                    # consider only valid hopping: (u, d) -> (0, ud) or (ud, 0)
+                    choices = [(0, 3), (3, 0)]
+                    choice = random.choice(choices)
+                    proposed_config[i] = choice[0]
+                    proposed_config[j] = choice[1]
+                    proposed_amp = vstate.amplitude(proposed_config).cpu()
+                    proposed_prob = abs(proposed_amp)**2
+                elif delta_n == 2:
+                    # consider only valid hopping: (0, ud) -> (u, d) or (d, u)
+                    choices = [(1,2), (2,1)]
+                    choice = random.choice(choices)
+                    proposed_config[i] = choice[0]
+                    proposed_config[j] = choice[1]
+                    proposed_amp = vstate.amplitude(proposed_config).cpu()
+                    proposed_prob = abs(proposed_amp)**2
+                else:
+                    raise ValueError("Invalid configuration")
+            try:
+                acceptance_ratio = min(1, (proposed_prob/self.current_prob))
+            except ZeroDivisionError:
+                acceptance_ratio = 1 if proposed_prob > 0 else 0
+            if random.random() < acceptance_ratio or (self.current_prob == 0):
+                self.current_config = proposed_config
+                self.current_amp = proposed_amp
+                self.current_prob = proposed_prob
+                self.accepts += 1
+
+        if self.random_edge:
+            site_pairs = random.choices(self.graph.edges(), k=self.subchain_length)
+        else:
+            site_pairs = self.graph.edges()
+
+        acceptance_rate = 0
+
+        while acceptance_rate < 0.05:
+            for (i, j) in site_pairs:
+                exchange_propose(i, j)
+            acceptance_rate = self.accepts / self.attempts if self.attempts > 0 else 0
 
         if self.current_amp == 0 and DEBUG:
             print(f'Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2')
