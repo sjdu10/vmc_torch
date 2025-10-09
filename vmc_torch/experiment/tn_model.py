@@ -15,9 +15,12 @@ from vmc_torch.fermion_utils import (
     calculate_phase_from_adjacent_trans_dict,
     decompose_permutation_into_transpositions,
     flatten_proj_params,
+    reconstruct_proj_params,
+    flatten_fts_params,
+    reconstruct_fts_params,
     insert_compressor,
     insert_proj_peps,
-    reconstruct_proj_params,
+    
 )
 from vmc_torch.global_var import DEBUG, set_debug
 
@@ -4901,6 +4904,8 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             nn_features_vec = nn_features.view(-1)
             nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
             # Add the correction to the original parameters
+            # print(f'nn_correction mean&std: {nn_correction.mean().item()}, {nn_correction.std().item()}')
+            # print(f'params_vec mean&std: {params_vec.mean().item()}, {params_vec.std().item()}')
             tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
             # Reconstruct the TN with the new parameters
             psi = qtn.unpack(tn_nn_params, self.skeleton)
@@ -4910,7 +4915,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             if self.max_bond is None:
                 amp = amp
                 if self.tree is None:
-                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=100, parallel=True)
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=False)
                     self.tree = amp.contraction_tree(optimize=opt)
                 amp_val = amp.contract(optimize=self.tree)
             else:
@@ -5240,7 +5245,7 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
             tn_params_vec = flatten_tn_params(tn_params_dict)
             self.mlp[tid] = nn.Sequential(
                 nn.Linear(mlp_input_dim, nn_final_dim),
-                nn.LeakyReLU(),
+                nn.GELU(),
                 nn.Linear(nn_final_dim, tn_params_vec.numel()),
             )
             self.mlp[tid].to(self.param_dtype)
@@ -5307,6 +5312,158 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
                 amp = amp
                 if self.tree is None:
                     opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp_val = amp.contract()
+                
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
+class fTN_backflow_attn_Tensorwise_Model_v5(wavefunctionModel):
+    """
+        For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
+        This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
+        Positional encoding is added to the input of the attention block in this model.
+        Update: do not flatten the features from the attention block, instead use them directly in each on-site MLP to generate the tensor correction. And modify the amp instead of the state tensor.
+    """
+    def __init__(
+        self,
+        ftn,
+        max_bond=None,
+        embedding_dim=32,
+        attention_heads=4,
+        nn_final_dim=4,
+        pwmlpdim=10,
+        nn_eta=1.0,
+        dtype=torch.float32,
+        eps=5e-3,
+    ):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly
+        phys_dim = ftn.phys_dim()
+        
+        self.nn = SelfAttn_MLP(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embed_dim=embedding_dim,
+            attention_heads=attention_heads,
+            dtype=self.param_dtype,
+            position_wise_mlp_dim=pwmlpdim,
+        )
+
+        # for each tensor (labelled by tid), assign a MLP
+        self.mlp = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            mlp_input_dim = embedding_dim
+            tn_params_dict = {
+                tid: params[int(tid)]
+            }
+            tn_params_vec = flatten_tn_params(tn_params_dict)
+            self.mlp[tid] = nn.Sequential(
+                nn.Linear(mlp_input_dim, nn_final_dim),
+                nn.GELU(),
+                nn.Linear(nn_final_dim, int(tn_params_vec.numel()/4)),
+            )
+            self.mlp[tid].to(self.param_dtype)
+        
+        # Initialize the MLP last layer weights and biases with small values
+        for mlp in self.mlp.values():
+            last_layer = mlp[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.uniform_(last_layer.weight, a=-eps, b=eps)
+                if last_layer.bias is not None:
+                    nn.init.uniform_(last_layer.bias, a=-eps, b=eps)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+
+        self.model_structure = {
+            'fPEPS_backflow_attn_Tensorwise_MLP':
+            {
+                'D': ftn.max_bond(), 
+                'Lx': ftn.Lx, 'Ly': ftn.Ly, 
+                'symmetry': self.symmetry, 
+                'max_bond': max_bond,
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta, 
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+            },
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        self.tree = None
+    
+    def amplitude(self, x):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+        
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(params, self.skeleton)
+
+            # Get the amplitude
+            amp = psi.get_amp(x_i)
+
+            nn_features = self.nn(x_i)
+            for tid, ts in amp.tensor_map.items():
+                tid_str = str(tid)
+                nn_correction = self.mlp[tid_str](nn_features[tid])
+                ts_param = ts.get_params()
+                ts_param_vec = flatten_fts_params(ts_param)
+                new_ts_param_vec = ts_param_vec + nn_correction * self.nn_eta
+                new_ts_param = reconstruct_fts_params(new_ts_param_vec, ts_param)
+                ts.set_params(new_ts_param)
+
+            if self.max_bond is None:
+                amp = amp
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=False)
                     self.tree = amp.contraction_tree(optimize=opt)
                 amp_val = amp.contract(optimize=self.tree)
             else:
@@ -7679,7 +7836,12 @@ class NNBF_attention(wavefunctionModel):
         return torch.stack(batch_amps)
 
 class NNBF_attention_Nsd(wavefunctionModel):
-    """Assuming total Sz=0."""
+    """Assuming total Sz=0.
+    NOTE: 
+    1. position-wise hard coded learnable embedding (x)
+    2. Initialization: only last layer of MLP is initilaized with small std
+    3. Change the last layer of all-to-all mlp to position-wise mlp embed_dim=256
+    """
 
     def __init__(
         self,
@@ -7791,6 +7953,161 @@ class NNBF_attention_Nsd(wavefunctionModel):
                 M = (
                     self.Ms[sd_index] + F.reshape(self.Ms[sd_index].shape) * self.nn_eta
                 )
+            elif self.nn_eta == 0:  # Pure Slater determinant calculation
+                M = self.Ms[sd_index] 
+
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the 2Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = M[R]
+            det = torch.linalg.det(A)
+            amp = det
+
+            return amp
+
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=torch.int)
+
+            amp_val = sum([backflow_det(x_i, sd_index=sd) for sd in range(self.Nsd)]) / self.Nsd
+
+            batch_amps.append(amp_val)
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
+class NNBF_attention_Nsd_v1(wavefunctionModel):
+    """Assuming total Sz=0.
+    NOTE: 
+    1. position-wise hard coded learnable embedding (x)
+    2. Initialization: only last layer of MLP is initilaized with small std
+    3. Change the last layer of all-to-all mlp to position-wise mlp embed_dim=256
+    """
+
+    def __init__(
+        self,
+        nsite,
+        hilbert,
+        kernel_init=None,
+        param_dtype=torch.float32,
+        hidden_dim=64,
+        nn_eta=1,
+        embed_dim=16,
+        attention_heads=4,
+        attention_layers=1,
+        position_wise_mlp_hidden_dim=64,
+        phys_dim=4,
+        Nsd=1,
+        eps=1e-3,
+    ):
+        super(NNBF_attention_Nsd_v1, self).__init__()
+
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        self.Nsd = Nsd
+
+        # Initialize the parameter M (N x Nf matrix) for each Slater determinant
+        self.Ms = nn.ParameterList([
+            nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype))
+            if kernel_init is not None
+            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            )
+            for _ in range(self.Nsd)
+        ])
+        
+        self.embed_dim = embed_dim
+        self.attention_heads = attention_heads
+        self.attention_layers = attention_layers
+        self.position_wise_mlp_hidden_dim = position_wise_mlp_hidden_dim
+        self.phys_dim = phys_dim
+        self.nsite = nsite
+
+        # Initialize Nsd NN models, where each has input n and outputs a matrix with the same shape as M
+        self.backflow_transformers = nn.ModuleList()
+        for _ in range(self.Nsd):
+            # Transformer self-attention block (ViT style)
+            attn = StackedSelfAttn(
+                2*nsite,
+                num_classes=self.phys_dim,
+                embedding_dim=self.embed_dim,
+                attention_heads=self.attention_heads,
+                dtype=self.param_dtype,
+                num_layers=self.attention_layers,
+                d_inner=self.position_wise_mlp_hidden_dim,
+                use_positional_encoding=True,
+            )
+
+            spatial_mlp_lst = nn.ModuleList()
+            for site in range(2*nsite):
+                fnn = nn.Sequential(
+                    nn.Linear(self.embed_dim, hidden_dim, dtype=self.param_dtype),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.hilbert.n_fermions, dtype=self.param_dtype),
+                )
+                fnn.to(self.param_dtype)
+                # initialize the last layer with small std
+                nn.init.normal_(fnn[2].weight, mean=0.0, std=eps)
+                nn.init.constant_(fnn[2].bias, 0.0)
+                spatial_mlp_lst.append(fnn)
+
+            # Combine attn and fnn into a single nn.ModuleList representing one transformer block
+            # This block transforms the input state (n) into a backflow matrix (delta_M)
+            transformer_block = nn.ModuleList([attn, spatial_mlp_lst])
+
+            # Convert NNs to the appropriate data type
+            transformer_block.to(self.param_dtype)
+            
+            # Add the block to the main list
+            self.backflow_transformers.append(transformer_block)
+        
+        self.backflow_transformers.to(self.param_dtype)
+
+        self.nn_eta = nn_eta
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            "NNBF w attention": {
+                "N_site": self.nsite,
+                "N_fermions": self.hilbert.n_fermions,
+                "N_fermions_per_spin": self.hilbert.n_fermions_per_spin,
+                "nn_eta": self.nn_eta,
+                "final_nn_hidden_dim": hidden_dim,
+                "embed_dim": self.embed_dim,
+                "attention_heads": self.attention_heads,
+                "attention_layers": self.attention_layers,
+                "position_wise_mlp_hidden_dim": self.position_wise_mlp_hidden_dim,
+                "phys_dim": self.phys_dim,
+                "Nsd": self.Nsd,
+            }
+        }
+
+    def amplitude(self, x):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(x, sd_index=0):
+            n = torch.tensor(
+                from_quimb_config_to_netket_config(x), dtype=self.param_dtype
+            )
+            
+            if self.nn_eta != 0:
+                # Compute the backflow matrix F using the neural network
+                attn_output = self.backflow_transformers[sd_index][0](n) # shape: (2*nsite, embed_dim)
+                F_lst = []
+                for site in range(2*self.nsite):
+                    F_site = self.backflow_transformers[sd_index][1][site](attn_output[site])
+                    F_lst.append(F_site)
+                F = torch.stack(F_lst)
+                # print(f'MO mean&std: {self.Ms[sd_index].mean().item():.4f}, {self.Ms[sd_index].std().item():.4f}')
+                # print(f'F mean&std: {F.mean().item():.4f}, {F.std().item():.4f}')
+                M = self.Ms[sd_index] + F * self.nn_eta
+                
             elif self.nn_eta == 0:  # Pure Slater determinant calculation
                 M = self.Ms[sd_index] 
 

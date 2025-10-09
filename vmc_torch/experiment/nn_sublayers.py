@@ -182,8 +182,9 @@ class SelfAttn_MLP(nn.Module):
         embed_dim,
         attention_heads,
         dtype=torch.float32,
-        layer_norm=False,
+        layer_norm=True,
         position_wise_mlp=True,
+        position_wise_mlp_dim=None,
         positional_encoding=True,
     ):
         super(SelfAttn_MLP, self).__init__()
@@ -202,11 +203,12 @@ class SelfAttn_MLP(nn.Module):
             embed_dim=embed_dim, num_heads=attention_heads
         )
         # Position-wise feed-forward network
-        self.mlp = (
-            PositionwiseFeedForward(d_in=embed_dim, d_hid=embed_dim * 2)
-            if position_wise_mlp
-            else lambda x: x
-        )
+        if position_wise_mlp:
+            if position_wise_mlp_dim is None:
+                position_wise_mlp_dim = embed_dim * 2
+            self.mlp = PositionwiseFeedForward(d_in=embed_dim, d_hid=position_wise_mlp_dim)
+        else:
+            self.mlp = lambda x: x  # identity map
 
         self.dtype = dtype
         self.layer_norm = layer_norm
@@ -234,11 +236,16 @@ class SelfAttn_MLP(nn.Module):
         attn_output, _ = self.self_attention(embedded)
 
         # Step 4: Residual connection and layer normalization
+        
+        # print(f'Embedded mean, std: {embedded.mean().item()}, {embedded.std().item()}')
+        # print(f'Attention output mean, std: {attn_output.mean().item()}, {attn_output.std().item()}')
+
         # If layer_norm is True, apply layer normalization
         if self.layer_norm:
             attn_output = F.layer_norm(attn_output + embedded, attn_output.size()[1:])
         else:
             attn_output = attn_output + embedded
+        # print(f'Post-layer-norm attention output mean, std: {attn_output.mean().item()}, {attn_output.std().item()}')
 
         # Step 5: Pass through the position-wise feed-forward network with residual connection
         if self.position_wise_mlp:
