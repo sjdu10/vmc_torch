@@ -1097,8 +1097,8 @@ class MetropolisExchangeSamplerSpinful_hopping(Sampler):
         dtype : torch.dtype
 
         """
-        self.hopping_rate = hopping_rate
         super().__init__(hi, graph, N_samples, burn_in_steps, reset_chain, random_edge, subchain_length, equal_partition, dtype, device=device)
+        self.hopping_rate = hopping_rate
 
     def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
