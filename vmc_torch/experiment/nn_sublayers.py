@@ -490,11 +490,11 @@ class StackedSelfAttn_FFNN(nn.Module):
                         "attention": SelfAttention(
                             embed_dim=self.embedding_dim, num_heads=attention_heads
                         ),
-                        "layer_norm1": nn.LayerNorm(self.embedding_dim),
+                        "layer_norm1": nn.LayerNorm(self.embedding_dim, elementwise_affine=False),
                         "ffn": PositionwiseFeedForward(
                             d_in=self.embedding_dim, d_hid=d_inner
                         ),
-                        "layer_norm2": nn.LayerNorm(self.embedding_dim),
+                        "layer_norm2": nn.LayerNorm(self.embedding_dim, elementwise_affine=False),
                     }
                 )
                 for _ in range(num_layers)

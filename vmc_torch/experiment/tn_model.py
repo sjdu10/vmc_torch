@@ -51,7 +51,7 @@ def init_weights_kaiming(m):
 
 # Define the custom zero-initialization function
 def init_weights_to_zero(m, std=1e-3):
-    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding, nn.LayerNorm)):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding)):
         # Set weights and biases to zero
         if hasattr(m, 'weight') and m.weight is not None:
             nn.init.normal_(m.weight, mean=0.0, std=std)
@@ -60,7 +60,7 @@ def init_weights_to_zero(m, std=1e-3):
 
 # Define the custom uniform initialization function
 def init_weights_uniform(m, a=-5e-3, b=5e-3):
-    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding, nn.LayerNorm)):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding)):
         # Set weights and biases to zero
         if hasattr(m, 'weight') and m.weight is not None:
             nn.init.uniform_(m.weight, a=a, b=b)
@@ -2830,15 +2830,7 @@ class fTNModel_reuse(wavefunctionModel):
                 return amp_tn
 
     def amplitude(self, x):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        params = {
-            int(tid): {
-                ast.literal_eval(sector): data for sector, data in blk_array.items()
-            }
-            for tid, blk_array in self.torch_tn_params.items()
-        }
-        # Reconstruct the TN with the new parameters
-        psi = qtn.unpack(params, self.skeleton)
+        psi = self.psi()
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -2852,7 +2844,6 @@ class fTNModel_reuse(wavefunctionModel):
                 if x_i.dtype != self.param_dtype:
                     x_i = x_i.to(torch.int if self.functional else self.param_dtype)
             # Get the amplitude
-            # amp = psi.get_amp(x_i, conj=True, functional=self.functional)
             amp_tn = self.get_amp_tn(x_i)
 
             if self.max_bond is None:
@@ -7857,6 +7848,7 @@ class NNBF_attention_Nsd(wavefunctionModel):
         position_wise_mlp_hidden_dim=64,
         phys_dim=4,
         Nsd=1,
+        eps=None,
     ):
         super(NNBF_attention_Nsd, self).__init__()
 
@@ -7901,6 +7893,11 @@ class NNBF_attention_Nsd(wavefunctionModel):
                 nn.GELU(),
                 nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions, dtype=self.param_dtype),
             )
+            if eps is not None:
+                # Initialize the last layer with small std
+                last_mlp_layer = fnn[-1]
+                nn.init.normal_(last_mlp_layer.weight, mean=0.0, std=eps)
+                nn.init.constant_(last_mlp_layer.bias, 0.0)
 
             # Combine attn and fnn into a single nn.ModuleList representing one transformer block
             # This block transforms the input state (n) into a backflow matrix (delta_M)
@@ -7911,6 +7908,7 @@ class NNBF_attention_Nsd(wavefunctionModel):
             
             # Add the block to the main list
             self.backflow_transformers.append(transformer_block)
+        
         
         self.backflow_transformers.to(self.param_dtype)
 
@@ -8001,7 +7999,7 @@ class NNBF_attention_Nsd_v1(wavefunctionModel):
         position_wise_mlp_hidden_dim=64,
         phys_dim=4,
         Nsd=1,
-        eps=1e-3,
+        eps=None,
     ):
         super(NNBF_attention_Nsd_v1, self).__init__()
 
@@ -8044,14 +8042,15 @@ class NNBF_attention_Nsd_v1(wavefunctionModel):
             spatial_mlp_lst = nn.ModuleList()
             for site in range(2*nsite):
                 fnn = nn.Sequential(
-                    nn.Linear(self.embed_dim, hidden_dim, dtype=self.param_dtype),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim, self.hilbert.n_fermions, dtype=self.param_dtype),
+                    nn.Linear(self.embed_dim, self.hilbert.n_fermions, dtype=self.param_dtype),
+                    # nn.GELU(),
+                    # nn.Linear(hidden_dim, self.hilbert.n_fermions, dtype=self.param_dtype),
                 )
                 fnn.to(self.param_dtype)
-                # initialize the last layer with small std
-                nn.init.normal_(fnn[2].weight, mean=0.0, std=eps)
-                nn.init.constant_(fnn[2].bias, 0.0)
+                if eps is not None:
+                    # Initialize the last layer with small std
+                    nn.init.normal_(fnn[-1].weight, mean=0.0, std=eps)
+                    nn.init.constant_(fnn[-1].bias, 0.0)
                 spatial_mlp_lst.append(fnn)
 
             # Combine attn and fnn into a single nn.ModuleList representing one transformer block
@@ -8063,6 +8062,7 @@ class NNBF_attention_Nsd_v1(wavefunctionModel):
             
             # Add the block to the main list
             self.backflow_transformers.append(transformer_block)
+        
         
         self.backflow_transformers.to(self.param_dtype)
 
