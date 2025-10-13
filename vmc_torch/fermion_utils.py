@@ -413,7 +413,9 @@ class fPEPS(qtn.PEPS):
                     elif self.symmetry == 'U1U1':
                         new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
                     new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=self.symmetry)
-                except:
+                except Exception as e:
+                    print("Error in constructing new f-tensor data:")
+                    print(e)
                     # Error when constructing the new f-tensor
                     print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
                     
