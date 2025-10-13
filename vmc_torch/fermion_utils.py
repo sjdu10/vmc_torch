@@ -283,7 +283,6 @@ class fPEPS(qtn.PEPS):
 
         return amp
     
-    # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
     def get_amp(self, config, inplace=False, conj=True, reverse=1, contract=True, efficient=True, functional=False):
         """Get the amplitude of a configuration in a PEPS."""
         if functional:

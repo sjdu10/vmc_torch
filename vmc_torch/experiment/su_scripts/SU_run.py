@@ -6,15 +6,15 @@ import symmray as sr
 import pickle
 
 # Define the lattice shape
-Lx = 4
-Ly = 4
+Lx = 3
+Ly = 2
 spinless = False
 N = int(Lx * Ly)
 # Define the fermion filling and the Hilbert space
 N_f = int(Lx*Ly-2)
 
 # SU in quimb
-D = 6
+D = 4
 seed = 2
 symmetry = 'U1'
 spinless = False
