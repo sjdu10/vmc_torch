@@ -378,7 +378,8 @@ class fPEPS(qtn.PEPS):
 
                         # 1. Determine which index to select (0 or 1) from the input vector.
                         #    `argmax` finds the position of the '1.0'.
-                        select_index = torch.argmax(input_vec).item()
+                        # select_index = torch.argmax(input_vec).item()
+                        select_index = do('argmax', input_vec)
 
                         # 2. Build the slicer tuple dynamically.
                         #    This creates a list of `slice(None)` (which is equivalent to `:`)
