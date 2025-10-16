@@ -236,12 +236,12 @@ class Variational_State:
 
         return stats_dict, op_grad
     
-    def expect(self, op, full_hi=False, message_tag=None):
+    def expect(self, op, full_hi=False, message_tag=None, vec_op=False):
         """
         Compute the expectation value of the operator `op`.
 
         Args:
-            op (netket operator object): The operator for which the expectation value and gradient are calculated.
+            op (operator object): The operator for which the expectation value and gradient are calculated.
             full_hi (bool): Whether to use the full Hilbert space expectation value and gradient calculation.
 
         Returns:
@@ -254,7 +254,7 @@ class Variational_State:
             chain_length = self.Ns//SIZE # Number of samples per rank
             # use MPI for sampling
             t0 = MPI.Wtime()
-            op_expect, op_var, op_err = self.collect_samples(op, chain_length=chain_length)
+            op_expect, op_var, op_err = self.collect_samples(op, chain_length=chain_length, vec_op=vec_op)
             t1 = MPI.Wtime()
             self.equal_sampling_time = t1 - t0
         
@@ -266,7 +266,7 @@ class Variational_State:
 
             # use MPI for sampling, but sampler may have different number of samples per rank
             t0 = MPI.Wtime()
-            op_expect, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag)
+            op_expect, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag, vec_op=vec_op)
             t1 = MPI.Wtime()
             self.eager_sampling_time = t1 - t0
         
@@ -275,7 +275,10 @@ class Variational_State:
 
         return stats_dict
     
-    def collect_samples(self, op, chain_length=1):
+    
+    
+    
+    def collect_samples(self, op, chain_length=1, vec_op=False):
         """
             Rank 0 returns the expectation value, variance, and error of the operator.
         """
@@ -286,7 +289,7 @@ class Variational_State:
         # this should be a list of local samples statistics:
         # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         t_sample_start = MPI.Wtime()
-        local_samples = self.sampler.sample(op=op, vstate=vstate, chain_length=chain_length)
+        local_samples = self.sampler.sample(op=op, vstate=vstate, chain_length=chain_length, vec_op=vec_op)
         self.clear_cache()
         t_sample_end = MPI.Wtime()
         # if DEBUG:
@@ -306,17 +309,20 @@ class Variational_State:
         op_expect = COMM.allreduce(local_op_loc_sum, op=MPI.SUM)/self.Ns # op_expect is seen by all ranks
         t01 = MPI.Wtime()
 
-        # Total sample variance calculation is collected ONLY on rank 0
-        local_op_loc_mean = local_op_loc_sum/chain_length
-        # (n_i - 1)* s^2_i
-        local_op_loc_sqrd_sum = (chain_length-1)*local_op_var + chain_length*(local_op_loc_mean - op_expect)**2
-        op_var = COMM.reduce(local_op_loc_sqrd_sum, op=MPI.SUM, root=0)
+        if not vec_op:
+            # Total sample variance calculation is collected ONLY on rank 0
+            local_op_loc_mean = local_op_loc_sum/chain_length
+            # (n_i - 1)* s^2_i
+            local_op_loc_sqrd_sum = (chain_length-1)*local_op_var + chain_length*(local_op_loc_mean - op_expect)**2
+            op_var = COMM.reduce(local_op_loc_sqrd_sum, op=MPI.SUM, root=0)
 
-        # Rhat diagnostics on rank 0. Rhat is the potential scale reduction factor. R\hat = V\hat/W, where V\hat is an unbiased estimation of variance form B and W and W is the within-chain variance.
-        # within-chain variance (W)
-        W_sum = COMM.reduce(W_loc, op=MPI.SUM, root=0)
-        # between-chain variance (B)
-        chain_means = COMM.gather(chain_means_loc, root=0) # [[m_11, m_12], [m_21, m_22], ..., [m_q1, m_q2]] where q is the number of ranks
+            # Rhat diagnostics on rank 0. Rhat is the potential scale reduction factor. R\hat = V\hat/W, where V\hat is an unbiased estimation of variance form B and W and W is the within-chain variance.
+            # within-chain variance (W)
+            W_sum = COMM.reduce(W_loc, op=MPI.SUM, root=0)
+            # between-chain variance (B)
+            chain_means = COMM.gather(chain_means_loc, root=0) # [[m_11, m_12], [m_21, m_22], ..., [m_q1, m_q2]] where q is the number of ranks
+        else:
+            op_var = None
 
         t1 = MPI.Wtime()
         self.MPI_communication_time = t1 - t_sample_end
@@ -327,21 +333,23 @@ class Variational_State:
             if DEBUG:
                 print('     Time for op_expect: {}'.format(t01-t0))
                 print('     Time for op_var: {}'.format(t1-t01))
-            op_var = op_var/self.Ns
+            op_var = op_var/self.Ns if op_var is not None else None
 
-            chain_means = np.concatenate(chain_means, axis=0)
-            sub_chain_length = chain_length//2
-            sub_chain_num = 2*SIZE
-            B = sub_chain_length * np.var(chain_means, ddof=1)
-            W = W_sum/sub_chain_num
+            if not vec_op:
+                # Rhat diagnostics
+                chain_means = np.concatenate(chain_means, axis=0)
+                sub_chain_length = chain_length//2
+                sub_chain_num = 2*SIZE
+                B = sub_chain_length * np.var(chain_means, ddof=1)
+                W = W_sum/sub_chain_num
 
-            # estimated variance: V\hat
-            V_hat = (sub_chain_length - 1)/sub_chain_length * W + B/sub_chain_length# + mean_correction
-            R_hat = np.sqrt(V_hat/W)
-            print('R_hat: {}'.format(R_hat))
-            print('V_hat:{}, OP_var:{}'.format(V_hat, op_var))
+                # estimated variance: V\hat
+                V_hat = (sub_chain_length - 1)/sub_chain_length * W + B/sub_chain_length# + mean_correction
+                R_hat = np.sqrt(V_hat/W)
+                print('R_hat: {}'.format(R_hat))
+                print('V_hat:{}, OP_var:{}'.format(V_hat, op_var))
 
-            op_mean_err = np.sqrt(op_var/self.Ns) # standard error of the mean value of the local op
+            op_mean_err = np.sqrt(op_var/self.Ns) if op_var is not None else None # standard error of the mean value of the local op
 
             return op_expect, op_var, op_mean_err
         
@@ -349,7 +357,7 @@ class Variational_State:
             return None, None, None
     
 
-    def collect_samples_eager(self, op, message_tag=None):
+    def collect_samples_eager(self, op, message_tag=None, vec_op=False):
         vstate = self
         
         # Sample on each rank
@@ -357,7 +365,7 @@ class Variational_State:
         # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
 
         t_sample_start = MPI.Wtime()
-        local_samples = self.sampler.sample_eager(op=op, vstate=vstate, message_tag=message_tag)
+        local_samples = self.sampler.sample_eager(op=op, vstate=vstate, message_tag=message_tag, vec_op=vec_op)
         self.clear_cache()
         t_sample_end = MPI.Wtime()
         # if DEBUG:
@@ -378,14 +386,17 @@ class Variational_State:
         op_expect = COMM.allreduce(local_op_loc_sum, op=MPI.SUM)/total_sample_Ns # op_expect is seen by all ranks
         t01 = MPI.Wtime()
 
-        # compute the total sample variance
-        if n_local_samples > 0:
-            local_op_loc_mean = local_op_loc_sum/n_local_samples
-            local_W_var = (n_local_samples-1)*local_op_var + n_local_samples*(local_op_loc_mean - op_expect)**2
+        if not vec_op:
+            # compute the total sample variance
+            if n_local_samples > 0:
+                local_op_loc_mean = local_op_loc_sum/n_local_samples
+                local_W_var = (n_local_samples-1)*local_op_var + n_local_samples*(local_op_loc_mean - op_expect)**2
+            else:
+                local_op_loc_mean = 0.
+                local_W_var = 0.
+            op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
         else:
-            local_op_loc_mean = 0.
-            local_W_var = 0.
-        op_var = COMM.reduce(local_W_var, op=MPI.SUM, root=0)
+            op_var = None
         self.MPI_communication_time = MPI.Wtime() - t_sample_end
 
         if RANK == 0:
@@ -395,8 +406,8 @@ class Variational_State:
                 print('     Time for op_expect: {}'.format(t01-t0))
 
             # Standard error of the mean value of the local op
-            op_var = op_var/total_sample_Ns
-            op_mean_err = np.sqrt(op_var/total_sample_Ns)
+            op_var = op_var/total_sample_Ns if op_var is not None else None
+            op_mean_err = np.sqrt(op_var/total_sample_Ns) if op_var is not None else None
 
             return op_expect, op_var, op_mean_err
         

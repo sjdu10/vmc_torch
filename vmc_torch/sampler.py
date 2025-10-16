@@ -151,7 +151,7 @@ class Sampler(AbstractSampler):
             psi_sigma = 0
             while psi_sigma == 0:
                 # We need to make sure that the amplitude is not zero
-                sigma, psi_sigma = self._sample_next(vstate)
+                sigma, psi_sigma = self._sample_next(vstate, burn_in=True)
             configs[_] = sigma
             amps[_] = psi_sigma
 
@@ -159,7 +159,7 @@ class Sampler(AbstractSampler):
 
         
 
-    def sample(self, vstate, op, chain_length=1):
+    def sample(self, vstate, op, chain_length=1, vec_op=False):
         """
         Sample configurations and compute the local operator.
         
@@ -221,8 +221,9 @@ class Sampler(AbstractSampler):
             psi_eta = psi_eta.cpu().detach().numpy()
 
             # compute the local operator
-            op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
-            op_loc_vec[chain_step] = op_loc
+            op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1) if not vec_op else O_etasigma * (psi_eta / psi_sigma)
+            if not vec_op:
+                op_loc_vec[chain_step] = op_loc
 
             # accumulate the local operator
             op_loc_sum += op_loc
@@ -252,13 +253,16 @@ class Sampler(AbstractSampler):
         if RANK == 0:
             pbar.close()
         
-        # The following is for computing the Rhat diagnostic using the Gelman-Rubin formula
-
-        # Step 1：split the chain in half and compute the within chain variance
-        split_chains = np.split(op_loc_vec, 2)
-        # Step 2: compute the within chain variance
-        W_loc = np.sum([np.var(split_chain) for split_chain in split_chains])
-        chain_means_loc = [np.mean(split_chain) for split_chain in split_chains]
+        if not vec_op:
+            # The following is for computing the Rhat diagnostic using the Gelman-Rubin formula
+            # Step 1：split the chain in half and compute the within chain variance
+            split_chains = np.split(op_loc_vec, 2)
+            # Step 2: compute the within chain variance
+            W_loc = np.sum([np.var(split_chain) for split_chain in split_chains])
+            chain_means_loc = [np.mean(split_chain) for split_chain in split_chains]
+        else:
+            W_loc = None
+            chain_means_loc = None
 
         samples = (op_loc_sum, op_loc_var, W_loc, chain_means_loc)
         self.attempts = 0
@@ -266,7 +270,7 @@ class Sampler(AbstractSampler):
         return samples
     
     @torch.no_grad()
-    def sample_eager(self, vstate, op, message_tag=None):
+    def sample_eager(self, vstate, op, message_tag=None, **kwargs):
         """Sample eagerly for the local energy and amplitude gradient for each configuration.
         return a tuple of (op_loc_sum, op_loc_var, n)"""
         assert not self.equal_partition, 'Must not use equal partition for eager sampling.'
@@ -291,7 +295,7 @@ class Sampler(AbstractSampler):
         if RANK == 0:
             pbar = tqdm(total=self.Ns, desc='Sampling starts...')
             for _ in range(2):
-                op_loc, _ = self._sample_expect(vstate, op)
+                op_loc, _ = self._sample_expect(vstate, op, **kwargs)
                 op_loc_vec.append(op_loc)
                 op_loc_sum += op_loc
 
@@ -324,7 +328,7 @@ class Sampler(AbstractSampler):
         
         else:
             while not terminate[0]:
-                op_loc, _ = self._sample_expect(vstate, op)
+                op_loc, _ = self._sample_expect(vstate, op, **kwargs)
                 n += 1
                 op_loc_vec.append(op_loc)
                 # accumulate the local energy and amplitude gradient
@@ -642,7 +646,7 @@ class Sampler(AbstractSampler):
         return op_loc, logpsi_sigma_grad, time1 - time0
     
     @torch.no_grad()
-    def _sample_expect(self, vstate, op):
+    def _sample_expect(self, vstate, op, vec_op=False):
         """Get one sample of the local operator."""
         time0 = MPI.Wtime()
         # sample the next configuration
@@ -669,7 +673,7 @@ class Sampler(AbstractSampler):
         psi_eta = psi_eta.cpu().detach().numpy()
 
         # compute the local operator
-        op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+        op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1) if not vec_op else O_etasigma * (psi_eta / psi_sigma)
 
         self.sample_time += (time1 - time0) # for profiling purposes
         self.local_energy_time += (time3 - time2)
