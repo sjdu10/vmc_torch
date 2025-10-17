@@ -32,17 +32,17 @@ RANK = COMM.Get_rank()
 torch.manual_seed(1234 + RANK)
 # Hamiltonian parameters
 Lx = int(4)
-Ly = int(2)
+Ly = int(4)
 symmetry = 'Z2'
 t = 1.0
 U = 8.0
-N_f = int(Lx*Ly-2)
+N_f = int(Lx*Ly)
 n_fermions_per_spin = (N_f//2, N_f//2)
 H = spinful_Fermi_Hubbard_square_lattice_torch(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
 # TN parameters
-D = 4
-chi = 32
+D = 6
+chi = 24
 dtype=torch.float64
 
 if symmetry == 'U1_Z2':
@@ -68,7 +68,7 @@ peps.apply_to_arrays(lambda x: torch.tensor(scale*x, dtype=dtype))
 peps.exponent = 0.0
 
 # VMC sample size
-N_samples = int(2e2)
+N_samples = int(2e3)
 N_samples = closest_divisible(N_samples, SIZE)
 if (N_samples/SIZE)%2 != 0:
     N_samples += SIZE
@@ -158,19 +158,33 @@ charge_op = charge_density_square_lattice(Lx, Ly, N_f, n_fermions_per_spin=n_fer
 spin_op = spin_density_square_lattice(Lx, Ly, N_f, n_fermions_per_spin=n_fermions_per_spin)
 if __name__ == "__main__":
     # cop_dict = variational_state.expect(charge_op, vec_op=True)
+        
     # sop_dict = variational_state.expect(spin_op, vec_op=True)
     # # # op_dict = variational_state.expect(H, vec_op=False)
     # if RANK == 0:
     #     print(cop_dict)
     #     print(sop_dict)
+    
     local_configs, local_amps = sampler.sample_configs(
         variational_state,
-        chain_length=10,
-        iprint=1
+        chain_length=N_samples // SIZE,
+        iprint=1 if RANK == 0 else 0,
     )
-    def convert_config_to_charge(sigma):
-        charge_map = {0: 0, 1: 1, 2: 1, 3: 2}
-        return torch.tensor([charge_map[s.item()] for s in sigma], dtype=dtype)
-    local_charges = torch.stack([convert_config_to_charge(sigma) for sigma in local_configs])
-    print(local_configs)
-    print(local_charges)
+
+    # gather all local configs to rank 0
+    all_local_configs = COMM.gather(local_configs, root=0)
+
+    if RANK == 0:
+        local_configs = torch.cat(all_local_configs, dim=0)
+        os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/', exist_ok=True)
+        # save to local npy file
+        import numpy as np
+        np.save(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{model_name}/chi={chi}/sampled_configs.npy', local_configs.numpy())
+
+
+    # def convert_config_to_charge(sigma):
+    #     charge_map = {0: 0, 1: 1, 2: 1, 3: 2}
+    #     return torch.tensor([charge_map[s.item()] for s in sigma], dtype=dtype)
+    # local_charges = torch.stack([convert_config_to_charge(sigma) for sigma in local_configs])
+    # print(local_configs)
+    # print(local_charges)
