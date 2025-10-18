@@ -1,5 +1,5 @@
 import os
-from vmc_torch.fermion_utils import generate_random_fpeps, u1peps_to_z2peps
+from vmc_torch.fermion_utils import generate_random_fpeps, u1peps_to_z2peps, generate_random_fpeps_symmray
 import quimb.tensor as qtn
 import symmray as sr
 import pickle
@@ -104,8 +104,8 @@ def fermi_hubbard_local_array_w_spf(
 
 def mu_f(sitea, siteb, target_sites, cpf=0, mu=0):
     return (cpf+mu if sitea in target_sites else mu, cpf+mu if siteb in target_sites else mu)
-def spf_f(sitea, siteb, target_sites, spf=0):
-    return (spf if sitea in target_sites else 0, spf if siteb in target_sites else 0)
+def spf_f(sitea, siteb, target_sites: dict, spf=0):
+    return (spf*target_sites.get(sitea, 0), spf*target_sites.get(siteb, 0))
 
 def run_u1SU_w_pinning_field(
     Lx, Ly, D, N_f, t, U, mu, cpf, cpf_target_sites, spf, spf_target_sites, pwd, seed, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)],
@@ -128,8 +128,8 @@ def run_u1SU_w_pinning_field(
         List of sites to apply the charge pinning field.
     spf : float
         Spin pinning field (magnetic field) strength.
-    spf_target_sites : list of tuple
-        List of sites to apply the spin pinning field.
+    spf_target_sites : dict: tuple -> int
+        Dictionary of sites to apply the magnetic field with target field direction (+1 or -1).
     pwd : str
         Path to save the data.
     seed : int
@@ -164,13 +164,14 @@ def run_u1SU_w_pinning_field(
             return peps
         else:
             print('No existing files found')
-            raise ValueError('No existing files found')
+            raise FileNotFoundError('No existing SU fPEPS state found with the specified pinning fields.')
 
     # Define the lattice shape
     spinless = False
 
     # SU in quimb
-    rpeps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)[0]
+    # rpeps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)[0]
+    rpeps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)
     edges = qtn.edges_2d_square(Lx, Ly)
     site_info = sr.parse_edges_to_site_info(
         edges,

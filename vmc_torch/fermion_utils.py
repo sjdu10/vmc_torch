@@ -450,6 +450,57 @@ class fPEPS(qtn.PEPS):
         )
         return amp
 
+def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=False, spinless=False):
+    edges = qtn.edges_2d_square(Lx, Ly, cyclic=False)
+    site_info = parse_edges_to_site_info(
+        edges,
+        D,
+        phys_dim=4,
+        site_ind_id="k{},{}",
+        site_tag_id="I{},{}",
+    )
+    sites = list(site_info.keys())
+
+    # generate random binary string with Nf ones and Lx*Ly-Nf zeros
+    def generate_initial_config(Nf, Lx, Ly):
+        np.random.seed(seed)
+        total_sites = Lx * Ly
+        config = np.array([1] * Nf + [0] * (total_sites - Nf))
+        np.random.shuffle(config)
+        return config
+
+    rcharge_config = generate_initial_config(Nf, Lx, Ly)
+
+    def site_charge(site):
+        charge_dict = dict(zip(sites, rcharge_config))
+        return charge_dict[site]
+
+    fpeps = sr.PEPS_fermionic_rand(
+        symmetry,
+        Lx,
+        Ly,
+        bond_dim=D,
+        phys_dim=4 if not spinless else 2,
+        site_charge=site_charge,
+        seed=seed,
+        cyclic=cyclic,
+    )
+
+    fpeps.view_as_(
+        fPEPS,
+        site_ind_id="k{},{}",
+        site_tag_id="I{},{}",
+        x_tag_id="X{}",
+        y_tag_id="Y{}",
+        Lx=Lx,
+        Ly=Ly,
+    )
+    peps = fpeps.copy() # set symmetry during initialization
+    for ts in peps.tensors:
+        if ts.data.oddpos:
+            x, y = ts.data.oddpos[0].label
+            ts.data._oddpos[0]._label = 3*(x*Lx + y) # 3*tid
+    return peps
 
 
 def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=False):
