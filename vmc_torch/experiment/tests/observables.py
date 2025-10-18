@@ -165,10 +165,9 @@ if __name__ == "__main__":
     #     print(cop_dict)
     #     print(sop_dict)
     
-    local_configs, local_amps = sampler.sample_configs(
+    local_configs, local_amps = sampler.sample_configs_eager(
         variational_state,
-        chain_length=N_samples // SIZE,
-        iprint=1 if RANK == 0 else 0,
+        message_tag=42
     )
 
     # gather all local configs to rank 0

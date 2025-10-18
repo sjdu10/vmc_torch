@@ -126,6 +126,7 @@ class Sampler(AbstractSampler):
         Must be implemented in the derived class."""
         raise NotImplementedError
     
+    @torch.no_grad()
     def sample_configs(self, vstate, chain_length=1, iprint=0):
         """
         Sample configurations.
@@ -155,6 +156,83 @@ class Sampler(AbstractSampler):
             configs[_] = sigma
             amps[_] = psi_sigma
 
+        return configs, amps
+    
+    @torch.no_grad()
+    def sample_configs_eager(self, vstate, message_tag=None, **kwargs):
+        """Sample eagerly for the configs and amplitudes.
+        return two tensors: configs and amps"""
+        assert not self.equal_partition, 'Must not use equal partition for eager sampling.'
+
+        if RANK == 0:
+            print('Burn-in...')
+        t_burnin0 = MPI.Wtime()
+        self.burn_in(vstate)
+        t_burnin1 = MPI.Wtime()
+        if RANK == 0:
+            print('Burn-in time:', t_burnin1 - t_burnin0)
+        self.burn_in_time = t_burnin1 - t_burnin0
+
+        # We only estimate the variance of op_loc locally
+        n = 0
+        n_total = 0
+        sigma_vec = []
+        amp_vec = []
+        terminate = np.array([0], dtype=np.int32)
+
+        if RANK == 0:
+            pbar = tqdm(total=self.Ns, desc='Sampling starts...')
+            for _ in range(2):
+                sigma, psi_sigma = self._sample_next(vstate, burn_in=True)
+                sigma_vec.append(sigma.cpu().numpy())
+                amp_vec.append(psi_sigma.cpu().numpy())
+                n += 1
+                n_total += 1
+                pbar.update(1)
+            
+            # Discard messages from previous steps
+            while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
+                redundant_message = np.empty(1, dtype=np.int32)
+                COMM.Recv([redundant_message, MPI.INT], source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
+                del redundant_message
+            
+            while not terminate[0]:
+                # Receive the local sample count from each rank
+                buf = np.empty(1, dtype=np.int32)
+                COMM.Recv([buf, MPI.INT],source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
+                dest_rank = buf[0]
+                n_total += 1
+                pbar.update(1)
+                # Check if we have enough samples
+                if n_total >= self.Ns:
+                    terminate = np.array([1], dtype=np.int32)
+                    for dest_rank in range(1, SIZE):
+                        COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
+                # Send the termination signal to the rank
+                COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
+
+            pbar.close()
+        
+        else:
+            while not terminate[0]:
+                sigma, psi_sigma = self._sample_next(vstate, burn_in=True)
+                sigma_vec.append(sigma.cpu().numpy())
+                amp_vec.append(psi_sigma.cpu().numpy())
+                n += 1
+
+                buf = np.array([RANK], dtype=np.int32)
+                # Send the local sample count to rank 0
+                # COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                COMM.Send([buf, MPI.INT], dest=0, tag=message_tag+TAG_OFFSET)
+                # Receive the termination signal from rank 0
+                terminate = np.empty(1, dtype=np.int32)
+                COMM.Recv([terminate, MPI.INT], source=0, tag=message_tag+1)
+
+        vstate.clear_env_cache()
+        
+        configs = torch.tensor(np.array(sigma_vec), dtype=self.dtype, device=self.device)
+        amps = torch.tensor(np.array(amp_vec), dtype=self.dtype, device=self.device)
+        
         return configs, amps
 
         

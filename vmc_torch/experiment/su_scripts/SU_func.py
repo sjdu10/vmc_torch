@@ -164,7 +164,7 @@ def run_u1SU_w_pinning_field(
             return peps
         else:
             print('No existing files found')
-            return None
+            raise ValueError('No existing files found')
 
     # Define the lattice shape
     spinless = False
