@@ -259,7 +259,36 @@ class fPEPS(qtn.PEPS):
                 new_charge_sec_data_dict = {}
                 for charge_blk, data in charge_sec_data_dict.items():
                     if charge_blk[phys_ind_order] == charge:
-                        new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
+                        # ------------------------------------------------------------------
+                        # Replacement for: 
+                        # new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
+                        # ------------------------------------------------------------------
+
+                        # 1. Determine which index to select (0 or 1) from the input vector.
+                        #    `argmax` finds the position of the '1.0'.
+                        # select_index = torch.argmax(input_vec).item()
+                        select_index = do('argmax', input_vec)
+
+                        # 2. Build the slicer tuple dynamically.
+                        #    This creates a list of `slice(None)` (which is equivalent to `:`)
+                        #    and inserts the `select_index` at the correct position.
+                        slicer = [slice(None)] * data.ndim
+                        slicer[phys_ind_order] = select_index
+
+                        # 3. Apply the slice to get the new data.
+                        new_data = data[tuple(slicer)]
+
+                        # 4. Fermionic sign correction due to potential permutation of odd indices.
+                        #     (In our convention the physical ind should be the last ind during contraction)
+                        if charge % 2 != 0 and phys_ind_order != len(charge_blk) - 1:
+                            # Count how many odd indices are to the right of the physical index.
+                            # Check if odd physical ind permutes through odd number of odd indices.
+                            num_odd_right_blk = sum(1 for i in charge_blk[phys_ind_order + 1:] if i % 2 == 1)
+                            if num_odd_right_blk % 2 == 1:
+                                # local fermionic sign change due to odd parity inds + odd permutation
+                                new_data = -new_data
+                        # ------------------------------------------------------------------
+                        
                         new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order+1:]
                         new_charge_sec_data_dict[new_charge_blk]=new_data
                         
@@ -389,6 +418,16 @@ class fPEPS(qtn.PEPS):
 
                         # 3. Apply the slice to get the new data.
                         new_data = data[tuple(slicer)]
+
+                        # 4. Fermionic sign correction due to potential permutation of odd indices.
+                        #     (In our convention the physical ind should be the last ind during contraction)
+                        if charge % 2 != 0 and phys_ind_order != len(charge_blk) - 1:
+                            # Count how many odd indices are to the right of the physical index.
+                            # Check if odd physical ind permutes through odd number of odd indices.
+                            num_odd_right_blk = sum(1 for i in charge_blk[phys_ind_order + 1:] if i % 2 == 1)
+                            if num_odd_right_blk % 2 == 1:
+                                # local fermionic sign change due to odd parity inds + odd permutation
+                                new_data = -new_data
                         # ------------------------------------------------------------------
 
                         new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order + 1:] # new charge block

@@ -83,8 +83,14 @@ def fermi_hubbard_local_array_w_spf(
         (-mua / coordinations[0], (ad.dag, ad)),
         (-mub / coordinations[1], (bu.dag, bu)),
         (-mub / coordinations[1], (bd.dag, bd)),
+    ]
+    if spfa != 0.0:
+        terms += [
         (-spfa/2/coordinations[0], (au.dag, au)),
         ( spfa/2/coordinations[0], (ad.dag, ad)),
+    ]
+    if spfb != 0.0:
+        terms += [
         (-spfb/2/coordinations[1], (bu.dag, bu)),
         ( spfb/2/coordinations[1], (bd.dag, bd)),
     ]
@@ -103,8 +109,12 @@ def fermi_hubbard_local_array_w_spf(
     )
 
 def mu_f(sitea, siteb, target_sites, cpf=0, mu=0):
+    if cpf == 0:
+        return mu
     return (cpf+mu if sitea in target_sites else mu, cpf+mu if siteb in target_sites else mu)
 def spf_f(sitea, siteb, target_sites: dict, spf=0):
+    if spf == 0:
+        return 0
     return (spf*target_sites.get(sitea, 0), spf*target_sites.get(siteb, 0))
 
 def run_u1SU_w_pinning_field(

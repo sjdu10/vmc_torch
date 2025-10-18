@@ -2091,10 +2091,10 @@ class fTNModel_Jastrow(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=torch.int if self.functional else self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.int)
             else:
                 if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(torch.int if self.functional else self.param_dtype)
+                    x_i = x_i.to(torch.int)
             # Get the amplitude
             amp = psi.get_amp(x_i, conj=True)
             if self.max_bond is None:
