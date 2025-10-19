@@ -8,6 +8,7 @@ from symmray.fermionic_local_operators import (
     FermionicOperator,
     get_spinful_charge_indexmap,
 )
+from vmc_torch.fermion_utils import format_fpeps_keys
 
 def fermi_hubbard_local_array_w_spf(
     symmetry,
@@ -119,7 +120,7 @@ def spf_f(sitea, siteb, target_sites: dict, spf=0):
 
 def run_u1SU_w_pinning_field(
     Lx, Ly, D, N_f, t, U, mu, cpf, cpf_target_sites, spf, spf_target_sites, pwd, seed, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)],
-    **su_kwargs
+    rfpeps_kwargs={'subsizes':'maximal'}, **su_kwargs
 ):
     """
     Lx : int
@@ -150,6 +151,8 @@ def run_u1SU_w_pinning_field(
         Whether to run the simple update or just load existing state, by default True.
     su_evolve_schedule : list of tuple, optional
         List of (n_steps, tau) for SU evolution, by default [(100, 0.01)].
+    rfpeps_kwargs : dict, optional
+        Additional kwargs for random fPEPS generation, by default {}.
     su_kwargs : dict, optional
         Additional kwargs for SimpleUpdateGen, by default {}.
     """
@@ -181,7 +184,7 @@ def run_u1SU_w_pinning_field(
 
     # SU in quimb
     # rpeps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)[0]
-    rpeps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)
+    rpeps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless, **rfpeps_kwargs)
     edges = qtn.edges_2d_square(Lx, Ly)
     site_info = sr.parse_edges_to_site_info(
         edges,
@@ -213,14 +216,18 @@ def run_u1SU_w_pinning_field(
         D=D, 
         **su_kwargs
     )
+    print('Starting SU evolution with pinning fields...')
     # Evolve the U1-fPEPS
     for n_steps, tau in su_evolve_schedule:
         u1su.evolve(n_steps, tau=tau)
+    
+    fig, _ = u1su.plot()
+    fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution_cpf={cpf}_spf={spf}.png')
 
     u1peps = u1su.get_state()
     u1peps.equalize_norms_(value=1)
     u1peps.exponent = 0.0
-
+    u1peps = format_fpeps_keys(u1peps)
     # save the state
     params, skeleton = qtn.pack(u1peps)
     if save_file:
@@ -290,7 +297,8 @@ def run_u1SU(
         # Define the lattice shape
         spinless = False
         # SU in quimb
-        peps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)[0]
+        # peps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)[0]
+        peps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)
     
     edges = qtn.edges_2d_square(Lx, Ly)
     site_info = sr.parse_edges_to_site_info(
@@ -323,9 +331,14 @@ def run_u1SU(
     # Evolve the U1-fPEPS
     for n_steps, tau in su_evolve_schedule:
         u1su.evolve(n_steps, tau=tau)
+    
+    fig, _ = u1su.plot()
+    fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution.png')
+
     u1peps = u1su.get_state()
     u1peps.equalize_norms_(value=1)
     u1peps.exponent = 0.0
+    u1peps = format_fpeps_keys(u1peps)
 
     # save the state
     params, skeleton = qtn.pack(u1peps)
@@ -428,6 +441,10 @@ def run_z2SU(
     # Evolve the Z2-fPEPS
     for n_steps, tau in su_evolve_schedule:
         z2su.evolve(n_steps, tau=tau)
+    
+    fig, _ = z2su.plot()
+    fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution.png')
+
     z2peps = z2su.get_state()
     z2peps.equalize_norms_(value=1)
     z2peps.exponent = 0.0
@@ -538,6 +555,10 @@ def run_z2SU_from_u1SU(
     # Evolve the Z2-fPEPS
     for n_steps, tau in su_evolve_schedule:
         z2su.evolve(n_steps, tau=tau)
+    
+    fig, _ = z2su.plot()
+    fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution_U1SU.png')
+
     z2peps = z2su.get_state()
     z2peps.equalize_norms_(value=1)
     z2peps.exponent = 0.0
