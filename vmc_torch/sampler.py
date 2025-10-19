@@ -662,15 +662,15 @@ class Sampler(AbstractSampler):
         logpsi_sigma_grad_mat = np.asarray(logpsi_sigma_grad_mat).T
         op_loc_vec = np.asarray(op_loc_vec)
         
-        if RANK == 1:
-            # compute autocorrelation time of op_loc_vec for RANK1
-            # This is a simple implementation of the integrated autocorrelation time
-            def integrated_autocorr_time(samples, max_lag=None):
-                acf_vals = acf(samples, nlags=max_lag, fft=True)
-                return 1 + 2 * np.sum(acf_vals[1:])  # Sum over lags ≥ 1
+        # if RANK == 1:
+        #     # compute autocorrelation time of op_loc_vec for RANK1
+        #     # This is a simple implementation of the integrated autocorrelation time
+        #     def integrated_autocorr_time(samples, max_lag=None):
+        #         acf_vals = acf(samples, nlags=max_lag, fft=True)
+        #         return 1 + 2 * np.sum(acf_vals[1:])  # Sum over lags ≥ 1
 
-            iat = integrated_autocorr_time(op_loc_vec, max_lag=100)
-            print(f"    RANK1 sample size: {op_loc_vec.size}, Local Energy Integrated Autocorrelation Time: {iat}")
+        #     iat = integrated_autocorr_time(op_loc_vec, max_lag=100)
+        #     print(f"    RANK1 sample size: {op_loc_vec.size}, Local Energy Integrated Autocorrelation Time: {iat}")
 
         if n > 1:
             op_loc_var = np.var(op_loc_vec, ddof=1)

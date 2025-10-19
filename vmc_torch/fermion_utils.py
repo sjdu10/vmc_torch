@@ -42,6 +42,20 @@ try:
 except Exception:
     parse_edges_to_site_info = sr.parse_edges_to_site_info
 
+def farr_sector_format(farray):
+    new_blocks = {}
+    for charge_blk, data in farray.blocks.items():
+        new_charge_blk = tuple(map(int, charge_blk))
+        new_blocks[new_charge_blk] = data
+    farray.modify(blocks=new_blocks)
+    return farray
+
+def format_fpeps_keys(peps):
+    peps = peps.copy()
+    for ts in peps.tensors:
+        ts.modify(data=farr_sector_format(ts.data))
+    return peps.copy()
+
 def u1arr_to_z2arr(u1array):
     """
     Convert a FermionicArray with U1 symmetry to a FermionicArray with Z2 symmetry
@@ -489,7 +503,7 @@ class fPEPS(qtn.PEPS):
         )
         return amp
 
-def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=False, spinless=False):
+def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=False, spinless=False, subsizes=None):
     edges = qtn.edges_2d_square(Lx, Ly, cyclic=False)
     site_info = parse_edges_to_site_info(
         edges,
@@ -523,7 +537,9 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
         site_charge=site_charge,
         seed=seed,
         cyclic=cyclic,
+        subsizes=subsizes
     )
+    fpeps = format_fpeps_keys(fpeps)
 
     fpeps.view_as_(
         fPEPS,
@@ -538,7 +554,7 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
     for ts in peps.tensors:
         if ts.data.oddpos:
             x, y = ts.data.oddpos[0].label
-            ts.data._oddpos[0]._label = 3*(x*Lx + y) # 3*tid
+            ts.data._oddpos[0]._label = 3*(x*Ly + y) # 3*tid
     return peps
 
 
