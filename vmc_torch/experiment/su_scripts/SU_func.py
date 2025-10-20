@@ -221,8 +221,7 @@ def run_u1SU_w_pinning_field(
     for n_steps, tau in su_evolve_schedule:
         u1su.evolve(n_steps, tau=tau)
     
-    fig, _ = u1su.plot()
-    fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution_cpf={cpf}_spf={spf}.png')
+    
 
     u1peps = u1su.get_state()
     u1peps.equalize_norms_(value=1)
@@ -236,6 +235,8 @@ def run_u1SU_w_pinning_field(
             pickle.dump(skeleton, f)
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params_cpf={cpf}_spf={spf}.pkl', 'wb') as f:
             pickle.dump(params, f)
+        fig, _ = u1su.plot()
+        fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution_cpf={cpf}_spf={spf}.png')
     print('===================================')
     return u1peps
 
@@ -332,8 +333,7 @@ def run_u1SU(
     for n_steps, tau in su_evolve_schedule:
         u1su.evolve(n_steps, tau=tau)
     
-    fig, _ = u1su.plot()
-    fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution.png')
+    
 
     u1peps = u1su.get_state()
     u1peps.equalize_norms_(value=1)
@@ -348,6 +348,8 @@ def run_u1SU(
             pickle.dump(skeleton, f)
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params.pkl', 'wb') as f:
             pickle.dump(params, f)
+        fig, _ = u1su.plot()
+        fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution.png')
     print('===================================')
     return u1peps
 
@@ -442,8 +444,7 @@ def run_z2SU(
     for n_steps, tau in su_evolve_schedule:
         z2su.evolve(n_steps, tau=tau)
     
-    fig, _ = z2su.plot()
-    fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution.png')
+    
 
     z2peps = z2su.get_state()
     z2peps.equalize_norms_(value=1)
@@ -456,6 +457,8 @@ def run_z2SU(
             pickle.dump(skeleton, f)
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_su_params.pkl', 'wb') as f:
             pickle.dump(params, f)
+        fig, _ = z2su.plot()
+        fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution.png')
     print('===================================')
     return z2peps
 
@@ -556,8 +559,7 @@ def run_z2SU_from_u1SU(
     for n_steps, tau in su_evolve_schedule:
         z2su.evolve(n_steps, tau=tau)
     
-    fig, _ = z2su.plot()
-    fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution_U1SU.png')
+    
 
     z2peps = z2su.get_state()
     z2peps.equalize_norms_(value=1)
@@ -570,6 +572,8 @@ def run_z2SU_from_u1SU(
             pickle.dump(skeleton, f)
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_su_params_U1SU.pkl', 'wb') as f:
             pickle.dump(params, f)
+        fig, _ = z2su.plot()
+        fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution_U1SU.png')
     
     print('===================================')
     return z2peps
