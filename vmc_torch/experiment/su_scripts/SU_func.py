@@ -463,7 +463,7 @@ def run_z2SU(
     return z2peps
 
 def run_z2SU_from_u1SU(
-    Lx, Ly, D, N_f, t, U, mu, pwd, u1peps=None, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)],
+    Lx, Ly, D, N_f, t, U, mu, pwd, u1peps=None, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)], save_every=None,
     **su_kwargs
 ):
     """
@@ -549,10 +549,25 @@ def run_z2SU_from_u1SU(
         for (sitea, siteb) in edges
     }
     z2ham = qtn.LocalHam2D(Lx, Ly, H2=z2_terms)
+    
+    def save_state(su, save_every):
+        if su.n%save_every==0:
+            z2peps = su.get_state()
+            z2peps.equalize_norms_(value=1)
+            z2peps.exponent = 0.0
+            params, skeleton = qtn.pack(z2peps)
+            os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/u1su_intermediates', exist_ok=True)
+            with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/u1su_intermediates/peps_skeleton_step{su.n}.pkl', 'wb') as f:
+                pickle.dump(skeleton, f)
+            with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/u1su_intermediates/peps_su_params_step{su.n}.pkl', 'wb') as f:
+                pickle.dump(params, f)
+            print(f'Saved intermediate state at step {su.n}')
+    
     z2su = qtn.SimpleUpdateGen(
         peps, 
         z2ham, 
         D=D, 
+        callback=(lambda su: save_state(su, save_every)) if save_every is not None else None,
         **su_kwargs
     )
     # Evolve the Z2-fPEPS
