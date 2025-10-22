@@ -571,10 +571,10 @@ def run_z2SU_from_u1SU(
         **su_kwargs
     )
     # Evolve the Z2-fPEPS
-    for n_steps, tau in su_evolve_schedule:
-        z2su.evolve(n_steps, tau=tau)
-    
-    
+    if su_evolve_schedule:
+        for n_steps, tau in su_evolve_schedule:
+            z2su.evolve(n_steps, tau=tau)
+
 
     z2peps = z2su.get_state()
     z2peps.equalize_norms_(value=1)
