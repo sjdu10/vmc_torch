@@ -587,8 +587,11 @@ def run_z2SU_from_u1SU(
             pickle.dump(skeleton, f)
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_su_params_U1SU.pkl', 'wb') as f:
             pickle.dump(params, f)
-        fig, _ = z2su.plot()
-        fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution_U1SU.png')
+        try:
+            fig, _ = z2su.plot()
+            fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution_U1SU.png')
+        except Exception:
+            ...
     
     print('===================================')
     return z2peps
