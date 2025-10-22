@@ -112,7 +112,7 @@ def fermi_hubbard_local_array_w_spf(
 def mu_f(sitea, siteb, target_sites, cpf=0, mu=0):
     if cpf == 0:
         return mu
-    return (cpf+mu if sitea in target_sites else mu, cpf+mu if siteb in target_sites else mu)
+    return (mu+cpf*target_sites.get(sitea, 0), mu+cpf*target_sites.get(siteb, 0))
 def spf_f(sitea, siteb, target_sites: dict, spf=0):
     if spf == 0:
         return 0
@@ -330,10 +330,10 @@ def run_u1SU(
         **su_kwargs
     )
     # Evolve the U1-fPEPS
-    for n_steps, tau in su_evolve_schedule:
-        u1su.evolve(n_steps, tau=tau)
-    
-    
+    if su_evolve_schedule:
+        for n_steps, tau in su_evolve_schedule:
+            u1su.evolve(n_steps, tau=tau)
+
 
     u1peps = u1su.get_state()
     u1peps.equalize_norms_(value=1)
@@ -348,8 +348,11 @@ def run_u1SU(
             pickle.dump(skeleton, f)
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params.pkl', 'wb') as f:
             pickle.dump(params, f)
-        fig, _ = u1su.plot()
-        fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution.png')
+        try:
+            fig, _ = u1su.plot()
+            fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution.png')
+        except Exception as e:
+            ...
     print('===================================')
     return u1peps
 
