@@ -525,8 +525,12 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
     rcharge_config = generate_initial_config(Nf, Lx, Ly)
 
     def site_charge(site):
-        charge_dict = dict(zip(sites, rcharge_config))
-        return charge_dict[site]
+        if symmetry == 'U1':
+            charge_dict = dict(zip(sites, rcharge_config))
+            return charge_dict[site]
+        elif symmetry == 'Z2':
+            # all zero parity for random Z2 fPEPS
+            return 0
 
     fpeps = sr.PEPS_fermionic_rand(
         symmetry,
