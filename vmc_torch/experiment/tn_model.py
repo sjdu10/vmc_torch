@@ -100,15 +100,15 @@ class wavefunctionModel(torch.nn.Module):
             with torch.no_grad():
                 param.copy_(new_param_values)
             pointer += num_param
-    
-    def amplitude(self, x):
+
+    def amplitude(self, x, **kwargs):
         raise NotImplementedError
     
     def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
-        return self.amplitude(x)
+        return self.amplitude(x, **kwargs)
     
     def clear_wavefunction_env_cache(self):
         pass
@@ -275,7 +275,7 @@ class circuit_TNF(wavefunctionModel):
         peps = qtn.unpack(params, self.skeleton)
         return peps
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         psi = self.get_state()
         batch_amps = []
         for x_i in x:
@@ -338,7 +338,7 @@ class PEPS_model(wavefunctionModel):
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # update self.PEPS
         params ={
             int(tid): data
@@ -436,7 +436,7 @@ class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             pointer += num_param
         return new_params
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         tn_params_vec = torch.cat(
             [param.reshape(-1) for param in self.torch_tn_params.values()]
         )
@@ -567,7 +567,7 @@ class PEPS_NN_Model(torch.nn.Module):
             x = x.unsqueeze(0)
         return self.amplitude(x)
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         params ={
             int(tid): data
             for tid, data in self.torch_tn_params.items()
@@ -684,7 +684,7 @@ class PEPS_NNproj_Model(torch.nn.Module):
             x = x.unsqueeze(0)
         return self.amplitude(x)
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         params ={
             int(tid): data
             for tid, data in self.torch_tn_params.items()
@@ -805,7 +805,7 @@ class PEPS_delocalized_Model(torch.nn.Module):
             if param is not None:
                 param.grad = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # update self.PEPS
         params ={
             int(tid): data
@@ -862,7 +862,7 @@ class fMPSModel(wavefunctionModel):
             'fMPS (exact contraction)':{'D': ftn.max_bond(), 'L': ftn.L, 'symmetry': self.symmetry, 'cyclic': ftn.cyclic, 'skeleton': self.skeleton},
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -931,7 +931,7 @@ class fMPS_TNFModel(wavefunctionModel):
             },
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1009,7 +1009,7 @@ class fMPS_backflow_Model(wavefunctionModel):
 
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1090,7 +1090,7 @@ class fMPS_backflow_attn_Model(wavefunctionModel):
 
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1188,7 +1188,7 @@ class fMPS_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         }
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1304,7 +1304,7 @@ class fMPS_BFA_cluster_Model(wavefunctionModel):
         }
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1778,7 +1778,7 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         
         self.set_config_ref(config)
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -1920,8 +1920,21 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
 #------------ fermionic PEPS based model ------------
 
 class fTNModel(wavefunctionModel):
-
-    def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False):
+    def __init__(
+        self,
+        ftn,
+        max_bond=None,
+        dtype=torch.float32,
+        functional=False,
+        contraction_kwargs={"mode": "mps"},
+        grad_contraction_kwargs={
+            "mode": "fit",
+            "tol": 1e-5,
+            "tn_fit": "zipup",
+            "bsz": 2,
+            "max_iterations": 5,
+        },
+    ):
         super().__init__()
         self.param_dtype = dtype
         self.functional = functional
@@ -1949,6 +1962,8 @@ class fTNModel(wavefunctionModel):
         if max_bond is None or max_bond <= 0:
             max_bond = None
         self.max_bond = max_bond
+        self.contraction_kwargs = contraction_kwargs
+        self.grad_contraction_kwargs = grad_contraction_kwargs
         self.tree = None
     
     def get_amp_tn(self, config):
@@ -1967,8 +1982,8 @@ class fTNModel(wavefunctionModel):
 
         return amp
 
-    
-    def amplitude(self, x):
+
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1979,12 +1994,20 @@ class fTNModel(wavefunctionModel):
         }
         # Reconstruct the TN with the new parameters
         psi = qtn.unpack(params, self.skeleton)
+
+        # get grad (bool) from kwargs
+        grad = kwargs.get('grad', False)
+        if grad:
+            contraction_kwargs = self.grad_contraction_kwargs
+        else:
+            contraction_kwargs = self.contraction_kwargs
+
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=torch.int if self.functional else self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
@@ -1999,8 +2022,8 @@ class fTNModel(wavefunctionModel):
                 amp_val = amp.contract(optimize=self.tree)
 
             else:
-                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
-                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1], **contraction_kwargs)
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1], **contraction_kwargs)
                 amp_val = amp.contract()
 
             if not self.functional:
@@ -2074,7 +2097,7 @@ class fTNModel_Jastrow(wavefunctionModel):
         self.tree = None
 
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -2196,7 +2219,7 @@ class fTNModel_vec(wavefunctionModel):
             
         return phase
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -2829,7 +2852,7 @@ class fTNModel_reuse(wavefunctionModel):
                 #     print(f'Efficient amp tn construction (local), amp_tn exponent: {amp_tn.exponent}')
                 return amp_tn
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         psi = self.psi()
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
@@ -3572,7 +3595,7 @@ class fTNModel_reuse(wavefunctionModel):
 #                 #     print(f'Efficient amp tn construction (local), amp_tn exponent: {amp_tn.exponent}')
 #                 return amp_tn
     
-#     def amplitude(self, x):
+#     def amplitude(self, x, **kwargs):
 #         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
 #         params = {
 #             int(tid): {
@@ -3780,7 +3803,7 @@ class fTNModel_test(wavefunctionModel):
         self.max_bond = max_bond
         
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3862,7 +3885,7 @@ class fTN_backflow_Model(wavefunctionModel):
         self.max_bond = max_bond
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3953,7 +3976,7 @@ class fTN_backflow_Model_embedding(wavefunctionModel):
         self.max_bond = max_bond
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -4087,7 +4110,7 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
         self.nn_eta = nn_eta
         self.max_bond = max_bond if max_bond and max_bond > 0 else None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         tn_params = {}
         
         batch_amps = []
@@ -4168,7 +4191,7 @@ class PureAttention_Model(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
     
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -4216,7 +4239,7 @@ class PureNN_Model(wavefunctionModel):
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -4287,7 +4310,7 @@ class fTN_backflow_attn_Model(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -4388,7 +4411,7 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
         self.max_bond = max_bond
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -4503,7 +4526,7 @@ class fTN_backflow_attn_Model_Stacked(wavefunctionModel):
         self.max_bond = max_bond
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -4612,7 +4635,7 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         tn_nn_params = {}
 
         # `x` is expected to be batched as (batch_size, input_dim)
@@ -4742,7 +4765,7 @@ class fTN_backflow_attn_Tensorwise_Model(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -4868,7 +4891,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5005,7 +5028,7 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5137,7 +5160,7 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5267,7 +5290,7 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5414,7 +5437,7 @@ class fTN_backflow_attn_Tensorwise_Model_v5(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5572,7 +5595,7 @@ class fTN_BFA_cluster_Model(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5641,11 +5664,19 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         dtype=torch.float32,
         debug=False,
         contraction_kwargs={"mode": "mps"},
+        grad_contraction_kwargs={
+            "mode": "fit",
+            "tol": 1e-5,
+            "tn_fit": "zipup",
+            "bsz": 2,
+            "max_iterations": 5,
+        },
     ):
         super().__init__()
         self.param_dtype = dtype
         self.debug = debug
         self.contraction_kwargs = contraction_kwargs
+        self.grad_contraction_kwargs = grad_contraction_kwargs
 
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(fpeps)
@@ -5777,27 +5808,34 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                     env_y_row_config[('ymin', cols_config)] = env_y[key]
         return env_y_row_config
 
-    def cache_env_x(self, amp, config):
+    def cache_env_x(self, amp, config, contraction_kwargs=None):
         """
             Cache the environment x for the given configuration
         """
-        env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0, **self.contraction_kwargs)
+        if contraction_kwargs is None:
+            contraction_kwargs = self.contraction_kwargs
+        env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0, **contraction_kwargs)
         env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
         self._env_x_cache = env_x_cache
         self.config_ref = config
-    
-    def cache_env_y(self, amp, config):
-        env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0, **self.contraction_kwargs)
+
+    def cache_env_y(self, amp, config, contraction_kwargs=None):
+        """
+            Cache the environment y for the given configuration
+        """
+        if contraction_kwargs is None:
+            contraction_kwargs = self.contraction_kwargs
+        env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0, **contraction_kwargs)
         env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
         self._env_y_cache = env_y_cache
         self.config_ref = config
-    
-    def cache_env(self, amp, config):
+
+    def cache_env(self, amp, config, contraction_kwargs=None):
         """
             Cache the environment x and y for the given configuration
         """
-        self.cache_env_x(amp, config)
-        self.cache_env_y(amp, config)
+        self.cache_env_x(amp, config, contraction_kwargs=contraction_kwargs)
+        self.cache_env_y(amp, config, contraction_kwargs=contraction_kwargs)
         
     @property
     def env_x_cache(self):
@@ -6187,7 +6225,9 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         psi = qtn.unpack(tn_params, self.skeleton)
         return psi
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
+        grad = kwargs.get("grad", False)
+
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -6210,7 +6250,8 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                 amp_val = amp.contract(optimize=self.tree) * torch.sum(torch.exp(self.jastrow(x_i)))
             else:
                 if self.cache_env_mode:
-                    self.cache_env_x(amp, x_i)
+                    if grad:
+                        self.cache_env_x(amp, x_i, contraction_kwargs=self.grad_contraction_kwargs)
                     # self.cache_env_y(amp, x_i)
                     assert (self.config_ref == x_i).all()
 
@@ -6442,7 +6483,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -6574,7 +6615,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -6722,7 +6763,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -6930,7 +6971,7 @@ class fTN_Transformer_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         assert x.ndim != 1, "Amplitude input must be batched."
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
@@ -7083,7 +7124,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -7286,7 +7327,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
 
         return new_proj_tn
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -7400,7 +7441,7 @@ class SlaterDeterminant(wavefunctionModel):
             'SlaterDeterminant':{'N_orbitals': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions}
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Define the slater determinant function manually to loop over inputs
         def slater_det(n):
             # Find the positions of the occupied orbitals
@@ -7570,7 +7611,7 @@ class NeuralBackflow_spinful(wavefunctionModel):
             'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
@@ -7636,7 +7677,7 @@ class NNBF(wavefunctionModel):
             'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin, 'nn_eta': self.nn_eta}
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
@@ -7769,7 +7810,7 @@ class NNBF_attention(wavefunctionModel):
             }
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
@@ -7933,7 +7974,7 @@ class NNBF_attention_Nsd(wavefunctionModel):
             }
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
@@ -8087,7 +8128,7 @@ class NNBF_attention_Nsd_v1(wavefunctionModel):
             }
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
@@ -8183,7 +8224,7 @@ class HFDS(wavefunctionModel):
                     'N_hidden_fermions': self.Nh, 'Jastrow': self.jastrow}
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs

@@ -103,16 +103,16 @@ class Variational_State:
     # @tensor_aware_lru_cache(maxsize=AMP_CACHE_SIZE)
     def amplitude(self, x, _cache=0):
         with torch.no_grad():
-            if not type(x) == torch.Tensor:
+            if not isinstance(x, torch.Tensor):
                 x = torch.tensor(np.asarray(x), dtype=self.dtype)
             return self.vstate_func(x)
     
     # @tensor_aware_lru_cache(maxsize=GRAD_CACHE_SIZE)
     def amplitude_grad(self, x, retain_graph=False):
-        if not type(x) == torch.Tensor:
+        if not isinstance(x, torch.Tensor):
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
         self.reset()
-        amp = self.vstate_func(x)
+        amp = self.vstate_func(x, grad=True)
 
         if isinstance(self.vstate_func, vmc_torch.experiment.tn_model.fTNModel_reuse):
             try:
@@ -122,8 +122,8 @@ class Variational_State:
                 else:
                     self.vstate_func.get_grad()
                     vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
-            except:
-                raise ValueError(f"model grad debug fail")
+            except Exception:
+                raise ValueError("model grad debug fail")
 
             if DEBUG:
                 self.reset()
@@ -139,14 +139,6 @@ class Variational_State:
             # Backpropagate the amplitude to compute the gradient
             amp.backward(retain_graph=retain_graph)
             vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
-
-        # try:
-        # except:
-        #     print(f"Amplitude backward failed, returning zero gradient.")
-        #     print(f"Rank {RANK} amplitude: {amp}")
-        #     # amp is 0
-        #     self.reset()
-        #     return amp, torch.zeros((self.Np,), dtype=self.dtype)
 
         # Clear the gradient
         self.reset()
