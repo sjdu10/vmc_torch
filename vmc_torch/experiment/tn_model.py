@@ -1927,13 +1927,7 @@ class fTNModel(wavefunctionModel):
         dtype=torch.float32,
         functional=False,
         contraction_kwargs={"mode": "mps"},
-        grad_contraction_kwargs={
-            "mode": "fit",
-            "tol": 1e-5,
-            "tn_fit": "zipup",
-            "bsz": 2,
-            "max_iterations": 5,
-        },
+        grad_contraction_kwargs={"mode": "mps"},
     ):
         super().__init__()
         self.param_dtype = dtype
@@ -5664,13 +5658,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         dtype=torch.float32,
         debug=False,
         contraction_kwargs={"mode": "mps"},
-        grad_contraction_kwargs={
-            "mode": "fit",
-            "tol": 1e-5,
-            "tn_fit": "zipup",
-            "bsz": 2,
-            "max_iterations": 5,
-        },
+        grad_contraction_kwargs={"mode": "mps"},
     ):
         super().__init__()
         self.param_dtype = dtype
