@@ -6238,17 +6238,22 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                 amp_val = amp.contract(optimize=self.tree) * torch.sum(torch.exp(self.jastrow(x_i)))
             else:
                 if self.cache_env_mode:
-                    if grad:
-                        self.cache_env_x(amp, x_i, contraction_kwargs=self.grad_contraction_kwargs)
+                    self.cache_env_x(amp, x_i)
                     # self.cache_env_y(amp, x_i)
                     assert (self.config_ref == x_i).all()
-
-                    config_2d = self.from_1d_to_2d(x_i)
-                    key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
-                    key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
-                    amp_bot = self.env_x_cache[key_bot]
-                    amp_top = self.env_x_cache[key_top]
-                    amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
+                    if not grad:
+                        config_2d = self.from_1d_to_2d(x_i)
+                        key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
+                        key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+                        amp_bot = self.env_x_cache[key_bot]
+                        amp_top = self.env_x_cache[key_top]
+                        amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
+                    else:
+                        # for gradient calculation, we do not reuse the cached environment
+                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, self.Ly//2-1], **self.grad_contraction_kwargs)
+                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[self.Ly//2, self.Ly-1], **self.grad_contraction_kwargs)
+                        assert self.skeleton.exponent == 0
+                        amp_val = amp.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                 else:
                     if not self.env_x_cache and not self.env_y_cache:
                         # check whether we can reuse the cached environment
