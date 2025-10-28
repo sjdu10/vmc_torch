@@ -360,9 +360,9 @@ class fPEPS(qtn.PEPS):
         peps = self if inplace else self.copy()
         backend = self.tensors[0].data.backend
         dtype = eval(backend + '.' + self.tensors[0].data.dtype)
-        if type(config) == numpy.ndarray:
+        if isinstance(config, numpy.ndarray):
             kwargs = {'like': config, 'dtype': dtype}
-        elif type(config) == torch.Tensor:
+        elif isinstance(config, torch.Tensor):
             device = list(self.tensors[0].data.blocks.values())[0].device
             kwargs = {'like': config, 'device': device, 'dtype': dtype}
         

@@ -299,7 +299,7 @@ def run_u1SU(
         spinless = False
         # SU in quimb
         # peps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)[0]
-        peps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)
+        peps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless, subsizes='equal')
     
     edges = qtn.edges_2d_square(Lx, Ly)
     site_info = sr.parse_edges_to_site_info(
@@ -466,7 +466,7 @@ def run_z2SU(
     return z2peps
 
 def run_z2SU_from_u1SU(
-    Lx, Ly, D, N_f, t, U, mu, pwd, u1peps=None, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)], save_every=None,
+    Lx, Ly, D, N_f, t, U, mu, pwd, u1peps=None, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)], save_every=None, random_init=False,
     **su_kwargs
 ):
     """
@@ -516,19 +516,23 @@ def run_z2SU_from_u1SU(
     if u1peps is not None:
         peps = u1peps_to_z2peps(u1peps)
     else:
-        # try loading existing U1-fPEPS
-        print('Loading existing U1-fPEPS state...')
-        params_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params.pkl'
-        skeleton_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_skeleton.pkl'
-        if os.path.exists(params_file) and os.path.exists(skeleton_file):
-            print('Found existing U1-fPEPS files, loading...')
-            skeleton = pickle.load(open(skeleton_file, 'rb'))
-            peps_params = pickle.load(open(params_file, 'rb'))
-            u1peps = qtn.unpack(peps_params, skeleton)
-            peps = u1peps_to_z2peps(u1peps)
+        if random_init:
+            print('Use random initialization instead.')
+            peps = generate_random_fpeps_symmray(Lx, Ly, D, symmetry='U1', Nf=N_f, subsizes='equal', seed=42)
+            # peps = generate_random_fpeps(Lx, Ly, D=D, seed=42, symmetry='U1', Nf=N_f, spinless=False)[0]
+            peps = u1peps_to_z2peps(peps)
         else:
-            print('No existing U1-fPEPS files found, cannot proceed.')
-            return None
+            # try loading existing U1-fPEPS
+            print('Loading existing U1-fPEPS state...')
+            params_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params.pkl'
+            skeleton_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_skeleton.pkl'
+            if os.path.exists(params_file) and os.path.exists(skeleton_file):
+                print('Found existing U1-fPEPS files, loading...')
+                skeleton = pickle.load(open(skeleton_file, 'rb'))
+                peps_params = pickle.load(open(params_file, 'rb'))
+                u1peps = qtn.unpack(peps_params, skeleton)
+                peps = u1peps_to_z2peps(u1peps)
+        
     
     edges = qtn.edges_2d_square(Lx, Ly)
     site_info = sr.parse_edges_to_site_info(
@@ -582,8 +586,22 @@ def run_z2SU_from_u1SU(
     z2peps = z2su.get_state()
     z2peps.equalize_norms_(value=1)
     z2peps.exponent = 0.0
+    # correct the format of oddpos
+    for ts in z2peps.tensors:
+        ts.data.phase_sync(inplace=True)
+        # for Z2 fPEPS converted from U1 fPEPS, need to correct the format of oddpos
+        if ts.data.oddpos:
+            oddpos = ts.data.oddpos
+            if isinstance(oddpos[0].label, tuple):
+                nested_oddpos = oddpos[0].label[0]
+                if isinstance(nested_oddpos, FermionicOperator):
+                    ts.data._oddpos = (nested_oddpos,)
+                    
     # save the state
     params, skeleton = qtn.pack(z2peps)
+    for ts in skeleton.tensors:
+        assert ts.data._phases == {}
+
     if save_file:
         os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}', exist_ok=True)
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_skeleton_U1SU.pkl', 'wb') as f:
