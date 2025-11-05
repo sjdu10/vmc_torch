@@ -39,10 +39,10 @@ An example plot of the VMC training curves for various Ans\"atze on a spinless H
 
 
 ## References
-- "NetKet 3: Machine Learning Toolbox for Many-Body Quantum Systems" - *Filippo Vicentini and Damian Hofmann and Attila Szabó and Dian Wu and Christopher Roth and Clemens Giuliani and Gabriel Pescia and Jannes Nys and Vladimir Vargas-Calderón and Nikita Astrakhantsev and Giuseppe Carleo* - https://scipost.org/10.21468/SciPostPhysCodeb.7
+
+- "Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems" - *Si-Jing Du*, *Ao Chen* and *Garnet Kin-Lic Chan* - [arXiv: ](https://doi.org/10.48550/arXiv.2506.08329)
 
 - `symmray` - *Johnnie Gray* - https://github.com/jcmgray/symmray
 
 - `quimb` - *Johnnie Gray* - https://github.com/jcmgray/quimb
 
-- "Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems" - *Si-Jing Du*, *Ao Chen* and *Garnet Kin-Lic Chan* - [arXiv: ](https://doi.org/10.48550/arXiv.2506.08329)
