@@ -32,16 +32,16 @@ mpirun -np 10 python vmc_run_example.py
 ```
 Feel free to substitute the number `10` with any number of MPI ranks you want to use.
 
-An example plot of the VMC training curves for various Ans\"atze on a Fermi-Hubbard model: 
+An example plot (from Ref.[1]) of the VMC training curves for various Ans\"atze on a Fermi-Hubbard model: 
 
-![VMC_energy](./docs/pics/draft_model_compare_v1.pdf)
+![VMC training curves from Ref.[1]](./docs/pics/vmc_curves.png)
 
 
 ## References
 
-- "Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems" - *Si-Jing Du*, *Ao Chen* and *Garnet Kin-Lic Chan* - [arXiv:2506.08329](https://doi.org/10.48550/arXiv.2506.08329)
+[1] "Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems" - *Si-Jing Du*, *Ao Chen* and *Garnet Kin-Lic Chan* - [arXiv:2506.08329](https://doi.org/10.48550/arXiv.2506.08329)
 
-- `symmray` - *Johnnie Gray* - https://github.com/jcmgray/symmray
+[2] `symmray` - *Johnnie Gray* - https://github.com/jcmgray/symmray
 
-- `quimb` - *Johnnie Gray* - https://github.com/jcmgray/quimb
+[3] `quimb` - *Johnnie Gray* - https://github.com/jcmgray/quimb
 
