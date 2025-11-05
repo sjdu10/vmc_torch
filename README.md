@@ -32,10 +32,9 @@ mpirun -np 10 python vmc_run_example.py
 ```
 Feel free to substitute the number `10` with any number of MPI ranks you want to use.
 
-An example plot of the VMC training curves for various Ans\"atze on a spinless Hubbard model ($N_s$ is the VMC sample size): 
+An example plot of the VMC training curves for various Ans\"atze on a Fermi-Hubbard model: 
 
-(we also compare our neural backflow model updates with the Netket updates)
-![VMC_energy](./docs/pics/VMC_energy.png)
+![VMC_energy](./docs/pics/draft_model_compare_v1.pdf)
 
 
 ## References
