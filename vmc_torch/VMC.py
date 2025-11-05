@@ -231,7 +231,7 @@ class VMC:
                 if tmpdir is not None and save:
                     # save the energy statistics and model parameters to local directory
                     path = tmpdir
-                    params_path = path + f'/model_params_step{step}.pth'
+                    params_path = path + f'/model_params_step{step+1}.pth'
 
                     combined_data = {
                         'model_structure': self._state.model_structure,  # model structure as a dict

@@ -36,6 +36,53 @@ def get_psi_from_fTN(fTN_model):
     return psi
 
 
+def unpack_ftns(params_path, skeleton_path, scale=4.0, dtype=torch.float64):
+    """
+    Unpack fTNS from saved parameters and skeleton files.
+    
+    Parameters
+    ----------
+    params_path : str
+        Path to the saved parameters file.
+    skeleton_path : str
+        Path to the saved skeleton file.
+    scale : float, optional
+        Scaling factor to apply to the tensor elements. Default is 4.0.
+    dtype : torch.dtype, optional
+        Data type for the tensor elements. Default is torch.float64.
+    Returns
+    ----------
+    ftns : quimb fTNS
+    """
+    import pickle
+    import quimb.tensor as qtn
+    from symmray.fermionic_local_operators import FermionicOperator
+
+    skeleton = pickle.load(open(skeleton_path, "rb"))
+    params = pickle.load(open(params_path, "rb"))
+    ftns = qtn.unpack(params, skeleton)
+    # Precondition the fTNS
+    ## 1. Sync the stored fermionic phases
+    for ts in ftns.tensors:
+        ts.data.phase_sync(inplace=True)
+    ## 2. Scale the tensor elements
+    ftns.apply_to_arrays(lambda x: torch.tensor(scale*x, dtype=dtype))
+    ## 3. Set the exponent to 0.0
+    ftns.exponent = 0.0
+    # correct the format of oddpos
+    for ts in ftns.tensors:
+        ts.data.phase_sync(inplace=True)
+        # for Z2 fPEPS converted from U1 fPEPS, need to correct the format of oddpos
+        if ts.data.oddpos:
+            oddpos = ts.data.oddpos
+            if isinstance(oddpos[0].label, tuple):
+                nested_oddpos = oddpos[0].label[0]
+                if isinstance(nested_oddpos, FermionicOperator):
+                    ts.data._oddpos = (nested_oddpos,)
+    return ftns
+
+
+
 # ------Symmray function utils------
 try:
     parse_edges_to_site_info = sr.utils.parse_edges_to_site_info

@@ -1,6 +1,6 @@
 # vmc_torch
 
-A quantum variational Monte Carlo (VMC) code based on pyTorch for solving the ground-state properties of quantum many-body lattice Hamiltonians.
+A quantum variational Monte Carlo (VMC) code based on pyTorch for solving ground-state properties of quantum many-body lattice Hamiltonians.
 
 `vmc_torch` currently supports a wide range of variational ansatz, including bosonic/fermionic tensor network states (TNS) (e.g. MPS, PEPS) defined using Quimb and Symmray, and neural quantum states (NQS).
 
