@@ -126,7 +126,8 @@ class VMC:
             start, 
             stop, 
             tmpdir=None, 
-            save=True
+            save=True,
+            save_every=1
         ):
         """Run the VMC optimization loop."""
         self.Einit = 0.
@@ -257,7 +258,8 @@ class VMC:
                         }
                         combined_data['optimizer_state'] = optimizer_state
 
-                    torch.save(combined_data, params_path)
+                    if step % save_every == 0:
+                        torch.save(combined_data, params_path)
 
                     # update the MC_energy_stats.json
                     with open(path + f'/energy_stats_start_{start}.json', 'w') as f:

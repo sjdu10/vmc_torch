@@ -1,21 +1,31 @@
-from mpi4py import MPI
 import ast
-import time
+import cotengra as ctg
+
+# quimb
+import quimb.tensor as qtn
+
 # torch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.func import vmap
-
-# quimb
-import quimb.tensor as qtn
+from mpi4py import MPI
 from quimb.tensor.tensor_2d import Rotator2D, pairwise
-import cotengra as ctg
-
-from vmc_torch.fermion_utils import insert_proj_peps, flatten_proj_params, reconstruct_proj_params, insert_compressor
-from vmc_torch.fermion_utils import calculate_phase_from_adjacent_trans_dict, decompose_permutation_into_transpositions
+from torch.func import vmap
+from vmc_torch.fermion_utils import (
+    calculate_phase_from_adjacent_trans_dict,
+    decompose_permutation_into_transpositions,
+    flatten_proj_params,
+    reconstruct_proj_params,
+    flatten_fts_params,
+    reconstruct_fts_params,
+    insert_compressor,
+    insert_proj_peps,
+    
+)
 from vmc_torch.global_var import DEBUG, set_debug
-from vmc_torch.experiment.nn_sublayers import *
+
+from .nn_sublayers import *
+
 flatten_tn_params = flatten_proj_params
 reconstruct_tn_params = reconstruct_proj_params
 
@@ -41,7 +51,7 @@ def init_weights_kaiming(m):
 
 # Define the custom zero-initialization function
 def init_weights_to_zero(m, std=1e-3):
-    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding, nn.LayerNorm)):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding)):
         # Set weights and biases to zero
         if hasattr(m, 'weight') and m.weight is not None:
             nn.init.normal_(m.weight, mean=0.0, std=std)
@@ -50,7 +60,7 @@ def init_weights_to_zero(m, std=1e-3):
 
 # Define the custom uniform initialization function
 def init_weights_uniform(m, a=-5e-3, b=5e-3):
-    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding, nn.LayerNorm)):
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.Embedding)):
         # Set weights and biases to zero
         if hasattr(m, 'weight') and m.weight is not None:
             nn.init.uniform_(m.weight, a=a, b=b)
@@ -83,32 +93,229 @@ class wavefunctionModel(torch.nn.Module):
     
     def load_params(self, new_params):
         pointer = 0
-        for param, shape in zip(self.parameters(), self.param_shapes):
+        for param in self.parameters():
+            shape = param.shape
             num_param = param.numel()
             new_param_values = new_params[pointer:pointer+num_param].view(shape)
             with torch.no_grad():
                 param.copy_(new_param_values)
             pointer += num_param
-    
-    def amplitude(self, x):
+
+    def amplitude(self, x, **kwargs):
         raise NotImplementedError
     
     def forward(self, x, **kwargs):
         if x.ndim == 1:
             # If input is not batched, add a batch dimension
             x = x.unsqueeze(0)
-        return self.amplitude(x)
+        return self.amplitude(x, **kwargs)
     
     def clear_wavefunction_env_cache(self):
         pass
+    
+    def update_env_x_cache_to_row(self, *args, **kwargs):
+        pass
+    def update_env_y_cache_to_col(self, *args, **kwargs):
+        pass
+    def clear_env_x_cache(self,**kwargs):
+        pass
+    def clear_env_y_cache(self,**kwargs):
+        pass
+
+    def get_tn_params_vec(self):
+        if not hasattr(self, 'torch_tn_params'):
+            pass
+        # get the current TN parameters as a flattened vector
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+        return params_vec
 
     def update_cached_cache(self):
         pass
 
 #------------ bosonic TN model ------------
+class MPS_TNF(qtn.MatrixProductState):
+    def __init__(self, arrays, depth=None, L=None, *args, **kwargs):
+        if isinstance(arrays, MPS_TNF):
+            self.Lx = arrays.Lx
+            self.Ly = arrays.Ly
+            super().__init__(arrays, *args, **kwargs)
+            return
+        self.Lx = depth+1
+        self.Ly = L
+        super().__init__(arrays, *args, **kwargs)
+    
+    def set_Lx(self, Lx):
+        self.Lx = Lx
+    def set_Ly(self, Ly):
+        self.Ly = Ly
+
+    # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
+    def get_amp(self, config, inplace=False, conj=True, reverse=1):
+        """Get the amplitude of a configuration in a PEPS."""
+        tnf = self if inplace else self.copy()
+        # product_state = self.product_bra_state(config, reverse=reverse).conj() if conj else self.product_bra_state(config, reverse=reverse)
+        
+        # amp = tnf|product_state # ---T---<---|n>
+
+        amp = tnf.isel({tnf.site_inds[i]: int(s) for i, s in enumerate(config)})
+        
+        # for ind in tnf.site_inds:
+        #     amp.contract_ind(ind)
+
+        amp.view_as_(
+            qtn.PEPS,
+            site_ind_id="k{}",
+            x_tag_id="ROUND_{}",
+            y_tag_id="I{}", 
+            site_tag_id="I{},{}",
+            Lx=tnf.Lx,
+            Ly=tnf.Ly,
+        )
+        return amp
+    
+class circuit_TNF(wavefunctionModel):
+    def __init__(
+            self, 
+            mps, 
+            ham, 
+            trotter_tau, 
+            depth, 
+            second_order_reflect=False,
+            from_which='ymin',
+            max_bond=None,
+            dtype=torch.float32
+        ):
+        super().__init__(dtype)
+        self.param_dtype = dtype
+        self.trotter_tau = trotter_tau
+        self.depth = depth
+        self.second_order_reflect = second_order_reflect
+        self.max_bond = max_bond if (type(max_bond) is int and max_bond > 0) else None
+        self.from_which = from_which
+
+        self.ham = ham
+        circuit_tnf = self.form_gated_mps_tnf(
+            mps, 
+            ham, 
+            depth,
+            tau = trotter_tau,
+        )
+
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(circuit_tnf)
+
+        self.torch_tn_params = {
+            str(tid): nn.Parameter(data)  # Convert Tensor to Parameter
+            for tid, data in params.items()
+        }
+        # register the torch tensors as parameters
+        for tid, param in self.torch_tn_params.items():
+            self.register_parameter(tid, param)
+        
+    def form_gated_mps_tnf(
+        self,
+        mps, 
+        ham, 
+        depth,
+        tau = 0.5,
+        nn_where_list=None,
+        x_tag_id="ROUND_{}",
+        y_tag_id="I{}",
+        site_tag_id="I{},{}",
+    ):
+        mps1 = mps.copy()
+
+        if not isinstance(nn_where_list, list):
+            Warning("nn_where_list is not a list of tuples, using all nearest neighbor terms in the Hamiltonian")
+            nn_where_list = [(i, i+1) for i in range(mps.L-1)]
+        
+        # Change tags for the initial MPS
+        for ts in mps1.tensors:
+            ts.modify(tags=['ROUND_0']+list(ts.tags))
+        
+        # Apply the gates and add corresponding tags
+        for i in range(depth):
+            for where in nn_where_list:
+                gate = ham.get_gate_expm(where, -1*tau)
+                site_inds = [mps1.site_ind_id.format(site) for site in where]
+                extra_tags = ['ROUND_{}'.format(i+1)]
+                ltag = mps1.site_tag_id.format(where[0])
+                rtag = mps1.site_tag_id.format(where[1])
+                mps1 = mps1.gate_inds(gate, inds=site_inds, contract='split-gate', tags=extra_tags, ltags=ltag, rtags=rtag)
+        
+        # Contract the gates in each round to a MPO
+        for i in range(1,depth+1):
+            for site in mps1.sites:
+                mps1.contract_tags_([mps1.site_tag_id.format(site), f'ROUND_{i}'], inplace=True, which='all')
+        
+        # Add site tags
+        for x in range(0,depth+1):
+            for y in range(mps1.L):
+                ts = mps1[[x_tag_id.format(x), y_tag_id.format(y)]]
+                ts.add_tag(site_tag_id.format(x,y))
+        
+        circuit_tnf = MPS_TNF.from_TN(mps1)
+        circuit_tnf.set_Lx(depth+1)
+        circuit_tnf.set_Ly(mps1.L)
+
+        return circuit_tnf
+
+    def get_state(self):
+        params ={
+            int(tid): data
+            for tid, data in self.torch_tn_params.items()
+        }
+        peps = qtn.unpack(params, self.skeleton)
+        return peps
+
+    def amplitude(self, x, **kwargs):
+        psi = self.get_state()
+        batch_amps = []
+        for x_i in x:
+            if not type(x_i) == torch.Tensor:
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            
+            amp = psi.get_amp(x_i)
+
+            if self.max_bond is None:
+                amp_val = amp.contract()
+            else:
+                if self.from_which == 'ymin':
+                    amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-1])
+                elif self.from_which == 'ymax':
+                    amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly-1])
+                elif self.from_which == 'yboth':
+                    # print('Using MPS contraction scheme from yboth')
+                    amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                    amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                elif self.from_which == 'xmax':
+                    amp = amp.contract_boundary_from_xmax(max_bond=self.max_bond, cutoff=0.0, xrange=[0, psi.Lx-1])
+                elif self.from_which == 'xmin':
+                    print('Using MPS contraction scheme from xmin')
+                    amp = amp.contract_boundary_from_xmin(max_bond=self.max_bond, cutoff=0.0, xrange=[0, psi.Lx-1])
+                else:
+                    raise ValueError('from_which should be one of ymin, ymax, yboth, xmax, xmin')
+            
+                amp_val = amp.contract()
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+            
+        return torch.stack(batch_amps)
 
 
-class PEPS_model(torch.nn.Module):
+
+
+        
+
+class PEPS_model(wavefunctionModel):
     def __init__(self, peps, max_bond=None):
         super().__init__()
         self.peps = peps
@@ -128,46 +335,10 @@ class PEPS_model(torch.nn.Module):
         # register the torch tensors as parameters
         for tid, param in self.torch_tn_params.items():
             self.register_parameter(tid, param)
-        
-        # self.load_params(self.from_params_to_vec())
-    
-    def from_params_to_vec(self):
-        return torch.cat([param.data.reshape(-1) for param in self.parameters()])
-    
-    def load_params(self, vec):
-        pointer = 0
-        for param in self.parameters():
-            num_param = param.numel()
-            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
-            with torch.no_grad():
-                param.copy_(new_param_values)
-            pointer += num_param
-    
-    def from_vec_to_params(self, vec):
-        # XXX: useful at all? Yes for spin PEPS
-        pointer = 0
-        new_params = {}
-        for tid, param in self.torch_tn_params.items():
-            num_param = param.numel()
-            new_param_values = vec[pointer:pointer+num_param].view(param.shape)
-            new_params[tid] = new_param_values
-            pointer += num_param
-        return new_params
-    
-    @property
-    def num_params(self):
-        return len(self.from_params_to_vec())
-    
-    def params_grad_to_vec(self):
-        param_grad_vec = torch.cat([param.grad.reshape(-1) if param.grad is not None else torch.zeros_like(param).reshape(-1) for param in self.parameters()])
-        return param_grad_vec
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
 
-    def clear_grad(self):
-        for param in self.parameters():
-            if param is not None:
-                param.grad = None
-    
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # update self.PEPS
         params ={
             int(tid): data
@@ -189,12 +360,6 @@ class PEPS_model(torch.nn.Module):
             return func(x)
         else:
             return torch.stack([func(xi) for xi in x])
-    
-    def forward(self, x, **kwargs):
-        if x.ndim == 1:
-            # If input is not batched, add a batch dimension
-            x = x.unsqueeze(0)
-        return self.amplitude(x, **kwargs)
 
 class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
     """
@@ -271,7 +436,7 @@ class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             pointer += num_param
         return new_params
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         tn_params_vec = torch.cat(
             [param.reshape(-1) for param in self.torch_tn_params.values()]
         )
@@ -402,7 +567,7 @@ class PEPS_NN_Model(torch.nn.Module):
             x = x.unsqueeze(0)
         return self.amplitude(x)
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         params ={
             int(tid): data
             for tid, data in self.torch_tn_params.items()
@@ -519,7 +684,7 @@ class PEPS_NNproj_Model(torch.nn.Module):
             x = x.unsqueeze(0)
         return self.amplitude(x)
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         params ={
             int(tid): data
             for tid, data in self.torch_tn_params.items()
@@ -640,7 +805,7 @@ class PEPS_delocalized_Model(torch.nn.Module):
             if param is not None:
                 param.grad = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # update self.PEPS
         params ={
             int(tid): data
@@ -697,7 +862,7 @@ class fMPSModel(wavefunctionModel):
             'fMPS (exact contraction)':{'D': ftn.max_bond(), 'L': ftn.L, 'symmetry': self.symmetry, 'cyclic': ftn.cyclic, 'skeleton': self.skeleton},
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -766,7 +931,7 @@ class fMPS_TNFModel(wavefunctionModel):
             },
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -844,7 +1009,7 @@ class fMPS_backflow_Model(wavefunctionModel):
 
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -925,7 +1090,7 @@ class fMPS_backflow_attn_Model(wavefunctionModel):
 
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1023,7 +1188,7 @@ class fMPS_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         }
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1139,7 +1304,7 @@ class fMPS_BFA_cluster_Model(wavefunctionModel):
         }
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1613,7 +1778,7 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         
         self.set_config_ref(config)
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -1755,8 +1920,15 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
 #------------ fermionic PEPS based model ------------
 
 class fTNModel(wavefunctionModel):
-
-    def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False):
+    def __init__(
+        self,
+        ftn,
+        max_bond=None,
+        dtype=torch.float32,
+        functional=False,
+        contraction_kwargs={"mode": "mps"},
+        grad_contraction_kwargs={"mode": "mps"},
+    ):
         super().__init__()
         self.param_dtype = dtype
         self.functional = functional
@@ -1784,10 +1956,11 @@ class fTNModel(wavefunctionModel):
         if max_bond is None or max_bond <= 0:
             max_bond = None
         self.max_bond = max_bond
+        self.contraction_kwargs = contraction_kwargs
+        self.grad_contraction_kwargs = grad_contraction_kwargs
         self.tree = None
-
     
-    def amplitude(self, x):
+    def get_amp_tn(self, config):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1798,12 +1971,37 @@ class fTNModel(wavefunctionModel):
         }
         # Reconstruct the TN with the new parameters
         psi = qtn.unpack(params, self.skeleton)
+        # Get the amplitude
+        amp = psi.get_amp(config)
+
+        return amp
+
+
+    def amplitude(self, x, **kwargs):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(params, self.skeleton)
+
+        # get grad (bool) from kwargs
+        grad = kwargs.get('grad', False)
+        if grad:
+            contraction_kwargs = self.grad_contraction_kwargs
+        else:
+            contraction_kwargs = self.contraction_kwargs
+
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=torch.int if self.functional else self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
@@ -1818,8 +2016,8 @@ class fTNModel(wavefunctionModel):
                 amp_val = amp.contract(optimize=self.tree)
 
             else:
-                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
-                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1], **contraction_kwargs)
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1], **contraction_kwargs)
                 amp_val = amp.contract()
 
             if not self.functional:
@@ -1893,7 +2091,7 @@ class fTNModel_Jastrow(wavefunctionModel):
         self.tree = None
 
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -1910,10 +2108,10 @@ class fTNModel_Jastrow(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=torch.int if self.functional else self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.int)
             else:
                 if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(torch.int if self.functional else self.param_dtype)
+                    x_i = x_i.to(torch.int)
             # Get the amplitude
             amp = psi.get_amp(x_i, conj=True)
             if self.max_bond is None:
@@ -2015,7 +2213,7 @@ class fTNModel_vec(wavefunctionModel):
             
         return phase
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -2063,24 +2261,40 @@ class fTNModel_vec(wavefunctionModel):
     def forward(self, x, **kwargs):
         return self.amplitude(x)
 
+
+
 class fTNModel_reuse(wavefunctionModel):
-    def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False, debug=False):
+    def __init__(
+        self,
+        ftn,
+        max_bond=None,
+        dtype=torch.float32,
+        functional=False,
+        debug=False,
+        contraction_kwargs={'mode':'mps'},
+    ):
         super().__init__()
         self.param_dtype = dtype
         self.functional = functional
         self.debug = debug
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
-        self.skeleton.exponent = 0
+        # self.skeleton.exponent = 0
 
         # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
-        self.torch_tn_params = nn.ModuleDict({
-            str(tid): nn.ParameterDict({
-                str(sector): nn.Parameter(data)
-                for sector, data in blk_array.items()
-            })
-            for tid, blk_array in params.items()
-        })
+        # NOTE: pytorch nn.ParameterDict automatically sorts the keys (as sorted(dict))
+        self.torch_tn_params = nn.ModuleDict(
+            {
+                str(tid): nn.ParameterDict(
+                    {
+                        str(sector): nn.Parameter(data)
+                        for sector, data in blk_array.items()
+                    }
+                )
+                for tid, blk_array in params.items()
+            }
+        )
+        self.tn_param_key_id = "torch_tn_params.{}.{}"
 
         # Get symmetry
         self.symmetry = ftn.arrays[0].symmetry
@@ -2089,7 +2303,12 @@ class fTNModel_reuse(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            f'fPEPS (chi={max_bond})':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+            f"fPEPS (chi={max_bond})": {
+                "D": ftn.max_bond(),
+                "Lx": ftn.Lx,
+                "Ly": ftn.Ly,
+                "symmetry": self.symmetry,
+            },
         }
         if max_bond is None or max_bond <= 0:
             max_bond = None
@@ -2097,134 +2316,199 @@ class fTNModel_reuse(wavefunctionModel):
         self.tree = None
         self.Lx = ftn.Lx
         self.Ly = ftn.Ly
-        self._env_x_cache = None
-        self._env_y_cache = None
+        self._env_x_cache = {}
+        self._env_y_cache = {}
         self.config_ref = None
         self.amp_ref = None
-    
-    def from_1d_to_2d(self, config, ordering='snake'):
-        if ordering == 'snake':
+        self.debug_amp_cache = []
+        self.contraction_kwargs = contraction_kwargs
+
+    def from_1d_to_2d(self, config, ordering="snake"):
+        if ordering == "snake":
             config_2d = config.reshape((self.Lx, self.Ly))
-        return config_2d
-    
+            return config_2d
+        else:
+            raise NotImplementedError(f"Ordering {ordering} is not implemented.")
+
+    def from_1dsite_to_2dsite(self, site, ordering="snake"):
+        """
+        Convert a 1d site index to a 2d site index.
+        site: 1d site index
+        """
+        if ordering == "snake":
+            return (site // self.Ly, site % self.Ly)
+        else:
+            raise ValueError(f"Unsupported ordering: {ordering}")
+
+    def from_2dsite_to_1dsite(self, site, ordering="snake"):
+        """
+        Convert a 2d site index to a 1d site index.
+        site: (row, col) tuple
+        """
+        if ordering == "snake":
+            return site[0] * self.Ly + site[1]
+        else:
+            raise ValueError(f"Unsupported ordering: {ordering}")
+
     def transform_quimb_env_x_key_to_config_key(self, env_x, config):
         """
-            Return a dictionary with the keys of of the config rows
+        Return a dictionary with the keys of of the config rows
         """
         config_2d = self.from_1d_to_2d(config)
         env_x_row_config = {}
         for key in env_x.keys():
-            if key[0] == 'xmax': # from bottom to top
+            if key[0] == "xmax":  # from bottom to top
                 row_n = key[1]
-                if row_n != self.Lx-1:
-                    rows_config = tuple(torch.cat(tuple(config_2d[row_n+1:].to(torch.int))).tolist())
-                    env_x_row_config[('xmax', rows_config)] = env_x[key]
-            elif key[0] == 'xmin': # from top to bottom
+                if row_n != self.Lx - 1:
+                    rows_config = tuple(
+                        torch.cat(tuple(config_2d[row_n + 1 :].to(torch.int))).tolist()
+                    )
+                    env_x_row_config[("xmax", rows_config)] = env_x[key]
+            elif key[0] == "xmin":  # from top to bottom
                 row_n = key[1]
                 if row_n != 0:
-                    rows_config = tuple(torch.cat(tuple(config_2d[:row_n].to(torch.int))).tolist())
-                    env_x_row_config[('xmin', rows_config)] = env_x[key]
+                    rows_config = tuple(
+                        torch.cat(tuple(config_2d[:row_n].to(torch.int))).tolist()
+                    )
+                    env_x_row_config[("xmin", rows_config)] = env_x[key]
         return env_x_row_config
-    
+
     def transform_quimb_env_y_key_to_config_key(self, env_y, config):
         """
-            Return a dictionary with the keys of of the config rows
+        Return a dictionary with the keys of of the config rows
         """
         config_2d = self.from_1d_to_2d(config)
         env_y_row_config = {}
         for key in env_y.keys():
-            if key[0] == 'ymax':
+            if key[0] == "ymax":
                 col_n = key[1]
-                if col_n != self.Ly-1:
-                    cols_config = tuple(torch.cat(tuple(config_2d[:, col_n+1:].to(torch.int))).tolist())
-                    env_y_row_config[('ymax', cols_config)] = env_y[key]
-            elif key[0] == 'ymin':
+                if col_n != self.Ly - 1:
+                    cols_config = tuple(
+                        torch.cat(
+                            tuple(config_2d[:, col_n + 1 :].to(torch.int))
+                        ).tolist()
+                    )
+                    env_y_row_config[("ymax", cols_config)] = env_y[key]
+            elif key[0] == "ymin":
                 col_n = key[1]
                 if col_n != 0:
-                    cols_config = tuple(torch.cat(tuple(config_2d[:, :col_n].to(torch.int))).tolist())
-                    env_y_row_config[('ymin', cols_config)] = env_y[key]
+                    cols_config = tuple(
+                        torch.cat(tuple(config_2d[:, :col_n].to(torch.int))).tolist()
+                    )
+                    env_y_row_config[("ymin", cols_config)] = env_y[key]
         return env_y_row_config
 
+    @torch.no_grad()
     def cache_env_x(self, amp, config):
         """
-            Cache the environment x for the given configuration
+        Cache the environment x for the given configuration
         """
-        env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0)
+        env_x = amp.compute_x_environments(
+            max_bond=self.max_bond, cutoff=0.0, **self.contraction_kwargs
+        )
         env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
         self._env_x_cache = env_x_cache
         self.config_ref = config
         self.amp_ref = amp
-    
+
+    @torch.no_grad()
     def cache_env_y(self, amp, config):
-        env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0)
+        """
+        Cache the environment y for the given configuration
+        """
+        env_y = amp.compute_y_environments(
+            max_bond=self.max_bond, cutoff=0.0, **self.contraction_kwargs
+        )
         env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
         self._env_y_cache = env_y_cache
         self.config_ref = config
         self.amp_ref = amp
-    
+
     def cache_env(self, amp, config):
         """
-            Cache the environment x and y for the given configuration
+        Cache the environment x and y for the given configuration
         """
         self.cache_env_x(amp, config)
         self.cache_env_y(amp, config)
-        
+
     @property
     def env_x_cache(self):
         """
-            Return the cached environment x
+        Return the cached environment x
         """
-        if hasattr(self, '_env_x_cache'):
+        if hasattr(self, "_env_x_cache"):
             return self._env_x_cache
         else:
             return None
-        
+
     @property
     def env_y_cache(self):
         """
-            Return the cached environment y
+        Return the cached environment y
         """
-        if hasattr(self, '_env_y_cache'):
+        if hasattr(self, "_env_y_cache"):
             return self._env_y_cache
         else:
             return None
-    
-    def clear_env_x_cache(self):
-        """
-            Clear the cached environment x
-        """
-        self._env_x_cache = None
 
-    def clear_env_y_cache(self):
+    def clear_env_x_cache(self, from_which=None):
         """
-            Clear the cached environment y
+        Clear the cached environment x
         """
-        self._env_y_cache = None
-    
+        if from_which is None:
+            self._env_x_cache = {}
+        else:
+            assert from_which in ["xmax", "xmin"], "from_which must be 'xmax' or 'xmin'"
+            for key in list(self._env_x_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_x_cache[key]
+
+    def clear_env_y_cache(self, from_which=None):
+        """
+        Clear the cached environment y
+        """
+        if from_which is None:
+            self._env_y_cache = {}
+        else:
+            assert from_which in ["ymax", "ymin"], "from_which must be 'ymax' or 'ymin'"
+            for key in list(self._env_y_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_y_cache[key]
+
     def clear_wavefunction_env_cache(self):
         self.clear_env_x_cache()
         self.clear_env_y_cache()
-    
+        self.config_ref = None
+        self.amp_ref = None
+
     def detect_changed_sites(self, config_ref, new_config):
         """
-            Detect the sites that have changed in the new configuration,
-            written in 1d coordinate format.
+        Detect the sites that have changed in the new configuration,
+        written in 1d coordinate format.
         """
-        #TODO
         changed_sites = set()
+        unchanged_sites = set()
         for i in range(self.Lx * self.Ly):
             if config_ref[i] != new_config[i]:
                 changed_sites.add(i)
+            else:
+                unchanged_sites.add(i)
         changed_sites = sorted(changed_sites)
+        unchanged_sites = sorted(unchanged_sites)
         if len(changed_sites) == 0:
-            return [], [], []
-        unchanged_sites_left = list(range(changed_sites[0]))
-        unchanged_sites_right = list(range(changed_sites[-1]+1, self.Lx * self.Ly))
-        return changed_sites, unchanged_sites_left, unchanged_sites_right
-    
+            return [], []
+        return changed_sites, unchanged_sites
+
+    def from_1d_sites_to_tids(self, sites):
+        """
+        Convert a list of 1d site indices to a list of tensor ids.
+        """
+        tids_list = list(self.skeleton.tensor_map.keys())
+        return [tids_list[site] for site in sites]
+
     def detect_changed_rows(self, config_ref, new_config):
         """
-            Detect the rows that have changed in the new configuration
+        Detect the rows that have changed in the new configuration
         """
         config_ref_2d = self.from_1d_to_2d(config_ref)
         new_config_2d = self.from_1d_to_2d(new_config)
@@ -2235,12 +2519,12 @@ class fTNModel_reuse(wavefunctionModel):
         if len(changed_rows) == 0:
             return [], [], []
         unchanged_rows_above = list(range(changed_rows[0]))
-        unchanged_rows_below = list(range(changed_rows[-1]+1, self.Lx))
+        unchanged_rows_below = list(range(changed_rows[-1] + 1, self.Lx))
         return changed_rows, unchanged_rows_above, unchanged_rows_below
-    
+
     def detect_changed_cols(self, config_ref, new_config):
         """
-            Detect the columns that have changed in the new configuration
+        Detect the columns that have changed in the new configuration
         """
         config_ref_2d = self.from_1d_to_2d(config_ref)
         new_config_2d = self.from_1d_to_2d(new_config)
@@ -2251,64 +2535,218 @@ class fTNModel_reuse(wavefunctionModel):
         if len(changed_cols) == 0:
             return [], [], []
         unchanged_cols_left = list(range(changed_cols[0]))
-        unchanged_cols_right = list(range(changed_cols[-1]+1, self.Ly))
+        unchanged_cols_right = list(range(changed_cols[-1] + 1, self.Ly))
         return changed_cols, unchanged_cols_left, unchanged_cols_right
-    
+
+    @torch.no_grad()
     def update_env_x_cache(self, config):
         """
-            Update the cached environment x for the given configuration
+        Update the cached environment x for the given configuration
         """
-        if self.env_x_cache is not None:
+        if self.env_x_cache:
             self.clear_env_x_cache()
         amp_tn = self.get_amp_tn(config)
-        self.cache_env_x(amp_tn, config)
+        self.cache_env_x(amp_tn, config, **self.contraction_kwargs)
         self.config_ref = config
         self.amp_ref = amp_tn
-    
-    def update_env_x_cache_to_row(self, config, row_id, from_which='xmin'):
+
+    def get_cache_key(self, config, from_which, row_id=None, col_id=None):
+        if row_id is None and col_id is None:
+            raise ValueError("Either row_id or col_id must be provided")
+        if row_id is not None:
+            assert from_which in ["xmax", "xmin"], (
+                "from_which must be 'xmax' or 'xmin' when row_id is provided"
+            )
+            config_2d = self.from_1d_to_2d(config)
+            rows_config = (
+                tuple(torch.cat(tuple(config_2d[row_id + 1 :].to(torch.int))).tolist())
+                if from_which == "xmax"
+                else tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())
+            )
+            return (from_which, rows_config)
+        if col_id is not None:
+            assert from_which in ["ymax", "ymin"], (
+                "from_which must be 'ymax' or 'ymin' when col_id is provided"
+            )
+            config_2d = self.from_1d_to_2d(config)
+            cols_config = (
+                tuple(
+                    torch.cat(tuple(config_2d[:, col_id + 1 :].to(torch.int))).tolist()
+                )
+                if from_which == "ymax"
+                else tuple(
+                    torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist()
+                )
+            )
+            return (from_which, cols_config)
+
+    @torch.no_grad()
+    def update_env_x_cache_to_row(
+        self, config, row_id, from_which="xmin", mode="reuse"
+    ):
         amp_tn = self.get_amp_tn(config)
-        new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
-        new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
-        # add the new env_x to the cache
-        if self.env_x_cache is None:
-            self._env_x_cache = new_env_x_cache
-        else:
-            self._env_x_cache.update(new_env_x_cache)
         self.config_ref = config
         self.amp_ref = amp_tn
-    
+
+        # add the new env_x to the cache
+        if not self.env_x_cache:
+            if from_which == "xmin" and row_id == self.Lx - 1:
+                row_id = self.Lx - 2
+            if from_which == "xmax" and row_id == 0:
+                row_id = 1
+            new_env_x = amp_tn.compute_environments(
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                xrange=(0, row_id + 1)
+                if from_which == "xmin"
+                else (row_id - 1, self.Lx - 1),
+                from_which=from_which,
+                **self.contraction_kwargs,
+            )
+            new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(
+                new_env_x, config
+            )
+            self._env_x_cache.update(new_env_x_cache)
+            return
+        else:
+            if (
+                (from_which == "xmin" and row_id == 0)
+                or (from_which == "xmax" and row_id == self.Lx - 1)
+                or mode == "force"
+            ):
+                if from_which == "xmin" and row_id == self.Lx - 1:
+                    row_id = self.Lx - 2
+                if from_which == "xmax" and row_id == 0:
+                    row_id = 1
+                new_env_x = amp_tn.compute_environments(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    xrange=(0, row_id + 1)
+                    if from_which == "xmin"
+                    else (row_id - 1, self.Lx - 1),
+                    from_which=from_which,
+                    **self.contraction_kwargs,
+                )
+                new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(
+                    new_env_x, config
+                )
+                self._env_x_cache.update(new_env_x_cache)
+                return
+
+            else:
+                assert mode == "reuse"
+                row_tn = amp_tn.select(amp_tn.x_tag(row_id))
+                cache_mps = self.env_x_cache[
+                    self.get_cache_key(config, from_which, row_id=row_id)
+                ]
+                new_cache_key = self.get_cache_key(
+                    config,
+                    from_which,
+                    row_id=row_id + 1 if from_which == "xmin" else row_id - 1,
+                )
+                new_cache_mps = row_tn | cache_mps
+
+                new_cache_mps.contract_boundary_from_(
+                    from_which=from_which,
+                    # xrange=(0, self.Lx - 1),
+                    xrange=(row_id-1, row_id) if from_which=='xmin' else (row_id, row_id+1), # more precisely contract the 2-row TN
+                    yrange=(0, self.Ly - 1),
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    **self.contraction_kwargs,
+                )
+                new_env_x_cache = {new_cache_key: new_cache_mps}
+                self._env_x_cache.update(new_env_x_cache)
+                return
+
+    @torch.no_grad()
     def update_env_y_cache(self, config):
         """
-            Update the cached environment y for the given configuration
+        Update the cached environment y for the given configuration
         """
-        if self.env_y_cache is not None:
+        if self.env_y_cache:
             self.clear_env_y_cache()
         amp_tn = self.get_amp_tn(config)
         self.cache_env_y(amp_tn, config)
         self.config_ref = config
         self.amp_ref = amp_tn
-    
-    def update_env_y_cache_to_col(self, config, col_id, from_which='ymin'):
+
+    @torch.no_grad()
+    def update_env_y_cache_to_col(
+        self, config, col_id, from_which="ymin", mode="reuse"
+    ):
         amp_tn = self.get_amp_tn(config)
-        new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
-        new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
-        # add the new env_y to the cache
-        if self.env_y_cache is None:
-            self._env_y_cache = new_env_y_cache
-        else:
-            self._env_y_cache.update(new_env_y_cache)
         self.config_ref = config
         self.amp_ref = amp_tn
-    
+        # add the new env_y to the cache
+        if not self.env_y_cache:
+            new_env_y = amp_tn.compute_environments(
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                yrange=(0, col_id + 1)
+                if from_which == "ymin"
+                else (col_id - 1, self.Ly - 1),
+                from_which=from_which,
+                **self.contraction_kwargs,
+            )
+            new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(
+                new_env_y, config
+            )
+            self._env_y_cache.update(new_env_y_cache)
+            return
+        else:
+            if (
+                (from_which == "ymin" and col_id == 0)
+                or (from_which == "ymax" and col_id == self.Ly - 1)
+                or mode == "force"
+            ):
+                new_env_y = amp_tn.compute_environments(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    yrange=(0, col_id + 1)
+                    if from_which == "ymin"
+                    else (col_id - 1, self.Ly - 1),
+                    from_which=from_which,
+                    **self.contraction_kwargs,
+                )
+                new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(
+                    new_env_y, config
+                )
+                self._env_y_cache.update(new_env_y_cache)
+                return
+            else:
+                assert mode == "reuse"
+                col_tn = amp_tn.select(amp_tn.y_tag(col_id))
+                cache_mps = self.env_y_cache[
+                    self.get_cache_key(config, from_which, col_id=col_id)
+                ]
+                new_cache_key = self.get_cache_key(
+                    config,
+                    from_which,
+                    col_id=col_id + 1 if from_which == "ymin" else col_id - 1,
+                )
+                new_cache_mps = col_tn | cache_mps
+                new_cache_mps.contract_boundary_from_(
+                    from_which=from_which,
+                    xrange=(0, self.Lx - 1),
+                    # yrange=(0, self.Ly - 1),
+                    yrange=(col_id-1, col_id) if from_which=='ymin' else (col_id, col_id+1), # more precisely contract the 2-col TN
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    **self.contraction_kwargs,
+                )
+                new_env_y_cache = {new_cache_key: new_cache_mps}
+                self._env_y_cache.update(new_env_y_cache)
+                return
+
     def psi(self):
         """
-            Return the wavefunction (fPEPS)
+        Return the wavefunction (fPEPS)
         """
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
-                ast.literal_eval(sector): data
-                for sector, data in blk_array.items()
+                ast.literal_eval(sector): data for sector, data in blk_array.items()
             }
             for tid, blk_array in self.torch_tn_params.items()
         }
@@ -2316,155 +2754,1015 @@ class fTNModel_reuse(wavefunctionModel):
         psi = qtn.unpack(params, self.skeleton)
         return psi
 
-    def get_local_amp_tensors(self, tids:list, config:torch.Tensor):
+    def get_local_amp_tensors(self, sites: list, config: torch.Tensor):
         """
-            Get the local tensors for the given tensor ids and configuration.
-            tids: a list of tensor ids. list of int.
-            config: the input configuration.
+        Get the local tensors for the given tensor ids and configuration.
+        config: the input configuration.
+        sites: a list of 1d site/2d site indices.
         """
         # first pick out the tensor parameters and form the local tn parameters vector
         local_ts_params = {}
+        # tids = self.from_1d_sites_to_tids(sites)
+        tids = (
+            self.from_1d_sites_to_tids(
+                [self.from_2dsite_to_1dsite(site) for site in sites]
+            )
+            if isinstance(sites[0], tuple)
+            else self.from_1d_sites_to_tids(sites)
+        )
         for tid in tids:
             local_ts_params[tid] = {
                 ast.literal_eval(sector): data
                 for sector, data in self.torch_tn_params[str(tid)].items()
             }
-        
+
         # Get sites corresponding to the tids
-        sites = [self.skeleton.sites[tid] for tid in tids]
+        sites_1d = (
+            [self.from_2dsite_to_1dsite(site) for site in sites]
+            if isinstance(sites[0], tuple)
+            else sites
+        )
+        sites_2d = (
+            sites
+            if isinstance(sites[0], tuple)
+            else [self.from_1dsite_to_2dsite(site) for site in sites]
+        )
 
         # Select the corresponding tensor skeleton
-        local_ts_skeleton = self.skeleton.select([self.skeleton.site_tag_id.format(*site) for site in sites], which='any')
+        local_ts_skeleton = self.skeleton.select(
+            [self.skeleton.site_tag_id.format(*site) for site in sites_2d], which="any"
+        )
 
         # Reconstruct the TN with the new parameters
-        local_ts = qtn.unpack(local_ts_params, local_ts_skeleton)
+        local_ftn = qtn.unpack(local_ts_params, local_ts_skeleton)
 
         # Fix the physical indices
-        return local_ts.fix_phys_inds(sites, config[tids])
-    
-    def get_amp_tn(self, config, cache_amp_tn=False):
-        # TODO: add a precheck for exisiting cached environment, and add a part to locally obtain the amp row without constrcuting the whole amp TN
-        if self.env_x_cache is None and self.env_y_cache is None:
+        return local_ftn.fix_phys_inds(sites_2d, config[sites_1d])
+
+    def get_amp_tn(self, config, reconstruct=False):
+        if self.amp_ref is None or reconstruct:
             psi = self.psi()
             # Check config type
-            if not type(config) == torch.Tensor:
-                config = torch.tensor(config, dtype=torch.int if self.functional else self.param_dtype)
+            if not isinstance(config, torch.Tensor):
+                config = torch.tensor(
+                    config, dtype=torch.int if self.functional else self.param_dtype
+                )
             else:
                 if config.dtype != self.param_dtype:
-                    config = config.to(torch.int if self.functional else self.param_dtype)
+                    config = config.to(
+                        torch.int if self.functional else self.param_dtype
+                    )
             # Get the amplitude
-            amp = psi.get_amp(config, conj=True, functional=self.functional)
-            return amp
-        else:
-            config_2d = self.from_1d_to_2d(config)
-            # detect the rows that have changed
-            changed_rows, unchanged_rows_above, unchanged_rows_below = self.detect_changed_rows(self.config_ref, config)
-            changed_cols, unchanged_cols_left, unchanged_cols_right = self.detect_changed_cols(self.config_ref, config)
+            amp_tn = psi.get_amp(config, conj=True, functional=self.functional)
+            # if self.debug:
+            #     print(f'Efficient amp tn construction (full), amp_tn exponent: {amp_tn.exponent}')
+            return amp_tn
 
-            if len(changed_rows) == 0 and len(changed_cols) == 0:
+        else:
+            # detect the sites that have changed
+            changed_sites, unchanged_sites = self.detect_changed_sites(
+                self.config_ref, config
+            )
+
+            if len(changed_sites) == 0:
                 return self.amp_ref
-            # reuse row envs
-            if len(changed_rows) <= len(changed_cols):
-                ... # reuse row envs
-        
-    
-    def amplitude(self, x):
-        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-        params = {
-            int(tid): {
-                ast.literal_eval(sector): data
-                for sector, data in blk_array.items()
-            }
-            for tid, blk_array in self.torch_tn_params.items()
-        }
-        # Reconstruct the TN with the new parameters
-        psi = qtn.unpack(params, self.skeleton)
+            else:
+                # substitute the changed sites tensors
+                local_amp_tn = self.get_local_amp_tensors(changed_sites, config)
+                unchanged_sites_2d = [
+                    self.from_1dsite_to_2dsite(site) for site in unchanged_sites
+                ]
+                unchanged_sites_tags = [
+                    self.skeleton.site_tag_id.format(*site)
+                    for site in unchanged_sites_2d
+                ]
+                unchanged_amp_tn = self.amp_ref.select(
+                    unchanged_sites_tags, which="any"
+                )
+                # merge the local_amp_tn and unchanged_amp_tn
+                amp_tn = local_amp_tn | unchanged_amp_tn
+                amp_tn.exponent = self.skeleton.exponent
+                # if self.debug:
+                #     print(f'Efficient amp tn construction (local), amp_tn exponent: {amp_tn.exponent}')
+                return amp_tn
+
+    def amplitude(self, x, **kwargs):
+        psi = self.psi()
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=torch.int if self.functional else self.param_dtype)
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(
+                    x_i, dtype=torch.int if self.functional else self.param_dtype
+                )
             else:
                 if x_i.dtype != self.param_dtype:
                     x_i = x_i.to(torch.int if self.functional else self.param_dtype)
             # Get the amplitude
-            amp = psi.get_amp(x_i, conj=True, functional=self.functional)
+            amp_tn = self.get_amp_tn(x_i)
 
             if self.max_bond is None:
-                amp = amp
+                amp = amp_tn
                 if self.tree is None:
-                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    opt = ctg.HyperOptimizer(
+                        progbar=True, max_repeats=10, parallel=True
+                    )
                     self.tree = amp.contraction_tree(optimize=opt)
-                amp_val = amp.contract(optimize=self.tree)
+                amp_val = amp.contract(
+                    optimize=self.tree
+                )  # quimb will address the cached exponent automatically
 
             else:
                 if self.cache_env_mode:
-                    self.cache_env_x(amp, x_i)
+                    self.cache_env_x(amp_tn, x_i)
                     # self.cache_env_y(amp, x_i)
                     self.config_ref = x_i
                     config_2d = self.from_1d_to_2d(x_i)
-                    key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
-                    key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+                    key_bot = (
+                        "xmax",
+                        tuple(
+                            torch.cat(
+                                tuple(config_2d[self.Lx // 2 :].to(torch.int))
+                            ).tolist()
+                        ),
+                    )
+                    key_top = (
+                        "xmin",
+                        tuple(
+                            torch.cat(
+                                tuple(config_2d[: self.Lx // 2].to(torch.int))
+                            ).tolist()
+                        ),
+                    )
                     amp_bot = self.env_x_cache[key_bot]
                     amp_top = self.env_x_cache[key_top]
-                    amp_val = (amp_bot|amp_top).contract()
+                    amp_val = (
+                        (amp_bot | amp_top).contract() * 10 ** (self.skeleton.exponent)
+                    )  # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
+                    if self.debug:
+                        amp_val1 = psi.get_amp(x_i).contract()
+                        print(
+                            f"Reused Amp val: {amp_val}, Exact Amp val: {amp_val1}, Rel error: {torch.abs(amp_val1 - amp_val) / torch.abs(amp_val1)}"
+                        )
+                        amp_val = amp_val1
 
                 else:
-                    if self.env_x_cache is None and self.env_y_cache is None:
+                    if not self.env_x_cache and not self.env_y_cache:
                         # check whether we can reuse the cached environment
-                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
-                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
-                        amp_val = amp.contract()
+                        amp = amp_tn.contract_boundary_from_ymin(
+                            max_bond=self.max_bond,
+                            cutoff=0.0,
+                            yrange=[0, psi.Ly // 2 - 1],
+                        )
+                        amp = amp.contract_boundary_from_ymax(
+                            max_bond=self.max_bond,
+                            cutoff=0.0,
+                            yrange=[psi.Ly // 2, psi.Ly - 1],
+                        )
+                        amp_val = (
+                            amp.contract()
+                        )  # quimb will address the cached exponent automatically
                     else:
                         config_2d = self.from_1d_to_2d(x_i)
                         # detect the rows that have changed
-                        changed_rows, unchanged_rows_above, unchanged_rows_below = self.detect_changed_rows(self.config_ref, x_i)
+                        changed_rows, unchanged_rows_above, unchanged_rows_below = (
+                            self.detect_changed_rows(self.config_ref, x_i)
+                        )
                         # detect the columns that have changed
-                        changed_cols, unchanged_cols_left, unchanged_cols_right = self.detect_changed_cols(self.config_ref, x_i)
+                        changed_cols, unchanged_cols_left, unchanged_cols_right = (
+                            self.detect_changed_cols(self.config_ref, x_i)
+                        )
                         if len(changed_rows) == 0:
-                            key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
-                            key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+                            key_bot = (
+                                "xmax",
+                                tuple(
+                                    torch.cat(
+                                        tuple(config_2d[self.Lx // 2 :].to(torch.int))
+                                    ).tolist()
+                                ),
+                            )
+                            key_top = (
+                                "xmin",
+                                tuple(
+                                    torch.cat(
+                                        tuple(config_2d[: self.Lx // 2].to(torch.int))
+                                    ).tolist()
+                                ),
+                            )
                             amp_bot = self.env_x_cache[key_bot]
                             amp_top = self.env_x_cache[key_top]
-                            amp_val = (amp_bot|amp_top).contract()
+                            amp_val = (amp_bot | amp_top).contract() * 10 ** (
+                                self.skeleton.exponent
+                            )
                         else:
                             if len(changed_rows) <= len(changed_cols):
                                 # for bottom envs, until the last row in the changed rows, we can reuse the env
                                 # for top envs, until the first row in the changed rows, we can reuse the env
-                                amp_changed_rows = qtn.TensorNetwork([amp.select(amp.x_tag_id.format(row_n)) for row_n in changed_rows])
+                                amp_changed_rows = qtn.TensorNetwork(
+                                    [
+                                        amp_tn.select(amp_tn.x_tag_id.format(row_n))
+                                        for row_n in changed_rows
+                                    ]
+                                )
                                 amp_unchanged_bottom_env = qtn.TensorNetwork()
                                 amp_unchanged_top_env = qtn.TensorNetwork()
                                 if len(unchanged_rows_below) != 0:
-                                    amp_unchanged_bottom_env = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[unchanged_rows_below].to(torch.int))).tolist()))]
+                                    amp_unchanged_bottom_env = self.env_x_cache[
+                                        (
+                                            "xmax",
+                                            tuple(
+                                                torch.cat(
+                                                    tuple(
+                                                        config_2d[
+                                                            unchanged_rows_below
+                                                        ].to(torch.int)
+                                                    )
+                                                ).tolist()
+                                            ),
+                                        )
+                                    ]
                                 if len(unchanged_rows_above) != 0:
-                                    amp_unchanged_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[unchanged_rows_above].to(torch.int))).tolist()))]
-                                amp_val = (amp_unchanged_bottom_env|amp_unchanged_top_env|amp_changed_rows).contract()
-                                # print(f'changed rows: {changed_rows}', self.from_1d_to_2d(x_i), self.from_1d_to_2d(self.config_ref))
+                                    amp_unchanged_top_env = self.env_x_cache[
+                                        (
+                                            "xmin",
+                                            tuple(
+                                                torch.cat(
+                                                    tuple(
+                                                        config_2d[
+                                                            unchanged_rows_above
+                                                        ].to(torch.int)
+                                                    )
+                                                ).tolist()
+                                            ),
+                                        )
+                                    ]
+                                amp_val = (
+                                    amp_unchanged_bottom_env
+                                    | amp_unchanged_top_env
+                                    | amp_changed_rows
+                                ).contract() * 10 ** (self.skeleton.exponent)
                             else:
                                 # for left envs, until the first column in the changed columns, we can reuse the env
                                 # for right envs, until the last column in the changed columns, we can reuse the env
-                                amp_changed_cols = qtn.TensorNetwork([amp.select(amp.y_tag_id.format(col_n)) for col_n in changed_cols])
+                                amp_changed_cols = qtn.TensorNetwork(
+                                    [
+                                        amp_tn.select(amp_tn.y_tag_id.format(col_n))
+                                        for col_n in changed_cols
+                                    ]
+                                )
                                 amp_unchanged_left_env = qtn.TensorNetwork()
                                 amp_unchanged_right_env = qtn.TensorNetwork()
                                 if len(unchanged_cols_left) != 0:
-                                    amp_unchanged_left_env = self.env_y_cache[('ymin', tuple(torch.cat(tuple(config_2d[:, unchanged_cols_left].to(torch.int))).tolist()))]
+                                    amp_unchanged_left_env = self.env_y_cache[
+                                        (
+                                            "ymin",
+                                            tuple(
+                                                torch.cat(
+                                                    tuple(
+                                                        config_2d[
+                                                            :, unchanged_cols_left
+                                                        ].to(torch.int)
+                                                    )
+                                                ).tolist()
+                                            ),
+                                        )
+                                    ]
                                 if len(unchanged_cols_right) != 0:
-                                    amp_unchanged_right_env = self.env_y_cache[('ymax', tuple(torch.cat(tuple(config_2d[:, unchanged_cols_right].to(torch.int))).tolist()))]
-                                amp_val = (amp_unchanged_left_env|amp_unchanged_right_env|amp_changed_cols).contract()
-                                
-            if amp_val==0.0:
+                                    amp_unchanged_right_env = self.env_y_cache[
+                                        (
+                                            "ymax",
+                                            tuple(
+                                                torch.cat(
+                                                    tuple(
+                                                        config_2d[
+                                                            :, unchanged_cols_right
+                                                        ].to(torch.int)
+                                                    )
+                                                ).tolist()
+                                            ),
+                                        )
+                                    ]
+                                amp_val = (
+                                    amp_unchanged_left_env
+                                    | amp_unchanged_right_env
+                                    | amp_changed_cols
+                                ).contract() * 10 ** (self.skeleton.exponent)
+
+            if amp_val == 0.0:
                 amp_val = torch.tensor(0.0)
-            
-            if self.debug:
-                print(f'Reused Amp: {amp_val}, Exact Amp: {self.get_amp_tn(x_i).contract()}')
-            
-            
+
+            # if self.debug:
+            #     amp_val_exact = psi.get_amp(x_i).contract()
+            #     if (amp_val - amp_val_exact).abs() > 1e-4:
+            #         print(f'Warning: Reused Amp val and Exact Amp val differ significantly! Reused Amp val: {amp_val}, Exact Amp val: {amp_val_exact}, Rel error: {torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)}')
             batch_amps.append(amp_val)
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
+
+    def get_grad(self):
+        """ "Compute the amplitude gradient by contracting TN without the on-site tensor."""
+        if self.debug:
+            print(
+                "Computing the amplitude gradient by contracting TN without the on-site tensor."
+            )
+        self.zero_grad()
+        sampled_x = self.config_ref
+        amp_tn = self.amp_ref
+        index_map = {0: 0, 1: 1, 2: 1, 3: 0}
+        array_map = {
+            0: torch.tensor([1.0, 0.0]),
+            1: torch.tensor([1.0, 0.0]),
+            2: torch.tensor([0.0, 1.0]),
+            3: torch.tensor([0.0, 1.0]),
+        }
+        config_2d = self.from_1d_to_2d(sampled_x)
+        for tid, model_ts_params in self.torch_tn_params.items():
+            with torch.no_grad():
+                # utils numbers
+                site_2d = self.from_1dsite_to_2dsite(int(tid))
+
+                p_ind = self.skeleton.site_ind_id.format(*site_2d)
+                p_ind_order = self.skeleton.tensor_map[int(tid)].inds.index(p_ind)
+                on_site_config = int(sampled_x[int(tid)])
+                on_site_config_parity = index_map[on_site_config]
+                site_tag = self.skeleton.site_tag_id.format(*site_2d)
+                input_vec = array_map[on_site_config]
+
+                ts0 = amp_tn.select(site_tag).contract()
+                ts_params = ts0.get_params()
+
+                # Reuse cached environment to compute grad_ts
+                row_id = site_2d[0]
+                # select the cached_env on both sides of the site tensor along the row
+                rows_above = list(range(row_id + 1, self.Lx))
+                rows_below = list(range(0, row_id))
+                cached_amp_tn_above = (
+                    self.env_x_cache[
+                        (
+                            "xmax",
+                            tuple(
+                                torch.cat(
+                                    tuple(config_2d[rows_above].to(torch.int))
+                                ).tolist()
+                            ),
+                        )
+                    ]
+                    if rows_above
+                    else qtn.TensorNetwork([])
+                )
+                cached_amp_tn_below = (
+                    self.env_x_cache[
+                        (
+                            "xmin",
+                            tuple(
+                                torch.cat(
+                                    tuple(config_2d[rows_below].to(torch.int))
+                                ).tolist()
+                            ),
+                        )
+                    ]
+                    if rows_below
+                    else qtn.TensorNetwork([])
+                )
+                within_row_sites = list(
+                    (site_2d[0], col_id)
+                    for col_id in range(self.Ly)
+                    if col_id != site_2d[1]
+                )
+                within_row_hole_tn = self.get_local_amp_tensors(
+                    within_row_sites, config=sampled_x
+                )
+                grad_ts = (
+                    within_row_hole_tn | cached_amp_tn_above | cached_amp_tn_below
+                ).contract()
+                grad_ts.data.phase_sync(inplace=True)
+
+            # # Exact contraction of the TN without the site tensor, naive calculation, expensive baseline.
+            # ts_left = [ts for ts in amp_tn.tensors if site_tag not in ts.tags]
+            # tn_left = qtn.TensorNetwork(ts_left)
+            # grad_ts = tn_left.contract()
+
+            # Back propagate through the final contraction
+            ts0.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(True))
+            grad_ts.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(False))
+            amp_temp = (ts0 | grad_ts).contract() * 10 ** (self.skeleton.exponent)
+            amp_temp.backward()
+
+            grad_ts_backprop_params = ts0.get_params().copy()  # correct gradients
+            for blk, ts_temp in ts0.get_params().items():
+                grad_ts_backprop_params[blk] = ts_temp.grad
+
+            # select the remaining sectors in model_ts_params
+            remaining_sliced_sectors = [sector for sector in sorted(ts_params)]
+            remaining_sectors = [
+                sector + (on_site_config_parity,) for sector in sorted(ts_params)
+            ]
+
+            for sliced_blk, blk in zip(remaining_sliced_sectors, remaining_sectors):
+                data = model_ts_params[str(blk)]
+                select_index = torch.argmax(input_vec).item()
+                slicer = [slice(None)] * data.ndim
+                slicer[p_ind_order] = select_index
+                reconstructed_grad_tensor = torch.zeros_like(data)
+                reconstructed_grad_tensor[tuple(slicer)] = grad_ts_backprop_params[
+                    sliced_blk
+                ]
+                data.grad = reconstructed_grad_tensor
+
+# class fTNModel_reuse(wavefunctionModel):
+#     def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False, debug=False):
+#         super().__init__()
+#         self.param_dtype = dtype
+#         self.functional = functional
+#         self.debug = debug
+#         # extract the raw arrays and a skeleton of the TN
+#         params, self.skeleton = qtn.pack(ftn)
+#         # self.skeleton.exponent = 0
+
+#         # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+#         # NOTE: pytorch nn.ParameterDict automatically sorts the keys (as sorted(dict))
+#         self.torch_tn_params = nn.ModuleDict({
+#             str(tid): nn.ParameterDict({
+#                 str(sector): nn.Parameter(data)
+#                 for sector, data in blk_array.items()
+#             })
+#             for tid, blk_array in params.items()
+#         })
+#         self.tn_param_key_id = 'torch_tn_params.{}.{}'
+
+#         # Get symmetry
+#         self.symmetry = ftn.arrays[0].symmetry
+
+#         # Store the shapes of the parameters
+#         self.param_shapes = [param.shape for param in self.parameters()]
+
+#         self.model_structure = {
+#             f'fPEPS (chi={max_bond})':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
+#         }
+#         if max_bond is None or max_bond <= 0:
+#             max_bond = None
+#         self.max_bond = max_bond
+#         self.tree = None
+#         self.Lx = ftn.Lx
+#         self.Ly = ftn.Ly
+#         self._env_x_cache = {}
+#         self._env_y_cache = {}
+#         self.config_ref = None
+#         self.amp_ref = None
+#         self.debug_amp_cache = []
+    
+#     def from_1d_to_2d(self, config, ordering='snake'):
+#         if ordering == 'snake':
+#             config_2d = config.reshape((self.Lx, self.Ly))
+#             return config_2d
+#         else:
+#             raise NotImplementedError(f'Ordering {ordering} is not implemented.')
+        
+#     def from_1dsite_to_2dsite(self, site, ordering='snake'):
+#         """
+#             Convert a 1d site index to a 2d site index.
+#             site: 1d site index
+#         """
+#         if ordering == 'snake':
+#             return (site // self.Ly, site % self.Ly)
+#         else:
+#             raise ValueError(f"Unsupported ordering: {ordering}")
+    
+#     def from_2dsite_to_1dsite(self, site, ordering='snake'):
+#         """
+#             Convert a 2d site index to a 1d site index.
+#             site: (row, col) tuple
+#         """
+#         if ordering == 'snake':
+#             return site[0] * self.Ly + site[1]
+#         else:
+#             raise ValueError(f"Unsupported ordering: {ordering}")
+    
+#     def transform_quimb_env_x_key_to_config_key(self, env_x, config):
+#         """
+#             Return a dictionary with the keys of of the config rows
+#         """
+#         config_2d = self.from_1d_to_2d(config)
+#         env_x_row_config = {}
+#         for key in env_x.keys():
+#             if key[0] == 'xmax': # from bottom to top
+#                 row_n = key[1]
+#                 if row_n != self.Lx-1:
+#                     rows_config = tuple(torch.cat(tuple(config_2d[row_n+1:].to(torch.int))).tolist())
+#                     env_x_row_config[('xmax', rows_config)] = env_x[key]
+#             elif key[0] == 'xmin': # from top to bottom
+#                 row_n = key[1]
+#                 if row_n != 0:
+#                     rows_config = tuple(torch.cat(tuple(config_2d[:row_n].to(torch.int))).tolist())
+#                     env_x_row_config[('xmin', rows_config)] = env_x[key]
+#         return env_x_row_config
+    
+#     def transform_quimb_env_y_key_to_config_key(self, env_y, config):
+#         """
+#             Return a dictionary with the keys of of the config rows
+#         """
+#         config_2d = self.from_1d_to_2d(config)
+#         env_y_row_config = {}
+#         for key in env_y.keys():
+#             if key[0] == 'ymax':
+#                 col_n = key[1]
+#                 if col_n != self.Ly-1:
+#                     cols_config = tuple(torch.cat(tuple(config_2d[:, col_n+1:].to(torch.int))).tolist())
+#                     env_y_row_config[('ymax', cols_config)] = env_y[key]
+#             elif key[0] == 'ymin':
+#                 col_n = key[1]
+#                 if col_n != 0:
+#                     cols_config = tuple(torch.cat(tuple(config_2d[:, :col_n].to(torch.int))).tolist())
+#                     env_y_row_config[('ymin', cols_config)] = env_y[key]
+#         return env_y_row_config
+
+#     @torch.no_grad()
+#     def cache_env_x(self, amp, config):
+#         """
+#             Cache the environment x for the given configuration
+#         """
+#         env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0)
+#         env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
+#         self._env_x_cache = env_x_cache
+#         self.config_ref = config
+#         self.amp_ref = amp
+    
+#     @torch.no_grad()
+#     def cache_env_y(self, amp, config):
+#         env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0)
+#         env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
+#         self._env_y_cache = env_y_cache
+#         self.config_ref = config
+#         self.amp_ref = amp
+    
+#     def cache_env(self, amp, config):
+#         """
+#             Cache the environment x and y for the given configuration
+#         """
+#         self.cache_env_x(amp, config)
+#         self.cache_env_y(amp, config)
+        
+#     @property
+#     def env_x_cache(self):
+#         """
+#             Return the cached environment x
+#         """
+#         if hasattr(self, '_env_x_cache'):
+#             return self._env_x_cache
+#         else:
+#             return None
+        
+#     @property
+#     def env_y_cache(self):
+#         """
+#             Return the cached environment y
+#         """
+#         if hasattr(self, '_env_y_cache'):
+#             return self._env_y_cache
+#         else:
+#             return None
+    
+#     def clear_env_x_cache(self, from_which=None):
+#         """
+#             Clear the cached environment x
+#         """
+#         if from_which is None:
+#             self._env_x_cache = {}
+#         else:
+#             assert from_which in ['xmax', 'xmin'], "from_which must be 'xmax' or 'xmin'"
+#             for key in list(self._env_x_cache.keys()):
+#                 if key[0] == from_which:
+#                     del self._env_x_cache[key]
+
+#     def clear_env_y_cache(self, from_which=None):
+#         """
+#             Clear the cached environment y
+#         """
+#         if from_which is None:
+#             self._env_y_cache = {}
+#         else:
+#             assert from_which in ['ymax', 'ymin'], "from_which must be 'ymax' or 'ymin'"
+#             for key in list(self._env_y_cache.keys()):
+#                 if key[0] == from_which:
+#                     del self._env_y_cache[key]
+
+#     def clear_wavefunction_env_cache(self):
+#         self.clear_env_x_cache()
+#         self.clear_env_y_cache()
+#         self.config_ref = None
+#         self.amp_ref = None
+    
+#     def detect_changed_sites(self, config_ref, new_config):
+#         """
+#             Detect the sites that have changed in the new configuration,
+#             written in 1d coordinate format.
+#         """
+#         changed_sites = set()
+#         unchanged_sites = set()
+#         for i in range(self.Lx * self.Ly):
+#             if config_ref[i] != new_config[i]:
+#                 changed_sites.add(i)
+#             else:
+#                 unchanged_sites.add(i)
+#         changed_sites = sorted(changed_sites)
+#         unchanged_sites = sorted(unchanged_sites)
+#         if len(changed_sites) == 0:
+#             return [], []
+#         return changed_sites, unchanged_sites
+
+#     def from_1d_sites_to_tids(self, sites):
+#         """
+#             Convert a list of 1d site indices to a list of tensor ids.
+#         """
+#         tids_list = list(self.skeleton.tensor_map.keys())
+#         return [tids_list[site] for site in sites]
+    
+#     def detect_changed_rows(self, config_ref, new_config):
+#         """
+#             Detect the rows that have changed in the new configuration
+#         """
+#         config_ref_2d = self.from_1d_to_2d(config_ref)
+#         new_config_2d = self.from_1d_to_2d(new_config)
+#         changed_rows = []
+#         for i in range(self.Lx):
+#             if not torch.equal(config_ref_2d[i], new_config_2d[i]):
+#                 changed_rows.append(i)
+#         if len(changed_rows) == 0:
+#             return [], [], []
+#         unchanged_rows_above = list(range(changed_rows[0]))
+#         unchanged_rows_below = list(range(changed_rows[-1]+1, self.Lx))
+#         return changed_rows, unchanged_rows_above, unchanged_rows_below
+    
+#     def detect_changed_cols(self, config_ref, new_config):
+#         """
+#             Detect the columns that have changed in the new configuration
+#         """
+#         config_ref_2d = self.from_1d_to_2d(config_ref)
+#         new_config_2d = self.from_1d_to_2d(new_config)
+#         changed_cols = []
+#         for i in range(self.Ly):
+#             if not torch.equal(config_ref_2d[:, i], new_config_2d[:, i]):
+#                 changed_cols.append(i)
+#         if len(changed_cols) == 0:
+#             return [], [], []
+#         unchanged_cols_left = list(range(changed_cols[0]))
+#         unchanged_cols_right = list(range(changed_cols[-1]+1, self.Ly))
+#         return changed_cols, unchanged_cols_left, unchanged_cols_right
+    
+#     @torch.no_grad()
+#     def update_env_x_cache(self, config):
+#         """
+#             Update the cached environment x for the given configuration
+#         """
+#         if self.env_x_cache:
+#             self.clear_env_x_cache()
+#         amp_tn = self.get_amp_tn(config)
+#         self.cache_env_x(amp_tn, config)
+#         self.config_ref = config
+#         self.amp_ref = amp_tn
+
+#     def get_cache_key(self, config, from_which, row_id=None, col_id=None):
+#         if row_id is None and col_id is None:
+#             raise ValueError("Either row_id or col_id must be provided")
+#         if row_id is not None:
+#             assert from_which in ['xmax', 'xmin'], "from_which must be 'xmax' or 'xmin' when row_id is provided"
+#             config_2d = self.from_1d_to_2d(config)
+#             rows_config = tuple(torch.cat(tuple(config_2d[row_id+1:].to(torch.int))).tolist()) if from_which=='xmax' else tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())
+#             return (from_which, rows_config)
+#         if col_id is not None:
+#             assert from_which in ['ymax', 'ymin'], "from_which must be 'ymax' or 'ymin' when col_id is provided"
+#             config_2d = self.from_1d_to_2d(config)
+#             cols_config = tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist()) if from_which=='ymax' else tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())
+#             return (from_which, cols_config)
+    
+#     @torch.no_grad()
+#     def update_env_x_cache_to_row(self, config, row_id, from_which='xmin', mode='reuse'):
+#         amp_tn = self.get_amp_tn(config)
+#         self.config_ref = config
+#         self.amp_ref = amp_tn
+
+#         # add the new env_x to the cache
+#         if not self.env_x_cache:
+#             new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
+#             new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+#             self._env_x_cache.update(new_env_x_cache)
+#             return
+#         else:
+#             if (from_which is 'xmin' and row_id == 0) or (from_which is 'xmax' and row_id == self.Lx-1) or mode is 'force':
+#                 new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
+#                 new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+#                 self._env_x_cache.update(new_env_x_cache)
+#                 return
+                
+#             else:
+#                 assert mode is 'reuse'
+#                 row_tn = amp_tn.select(amp_tn.x_tag(row_id))
+#                 cache_mps = self.env_x_cache[self.get_cache_key(config, from_which, row_id=row_id)]
+#                 new_cache_key = self.get_cache_key(config, from_which, row_id=row_id+1 if from_which=='xmin' else row_id-1)
+#                 new_cache_mps = (row_tn | cache_mps)
+#                 new_cache_mps.contract_boundary_from_(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
+#                 new_env_x_cache = {new_cache_key: new_cache_mps}
+#                 self._env_x_cache.update(new_env_x_cache)
+#                 return
+        
+#     @torch.no_grad()
+#     def update_env_y_cache(self, config):
+#         """
+#             Update the cached environment y for the given configuration
+#         """
+#         if self.env_y_cache:
+#             self.clear_env_y_cache()
+#         amp_tn = self.get_amp_tn(config)
+#         self.cache_env_y(amp_tn, config)
+#         self.config_ref = config
+#         self.amp_ref = amp_tn
+
+#     @torch.no_grad()
+#     def update_env_y_cache_to_col(self, config, col_id, from_which='ymin', mode='reuse'):
+#         amp_tn = self.get_amp_tn(config)
+#         self.config_ref = config
+#         self.amp_ref = amp_tn
+#         # add the new env_y to the cache
+#         if not self.env_y_cache:
+#             new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
+#             new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+#             self._env_y_cache.update(new_env_y_cache)
+#             return
+#         else:
+#             if (from_which is 'ymin' and col_id == 0) or (from_which is 'ymax' and col_id == self.Ly-1) or mode is 'force':
+#                 new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
+#                 new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+#                 self._env_y_cache.update(new_env_y_cache)
+#                 return
+#             else:
+#                 assert mode is 'reuse'
+#                 col_tn = amp_tn.select(amp_tn.y_tag(col_id))
+#                 cache_mps = self.env_y_cache[self.get_cache_key(config, from_which, col_id=col_id)]
+#                 new_cache_key = self.get_cache_key(config, from_which, col_id=col_id+1 if from_which=='ymin' else col_id-1)
+#                 new_cache_mps = (col_tn | cache_mps)
+#                 new_cache_mps.contract_boundary_from_(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
+#                 new_env_y_cache = {new_cache_key: new_cache_mps}
+#                 self._env_y_cache.update(new_env_y_cache)
+#                 return
+        
+    
+#     def psi(self):
+#         """
+#             Return the wavefunction (fPEPS)
+#         """
+#         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+#         params = {
+#             int(tid): {
+#                 ast.literal_eval(sector): data
+#                 for sector, data in blk_array.items()
+#             }
+#             for tid, blk_array in self.torch_tn_params.items()
+#         }
+#         # Reconstruct the TN with the new parameters
+#         psi = qtn.unpack(params, self.skeleton)
+#         return psi
+
+#     def get_local_amp_tensors(self, sites:list, config:torch.Tensor):
+#         """
+#             Get the local tensors for the given tensor ids and configuration.
+#             config: the input configuration.
+#             sites: a list of 1d site/2d site indices.
+#         """
+#         # first pick out the tensor parameters and form the local tn parameters vector
+#         local_ts_params = {}
+#         # tids = self.from_1d_sites_to_tids(sites)
+#         tids = self.from_1d_sites_to_tids([self.from_2dsite_to_1dsite(site) for site in sites]) if isinstance(sites[0], tuple) else self.from_1d_sites_to_tids(sites)
+#         for tid in tids:
+#             local_ts_params[tid] = {
+#                 ast.literal_eval(sector): data
+#                 for sector, data in self.torch_tn_params[str(tid)].items()
+#             }
+        
+#         # Get sites corresponding to the tids
+#         sites_1d = [self.from_2dsite_to_1dsite(site) for site in sites] if isinstance(sites[0], tuple) else sites
+#         sites_2d = sites if isinstance(sites[0], tuple) else [self.from_1dsite_to_2dsite(site) for site in sites]
+
+#         # Select the corresponding tensor skeleton
+#         local_ts_skeleton = self.skeleton.select([self.skeleton.site_tag_id.format(*site) for site in sites_2d], which='any')
+
+#         # Reconstruct the TN with the new parameters
+#         local_ftn = qtn.unpack(local_ts_params, local_ts_skeleton)
+
+#         # Fix the physical indices
+#         return local_ftn.fix_phys_inds(sites_2d, config[sites_1d])
+    
+#     def get_amp_tn(self, config, reconstruct=False):
+
+#         if self.amp_ref is None or reconstruct:
+#             psi = self.psi()
+#             # Check config type
+#             if not type(config) == torch.Tensor:
+#                 config = torch.tensor(config, dtype=torch.int if self.functional else self.param_dtype)
+#             else:
+#                 if config.dtype != self.param_dtype:
+#                     config = config.to(torch.int if self.functional else self.param_dtype)
+#             # Get the amplitude
+#             amp_tn = psi.get_amp(config, conj=True, functional=self.functional)
+#             # if self.debug:
+#             #     print(f'Efficient amp tn construction (full), amp_tn exponent: {amp_tn.exponent}')
+#             return amp_tn
+        
+#         else:
+#             # detect the sites that have changed
+#             changed_sites, unchanged_sites = self.detect_changed_sites(self.config_ref, config)
+
+#             if len(changed_sites) == 0:
+#                 return self.amp_ref
+#             else:
+#                 # substitute the changed sites tensors
+#                 local_amp_tn = self.get_local_amp_tensors(changed_sites, config)
+#                 unchanged_sites_2d = [self.from_1dsite_to_2dsite(site) for site in unchanged_sites]
+#                 unchanged_sites_tags = [self.skeleton.site_tag_id.format(*site) for site in unchanged_sites_2d]
+#                 unchanged_amp_tn = self.amp_ref.select(unchanged_sites_tags, which='any')
+#                 # merge the local_amp_tn and unchanged_amp_tn
+#                 amp_tn = local_amp_tn | unchanged_amp_tn
+#                 amp_tn.exponent = self.skeleton.exponent
+#                 # if self.debug:
+#                 #     print(f'Efficient amp tn construction (local), amp_tn exponent: {amp_tn.exponent}')
+#                 return amp_tn
+    
+#     def amplitude(self, x, **kwargs):
+#         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+#         params = {
+#             int(tid): {
+#                 ast.literal_eval(sector): data
+#                 for sector, data in blk_array.items()
+#             }
+#             for tid, blk_array in self.torch_tn_params.items()
+#         }
+#         # Reconstruct the TN with the new parameters
+#         psi = qtn.unpack(params, self.skeleton)
+#         # `x` is expected to be batched as (batch_size, input_dim)
+#         # Loop through the batch and compute amplitude for each sample
+#         batch_amps = []
+#         for x_i in x:
+#             # Check x_i type
+#             if not type(x_i) == torch.Tensor:
+#                 x_i = torch.tensor(x_i, dtype=torch.int if self.functional else self.param_dtype)
+#             else:
+#                 if x_i.dtype != self.param_dtype:
+#                     x_i = x_i.to(torch.int if self.functional else self.param_dtype)
+#             # Get the amplitude
+#             # amp = psi.get_amp(x_i, conj=True, functional=self.functional)
+#             amp_tn = self.get_amp_tn(x_i)
+
+#             if self.max_bond is None:
+#                 amp = amp_tn
+#                 if self.tree is None:
+#                     opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+#                     self.tree = amp.contraction_tree(optimize=opt)
+#                 amp_val = amp.contract(optimize=self.tree) # quimb will address the cached exponent automatically
+
+#             else:
+#                 if self.cache_env_mode:
+#                     self.cache_env_x(amp_tn, x_i)
+#                     # self.cache_env_y(amp, x_i)
+#                     self.config_ref = x_i
+#                     config_2d = self.from_1d_to_2d(x_i)
+#                     key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
+#                     key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+#                     amp_bot = self.env_x_cache[key_bot]
+#                     amp_top = self.env_x_cache[key_top]
+#                     amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
+#                     if self.debug:
+#                         amp_val1 = psi.get_amp(x_i).contract()
+#                         print(f'Reused Amp val: {amp_val}, Exact Amp val: {amp_val1}, Rel error: {torch.abs(amp_val1 - amp_val) / torch.abs(amp_val1)}')
+#                         amp_val = amp_val1
+
+#                 else:
+#                     if not self.env_x_cache and not self.env_y_cache:
+#                         # check whether we can reuse the cached environment
+#                         amp = amp_tn.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+#                         amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+#                         amp_val = amp.contract() # quimb will address the cached exponent automatically
+#                     else:
+#                         config_2d = self.from_1d_to_2d(x_i)
+#                         # detect the rows that have changed
+#                         changed_rows, unchanged_rows_above, unchanged_rows_below = self.detect_changed_rows(self.config_ref, x_i)
+#                         # detect the columns that have changed
+#                         changed_cols, unchanged_cols_left, unchanged_cols_right = self.detect_changed_cols(self.config_ref, x_i)
+#                         if len(changed_rows) == 0:
+#                             key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
+#                             key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+#                             amp_bot = self.env_x_cache[key_bot]
+#                             amp_top = self.env_x_cache[key_top]
+#                             amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent)
+#                         else:
+#                             if len(changed_rows) <= len(changed_cols):
+#                                 # for bottom envs, until the last row in the changed rows, we can reuse the env
+#                                 # for top envs, until the first row in the changed rows, we can reuse the env
+#                                 amp_changed_rows = qtn.TensorNetwork([amp_tn.select(amp_tn.x_tag_id.format(row_n)) for row_n in changed_rows])
+#                                 amp_unchanged_bottom_env = qtn.TensorNetwork()
+#                                 amp_unchanged_top_env = qtn.TensorNetwork()
+#                                 if len(unchanged_rows_below) != 0:
+#                                     amp_unchanged_bottom_env = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[unchanged_rows_below].to(torch.int))).tolist()))]
+#                                 if len(unchanged_rows_above) != 0:
+#                                     amp_unchanged_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[unchanged_rows_above].to(torch.int))).tolist()))]
+#                                 amp_val = (amp_unchanged_bottom_env|amp_unchanged_top_env|amp_changed_rows).contract() * 10**(self.skeleton.exponent)
+#                             else:
+#                                 # for left envs, until the first column in the changed columns, we can reuse the env
+#                                 # for right envs, until the last column in the changed columns, we can reuse the env
+#                                 amp_changed_cols = qtn.TensorNetwork([amp_tn.select(amp_tn.y_tag_id.format(col_n)) for col_n in changed_cols])
+#                                 amp_unchanged_left_env = qtn.TensorNetwork()
+#                                 amp_unchanged_right_env = qtn.TensorNetwork()
+#                                 if len(unchanged_cols_left) != 0:
+#                                     amp_unchanged_left_env = self.env_y_cache[('ymin', tuple(torch.cat(tuple(config_2d[:, unchanged_cols_left].to(torch.int))).tolist()))]
+#                                 if len(unchanged_cols_right) != 0:
+#                                     amp_unchanged_right_env = self.env_y_cache[('ymax', tuple(torch.cat(tuple(config_2d[:, unchanged_cols_right].to(torch.int))).tolist()))]
+#                                 amp_val = (amp_unchanged_left_env|amp_unchanged_right_env|amp_changed_cols).contract()*10**(self.skeleton.exponent)
+
+#             if amp_val==0.0:
+#                 amp_val = torch.tensor(0.0)
+            
+#             # if self.debug:
+#             #     amp_val_exact = psi.get_amp(x_i).contract()
+#             #     if (amp_val - amp_val_exact).abs() > 1e-4:
+#             #         print(f'Warning: Reused Amp val and Exact Amp val differ significantly! Reused Amp val: {amp_val}, Exact Amp val: {amp_val_exact}, Rel error: {torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)}')
+                
+
+#             batch_amps.append(amp_val)
+
+#         # Return the batch of amplitudes stacked as a tensor
+#         return torch.stack(batch_amps)
+    
+#     def get_grad(self):
+#         """"Compute the amplitude gradient by contracting TN without the on-site tensor."""
+#         if self.debug:
+#             print('Computing the amplitude gradient by contracting TN without the on-site tensor.')
+#         self.zero_grad()
+#         sampled_x = self.config_ref
+#         amp_tn = self.amp_ref
+#         index_map = {0: 0, 1: 1, 2: 1, 3: 0}
+#         array_map = {
+#             0: torch.tensor([1.0, 0.0]),
+#             1: torch.tensor([1.0, 0.0]),
+#             2: torch.tensor([0.0, 1.0]),
+#             3: torch.tensor([0.0, 1.0])
+#         }
+#         config_2d = self.from_1d_to_2d(sampled_x)
+#         for tid, model_ts_params in self.torch_tn_params.items():
+#             with torch.no_grad():
+#                 # utils numbers
+#                 site_2d = self.from_1dsite_to_2dsite(int(tid))
+
+#                 p_ind = self.skeleton.site_ind_id.format(*site_2d)
+#                 p_ind_order = self.skeleton.tensor_map[int(tid)].inds.index(p_ind)
+#                 on_site_config = int(sampled_x[int(tid)])
+#                 on_site_config_parity = index_map[on_site_config]
+#                 site_tag = self.skeleton.site_tag_id.format(*site_2d)
+#                 input_vec = array_map[on_site_config]
+
+#                 ts0 = amp_tn.select(site_tag).contract()
+#                 ts_params = ts0.get_params()
+
+#                 # Reuse cached environment to compute grad_ts
+#                 row_id = site_2d[0]
+#                 # select the cached_env on both sides of the site tensor along the row
+#                 rows_above = list(range(row_id+1, self.Lx))
+#                 rows_below = list(range(0, row_id))
+#                 cached_amp_tn_above = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[rows_above].to(torch.int))).tolist()))] if rows_above else qtn.TensorNetwork([])
+#                 cached_amp_tn_below = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[rows_below].to(torch.int))).tolist()))] if rows_below else qtn.TensorNetwork([])
+#                 within_row_sites = list((site_2d[0], col_id) for col_id in range(self.Ly) if col_id != site_2d[1])
+#                 within_row_hole_tn = self.get_local_amp_tensors(within_row_sites, config=sampled_x)
+#                 grad_ts = (within_row_hole_tn | cached_amp_tn_above | cached_amp_tn_below).contract()
+#                 grad_ts.data.phase_sync(inplace=True)
+            
+#             # # Exact contraction of the TN without the site tensor, naive calculation, expensive baseline.
+#             # ts_left = [ts for ts in amp_tn.tensors if site_tag not in ts.tags]
+#             # tn_left = qtn.TensorNetwork(ts_left)
+#             # grad_ts = tn_left.contract()
+
+#             # Back propagate through the final contraction
+#             ts0.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(True))
+#             grad_ts.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(False))
+#             amp_temp = (ts0|grad_ts).contract()*10**(self.skeleton.exponent)
+#             amp_temp.backward()
+
+#             grad_ts_backprop_params = ts0.get_params().copy() # correct gradients
+#             for blk, ts_temp in ts0.get_params().items():
+#                 grad_ts_backprop_params[blk] = ts_temp.grad
+
+#             # select the remaining sectors in model_ts_params
+#             remaining_sliced_sectors = [sector for sector in sorted(ts_params)]
+#             remaining_sectors = [sector + (on_site_config_parity,) for sector in sorted(ts_params)]
+
+#             for sliced_blk, blk in zip(remaining_sliced_sectors, remaining_sectors):
+#                 data = model_ts_params[str(blk)]
+#                 select_index = torch.argmax(input_vec).item()
+#                 slicer = [slice(None)] * data.ndim
+#                 slicer[p_ind_order] = select_index
+#                 reconstructed_grad_tensor = torch.zeros_like(data)
+#                 reconstructed_grad_tensor[tuple(slicer)] = grad_ts_backprop_params[sliced_blk]
+#                 data.grad = reconstructed_grad_tensor
+
 
 
 class fTNModel_test(wavefunctionModel):
@@ -2499,7 +3797,7 @@ class fTNModel_test(wavefunctionModel):
         self.max_bond = max_bond
         
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -2581,7 +3879,7 @@ class fTN_backflow_Model(wavefunctionModel):
         self.max_bond = max_bond
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -2672,7 +3970,7 @@ class fTN_backflow_Model_embedding(wavefunctionModel):
         self.max_bond = max_bond
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -2695,7 +3993,7 @@ class fTN_backflow_Model_embedding(wavefunctionModel):
         batch_amps = []
         for x_i, x_embedded_i in zip(x, x_embedded_flat):
             # Check x_embedded_i type
-            if not type(x_embedded_i) == torch.Tensor:
+            if not isinstance(x_embedded_i, torch.Tensor):
                 x_embedded_i = torch.tensor(x_embedded_i, dtype=self.param_dtype)
             else:
                 if x_embedded_i.dtype != self.param_dtype:
@@ -2806,7 +4104,7 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
         self.nn_eta = nn_eta
         self.max_bond = max_bond if max_bond and max_bond > 0 else None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         tn_params = {}
         
         batch_amps = []
@@ -2887,7 +4185,7 @@ class PureAttention_Model(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
     
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -2905,6 +4203,8 @@ class PureAttention_Model(wavefunctionModel):
         return torch.stack(batch_amps)
 
 import torch.nn.functional as F
+
+
 class PureNN_Model(wavefunctionModel):
     def __init__(self, phys_dim=4, n_site=None, embed_dim=4, nn_hidden_dim=128, dtype=torch.float32):
         super().__init__()
@@ -2933,7 +4233,7 @@ class PureNN_Model(wavefunctionModel):
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
@@ -3004,7 +4304,7 @@ class fTN_backflow_attn_Model(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3105,7 +4405,7 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
         self.max_bond = max_bond
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3220,7 +4520,7 @@ class fTN_backflow_attn_Model_Stacked(wavefunctionModel):
         self.max_bond = max_bond
         self.nn_eta = nn_eta
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3329,7 +4629,7 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         tn_nn_params = {}
 
         # `x` is expected to be batched as (batch_size, input_dim)
@@ -3459,7 +4759,7 @@ class fTN_backflow_attn_Tensorwise_Model(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3585,7 +4885,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3612,6 +4912,8 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             nn_features_vec = nn_features.view(-1)
             nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
             # Add the correction to the original parameters
+            # print(f'nn_correction mean&std: {nn_correction.mean().item()}, {nn_correction.std().item()}')
+            # print(f'params_vec mean&std: {params_vec.mean().item()}, {params_vec.std().item()}')
             tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
             # Reconstruct the TN with the new parameters
             psi = qtn.unpack(tn_nn_params, self.skeleton)
@@ -3621,7 +4923,7 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
             if self.max_bond is None:
                 amp = amp
                 if self.tree is None:
-                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=100, parallel=True)
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=False)
                     self.tree = amp.contraction_tree(optimize=opt)
                 amp_val = amp.contract(optimize=self.tree)
             else:
@@ -3720,7 +5022,7 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3778,7 +5080,7 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
         For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
         This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
         Positional encoding is added to the input of the attention block in this model.
-        Update from v1: after attention block an position wise MLP is used to add non-linearity to attention output, and potentially remove layer normalization.
+        Update from v1: after attention block an position-wise MLP is used to add non-linearity to attention output, and potentially remove layer normalization.
     """
     def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32, layer_norm=True, position_wise_mlp=True, positional_encoding=True):
         super().__init__()
@@ -3852,7 +5154,7 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3951,7 +5253,7 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
             tn_params_vec = flatten_tn_params(tn_params_dict)
             self.mlp[tid] = nn.Sequential(
                 nn.Linear(mlp_input_dim, nn_final_dim),
-                nn.LeakyReLU(),
+                nn.GELU(),
                 nn.Linear(nn_final_dim, tn_params_vec.numel()),
             )
             self.mlp[tid].to(self.param_dtype)
@@ -3982,7 +5284,7 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -3998,7 +5300,7 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
@@ -4018,6 +5320,158 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
                 amp = amp
                 if self.tree is None:
                     opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(optimize=self.tree)
+            else:
+                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp_val = amp.contract()
+                
+            if amp_val==0.0:
+                amp_val = torch.tensor(0.0)
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
+class fTN_backflow_attn_Tensorwise_Model_v5(wavefunctionModel):
+    """
+        For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
+        This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
+        Positional encoding is added to the input of the attention block in this model.
+        Update: do not flatten the features from the attention block, instead use them directly in each on-site MLP to generate the tensor correction. And modify the amp instead of the state tensor.
+    """
+    def __init__(
+        self,
+        ftn,
+        max_bond=None,
+        embedding_dim=32,
+        attention_heads=4,
+        nn_final_dim=4,
+        pwmlpdim=10,
+        nn_eta=1.0,
+        dtype=torch.float32,
+        eps=5e-3,
+    ):
+        super().__init__()
+        self.param_dtype = dtype
+        
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(ftn)
+
+        # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
+        self.torch_tn_params = nn.ModuleDict({
+            str(tid): nn.ParameterDict({
+                str(sector): nn.Parameter(data)
+                for sector, data in blk_array.items()
+            })
+            for tid, blk_array in params.items()
+        })
+
+        # Define the neural network
+        input_dim = ftn.Lx * ftn.Ly
+        phys_dim = ftn.phys_dim()
+        
+        self.nn = SelfAttn_MLP(
+            n_site=input_dim,
+            num_classes=phys_dim,
+            embed_dim=embedding_dim,
+            attention_heads=attention_heads,
+            dtype=self.param_dtype,
+            position_wise_mlp_dim=pwmlpdim,
+        )
+
+        # for each tensor (labelled by tid), assign a MLP
+        self.mlp = nn.ModuleDict()
+        for tid in self.torch_tn_params.keys():
+            mlp_input_dim = embedding_dim
+            tn_params_dict = {
+                tid: params[int(tid)]
+            }
+            tn_params_vec = flatten_tn_params(tn_params_dict)
+            self.mlp[tid] = nn.Sequential(
+                nn.Linear(mlp_input_dim, nn_final_dim),
+                nn.GELU(),
+                nn.Linear(nn_final_dim, int(tn_params_vec.numel()/4)),
+            )
+            self.mlp[tid].to(self.param_dtype)
+        
+        # Initialize the MLP last layer weights and biases with small values
+        for mlp in self.mlp.values():
+            last_layer = mlp[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.uniform_(last_layer.weight, a=-eps, b=eps)
+                if last_layer.bias is not None:
+                    nn.init.uniform_(last_layer.bias, a=-eps, b=eps)
+
+        # Get symmetry
+        self.symmetry = ftn.arrays[0].symmetry
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+
+        self.model_structure = {
+            'fPEPS_backflow_attn_Tensorwise_MLP':
+            {
+                'D': ftn.max_bond(), 
+                'Lx': ftn.Lx, 'Ly': ftn.Ly, 
+                'symmetry': self.symmetry, 
+                'max_bond': max_bond,
+                'nn_final_dim': nn_final_dim,
+                'nn_eta': nn_eta, 
+                'embedding_dim': embedding_dim,
+                'attention_heads': attention_heads,
+            },
+        }
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        self.tree = None
+    
+    def amplitude(self, x, **kwargs):
+        # Reconstruct the original parameter structure (by unpacking from the flattened dict)
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            else:
+                if x_i.dtype != self.param_dtype:
+                    x_i = x_i.to(self.param_dtype)
+        
+            # Reconstruct the TN with the new parameters
+            psi = qtn.unpack(params, self.skeleton)
+
+            # Get the amplitude
+            amp = psi.get_amp(x_i)
+
+            nn_features = self.nn(x_i)
+            for tid, ts in amp.tensor_map.items():
+                tid_str = str(tid)
+                nn_correction = self.mlp[tid_str](nn_features[tid])
+                ts_param = ts.get_params()
+                ts_param_vec = flatten_fts_params(ts_param)
+                new_ts_param_vec = ts_param_vec + nn_correction * self.nn_eta
+                new_ts_param = reconstruct_fts_params(new_ts_param_vec, ts_param)
+                ts.set_params(new_ts_param)
+
+            if self.max_bond is None:
+                amp = amp
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=False)
                     self.tree = amp.contraction_tree(optimize=opt)
                 amp_val = amp.contract(optimize=self.tree)
             else:
@@ -4135,7 +5589,7 @@ class fTN_BFA_cluster_Model(wavefunctionModel):
         self.nn_eta = nn_eta
         self.tree = None
     
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -4151,7 +5605,7 @@ class fTN_BFA_cluster_Model(wavefunctionModel):
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
@@ -4191,27 +5645,49 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
     """
         fPEPS + tensorwise attention backflow NN with finite receptive field
     """
-    def __init__(self, fpeps, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, radius=1, jastrow=False, dtype=torch.float32, debug=False):
+    def __init__(
+        self,
+        fpeps,
+        max_bond=None,
+        embedding_dim=32,
+        attention_heads=4,
+        nn_final_dim=4,
+        nn_eta=1.0,
+        radius=1,
+        jastrow=False,
+        dtype=torch.float32,
+        debug=False,
+        contraction_kwargs={"mode": "mps"},
+        grad_contraction_kwargs={"mode": "mps"},
+    ):
         super().__init__()
         self.param_dtype = dtype
         self.debug = debug
-        
+        self.contraction_kwargs = contraction_kwargs
+        self.grad_contraction_kwargs = grad_contraction_kwargs
+
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(fpeps)
         self.skeleton.exponent = 0
 
         # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
-        self.torch_tn_params = nn.ModuleDict({
-            str(tid): nn.ParameterDict({
-                str(sector): nn.Parameter(data)
-                for sector, data in blk_array.items()
-            })
-            for tid, blk_array in params.items()
-        })
+        self.torch_tn_params = nn.ModuleDict(
+            {
+                str(tid): nn.ParameterDict(
+                    {
+                        str(sector): nn.Parameter(data)
+                        for sector, data in blk_array.items()
+                    }
+                )
+                for tid, blk_array in params.items()
+            }
+        )
 
         # Get the receptive field for each site
         self.nn_radius = radius
-        self.receptive_field = get_receptive_field_2d(fpeps.Lx, fpeps.Ly, self.nn_radius)
+        self.receptive_field = get_receptive_field_2d(
+            fpeps.Lx, fpeps.Ly, self.nn_radius
+        )
 
         phys_dim = fpeps.phys_dim()
         # for each tensor (labelled by tid), assign a attention+MLP
@@ -4220,9 +5696,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
             # get the receptive field for the current tensor
             neighbors = self.receptive_field[int(tid)]
             input_dim = len(neighbors)
-            on_site_ts_params_dict ={
-                tid: params[int(tid)]
-            }
+            on_site_ts_params_dict = {tid: params[int(tid)]}
             on_site_ts_params_vec = flatten_tn_params(on_site_ts_params_dict)
             self.nn[tid] = SelfAttn_FFNN_block(
                 n_site=input_dim,
@@ -4231,19 +5705,19 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                 attention_heads=attention_heads,
                 nn_hidden_dim=nn_final_dim,
                 output_dim=on_site_ts_params_vec.numel(),
-                dtype=self.param_dtype
+                dtype=self.param_dtype,
             )
         if jastrow:
             global_jastrow_input_dim = fpeps.Lx * fpeps.Ly
             self.jastrow = SelfAttn_FFNN_block(
-                    n_site=global_jastrow_input_dim,
-                    num_classes=phys_dim,
-                    embedding_dim=embedding_dim,
-                    attention_heads=attention_heads,
-                    nn_hidden_dim=nn_final_dim,
-                    output_dim=1,
-                    dtype=self.param_dtype
-                )
+                n_site=global_jastrow_input_dim,
+                num_classes=phys_dim,
+                embedding_dim=embedding_dim,
+                attention_heads=attention_heads,
+                nn_hidden_dim=nn_final_dim,
+                output_dim=1,
+                dtype=self.param_dtype,
+            )
         else:
             self.jastrow = lambda x: torch.zeros(1)
 
@@ -4254,18 +5728,18 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'fPEPS_BFA_cluster':
-            {
-                'D': fpeps.max_bond(), 
-                'Lx': fpeps.Lx, 'Ly': fpeps.Ly, 
-                'radius': self.nn_radius,
-                'jastrow': jastrow,
-                'symmetry': self.symmetry, 
-                'nn_final_dim': nn_final_dim,
-                'nn_eta': nn_eta, 
-                'embedding_dim': embedding_dim,
-                'attention_heads': attention_heads,
-                'max_bond': max_bond,
+            "fPEPS_BFA_cluster": {
+                "D": fpeps.max_bond(),
+                "Lx": fpeps.Lx,
+                "Ly": fpeps.Ly,
+                "radius": self.nn_radius,
+                "jastrow": jastrow,
+                "symmetry": self.symmetry,
+                "nn_final_dim": nn_final_dim,
+                "nn_eta": nn_eta,
+                "embedding_dim": embedding_dim,
+                "attention_heads": attention_heads,
+                "max_bond": max_bond,
             },
         }
         if max_bond is None or max_bond <= 0:
@@ -4275,8 +5749,8 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         self.tree = None
         self.Lx = fpeps.Lx
         self.Ly = fpeps.Ly
-        self._env_x_cache = None
-        self._env_y_cache = None
+        self._env_x_cache = {}
+        self._env_y_cache = {}
         self.config_ref = None
     
     def from_1d_to_2d(self, config, ordering='snake'):
@@ -4322,27 +5796,34 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                     env_y_row_config[('ymin', cols_config)] = env_y[key]
         return env_y_row_config
 
-    def cache_env_x(self, amp, config):
+    def cache_env_x(self, amp, config, contraction_kwargs=None):
         """
             Cache the environment x for the given configuration
         """
-        env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0)
+        if contraction_kwargs is None:
+            contraction_kwargs = self.contraction_kwargs
+        env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0, **contraction_kwargs)
         env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
         self._env_x_cache = env_x_cache
         self.config_ref = config
-    
-    def cache_env_y(self, amp, config):
-        env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0)
+
+    def cache_env_y(self, amp, config, contraction_kwargs=None):
+        """
+            Cache the environment y for the given configuration
+        """
+        if contraction_kwargs is None:
+            contraction_kwargs = self.contraction_kwargs
+        env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0, **contraction_kwargs)
         env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
         self._env_y_cache = env_y_cache
         self.config_ref = config
-    
-    def cache_env(self, amp, config):
+
+    def cache_env(self, amp, config, contraction_kwargs=None):
         """
             Cache the environment x and y for the given configuration
         """
-        self.cache_env_x(amp, config)
-        self.cache_env_y(amp, config)
+        self.cache_env_x(amp, config, contraction_kwargs=contraction_kwargs)
+        self.cache_env_y(amp, config, contraction_kwargs=contraction_kwargs)
         
     @property
     def env_x_cache(self):
@@ -4364,21 +5845,45 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         else:
             return None
     
-    def clear_env_x_cache(self):
-        """
-            Clear the cached environment x
-        """
-        self._env_x_cache = None
+    # def clear_env_x_cache(self):
+    #     """
+    #         Clear the cached environment x
+    #     """
+    #     self._env_x_cache = None
 
-    def clear_env_y_cache(self):
+    # def clear_env_y_cache(self):
+    #     """
+    #         Clear the cached environment y
+    #     """
+    #     self._env_y_cache = None
+    def clear_env_x_cache(self, from_which=None):
         """
-            Clear the cached environment y
+        Clear the cached environment x
         """
-        self._env_y_cache = None
+        if from_which is None:
+            self._env_x_cache = {}
+        else:
+            assert from_which in ["xmax", "xmin"], "from_which must be 'xmax' or 'xmin'"
+            for key in list(self._env_x_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_x_cache[key]
+
+    def clear_env_y_cache(self, from_which=None):
+        """
+        Clear the cached environment y
+        """
+        if from_which is None:
+            self._env_y_cache = {}
+        else:
+            assert from_which in ["ymax", "ymin"], "from_which must be 'ymax' or 'ymin'"
+            for key in list(self._env_y_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_y_cache[key]
     
     def clear_wavefunction_env_cache(self):
         self.clear_env_x_cache()
         self.clear_env_y_cache()
+        self.config_ref = None
     
     def detect_effected_rows(self, config_ref, new_config):
         """
@@ -4456,47 +5961,104 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         """
             Update the cached environment x for the given configuration
         """
-        if self.env_x_cache is not None:
+        if self.env_x_cache:
             self.clear_env_x_cache()
         amp_tn = self.get_amp_tn(config)
         self.cache_env_x(amp_tn, config)
         self.config_ref = config
     
-    def update_env_x_cache_to_row(self, config, row_id, from_which='xmin'):
+    def update_env_x_cache_to_row(self, config, row_id, from_which="xmin", **kwargs):
         config_2d = self.from_1d_to_2d(config)
         amp_tn = self.get_amp_tn(config)
-        upper_effected_row_id = row_id - self.nn_radius if row_id - self.nn_radius >= 0 else 0
-        lower_effected_row_id = row_id + self.nn_radius if row_id + self.nn_radius < self.Lx else self.Lx-1
-        row_id = upper_effected_row_id if from_which == 'xmin' else lower_effected_row_id
+        upper_effected_row_id = (
+            row_id - self.nn_radius if row_id - self.nn_radius >= 0 else 0
+        )
+        lower_effected_row_id = (
+            row_id + self.nn_radius
+            if row_id + self.nn_radius < self.Lx
+            else self.Lx - 1
+        )
+        row_id = (
+            upper_effected_row_id if from_which == "xmin" else lower_effected_row_id
+        )
         # select the row_tn in the amp_tn that corresponds to the row_id
         row_tn = amp_tn.select(amp_tn.x_tag_id.format(row_id))
-        if from_which == 'xmin':
+        if from_which == "xmin":
             # check the whether previous env_x cache already contains the env w.r.t. row with id upper_effected_row_id
-            key_prev_rows = ('xmin', tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())) if row_id != 0 else ()
-            new_env_key = ('xmin', tuple(torch.cat(tuple(config_2d[:row_id+1].to(torch.int))).tolist()))
+            key_prev_rows = (
+                (
+                    "xmin",
+                    tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist()),
+                )
+                if row_id != 0
+                else ()
+            )
+            new_env_key = (
+                "xmin",
+                tuple(torch.cat(tuple(config_2d[: row_id + 1].to(torch.int))).tolist()),
+            )
             xrange = (0, row_id)
-        elif from_which == 'xmax':
+        elif from_which == "xmax":
             # check the whether previous env_x cache already contains the env w.r.t. row with id lower_effected_row_id
-            key_prev_rows = ('xmax', tuple(torch.cat(tuple(config_2d[row_id+1:].to(torch.int))).tolist())) if row_id != self.Lx-1 else ()
-            new_env_key = ('xmax', tuple(torch.cat(tuple(config_2d[row_id:].to(torch.int))).tolist()))
-            xrange = (row_id, self.Lx-1)
+            key_prev_rows = (
+                (
+                    "xmax",
+                    tuple(
+                        torch.cat(tuple(config_2d[row_id + 1 :].to(torch.int))).tolist()
+                    ),
+                )
+                if row_id != self.Lx - 1
+                else ()
+            )
+            new_env_key = (
+                "xmax",
+                tuple(torch.cat(tuple(config_2d[row_id:].to(torch.int))).tolist()),
+            )
+            xrange = (row_id, self.Lx - 1)
         else:
             raise ValueError("from_which must be either 'xmin' or 'xmax'")
 
-        if self.env_x_cache is not None: 
+        if self.env_x_cache:
             if key_prev_rows in self.env_x_cache:
                 prev_env_x = self.env_x_cache[key_prev_rows]
                 new_env_tn = prev_env_x | row_tn
-                new_env_tn.contract_boundary_from_(max_bond=self.max_bond, cutoff=0.0, xrange=xrange, from_which=from_which, yrange=(0, self.Ly-1))
+                new_env_tn.contract_boundary_from_(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    xrange=xrange,
+                    from_which=from_which,
+                    yrange=(0, self.Ly - 1),
+                    **self.contraction_kwargs,
+                )
                 new_env_x_cache = {new_env_key: new_env_tn}
             else:
-                new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
-                new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+                new_env_x = amp_tn.compute_environments(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    xrange=(0, row_id + 1)
+                    if from_which == "xmin"
+                    else (row_id - 1, self.Lx - 1),
+                    from_which=from_which,
+                    **self.contraction_kwargs,
+                )
+                new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(
+                    new_env_x, config
+                )
         else:
-            new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
-            new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
+            new_env_x = amp_tn.compute_environments(
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                xrange=(0, row_id + 1)
+                if from_which == "xmin"
+                else (row_id - 1, self.Lx - 1),
+                from_which=from_which,
+                **self.contraction_kwargs,
+            )
+            new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(
+                new_env_x, config
+            )
         # add the new env_x to the cache
-        if self.env_x_cache is None:
+        if not self.env_x_cache:
             self._env_x_cache = new_env_x_cache
         else:
             self._env_x_cache.update(new_env_x_cache)
@@ -4506,45 +6068,106 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         """
             Update the cached environment y for the given configuration
         """
-        if self.env_y_cache is not None:
+        if self.env_y_cache:
             self.clear_env_y_cache()
         amp_tn = self.get_amp_tn(config)
         self.cache_env_y(amp_tn, config)
         self.config_ref = config
     
-    def update_env_y_cache_to_col(self, config, col_id, from_which='ymin'):
+    def update_env_y_cache_to_col(self, config, col_id, from_which="ymin", **kwargs):
         config_2d = self.from_1d_to_2d(config)
         amp_tn = self.get_amp_tn(config)
-        left_effected_col_id = col_id - self.nn_radius if col_id - self.nn_radius >= 0 else 0
-        right_effected_col_id = col_id + self.nn_radius if col_id + self.nn_radius < self.Ly else self.Ly-1
-        col_id = left_effected_col_id if from_which == 'ymin' else right_effected_col_id
+        left_effected_col_id = (
+            col_id - self.nn_radius if col_id - self.nn_radius >= 0 else 0
+        )
+        right_effected_col_id = (
+            col_id + self.nn_radius
+            if col_id + self.nn_radius < self.Ly
+            else self.Ly - 1
+        )
+        col_id = left_effected_col_id if from_which == "ymin" else right_effected_col_id
         # select the col_tn in the amp_tn that corresponds to the col_id
         col_tn = amp_tn.select(amp_tn.y_tag_id.format(col_id))
         # check the whether previous env_y cache already contains the env w.r.t. col with id col_id
-        if from_which == 'ymin':
-            key_prev_cols = ('ymin', tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())) if col_id != 0 else ()
-            new_env_key = ('ymin', tuple(torch.cat(tuple(config_2d[:, :col_id+1].to(torch.int))).tolist()))
+        if from_which == "ymin":
+            key_prev_cols = (
+                (
+                    "ymin",
+                    tuple(
+                        torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist()
+                    ),
+                )
+                if col_id != 0
+                else ()
+            )
+            new_env_key = (
+                "ymin",
+                tuple(
+                    torch.cat(tuple(config_2d[:, : col_id + 1].to(torch.int))).tolist()
+                ),
+            )
             yrange = (0, col_id)
-        elif from_which == 'ymax':
-            key_prev_cols = ('ymax', tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist())) if col_id != self.Ly-1 else ()
-            new_env_key = ('ymax', tuple(torch.cat(tuple(config_2d[:, col_id:].to(torch.int))).tolist()))
-            yrange = (col_id, self.Ly-1)
+        elif from_which == "ymax":
+            key_prev_cols = (
+                (
+                    "ymax",
+                    tuple(
+                        torch.cat(
+                            tuple(config_2d[:, col_id + 1 :].to(torch.int))
+                        ).tolist()
+                    ),
+                )
+                if col_id != self.Ly - 1
+                else ()
+            )
+            new_env_key = (
+                "ymax",
+                tuple(torch.cat(tuple(config_2d[:, col_id:].to(torch.int))).tolist()),
+            )
+            yrange = (col_id, self.Ly - 1)
         else:
             raise ValueError("from_which must be either 'ymin' or 'ymax'")
-        if self.env_y_cache is not None:
+        if self.env_y_cache:
             if key_prev_cols in self.env_y_cache:
                 prev_env_y = self.env_y_cache[key_prev_cols]
                 new_env_tn = prev_env_y | col_tn
-                new_env_tn.contract_boundary_from_(max_bond=self.max_bond, cutoff=0.0, yrange=yrange, from_which=from_which, xrange=(0, self.Lx-1))
+                new_env_tn.contract_boundary_from_(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    yrange=yrange,
+                    from_which=from_which,
+                    xrange=(0, self.Lx - 1),
+                    **self.contraction_kwargs,
+                )
                 new_env_y_cache = {new_env_key: new_env_tn}
             else:
-                new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
-                new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+                new_env_y = amp_tn.compute_environments(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    yrange=(0, col_id + 1)
+                    if from_which == "ymin"
+                    else (col_id - 1, self.Ly - 1),
+                    from_which=from_which,
+                    **self.contraction_kwargs,
+                )
+                new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(
+                    new_env_y, config
+                )
         else:
-            new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
-            new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
+            new_env_y = amp_tn.compute_environments(
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                yrange=(0, col_id + 1)
+                if from_which == "ymin"
+                else (col_id - 1, self.Ly - 1),
+                from_which=from_which,
+                **self.contraction_kwargs,
+            )
+            new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(
+                new_env_y, config
+            )
         # add the new env_y to the cache
-        if self.env_y_cache is None:
+        if not self.env_y_cache:
             self._env_y_cache = new_env_y_cache
         else:
             self._env_y_cache.update(new_env_y_cache)
@@ -4576,13 +6199,29 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
 
         return amp
     
-    def amplitude(self, x):
+    def _get_pure_tns(self):
+        # get the pure TNS without backflow
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        params_vec = flatten_tn_params(params)
+        tn_params = reconstruct_proj_params(params_vec, params)
+        psi = qtn.unpack(tn_params, self.skeleton)
+        return psi
+    
+    def amplitude(self, x, **kwargs):
+        grad = kwargs.get("grad", False)
+
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
@@ -4602,18 +6241,24 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                     self.cache_env_x(amp, x_i)
                     # self.cache_env_y(amp, x_i)
                     assert (self.config_ref == x_i).all()
-
-                    config_2d = self.from_1d_to_2d(x_i)
-                    key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
-                    key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
-                    amp_bot = self.env_x_cache[key_bot]
-                    amp_top = self.env_x_cache[key_top]
-                    amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                    if not grad:
+                        config_2d = self.from_1d_to_2d(x_i)
+                        key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
+                        key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
+                        amp_bot = self.env_x_cache[key_bot]
+                        amp_top = self.env_x_cache[key_top]
+                        amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
+                    else:
+                        # for gradient calculation, we do not reuse the cached environment
+                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, self.Ly//2-1], **self.grad_contraction_kwargs)
+                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[self.Ly//2, self.Ly-1], **self.grad_contraction_kwargs)
+                        assert self.skeleton.exponent == 0
+                        amp_val = amp.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                 else:
-                    if self.env_x_cache is None and self.env_y_cache is None:
+                    if not self.env_x_cache and not self.env_y_cache:
                         # check whether we can reuse the cached environment
-                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, self.Ly//2-1])
-                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[self.Ly//2, self.Ly-1])
+                        amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, self.Ly//2-1], **self.contraction_kwargs)
+                        amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[self.Ly//2, self.Ly-1], **self.contraction_kwargs)
                         amp_val = amp.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
                     else:
                         config_2d = self.from_1d_to_2d(x_i)
@@ -4630,7 +6275,7 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                             key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
                             amp_bot = self.env_x_cache[key_bot]
                             amp_top = self.env_x_cache[key_top]
-                            amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                            amp_val = (amp_bot|amp_top).contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
                         else:
                             if len(changed_rows) <= len(changed_cols):
                                 # for bottom envs, until the last effected row, we can reuse the bottom envs
@@ -4659,14 +6304,25 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 amp_val_tn = amp_effected_rows|amp_uneffected_bottom_env|amp_uneffected_top_env
 
                                 middle_row = effected_rows[0] + (effected_rows[-1] - effected_rows[0])//2
-                                if len(uneffected_rows_above) <= len(uneffected_rows_below):
-                                    amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, middle_row])
-                                    amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row+1, self.Lx-1])
-                                else:
-                                    amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[0, middle_row-1])
-                                    amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row, self.Lx-1])
 
-                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                                # hit the boundary
+                                if middle_row == effected_rows[0]:
+                                    middle_row += 1
+                                elif middle_row == effected_rows[-1]:
+                                    middle_row -= 1
+
+                                if len(uneffected_rows_above) <= len(uneffected_rows_below):
+                                    if effected_rows[0] < middle_row:
+                                        amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[effected_rows[0], middle_row], **self.contraction_kwargs)
+                                    if effected_rows[-1] > middle_row+1:
+                                        amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row+1, effected_rows[-1]], **self.contraction_kwargs)
+                                else:
+                                    if effected_rows[0] < middle_row-1:
+                                        amp_val_tn.contract_boundary_from_xmin_(max_bond=self.max_bond, cutoff=0.0, xrange=[effected_rows[0], middle_row-1], **self.contraction_kwargs)
+                                    if effected_rows[-1] > middle_row:
+                                        amp_val_tn.contract_boundary_from_xmax_(max_bond=self.max_bond, cutoff=0.0, xrange=[middle_row, effected_rows[-1]], **self.contraction_kwargs)
+
+                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
                             else:
                                 col_tag_list = [amp.y_tag_id.format(col_n) for col_n in effected_cols]
                                 amp_effected_cols = amp.select(col_tag_list, which='any')
@@ -4691,20 +6347,41 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
                                 amp_val_tn = amp_effected_cols|amp_uneffected_left_env|amp_uneffected_right_env
 
                                 middle_col = effected_cols[0] + (effected_cols[-1] - effected_cols[0])//2
+                                # hit the boundary
+                                if middle_col == effected_cols[0]:
+                                    middle_col += 1
+                                elif middle_col == effected_cols[-1]:
+                                    middle_col -= 1
+                                    
                                 if len(uneffected_cols_left) <= len(uneffected_cols_right):
-                                    amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, middle_col])
-                                    amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col+1, self.Ly-1])
+                                    if effected_cols[0] < middle_col:
+                                        amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[effected_cols[0], middle_col], **self.contraction_kwargs)
+                                    if effected_cols[-1] > middle_col+1:
+                                        amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col+1, effected_cols[-1]], **self.contraction_kwargs)
                                 else:
-                                    amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, middle_col-1])
-                                    amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col, self.Ly-1])
+                                    if effected_cols[0] < middle_col-1:
+                                        amp_val_tn.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[effected_cols[0], middle_col-1], **self.contraction_kwargs)
+                                    if effected_cols[-1] > middle_col:
+                                        amp_val_tn.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[middle_col, effected_cols[-1]], **self.contraction_kwargs)
 
-                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                                amp_val = amp_val_tn.contract() * torch.sum(torch.exp(self.jastrow(x_i))) * 10 ** (self.skeleton.exponent)
 
             if amp_val==0.0:
                 amp_val = torch.tensor(0.0)
             
             if self.debug:
-                print(f"Reused Amp/Exact Amp: {amp_val/(self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i))))}")
+                exact_amp = self.get_amp_tn(x_i).contract() * torch.sum(torch.exp(self.jastrow(x_i)))
+                pure_tns = self._get_pure_tns()
+                pure_fpeps_amp = pure_tns.get_amp(x_i).contract()
+                if not torch.isclose(amp_val, exact_amp, atol=1e-3, rtol=1e-3):
+                    print(f"Amplitude mismatch: {amp_val} vs {exact_amp}")
+                    raise ValueError(f"Amplitude mismatch: {amp_val} vs {exact_amp}")
+                print(f"Exact/approximate relative error: {abs(amp_val-exact_amp)/abs(exact_amp)}, Pure fPEPS amp relative error: {abs(amp_val-pure_fpeps_amp)/abs(pure_fpeps_amp)}")
+                assert torch.isclose(amp_val, exact_amp, atol=1e-3, rtol=1e-3), f"Amplitude mismatch: {amp_val} vs {exact_amp}"
+                if self.nn_eta == 0.0 and self.jastrow(x_i)==1.0:
+                    assert torch.isclose(amp_val, pure_fpeps_amp, atol=1e-3, rtol=1e-3), f"Amplitude mismatch: {amp_val} vs {pure_fpeps_amp}"
+                # print(f"Reused Amp/Exact Amp: {amp_val/(self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i))))}")
+                # assert torch.isclose(amp_val, self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i)))), f"Amplitude mismatch: {amp_val} vs {self.get_amp_tn(x_i).contract()* torch.sum(torch.exp(self.jastrow(x_i)))}"
                 
             batch_amps.append(amp_val)
 
@@ -4799,7 +6476,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -4931,7 +6608,7 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5079,7 +6756,7 @@ class fTN_NN_2row_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5287,7 +6964,7 @@ class fTN_Transformer_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         assert x.ndim != 1, "Amplitude input must be batched."
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
@@ -5440,7 +7117,7 @@ class fTN_Transformer_Proj_lazy_Model(torch.nn.Module):
                 param.copy_(new_param_values)
             pointer += num_param
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5643,7 +7320,7 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
 
         return new_proj_tn
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
         params = {
             int(tid): {
@@ -5737,7 +7414,6 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
 
 
 class SlaterDeterminant(wavefunctionModel):
-    """For spin-1/2 fermions"""
     def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32):
         super(SlaterDeterminant, self).__init__()
         
@@ -5758,145 +7434,143 @@ class SlaterDeterminant(wavefunctionModel):
             'SlaterDeterminant':{'N_orbitals': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions}
         }
 
-    def amplitude(self, x):
-        # `x` is expected to be batched as (batch_size, input_dim)
-        # Loop through the batch and compute amplitude for each sample
+    def amplitude(self, x, **kwargs):
         # Define the slater determinant function manually to loop over inputs
-        def _det(n):
-            # Compute the backflow matrix F using the neural network
-            M  = self.M
+        def slater_det(n):
             # Find the positions of the occupied orbitals
             R = torch.nonzero(n, as_tuple=False).squeeze()
-            # Extract the 2Nf x Nf submatrix of M corresponding to the occupied orbitals
-            A = M[R]
-            det = torch.linalg.det(A)
-            amp = det
-
-            return amp
+            # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = self.M[R]
+            return torch.linalg.det(A)
         
+        # Apply slater_det to each element in the batch
         batch_amps = []
         for x_i in x:
             n_i = from_quimb_config_to_netket_config(x_i)
             # Check x_i type
-            if not type(n_i) == torch.Tensor:
-                n_i = torch.tensor(n_i, dtype=self.param_dtype)
+            if not isinstance(n_i, torch.Tensor):
+                n_i = torch.tensor(n_i, dtype=torch.int32)
 
-            amp_val=_det(n_i)
+            amp_val=slater_det(n_i)
             batch_amps.append(amp_val)
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
 
-# class NeuralJastrow(wavefunctionModel):
-#     def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
-#         super(NeuralJastrow, self).__init__()
+class NeuralJastrow(wavefunctionModel):
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
+        super(NeuralJastrow, self).__init__()
         
-#         self.hilbert = hilbert
-#         self.param_dtype = param_dtype
-#         self.hidden_dim = hidden_dim
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        self.hidden_dim = hidden_dim
         
-#         # Initialize the parameter M (N x Nf matrix)
-#         self.M = nn.Parameter(
-#             kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
-#             if kernel_init is not None 
-#             else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
-#         )
+        # Initialize the parameter M (N x Nf matrix)
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
 
-#         self.nn = nn.Sequential(
-#             nn.Linear(self.hilbert.n_orbitals, self.hidden_dim, dtype=self.param_dtype),
-#             nn.Tanh(),
-#             nn.Linear(self.hidden_dim, 1, dtype=self.param_dtype)
-#         )
+        self.nn = nn.Sequential(
+            nn.Linear(self.hilbert.n_orbitals, self.hidden_dim, dtype=self.param_dtype),
+            nn.Tanh(),
+            nn.Linear(self.hidden_dim, 1, dtype=self.param_dtype)
+        )
 
-#         # Store the shapes of the parameters
-#         self.param_shapes = [param.shape for param in self.parameters()]
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
 
-#         self.model_structure = {
-#             'NeuralJastrow':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
-#         }
+        self.model_structure = {
+            'NeuralJastrow':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
+        }
     
-#     def _determinant(self, A):
-#         # Compute the determinant of matrix A
-#         det = torch.linalg.det(A)
-#         return det
+    def _determinant(self, A):
+        # Compute the determinant of matrix A
+        det = torch.linalg.det(A)
+        return det
 
-#     def forward(self, n):
-#         if not type(n) == torch.Tensor:
-#             n = torch.tensor(n, dtype=torch.int32)
-#         n = n.to(self.param_dtype)
-#         # Define the slater determinant function manually to loop over inputs
-#         def slater_det_Jastrow(n):
-#             # Find the positions of the occupied orbitals
-#             R = torch.nonzero(n, as_tuple=False).squeeze()
+    def forward(self, n):
+        if not type(n) == torch.Tensor:
+            n = torch.tensor(n, dtype=torch.int32)
+        n = n.to(self.param_dtype)
+        # Define the slater determinant function manually to loop over inputs
+        def slater_det_Jastrow(n):
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
 
-#             # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
-#             A = self.M[R]
+            # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = self.M[R]
 
-#             # Jastrow factor
-#             J = torch.sum(self.nn(n))
+            # Jastrow factor
+            J = torch.sum(self.nn(n))
 
-#             return self._determinant(A)*torch.exp(J)
+            return self._determinant(A)*torch.exp(J)
         
-#         if n.ndim == 1:
-#             # If input is not batched, add a batch dimension
-#             n = n.unsqueeze(0)
-#         # Apply slater_det to each element in the batch
-#         batch_size = n.shape[0]
-#         return torch.stack([slater_det_Jastrow(n[i]) for i in range(batch_size)])
+        if n.ndim == 1:
+            # If input is not batched, add a batch dimension
+            n = n.unsqueeze(0)
+        # Apply slater_det to each element in the batch
+        batch_size = n.shape[0]
+        return torch.stack([slater_det_Jastrow(n[i]) for i in range(batch_size)])
 
-# class NeuralBackflow(wavefunctionModel):
-#     def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
-#         super(NeuralBackflow, self).__init__()
+class NeuralBackflow(wavefunctionModel):
+    def __init__(self, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64):
+        super(NeuralBackflow, self).__init__()
         
-#         self.hilbert = hilbert
-#         self.param_dtype = param_dtype
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
         
-#         # Initialize the parameter M (N x Nf matrix)
-#         self.M = nn.Parameter(
-#             kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
-#             if kernel_init is not None 
-#             else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
-#         )
+        # Initialize the parameter M (N x Nf matrix)
+        self.M = nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            if kernel_init is not None 
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
 
-#         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
-#         self.nn = nn.Sequential(
-#             nn.Linear(self.hilbert.n_orbitals, hidden_dim, dtype=self.param_dtype),
-#             nn.Tanh(),
-#             nn.Linear(hidden_dim, self.hilbert.n_orbitals*self.hilbert.n_fermions, dtype=self.param_dtype)
-#         )
+        # Initialize the neural network layer, input is n and output a matrix with the same shape as M
+        self.nn = nn.Sequential(
+            nn.Linear(self.hilbert.n_orbitals, hidden_dim, dtype=self.param_dtype),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, self.hilbert.n_orbitals*self.hilbert.n_fermions, dtype=self.param_dtype)
+        )
 
-#         # Store the shapes of the parameters
-#         self.param_shapes = [param.shape for param in self.parameters()]
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
 
-#         self.model_structure = {
-#             'Neuralbackflow':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
-#         }
+        self.model_structure = {
+            'Neuralbackflow':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
+        }
 
-#     def forward(self, n):
-#         if not type(n) == torch.Tensor:
-#             n = torch.tensor(n, dtype=self.param_dtype)
-#         n = n.to(self.param_dtype)
-#         # Define the slater determinant function manually to loop over inputs
-#         def backflow_det(n):
-#             # Compute the backflow matrix F using the neural network
-#             F = self.nn(n)
-#             M  = self.M + F.reshape(self.M.shape)
-#             # Find the positions of the occupied orbitals
-#             R = torch.nonzero(n, as_tuple=False).squeeze()
+    def forward(self, n):
+        if not type(n) == torch.Tensor:
+            n = torch.tensor(n, dtype=self.param_dtype)
+        n = n.to(self.param_dtype)
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(n):
+            # Compute the backflow matrix F using the neural network
+            F = self.nn(n)
+            M  = self.M + F.reshape(self.M.shape)
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
 
-#             # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
-#             A = M[R]
+            # Extract the Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = M[R]
 
-#             det = torch.linalg.det(A)
-#             return det
+            det = torch.linalg.det(A)
+            return det
 
-#         if n.ndim == 1:
-#             # If input is not batched, add a batch dimension
-#             n = n.unsqueeze(0)
-#         # Apply slater_det to each element in the batch
-#         batch_size = n.shape[0]
-#         return torch.stack([backflow_det(n[i]) for i in range(batch_size)])
+        if n.ndim == 1:
+            # If input is not batched, add a batch dimension
+            n = n.unsqueeze(0)
+        # Apply slater_det to each element in the batch
+        batch_size = n.shape[0]
+        return torch.stack([backflow_det(n[i]) for i in range(batch_size)])
 
-from vmc_torch.fermion_utils import from_quimb_config_to_netket_config, from_netket_config_to_quimb_config
+from vmc_torch.fermion_utils import (
+    from_netket_config_to_quimb_config,
+    from_quimb_config_to_netket_config,
+)
+
 
 class NeuralBackflow_spinful(wavefunctionModel):
     """Assuming total Sz=0."""
@@ -5930,7 +7604,7 @@ class NeuralBackflow_spinful(wavefunctionModel):
             'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
@@ -5980,9 +7654,8 @@ class NNBF(wavefunctionModel):
         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
             nn.Linear(self.hilbert.size, hidden_dim),
-            nn.Tanh(),
+            nn.GELU(),
             nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
-            ShiftedSinhYFixed(),
         )
 
         # Convert NNs to the appropriate data type
@@ -5997,7 +7670,7 @@ class NNBF(wavefunctionModel):
             'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin, 'nn_eta': self.nn_eta}
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
@@ -6022,7 +7695,7 @@ class NNBF(wavefunctionModel):
         for x_i in x:
             n_i = from_quimb_config_to_netket_config(x_i)
             # Check x_i type
-            if not type(n_i) == torch.Tensor:
+            if not isinstance(n_i, torch.Tensor):
                 n_i = torch.tensor(n_i, dtype=self.param_dtype)
 
             amp_val=backflow_det(n_i)
@@ -6032,26 +7705,55 @@ class NNBF(wavefunctionModel):
 
 class NNBF_attention(wavefunctionModel):
     """Assuming total Sz=0."""
-    def __init__(self, nsite, hilbert, kernel_init=None, param_dtype=torch.float32, hidden_dim=64, nn_eta=1, embed_dim=16, attention_heads=4, phys_dim=4, spinflip_symmetry=False):
+
+    def __init__(
+        self,
+        nsite,
+        hilbert,
+        kernel_init=None,
+        param_dtype=torch.float32,
+        hidden_dim=64,
+        nn_eta=1,
+        embed_dim=16,
+        attention_heads=4,
+        phys_dim=4,
+        spinflip_symmetry=False,
+    ):
         super(NNBF_attention, self).__init__()
-        
+
         self.hilbert = hilbert
         self.param_dtype = param_dtype
         self.spinflip_symmetry = spinflip_symmetry
-        
+
         # Initialize the parameter M (N x Nf matrix)
         self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)) 
-            if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            kernel_init(
+                torch.empty(
+                    self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype
+                )
+            )
+            if kernel_init is not None
+            else torch.randn(
+                self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype
+            )
         )
         if self.spinflip_symmetry:
             self.M_flip = nn.Parameter(
-                kernel_init(torch.empty(self.hilbert.size, self.hilbert.size - self.hilbert.n_fermions, dtype=self.param_dtype)) 
-                if kernel_init is not None 
-                else torch.randn(self.hilbert.size, self.hilbert.size-self.hilbert.n_fermions, dtype=self.param_dtype)
+                kernel_init(
+                    torch.empty(
+                        self.hilbert.size,
+                        self.hilbert.size - self.hilbert.n_fermions,
+                        dtype=self.param_dtype,
+                    )
+                )
+                if kernel_init is not None
+                else torch.randn(
+                    self.hilbert.size,
+                    self.hilbert.size - self.hilbert.n_fermions,
+                    dtype=self.param_dtype,
+                )
             )
-        
+
         self.attn = SelfAttn_block_pos(
             nsite,
             num_classes=phys_dim,
@@ -6059,23 +7761,23 @@ class NNBF_attention(wavefunctionModel):
             attention_heads=attention_heads,
             dtype=self.param_dtype,
         )
-        
+
         self.embed_dim = embed_dim
         self.attention_heads = attention_heads
         self.phys_dim = phys_dim
         self.nsite = nsite
 
-         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
+        # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
-            nn.Linear(embed_dim*nsite, hidden_dim),
+            nn.Linear(embed_dim * nsite, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
+            nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions),
         )
         if self.spinflip_symmetry:
             self.nn_flip = nn.Sequential(
-                nn.Linear(embed_dim*nsite, hidden_dim),
+                nn.Linear(embed_dim * nsite, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
+                nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions),
             )
 
         # Convert NNs to the appropriate data type
@@ -6088,26 +7790,29 @@ class NNBF_attention(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'NNBF w attention':{
-                'N_site': self.nsite, 
-                'N_fermions': self.hilbert.n_fermions, 
-                'N_fermions_per_spin': self.hilbert.n_fermions_per_spin, 
-                'nn_eta': self.nn_eta,
-                'embed_dim': self.embed_dim,
-                'attention_heads': self.attention_heads,
-                'phys_dim': self.phys_dim,
-                'spinflip_symmetry': self.spinflip_symmetry,
-                }
+            "NNBF w attention": {
+                "N_site": self.nsite,
+                "N_fermions": self.hilbert.n_fermions,
+                "N_fermions_per_spin": self.hilbert.n_fermions_per_spin,
+                "nn_eta": self.nn_eta,
+                "hidden_dim": hidden_dim,
+                "embed_dim": self.embed_dim,
+                "attention_heads": self.attention_heads,
+                "phys_dim": self.phys_dim,
+                "spinflip_symmetry": self.spinflip_symmetry,
+            }
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
         def backflow_det(x, spinflip_symmetry=False):
-            n = torch.tensor(from_quimb_config_to_netket_config(x), dtype=self.param_dtype)
+            n = torch.tensor(
+                from_quimb_config_to_netket_config(x), dtype=self.param_dtype
+            )
             if spinflip_symmetry:
-                n = torch.abs(1-n) # 0->1, 1->0
+                n = torch.abs(1 - n)  # 0->1, 1->0
                 x = from_netket_config_to_quimb_config(n)
                 x = torch.tensor(x, dtype=torch.int)
 
@@ -6115,10 +7820,18 @@ class NNBF_attention(wavefunctionModel):
                 # Compute the attention output
                 attn_features = self.attn(x).view(-1)
                 # Compute the backflow matrix F using the neural network
-                F = self.nn(attn_features) if not spinflip_symmetry else self.nn_flip(attn_features)
-                M  = self.M + F.reshape(self.M.shape)*self.nn_eta if not spinflip_symmetry else self.M_flip + F.reshape(self.M_flip.shape)*self.nn_eta
-            elif self.nn_eta == 0: # Pure Slater determinant calculation
-                M  = self.M if not spinflip_symmetry else self.M_flip
+                F = (
+                    self.nn(attn_features)
+                    if not spinflip_symmetry
+                    else self.nn_flip(attn_features)
+                )
+                M = (
+                    self.M + F.reshape(self.M.shape) * self.nn_eta
+                    if not spinflip_symmetry
+                    else self.M_flip + F.reshape(self.M_flip.shape) * self.nn_eta
+                )
+            elif self.nn_eta == 0:  # Pure Slater determinant calculation
+                M = self.M if not spinflip_symmetry else self.M_flip
 
             # Find the positions of the occupied orbitals
             R = torch.nonzero(n, as_tuple=False).squeeze()
@@ -6129,17 +7842,327 @@ class NNBF_attention(wavefunctionModel):
             amp = det
 
             return amp
-        
+
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=torch.int)
 
             if self.spinflip_symmetry:
-                amp_val  = (backflow_det(x_i, spinflip_symmetry=True) + backflow_det(x_i, spinflip_symmetry=False)) / 2
+                amp_val = (
+                    backflow_det(x_i, spinflip_symmetry=True)
+                    + backflow_det(x_i, spinflip_symmetry=False)
+                ) / 2
             else:
-                amp_val = backflow_det(x_i, spinflip_symmetry=False) 
+                amp_val = backflow_det(x_i, spinflip_symmetry=False)
+            batch_amps.append(amp_val)
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+class NNBF_attention_Nsd(wavefunctionModel):
+    """Assuming total Sz=0.
+    NOTE: 
+    1. position-wise hard coded learnable embedding (x)
+    2. Initialization: only last layer of MLP is initilaized with small std
+    3. Change the last layer of all-to-all mlp to position-wise mlp embed_dim=256
+    """
+
+    def __init__(
+        self,
+        nsite,
+        hilbert,
+        kernel_init=None,
+        param_dtype=torch.float32,
+        hidden_dim=64,
+        nn_eta=1,
+        embed_dim=16,
+        attention_heads=4,
+        attention_layers=1,
+        position_wise_mlp_hidden_dim=64,
+        phys_dim=4,
+        Nsd=1,
+        eps=None,
+    ):
+        super(NNBF_attention_Nsd, self).__init__()
+
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        self.Nsd = Nsd
+
+        # Initialize the parameter M (N x Nf matrix) for each Slater determinant
+        self.Ms = nn.ParameterList([
+            nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype))
+            if kernel_init is not None
+            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            )
+            for _ in range(self.Nsd)
+        ])
+        
+        self.embed_dim = embed_dim
+        self.attention_heads = attention_heads
+        self.attention_layers = attention_layers
+        self.position_wise_mlp_hidden_dim = position_wise_mlp_hidden_dim
+        self.phys_dim = phys_dim
+        self.nsite = nsite
+
+        # Initialize Nsd NN models, where each has input n and outputs a matrix with the same shape as M
+        self.backflow_transformers = nn.ModuleList()
+        for _ in range(self.Nsd):
+            # Transformer self-attention block (ViT style)
+            attn = StackedSelfAttn(
+                nsite,
+                num_classes=self.phys_dim,
+                embedding_dim=self.embed_dim,
+                attention_heads=self.attention_heads,
+                dtype=self.param_dtype,
+                num_layers=self.attention_layers,
+                d_inner=self.position_wise_mlp_hidden_dim,
+                use_positional_encoding=True,
+            )
+
+            fnn = nn.Sequential(
+                nn.Linear(self.embed_dim * nsite, hidden_dim, dtype=self.param_dtype),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions, dtype=self.param_dtype),
+            )
+            if eps is not None:
+                # Initialize the last layer with small std
+                last_mlp_layer = fnn[-1]
+                nn.init.normal_(last_mlp_layer.weight, mean=0.0, std=eps)
+                nn.init.constant_(last_mlp_layer.bias, 0.0)
+
+            # Combine attn and fnn into a single nn.ModuleList representing one transformer block
+            # This block transforms the input state (n) into a backflow matrix (delta_M)
+            transformer_block = nn.ModuleList([attn, fnn])
+
+            # Convert NNs to the appropriate data type
+            transformer_block.to(self.param_dtype)
+            
+            # Add the block to the main list
+            self.backflow_transformers.append(transformer_block)
+        
+        
+        self.backflow_transformers.to(self.param_dtype)
+
+        self.nn_eta = nn_eta
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            "NNBF w attention": {
+                "N_site": self.nsite,
+                "N_fermions": self.hilbert.n_fermions,
+                "N_fermions_per_spin": self.hilbert.n_fermions_per_spin,
+                "nn_eta": self.nn_eta,
+                "final_nn_hidden_dim": hidden_dim,
+                "embed_dim": self.embed_dim,
+                "attention_heads": self.attention_heads,
+                "attention_layers": self.attention_layers,
+                "position_wise_mlp_hidden_dim": self.position_wise_mlp_hidden_dim,
+                "phys_dim": self.phys_dim,
+                "Nsd": self.Nsd,
+            }
+        }
+
+    def amplitude(self, x, **kwargs):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(x, sd_index=0):
+            n = torch.tensor(
+                from_quimb_config_to_netket_config(x), dtype=self.param_dtype
+            )
+            
+            if self.nn_eta != 0:
+                # Compute the backflow matrix F using the neural network
+                transformed_x = self.backflow_transformers[sd_index][0](x)
+                F = self.backflow_transformers[sd_index][1](
+                    transformed_x.view(-1)
+                )
+                M = (
+                    self.Ms[sd_index] + F.reshape(self.Ms[sd_index].shape) * self.nn_eta
+                )
+            elif self.nn_eta == 0:  # Pure Slater determinant calculation
+                M = self.Ms[sd_index] 
+
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the 2Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = M[R]
+            det = torch.linalg.det(A)
+            amp = det
+
+            return amp
+
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=torch.int)
+
+            amp_val = sum([backflow_det(x_i, sd_index=sd) for sd in range(self.Nsd)]) / self.Nsd
+
+            batch_amps.append(amp_val)
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+
+class NNBF_attention_Nsd_v1(wavefunctionModel):
+    """Assuming total Sz=0.
+    NOTE: 
+    1. position-wise hard coded learnable embedding (x)
+    2. Initialization: only last layer of MLP is initilaized with small std
+    3. Change the last layer of all-to-all mlp to position-wise mlp embed_dim=256
+    """
+
+    def __init__(
+        self,
+        nsite,
+        hilbert,
+        kernel_init=None,
+        param_dtype=torch.float32,
+        hidden_dim=64,
+        nn_eta=1,
+        embed_dim=16,
+        attention_heads=4,
+        attention_layers=1,
+        position_wise_mlp_hidden_dim=64,
+        phys_dim=4,
+        Nsd=1,
+        eps=None,
+    ):
+        super(NNBF_attention_Nsd_v1, self).__init__()
+
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        self.Nsd = Nsd
+
+        # Initialize the parameter M (N x Nf matrix) for each Slater determinant
+        self.Ms = nn.ParameterList([
+            nn.Parameter(
+            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype))
+            if kernel_init is not None
+            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            )
+            for _ in range(self.Nsd)
+        ])
+        
+        self.embed_dim = embed_dim
+        self.attention_heads = attention_heads
+        self.attention_layers = attention_layers
+        self.position_wise_mlp_hidden_dim = position_wise_mlp_hidden_dim
+        self.phys_dim = phys_dim
+        self.nsite = nsite
+
+        # Initialize Nsd NN models, where each has input n and outputs a matrix with the same shape as M
+        self.backflow_transformers = nn.ModuleList()
+        for _ in range(self.Nsd):
+            # Transformer self-attention block (ViT style)
+            attn = StackedSelfAttn(
+                2*nsite,
+                num_classes=self.phys_dim,
+                embedding_dim=self.embed_dim,
+                attention_heads=self.attention_heads,
+                dtype=self.param_dtype,
+                num_layers=self.attention_layers,
+                d_inner=self.position_wise_mlp_hidden_dim,
+                use_positional_encoding=True,
+            )
+
+            spatial_mlp_lst = nn.ModuleList()
+            for site in range(2*nsite):
+                fnn = nn.Sequential(
+                    nn.Linear(self.embed_dim, self.hilbert.n_fermions, dtype=self.param_dtype),
+                    # nn.GELU(),
+                    # nn.Linear(hidden_dim, self.hilbert.n_fermions, dtype=self.param_dtype),
+                )
+                fnn.to(self.param_dtype)
+                if eps is not None:
+                    # Initialize the last layer with small std
+                    nn.init.normal_(fnn[-1].weight, mean=0.0, std=eps)
+                    nn.init.constant_(fnn[-1].bias, 0.0)
+                spatial_mlp_lst.append(fnn)
+
+            # Combine attn and fnn into a single nn.ModuleList representing one transformer block
+            # This block transforms the input state (n) into a backflow matrix (delta_M)
+            transformer_block = nn.ModuleList([attn, spatial_mlp_lst])
+
+            # Convert NNs to the appropriate data type
+            transformer_block.to(self.param_dtype)
+            
+            # Add the block to the main list
+            self.backflow_transformers.append(transformer_block)
+        
+        
+        self.backflow_transformers.to(self.param_dtype)
+
+        self.nn_eta = nn_eta
+
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.model_structure = {
+            "NNBF w attention": {
+                "N_site": self.nsite,
+                "N_fermions": self.hilbert.n_fermions,
+                "N_fermions_per_spin": self.hilbert.n_fermions_per_spin,
+                "nn_eta": self.nn_eta,
+                "final_nn_hidden_dim": hidden_dim,
+                "embed_dim": self.embed_dim,
+                "attention_heads": self.attention_heads,
+                "attention_layers": self.attention_layers,
+                "position_wise_mlp_hidden_dim": self.position_wise_mlp_hidden_dim,
+                "phys_dim": self.phys_dim,
+                "Nsd": self.Nsd,
+            }
+        }
+
+    def amplitude(self, x, **kwargs):
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        # Define the slater determinant function manually to loop over inputs
+        def backflow_det(x, sd_index=0):
+            n = torch.tensor(
+                from_quimb_config_to_netket_config(x), dtype=self.param_dtype
+            )
+            
+            if self.nn_eta != 0:
+                # Compute the backflow matrix F using the neural network
+                attn_output = self.backflow_transformers[sd_index][0](n) # shape: (2*nsite, embed_dim)
+                F_lst = []
+                for site in range(2*self.nsite):
+                    F_site = self.backflow_transformers[sd_index][1][site](attn_output[site])
+                    F_lst.append(F_site)
+                F = torch.stack(F_lst)
+                # print(f'MO mean&std: {self.Ms[sd_index].mean().item():.4f}, {self.Ms[sd_index].std().item():.4f}')
+                # print(f'F mean&std: {F.mean().item():.4f}, {F.std().item():.4f}')
+                M = self.Ms[sd_index] + F * self.nn_eta
+                
+            elif self.nn_eta == 0:  # Pure Slater determinant calculation
+                M = self.Ms[sd_index] 
+
+            # Find the positions of the occupied orbitals
+            R = torch.nonzero(n, as_tuple=False).squeeze()
+
+            # Extract the 2Nf x Nf submatrix of M corresponding to the occupied orbitals
+            A = M[R]
+            det = torch.linalg.det(A)
+            amp = det
+
+            return amp
+
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=torch.int)
+
+            amp_val = sum([backflow_det(x_i, sd_index=sd) for sd in range(self.Nsd)]) / self.Nsd
+
             batch_amps.append(amp_val)
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
@@ -6168,7 +8191,7 @@ class HFDS(wavefunctionModel):
         for i in range(self.Nh):
             setattr(self, f'nn{i}', nn.Sequential(
                 nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
-                nn.Tanh(),
+                nn.GELU(),
                 nn.Linear(hidden_dim, self.Nf+self.Nh, dtype=self.param_dtype)
             ))
 
@@ -6179,7 +8202,7 @@ class HFDS(wavefunctionModel):
         if self.jastrow:
             self.nn_jastrow = nn.Sequential(
                 nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
-                nn.Tanh(),
+                nn.GELU(),
                 nn.Linear(hidden_dim, 1, dtype=self.param_dtype)
             )
             self.nn_jastrow.to(self.param_dtype)
@@ -6194,7 +8217,7 @@ class HFDS(wavefunctionModel):
                     'N_hidden_fermions': self.Nh, 'Jastrow': self.jastrow}
         }
 
-    def amplitude(self, x):
+    def amplitude(self, x, **kwargs):
         # `x` is expected to be batched as (batch_size, input_dim)
         # Loop through the batch and compute amplitude for each sample
         # Define the slater determinant function manually to loop over inputs
@@ -6203,7 +8226,10 @@ class HFDS(wavefunctionModel):
             F = []
             for i in range(self.Nh):
                 F.append(getattr(self, f'nn{i}')(n))
-            F = torch.stack(F)
+            if self.Nh > 0:
+                F = torch.stack(F)
+            if not isinstance(F, torch.Tensor):
+                F = torch.tensor(F, dtype=self.param_dtype)
 
             M  = self.M
             # Find the positions of the occupied orbitals
@@ -6223,7 +8249,7 @@ class HFDS(wavefunctionModel):
         for x_i in x:
             n_i = from_quimb_config_to_netket_config(x_i)
             # Check x_i type
-            if not type(n_i) == torch.Tensor:
+            if not isinstance(n_i, torch.Tensor):
                 n_i = torch.tensor(n_i, dtype=self.param_dtype)
 
             amp_val=backflow_det(n_i)

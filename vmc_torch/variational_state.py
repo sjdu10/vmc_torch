@@ -7,6 +7,7 @@ import torch
 from autoray import do
 
 import vmc_torch
+from vmc_torch.experiment.tn_model import fTNModel_reuse
 
 from .global_var import DEBUG, set_debug, AMP_CACHE_SIZE, GRAD_CACHE_SIZE
 from .utils import tensor_aware_lru_cache
@@ -113,8 +114,7 @@ class Variational_State:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
         self.reset()
         amp = self.vstate_func(x, grad=True)
-
-        if isinstance(self.vstate_func, vmc_torch.experiment.tn_model.fTNModel_reuse):
+        if isinstance(self.vstate_func, fTNModel_reuse):
             try:
                 if self.vstate_func.debug:
                     amp.backward(retain_graph=retain_graph)

@@ -4,7 +4,7 @@ A quantum variational Monte Carlo (VMC) code based on pyTorch for solving ground
 
 `vmc_torch` currently supports a wide range of variational ansatz, including bosonic/fermionic tensor network states (TNS) (e.g. MPS, PEPS) defined using `quimb` and `symmray`, and neural quantum states (NQS).
 
-## Install
+## Installation
 
 **Installing the latest version directly from github:**
 
@@ -21,7 +21,7 @@ pip install --no-deps -U -e vmc_torch/
 
 ## Usage
 
-**Neural network state example:**
+**Fermionic neural network quantum state example:**
 
 In `/examples`, there's an example script for running VMC of a spinless Hubbard model on a `4x4` square lattice with OBC using various neural network quantum states.
 To run the code: 
