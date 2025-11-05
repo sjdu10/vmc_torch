@@ -23,7 +23,7 @@ pip install --no-deps -U -e vmc_torch/
 
 **Fermionic neural network quantum state example:**
 
-In `/examples`, there's an example script for running VMC for ground state of a `4x2` Fermi-Hubbard model on square lattice at half-filling (OBC) using Slater Determinant.
+In `/examples`, there's an example script for running VMC for ground state of a `4x2` Fermi-Hubbard model (OBC) on square lattice at half-filling using Slater Determinant.
 
 To run the code: 
 ```bash
