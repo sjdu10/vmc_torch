@@ -40,7 +40,7 @@ An example plot of the VMC training curves for various Ans\"atze on a spinless H
 
 ## References
 
-- "Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems" - *Si-Jing Du*, *Ao Chen* and *Garnet Kin-Lic Chan* - [arXiv: ](https://doi.org/10.48550/arXiv.2506.08329)
+- "Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems" - *Si-Jing Du*, *Ao Chen* and *Garnet Kin-Lic Chan* - [arXiv:2506.08329](https://doi.org/10.48550/arXiv.2506.08329)
 
 - `symmray` - *Johnnie Gray* - https://github.com/jcmgray/symmray
 
