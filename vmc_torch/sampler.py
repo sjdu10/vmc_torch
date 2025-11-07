@@ -623,28 +623,24 @@ class Sampler(AbstractSampler):
         
         else:
             while not terminate[0]:
-                try:
-                    op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
-                    if abs(op_loc) > 1e4: # discard the extreme samples
-                        continue
-                    n += 1
-                    op_loc_vec.append(op_loc)
-                    # accumulate the local energy and amplitude gradient
-                    op_loc_sum += op_loc
-                    logpsi_sigma_grad_sum += logpsi_sigma_grad
-                    op_logpsi_sigma_grad_product_sum += op_loc * logpsi_sigma_grad
-
-                    # collect the log-amplitude gradient
-                    logpsi_sigma_grad_mat.append(logpsi_sigma_grad)
-
-                    # buf = (RANK,)
-                    buf = np.array([RANK], dtype=np.int32)
-                    # Send the local sample count to rank 0
-                    # COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
-                    COMM.Send([buf, MPI.INT], dest=0, tag=message_tag+TAG_OFFSET)
-                except Exception as e:
-                    print(f"    RANK{RANK} Exception during sampling: {e}")
+                op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
+                if abs(op_loc) > 1e4: # discard the extreme samples
                     continue
+                n += 1
+                op_loc_vec.append(op_loc)
+                # accumulate the local energy and amplitude gradient
+                op_loc_sum += op_loc
+                logpsi_sigma_grad_sum += logpsi_sigma_grad
+                op_logpsi_sigma_grad_product_sum += op_loc * logpsi_sigma_grad
+
+                # collect the log-amplitude gradient
+                logpsi_sigma_grad_mat.append(logpsi_sigma_grad)
+
+                # buf = (RANK,)
+                buf = np.array([RANK], dtype=np.int32)
+                # Send the local sample count to rank 0
+                # COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                COMM.Send([buf, MPI.INT], dest=0, tag=message_tag+TAG_OFFSET)
                 # Receive the termination signal from rank 0
                 # terminate = COMM.recv(source=0, tag=message_tag+1)
                 terminate = np.empty(1, dtype=np.int32)
