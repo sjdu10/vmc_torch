@@ -7,7 +7,6 @@ import torch
 
 # quimb
 from mpi4py import MPI
-from statsmodels.tsa.stattools import acf
 from tqdm import tqdm
 
 from .global_var import DEBUG, TAG_OFFSET
@@ -623,8 +622,13 @@ class Sampler(AbstractSampler):
         
         else:
             while not terminate[0]:
-                op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
-                if abs(op_loc) > 1e4: # discard the extreme samples
+                try:
+                    op_loc, logpsi_sigma_grad, _ = self._sample_expect_grad(vstate, op)
+                except Exception as e:
+                    print(f"    RANK{RANK} Error in sampling: {e}, setting local energy and gradient to zero.")
+                    op_loc, logpsi_sigma_grad = 0, np.zeros(vstate.Np)
+
+                if abs(op_loc) > 1e8: # discard the extreme samples
                     continue
                 n += 1
                 op_loc_vec.append(op_loc)
@@ -657,16 +661,6 @@ class Sampler(AbstractSampler):
         # convert the list to numpy array
         logpsi_sigma_grad_mat = np.asarray(logpsi_sigma_grad_mat).T
         op_loc_vec = np.asarray(op_loc_vec)
-        
-        # if RANK == 1:
-        #     # compute autocorrelation time of op_loc_vec for RANK1
-        #     # This is a simple implementation of the integrated autocorrelation time
-        #     def integrated_autocorr_time(samples, max_lag=None):
-        #         acf_vals = acf(samples, nlags=max_lag, fft=True)
-        #         return 1 + 2 * np.sum(acf_vals[1:])  # Sum over lags ≥ 1
-
-        #     iat = integrated_autocorr_time(op_loc_vec, max_lag=100)
-        #     print(f"    RANK1 sample size: {op_loc_vec.size}, Local Energy Integrated Autocorrelation Time: {iat}")
 
         if n > 1:
             op_loc_var = np.var(op_loc_vec, ddof=1)
@@ -686,6 +680,8 @@ class Sampler(AbstractSampler):
             while psi_sigma == 0:
                 # We need to make sure that the amplitude is not zero
                 sigma, psi_sigma = self._sample_next(vstate)
+                if psi_sigma == 0:
+                    print(f"    RANK{RANK} Warning: Zero amplitude encountered during sampling.")
         time1 = MPI.Wtime()
 
         # compute local energy and amplitude gradient
