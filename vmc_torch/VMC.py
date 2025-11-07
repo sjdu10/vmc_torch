@@ -168,6 +168,10 @@ class VMC:
             # Precondition the gradient through SR (optional)
             preconditioned_grad = self.preconditioner(self._state, state_MC_loss_grad)
 
+            # detect if preconditioned_grad contains NaN or Inf, if so, raise an error
+            if torch.isnan(torch.tensor(preconditioned_grad)).any() or torch.isinf(torch.tensor(preconditioned_grad)).any():
+                raise ValueError("Preconditioned gradient contains NaN or Inf!")
+
             if SIZE > 1:
                 # collect rank1 sample time in rank 0
                 if RANK==1:
