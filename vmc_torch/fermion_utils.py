@@ -11,6 +11,7 @@ from quimb.tensor.tensor_core import bonds, tags_to_oset, rand_uuid
 from quimb.tensor.tensor_2d import Rotator2D, pairwise
 from vmc_torch.global_var import DEBUG
 import ast
+import pickle
 
 # ------Read fPEPS from fTN model------
 def get_psi_from_fTN(fTN_model):
@@ -35,8 +36,30 @@ def get_psi_from_fTN(fTN_model):
     psi = qtn.unpack(params, fTN_model.skeleton)
     return psi
 
+class CustomUnpickler(pickle.Unpickler):
+    # Define all relocations in one place
+    RELOCATIONS = {
+        ('symmray.abelian_core', 'BlockIndex'): ('symmray.sparse.sparse_index', 'BlockIndex'),
+        ('symmray.abelian_core', 'Z2Array'): ('symmray.sparse.sparse_abelian_array', 'Z2Array'),
+        ('symmray.fermionic_core', 'BlockIndex'): ('symmray.sparse.sparse_index', 'BlockIndex'),
+        ('symmray.fermionic_core', 'Z2FermionicArray'): ('symmray.sparse.sparse_fermionic_array', 'Z2FermionicArray'),
+    }
 
-def unpack_ftns(params_path, skeleton_path, scale=4.0, dtype=torch.float64):
+    def find_class(self, module, name):
+        # Check if this class was relocated
+        try:
+            return super().find_class(module, name)
+        except ModuleNotFoundError:
+            key = (module, name)
+            if key in self.RELOCATIONS:
+                module, name = self.RELOCATIONS[key]
+            try:
+                return super().find_class(module, name)
+            except ModuleNotFoundError as e:
+                print(f"Module not found: {module}, Error: {e}")
+                raise e
+            
+def unpack_ftns(params_path, skeleton_path, scale=4.0, dtype=torch.float64, new_symmray_format=False):
     """
     Unpack fTNS from saved parameters and skeleton files.
     
@@ -54,12 +77,22 @@ def unpack_ftns(params_path, skeleton_path, scale=4.0, dtype=torch.float64):
     ----------
     ftns : quimb fTNS
     """
-    import pickle
     import quimb.tensor as qtn
     from symmray.fermionic_local_operators import FermionicOperator
 
-    skeleton = pickle.load(open(skeleton_path, "rb"))
-    params = pickle.load(open(params_path, "rb"))
+    skeleton = CustomUnpickler(open(skeleton_path, "rb")).load()
+    params = CustomUnpickler(open(params_path, "rb")).load()
+    if new_symmray_format:
+        if skeleton.arrays[0].symmetry == 'Z2':
+            for i in range(len(skeleton.sites)):
+                tid = i
+                site = skeleton.sites[i]
+                site_tag = skeleton.site_tag(site)
+                skeleton[site_tag].data._label = 3*tid
+                skeleton[site_tag].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1))
+        else:
+            raise NotImplementedError("Only Z2 symmetry is supported for converting old fTN to new symmray format for now.")
+    
     ftns = qtn.unpack(params, skeleton)
     # Precondition the fTNS
     ## 1. Sync the stored fermionic phases
@@ -80,6 +113,9 @@ def unpack_ftns(params_path, skeleton_path, scale=4.0, dtype=torch.float64):
                 if isinstance(nested_oddpos, FermionicOperator):
                     ts.data._oddpos = (nested_oddpos,)
     return ftns
+
+
+
 
 
 
