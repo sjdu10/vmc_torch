@@ -197,8 +197,6 @@ class QR(torch.autograd.Function):
     def backward(self, dQ, dR):
         M1,M2,M3 = self.saved_tensors
         if len(M2.size())==1: # rank-deficient, do svd
-            # if DEBUG:
-            #     print("QRbackward: rank deficient, using SVD")
             U,S,Vh = M1,M2,M3
             dU,dSVh = dQ,dR
             dS = torch.diag(dSVh @ Vh.t())
@@ -211,10 +209,8 @@ class QR(torch.autograd.Function):
         A,Q,R = M1,M2,M3
         M,N = A.size()
         if M>=N:
-            # print(f"QRbackward: A is deep, M={M}, N={N}")
             return QRbackward_deep(Q,R,dQ,dR)
         else:
-            # print(f"QRbackward: A is wide, M={M}, N={N}")
             return QRbackward_wide(A,Q,R,dQ,dR)
 
 class QR_tao(torch.autograd.Function):
@@ -244,6 +240,7 @@ class QR_tao(torch.autograd.Function):
         return torch.cat([da, db], 1)
 
 def _simple_qr_backward(q, r, dq, dr):
+    #XXX: why written in such unintuitive way? Need to solve 2 linear systems, which can give NaNs?
     if r.shape[-2] != r.shape[-1]:
         raise NotImplementedError("QrGrad not implemented when ncols > nrows "
                           "or full_matrices is true and ncols != nrows.")
@@ -261,86 +258,58 @@ def _simple_qr_backward(q, r, dq, dr):
 
     grad_a = q @ (dr + _TriangularSolve(tril, r))
     grad_b = _TriangularSolve(dq - q @ qdq, r)
+    if torch.any(torch.isnan(grad_a)) or torch.any(torch.isnan(grad_b)):
+        print(q.shape, r.shape, q@r)
     return grad_a + grad_b
 
-# def copyltu(A):
-#     tril0 = A.tril(diagonal=0)
-#     tril1 = A.tril(diagonal=-1)
-#     return tril0 + tril1.t()
-# def QRbackward_deep(Q,R,dQ,dR):
-#     M = R@dR.t() - dQ.t()@Q
-#     dA = (dQ + Q@copyltu(M))@torch.linalg.inv(R.t())
-#     if not torch.all(torch.isfinite(dA)):
-#         raise ValueError("dA is not finite")
-#     return dA 
-# def QRbackward_wide(A,Q,R,dQ,dR):
-#     M,N = A.size()
-#     X,Y = A.split((M,N-M),dim=1)
-#     U,V = R.split((M,N-M),dim=1)
-#     dU,dV = dR.split((M,N-M),dim=1)
+class QR_tao_direct(torch.autograd.Function):
+    @staticmethod
+    def forward(self, A):
+        Q, R = torch.linalg.qr(A)
+        diag = R.diag()
+        if fix_sign:
+            sign = torch.sign(diag).reshape((1,-1))
+            Q = Q * sign
+            R = R * sign.t()
+        self.save_for_backward(A, Q, R)
+        return Q, R
 
-#     tmp = dQ+Y@dV.t()
-#     M = U@dU.t() - tmp.t()@Q
-#     dX = (tmp + Q @ copyltu(M))@torch.linalg.inv(U.t())
-#     if not torch.all(torch.isfinite(dX)):
-#         raise ValueError("dX is not finite")
-#     return torch.cat((dX,Q@dV),dim=1)
-# class QR(torch.autograd.Function):
-#     @staticmethod
-#     def forward(self, A):
-#         M,N = A.size()
-#         if M * N == 0:
-#             raise ValueError(f"input matrix to custom QR is size {(M,N)}")
-#         if not torch.all(torch.isfinite(A)): # A not finite
-#             raise ValueError("input matrix to custom QR is not finite")
-#         try:
-#             Q, R = torch.linalg.qr(A,mode='reduced')
-#         except:
-#             if be_verbose:
-#                 print('trouble in torch gesdd routine, falling back to scipy')
-#             Q, R = scipy.linalg.svd(A.detach().numpy(), mode='economic')
-#             Q = torch.from_numpy(Q)
-#             R = torch.from_numpy(R)
+    @staticmethod
+    def backward(self, dq, dr):
+        A, q, r = self.saved_tensors
+        if r.shape[0] == r.shape[1]:
+            return _simple_qr_backward(q, r, dq ,dr)
+        M, N = r.shape
+        B = A[:,M:]
+        dU = dr[:,:M]
+        dD = dr[:,M:]
+        U = r[:,:M]
+        da = _simple_qr_backward(q, U, dq+B@dD.t(), dU)
+        db = q@dD
+        return torch.cat([da, db], 1)
 
-#         diag = R.diag()
-#         if is_one(diag):
-#             print(R)
-#             raise ValueError
-#         inds = torch.abs(diag) < epsilon
-#         if inds.sum().numpy()>0: # rank deficient, revert to svd
-#         #if len(inds)>0: # rank deficient, revert to svd
-#             #print(inds,inds.sum())
-#             U,S,Vh = SVDforward(A)
-#             SVh = S.reshape((S.size(0),1)) * Vh
-#             self.save_for_backward(U, S, Vh)
-#             return U, SVh
+def _simple_qr_backward(q, r, dq, dr):
+    # a more direct calculation
+    if r.shape[-2] != r.shape[-1]:
+        raise NotImplementedError("QrGrad not implemented when ncols > nrows "
+                          "or full_matrices is true and ncols != nrows.")
 
-#         if fix_sign:
-#             sign = torch.sign(diag).reshape((1,-1))
-#             Q = Q * sign
-#             R = R * sign.t()
-#         self.save_for_backward(A,Q,R)
-#         return Q,R
-        
-#     @staticmethod
-#     def backward(self, dQ, dR):
-#         M1,M2,M3 = self.saved_tensors
-#         if len(M2.size())==1: # rank-deficient, do svd
-#             U,S,Vh = M1,M2,M3
-#             dU,dSVh = dQ,dR
-#             dS = torch.diag(dSVh @ Vh.t())
-#             dVh = S.reshape((S.size(0),1)) * dSVh
-#             return SVDbackward(dU,dS,dVh,U,S,Vh)
-#         if not torch.all(torch.isfinite(dQ)):
-#             raise ValueError("dQ is not finite")
-#         if not torch.all(torch.isfinite(dR)):
-#             raise ValueError("dR is not finite")
-#         A,Q,R = M1,M2,M3
-#         M,N = A.size()
-#         if M>=N:
-#             return QRbackward_deep(Q,R,dQ,dR)
-#         else:
-#             return QRbackward_wide(A,Q,R,dQ,dR)
+    rdr = r @ dr.t()
+    M = rdr - dq.t() @ q
+    M = copyltu(M)
+
+    def _TriangularSolve(x, r):
+        """Equiv to x @ torch.inverse(r).t() if r is upper-tri."""
+        res = torch.linalg.solve_triangular(r, x.t(), upper=True).t()
+        return res
+    
+    grad = _TriangularSolve(dq + q @ M, r)
+    if torch.any(torch.isnan(grad)):
+        print('Solving the QR backward linear system gives NaN!')
+        print(f'Solving xR=A with R={r}, A={dq + q @ M}')
+        print(f'Get grad={grad}')
+        print(q, r, q@r)
+    return grad
 
 ########## Test ##########
 
@@ -351,21 +320,21 @@ def test_svd():
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(SVD.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"SVD Test Pass for {M},{N}! time={time.time()-t0}")
+    print(f"SVD Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
 
     M, N = 20, 50
     torch.manual_seed(2)
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(SVD.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"SVD Test Pass for {M},{N}! time={time.time()-t0} ")
+    print(f"SVD Test Pass for matrix shape {M}x{N}! time={time.time()-t0} ")
 
     M, N = 20, 20
     torch.manual_seed(2)
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(SVD.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"SVD Test Pass for {M},{N}! time={time.time()-t0}")
+    print(f"SVD Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
         
 def test_qr():
     M, N = 50, 20
@@ -373,21 +342,21 @@ def test_qr():
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(QR.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"QR Test Pass for {M},{N}! time={time.time()-t0}")
+    print(f"QR Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
 
     M, N = 20, 50
     torch.manual_seed(2)
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(QR.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"QR Test Pass for {M},{N}! time={time.time()-t0}")
+    print(f"QR Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
 
     M, N = 20, 20
     torch.manual_seed(2)
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(QR.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"QR Test Pass for {M},{N}! time={time.time()-t0}")
+    print(f"QR Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
 
 def test_qr_tao():
     M, N = 50, 20
@@ -395,26 +364,49 @@ def test_qr_tao():
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(QR_tao.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"QR_tao Test Pass for {M},{N}! time={time.time()-t0}")
+    print(f"QR_tao Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
 
     M, N = 20, 50
     torch.manual_seed(2)
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(QR_tao.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"QR_tao Test Pass for {M},{N}! time={time.time()-t0}")
+    print(f"QR_tao Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
 
     M, N = 20, 20
     torch.manual_seed(2)
     input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
     t0 = time.time()
     assert(torch.autograd.gradcheck(QR_tao.apply, (input), eps=1e-6, atol=1e-4))
-    print(f"QR_tao Test Pass for {M},{N}! time={time.time()-t0}")
+    print(f"QR_tao Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
+
+def test_qr_tao_direct():
+    M, N = 50, 20
+    torch.manual_seed(2)
+    input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
+    t0 = time.time()
+    assert(torch.autograd.gradcheck(QR_tao_direct.apply, (input), eps=1e-6, atol=1e-4))
+    print(f"QR_tao_direct Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
+
+    M, N = 20, 50
+    torch.manual_seed(2)
+    input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
+    t0 = time.time()
+    assert(torch.autograd.gradcheck(QR_tao_direct.apply, (input), eps=1e-6, atol=1e-4))
+    print(f"QR_tao_direct Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
+
+    M, N = 20, 20
+    torch.manual_seed(2)
+    input = torch.rand(M, N, dtype=torch.float64, requires_grad=True)
+    t0 = time.time()
+    assert(torch.autograd.gradcheck(QR_tao_direct.apply, (input), eps=1e-6, atol=1e-4))
+    print(f"QR_tao_direct Test Pass for matrix shape {M}x{N}! time={time.time()-t0}")
 
 if __name__=='__main__':
     # test_svd()
     test_qr()
     test_qr_tao()
+    test_qr_tao_direct()
 
 
 

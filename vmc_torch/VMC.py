@@ -169,7 +169,7 @@ class VMC:
             preconditioned_grad = self.preconditioner(self._state, state_MC_loss_grad)
 
             # detect if preconditioned_grad contains NaN or Inf, if so, raise an error
-            if torch.isnan(torch.tensor(preconditioned_grad)).any() or torch.isinf(torch.tensor(preconditioned_grad)).any():
+            if torch.isnan(preconditioned_grad).any() or torch.isinf(preconditioned_grad).any():
                 raise ValueError("Preconditioned gradient contains NaN or Inf!")
 
             if SIZE > 1:
@@ -233,6 +233,19 @@ class VMC:
                 
                 self._state.reset() # Clear out the gradient of the state parameters
                 
+            else:
+                new_param_vec = np.empty(self._state.Np, dtype=float)
+                self._state.reset()
+            
+            self._state.clear_memory() # Clear out the memory
+
+            # Broadcast the new parameter vector to all ranks
+            COMM.Bcast(new_param_vec,root=0)
+            # Update the quantum state with the new parameter vector
+            self._state.update_state(new_param_vec) # Reload the new parameter vector into the quantum state
+
+            # Save the model parameters and energy statistics
+            if RANK == 0:
                 if tmpdir is not None and save:
                     # save the energy statistics and model parameters to local directory
                     path = tmpdir
@@ -268,17 +281,6 @@ class VMC:
                     # update the MC_energy_stats.json
                     with open(path + f'/energy_stats_start_{start}.json', 'w') as f:
                         json.dump(MC_energy_stats, f)
-                
-            else:
-                new_param_vec = np.empty(self._state.Np, dtype=float)
-                self._state.reset()
-            
-            self._state.clear_memory() # Clear out the memory
-
-            # Broadcast the new parameter vector to all ranks
-            COMM.Bcast(new_param_vec,root=0)
-            # Update the quantum state with the new parameter vector
-            self._state.update_state(new_param_vec) # Reload the new parameter vector into the quantum state
             
         return MC_energy_stats
     

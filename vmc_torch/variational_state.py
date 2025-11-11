@@ -93,7 +93,7 @@ class Variational_State:
 
     def update_state(self, new_param_vec):
         """Update the variational state with the new parameter vector."""
-        if not type(new_param_vec) == torch.Tensor:
+        if not isinstance(new_param_vec, torch.Tensor):
             new_param_vec = torch.tensor(new_param_vec, dtype=self.dtype)
         self.vstate_func.load_params(new_param_vec)
         self.clear_cache()
