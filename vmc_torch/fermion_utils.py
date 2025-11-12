@@ -59,7 +59,7 @@ class CustomUnpickler(pickle.Unpickler):
                 print(f"Module not found: {module}, Error: {e}")
                 raise e
             
-def unpack_ftns(params_path, skeleton_path, scale=4.0, dtype=torch.float64, new_symmray_format=False):
+def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None, scale=4.0, dtype=torch.float64, new_symmray_format=False):
     """
     Unpack fTNS from saved parameters and skeleton files.
     
@@ -79,9 +79,9 @@ def unpack_ftns(params_path, skeleton_path, scale=4.0, dtype=torch.float64, new_
     """
     import quimb.tensor as qtn
     from symmray.fermionic_local_operators import FermionicOperator
-
-    skeleton = CustomUnpickler(open(skeleton_path, "rb")).load()
-    params = CustomUnpickler(open(params_path, "rb")).load()
+    if params is None and skeleton is None:
+        skeleton = CustomUnpickler(open(skeleton_path, "rb")).load()
+        params = CustomUnpickler(open(params_path, "rb")).load()
     if new_symmray_format:
         if skeleton.arrays[0].symmetry == 'Z2':
             for i in range(len(skeleton.sites)):

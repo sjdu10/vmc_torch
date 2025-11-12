@@ -211,6 +211,14 @@ class SR(Preconditioner):
                 self.sr_convergence = info
                 return torch.tensor(dp, dtype=self.dtype)
 
+class minSR(Preconditioner):
+    """
+    minSR as in https://arxiv.org/abs/2302.01941
+
+    Need to send all logamp_grad vectors to rank 0 to form the dense O_sk matrix, then take pseudo-inverse.
+    """
+    ...
+
 #------------------------------------------------------------
 # Scheduler
 class Scheduler:
