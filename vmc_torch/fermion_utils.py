@@ -88,8 +88,11 @@ def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None
                 tid = i
                 site = skeleton.sites[i]
                 site_tag = skeleton.site_tag(site)
-                skeleton[site_tag].data._label = 3*tid
-                skeleton[site_tag].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1))
+                try:
+                    skeleton[site_tag].data._label = 3*tid
+                    skeleton[site_tag].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1))
+                except Exception:
+                    pass
         else:
             raise NotImplementedError("Only Z2 symmetry is supported for converting old fTN to new symmray format for now.")
     
