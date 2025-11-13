@@ -677,17 +677,23 @@ class Sampler(AbstractSampler):
         # sample the next configuration
         psi_sigma = 0
         with torch.no_grad():
+            iter = 0
             while psi_sigma == 0:
                 # We need to make sure that the amplitude is not zero
                 sigma, psi_sigma = self._sample_next(vstate)
-                if psi_sigma == 0:
-                    print(f"    RANK{RANK} Warning: Zero amplitude encountered during sampling.")
+                iter += 1
+                if iter > 50:
+                    print(f"    RANK{RANK} Warning: Exceeded 50 attempts to find non-zero amplitude. Break out.")
+                    break
         time1 = MPI.Wtime()
 
         # compute local energy and amplitude gradient
         vstate.set_cache_env_mode(on=True)
         psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
         vstate.set_cache_env_mode(on=False)
+
+        if logpsi_sigma_grad.abs().max() > 1e7:
+            print(f"    RANK{RANK} Warning: Large gradient encountered: max|grad| = {logpsi_sigma_grad.abs().max():.10g}, psi_sigma = {psi_sigma.item():.10g}")
 
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
         time2 = MPI.Wtime()
