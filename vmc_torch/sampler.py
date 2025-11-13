@@ -692,10 +692,10 @@ class Sampler(AbstractSampler):
         psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
         vstate.set_cache_env_mode(on=False)
 
-        if DEBUG:
-            if logpsi_sigma_grad.abs().max() > 1e7:
-                print(f"    RANK{RANK} Warning: Large gradient encountered: max|grad| = {logpsi_sigma_grad.abs().max():.10g}, psi_sigma = {psi_sigma.item():.10g}, sigma = {sigma.cpu().numpy()}")
-                raise ValueError("Large gradient encountered.")
+        # # if DEBUG:
+        if logpsi_sigma_grad.abs().max() > 1e5:
+            # do clipping to the large values in the gradient: set those values to 0
+            logpsi_sigma_grad = torch.where(logpsi_sigma_grad.abs() > 1e5, torch.zeros_like(logpsi_sigma_grad), logpsi_sigma_grad)
 
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
         time2 = MPI.Wtime()

@@ -162,11 +162,10 @@ class QR(torch.autograd.Function):
         if M * N == 0:
             raise ValueError(f"input matrix to custom QR is size {(M,N)}")
         if not torch.all(torch.isfinite(A)): # A not finite
-            print(A)
             raise ValueError("input matrix to custom QR is not finite")
         try:
             Q, R = torch.linalg.qr(A,mode='reduced')
-        except:
+        except Exception:
             if be_verbose:
                 print('trouble in torch gesdd routine, falling back to scipy')
             Q, R = scipy.linalg.svd(A.detach().numpy(), mode='economic')
@@ -177,10 +176,10 @@ class QR(torch.autograd.Function):
         # if is_one(diag):
         #     print(R)
         #     raise ValueError
+        
         inds = torch.abs(diag) < 1e-6
         if sum(inds) > 0: # rank deficient, revert to svd
-            # if DEBUG:
-            #     print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
+            # print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
             U,S,Vh = SVDforward(A)
             SVh = S.reshape((S.size(0),1)) * Vh
             self.save_for_backward(U, S, Vh)
@@ -278,17 +277,17 @@ class QR_tao_direct(torch.autograd.Function):
     def backward(self, dq, dr):
         A, q, r = self.saved_tensors
         if r.shape[0] == r.shape[1]:
-            return _simple_qr_backward(q, r, dq ,dr)
+            return _simple_qr_backward_direct(q, r, dq ,dr)
         M, N = r.shape
         B = A[:,M:]
         dU = dr[:,:M]
         dD = dr[:,M:]
         U = r[:,:M]
-        da = _simple_qr_backward(q, U, dq+B@dD.t(), dU)
+        da = _simple_qr_backward_direct(q, U, dq+B@dD.t(), dU)
         db = q@dD
         return torch.cat([da, db], 1)
 
-def _simple_qr_backward(q, r, dq, dr):
+def _simple_qr_backward_direct(q, r, dq, dr):
     # a more direct calculation
     if r.shape[-2] != r.shape[-1]:
         raise NotImplementedError("QrGrad not implemented when ncols > nrows "
@@ -305,10 +304,12 @@ def _simple_qr_backward(q, r, dq, dr):
     
     grad = _TriangularSolve(dq + q @ M, r)
     if torch.any(torch.isnan(grad)):
-        print('Solving the QR backward linear system gives NaN!')
-        print(f'Solving xR=A with R={r}, A={dq + q @ M}')
-        print(f'Get grad={grad}')
-        print(q, r, q@r)
+        # print('Solving the QR backward linear system gives NaN!')
+        # print(f'Solving xR=A with R={r}, A={dq + q @ M}')
+        # print(f'Get grad={grad}')
+        new_grad = _TriangularSolve(dq + q @ M, r+torch.eye(r.size(0),dtype=r.dtype)*r.diag().abs().max()*1e-3)
+        # print(f'With regularization, get grad={new_grad}')
+        grad = new_grad
     return grad
 
 ########## Test ##########
