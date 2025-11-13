@@ -694,8 +694,9 @@ class Sampler(AbstractSampler):
 
         # # if DEBUG:
         if logpsi_sigma_grad.abs().max() > 1e5:
-            # do clipping to the large values in the gradient: set those values to 0
-            logpsi_sigma_grad = torch.where(logpsi_sigma_grad.abs() > 1e5, torch.zeros_like(logpsi_sigma_grad), logpsi_sigma_grad)
+            logpsi_sigma_grad = torch.clamp(logpsi_sigma_grad, min=-1e5, max=1e5)
+            # # do clipping to the large values in the gradient: set those values to 0
+            # logpsi_sigma_grad = torch.where(logpsi_sigma_grad.abs() > 1e5, torch.zeros_like(logpsi_sigma_grad), logpsi_sigma_grad)
 
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
         time2 = MPI.Wtime()
