@@ -692,8 +692,10 @@ class Sampler(AbstractSampler):
         psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
         vstate.set_cache_env_mode(on=False)
 
-        if logpsi_sigma_grad.abs().max() > 1e7:
-            print(f"    RANK{RANK} Warning: Large gradient encountered: max|grad| = {logpsi_sigma_grad.abs().max():.10g}, psi_sigma = {psi_sigma.item():.10g}")
+        if DEBUG:
+            if logpsi_sigma_grad.abs().max() > 1e7:
+                print(f"    RANK{RANK} Warning: Large gradient encountered: max|grad| = {logpsi_sigma_grad.abs().max():.10g}, psi_sigma = {psi_sigma.item():.10g}, sigma = {sigma.cpu().numpy()}")
+                raise ValueError("Large gradient encountered.")
 
         # compute the connected non-zero operator matrix elements <eta|O|sigma>
         time2 = MPI.Wtime()
@@ -712,7 +714,7 @@ class Sampler(AbstractSampler):
         op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
 
         if DEBUG:
-            if abs(op_loc) > 1e3:
+            if abs(op_loc) > 1e4:
                 print(f"    RANK{RANK} Local Energy: {op_loc} Amplitude: {psi_sigma.item():.10g} Gradient mean: {np.mean(abs(logpsi_sigma_grad))}")
 
         self.sample_time += (time1 - time0) # for profiling purposes
