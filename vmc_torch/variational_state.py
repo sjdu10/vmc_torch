@@ -29,6 +29,7 @@ class Variational_State:
         self.equal_partition = sampler.equal_partition
         self.logamp_grad_matrix = None
         self.mean_logamp_grad = None
+        self.local_op_vec = None
         self.dtype = dtype
         self.iprint = iprint
         self.eager_sampling_time = None
@@ -89,6 +90,7 @@ class Variational_State:
         """Clear the memory of the variational state."""
         self.logamp_grad_matrix = None
         self.mean_logamp_grad = None
+        self.local_op_vec = None
         self.reset()
 
     def update_state(self, new_param_vec):
@@ -168,6 +170,14 @@ class Variational_State:
         else:
             # should be computed during sampling
             return self.logamp_grad_matrix, self.mean_logamp_grad
+    
+    def get_loc_energy_vec(self):
+        """Return the local energy vector."""
+        if self.sampler is None:
+            raise ValueError("Sampler must be provided for sampling!")
+        else:
+            # should be computed during sampling
+            return self.local_op_vec
     
 
     def full_hi_expect_and_grad(self, op):
@@ -523,6 +533,7 @@ class Variational_State:
         local_op_logamp_grad_product_sum = local_samples[2]
         local_op_var = local_samples[3]
         local_logamp_grad_matrix = local_samples[4]
+        local_op_vec = local_samples[5]
         n_local_samples = local_logamp_grad_matrix.shape[1]
         total_sample_Ns = COMM.allreduce(n_local_samples, op=MPI.SUM)
 
@@ -544,6 +555,7 @@ class Variational_State:
         # each rank has their local batch of logamp_grad_matrix, but shares the same mean_logamp_grad
         self.logamp_grad_matrix = local_logamp_grad_matrix
         self.mean_logamp_grad = mean_logamp_grad
+        self.local_op_vec = local_op_vec
 
         # compute the total sample variance
         if n_local_samples > 0:

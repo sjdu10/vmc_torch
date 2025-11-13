@@ -212,6 +212,8 @@ class VMC:
                     print(f"{'Equal sampling time':<30} | {self._state.equal_sampling_time:>12.4f}")
                 if type(self.preconditioner) is SR:
                     print(f"{f'SR solver time (conv={self.preconditioner.sr_convergence})':<30} | {self.preconditioner.sr_time:>12.4f}")
+                if type(self.preconditioner) is minSR:
+                    print(f"{'minSR solver time':<30} | {self.preconditioner.minSR_time:>12.4f}")
                 
             # print(self._state.sampler.sample_time, self._state.sampler.local_energy_time)
             self._state.sampler.sample_time = 0
@@ -275,7 +277,7 @@ class VMC:
                         }
                         combined_data['optimizer_state'] = optimizer_state
 
-                    if step % save_every == 0:
+                    if step % save_every == 0 or step == stop - 1:
                         torch.save(combined_data, params_path)
 
                     # update the MC_energy_stats.json

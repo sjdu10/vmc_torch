@@ -666,7 +666,7 @@ class Sampler(AbstractSampler):
             op_loc_var = np.var(op_loc_vec, ddof=1)
         else:
             op_loc_var = 0
-        samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
+        samples = (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, op_loc_vec)
         self.attempts = 0
         self.accepts = 0
         return samples

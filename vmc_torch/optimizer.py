@@ -192,7 +192,7 @@ class SR(Preconditioner):
                     # for i in range(logamp_grad_matrix.shape[1]):
                     #     x_out += np.dot(logamp_grad_matrix[:, i], x)*logamp_grad_matrix[:, i]
                     # use matrix multiplication for speedup
-                    x_out = np.dot(logamp_grad_matrix, np.dot(logamp_grad_matrix.T, x))
+                    x_out = do('dot', logamp_grad_matrix, do('dot', logamp_grad_matrix.T, x))
                     x_out = x_out/state.Ns
                     x_out -= np.dot(mean_logamp_grad, x)*mean_logamp_grad
                     return x_out + eta*x 
@@ -217,7 +217,35 @@ class minSR(Preconditioner):
 
     Need to send all logamp_grad vectors to rank 0 to form the dense O_sk matrix, then take pseudo-inverse.
     """
-    ...
+    def __call__(self, state, *args, **kwargs):
+        """Solve the linear equation in rank 0 after sending all logamp_grad vectors to rank 0 from all ranks."""
+        local_logamp_grad_matrix, mean_logamp_grad = state.get_logamp_grad_matrix()
+        # gather all local logamp_grad_matrix to rank 0 in a specific ordering (rank0, rank1, ..., rankN)
+        logamp_grad_matrix_list = COMM.gather(local_logamp_grad_matrix, root=0)
+
+        local_E_s = state.get_loc_energy_vec() # shape (Ns,)
+        E_s_list = COMM.gather(local_E_s, root=0)
+        if RANK != 0:
+            # All ranks but rank 0 return zeros
+            return torch.zeros(state.Np, dtype=self.dtype)
+        
+        logamp_grad_matrix = np.concatenate(logamp_grad_matrix_list, axis=1)
+        E_s = np.concatenate(E_s_list, axis=0) # shape (Ns,)
+        Ns = logamp_grad_matrix.shape[1]
+        O_sk = (logamp_grad_matrix - mean_logamp_grad[:, np.newaxis]).T/np.sqrt(Ns) # shape (Ns, Np)
+        T = do('dot', O_sk, O_sk.conj().T) # shape (Ns, Ns)
+        E_s = (E_s - np.mean(E_s))/np.sqrt(Ns) # shape (Ns,)
+
+        # need to solve O_sk * dp = E_s in the least square sense, using the pseudo-inverse of O_sk to get the minimum norm solution
+        t0 = time.time()
+        T_inv = scipy.linalg.pinv(T, rtol=1e-12, atol=0) # shape (Ns, Ns)
+        t1 = time.time()
+        self.minSR_time = t1 - t0
+        dp = do('dot', O_sk.conj().T, do('dot', T_inv, E_s)) # dp = O_sk^dagger * T_inv * E_s, shape (Np,)
+        return torch.tensor(dp, dtype=self.dtype)
+
+        
+
 
 #------------------------------------------------------------
 # Scheduler
