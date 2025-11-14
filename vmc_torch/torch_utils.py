@@ -177,13 +177,14 @@ class QR(torch.autograd.Function):
         #     print(R)
         #     raise ValueError
         
-        inds = torch.abs(diag) < 1e-6
-        if sum(inds) > 0: # rank deficient, revert to svd
-            # print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
-            U,S,Vh = SVDforward(A)
-            SVh = S.reshape((S.size(0),1)) * Vh
-            self.save_for_backward(U, S, Vh)
-            return U, SVh
+        if A.requires_grad:
+            inds = torch.abs(diag) < 1e-6
+            if sum(inds) > 0: # rank deficient, revert to svd if require gradient
+                # print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
+                U,S,Vh = SVDforward(A)
+                SVh = S.reshape((S.size(0),1)) * Vh
+                self.save_for_backward(U, S, Vh)
+                return U, SVh
 
         if fix_sign:
             sign = torch.sign(diag).reshape((1,-1))
@@ -195,11 +196,12 @@ class QR(torch.autograd.Function):
     @staticmethod
     def backward(self, dQ, dR):
         M1,M2,M3 = self.saved_tensors
-        if len(M2.size())==1: # rank-deficient, do svd
+        # if len(M2.size())==1:
+        if M2.ndim==1: # in the forward we used SVD instead of QR due to rank deficiency (zeros on R's diagonal), and M2 is S here
             U,S,Vh = M1,M2,M3
             dU,dSVh = dQ,dR
-            dS = torch.diag(dSVh @ Vh.t())
-            dVh = S.reshape((S.size(0),1)) * dSVh
+            dS = torch.diag(dSVh @ Vh.t()) # dU is actually \partial(L)/\partial(U)
+            dVh = S.reshape((S.size(0),1)) * dSVh # Chain rule to get dVh, as d(SVh) = \partial(L)/\partial(SVh)
             return SVDbackward(dU,dS,dVh,U,S,Vh)
         if not torch.all(torch.isfinite(dQ)):
             raise ValueError("dQ is not finite")
@@ -266,6 +268,10 @@ class QR_tao_direct(torch.autograd.Function):
     def forward(self, A):
         Q, R = torch.linalg.qr(A)
         diag = R.diag()
+        inds = torch.abs(diag) < 1e-6
+        if sum(inds) > 0: # rank deficient, add diagonal regularization
+            # note that R can be rectangular here
+            R = R + torch.eye(R.size(0), R.size(1), dtype=R.dtype, device=R.device) * 1e-6
         if fix_sign:
             sign = torch.sign(diag).reshape((1,-1))
             Q = Q * sign
