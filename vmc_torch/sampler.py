@@ -689,7 +689,7 @@ class Sampler(AbstractSampler):
 
         # compute local energy and amplitude gradient
         vstate.set_cache_env_mode(on=True)
-        psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
+        _, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
         vstate.set_cache_env_mode(on=False)
 
         # # if DEBUG:

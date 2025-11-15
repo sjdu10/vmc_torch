@@ -177,7 +177,7 @@ class QR(torch.autograd.Function):
         #     print(R)
         #     raise ValueError
         
-        if A.requires_grad:
+        if A.requires_grad: #NOTE: RISK!: the final contraction using forward QR and forward SVD may give different results due to numerical errors
             inds = torch.abs(diag) < 1e-6
             if sum(inds) > 0: # rank deficient, revert to svd if require gradient
                 # print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
@@ -268,10 +268,9 @@ class QR_tao_direct(torch.autograd.Function):
     def forward(self, A):
         Q, R = torch.linalg.qr(A)
         diag = R.diag()
-        inds = torch.abs(diag) < 1e-6
-        if sum(inds) > 0: # rank deficient, add diagonal regularization
+        if torch.any(diag.abs() < 1e-7): # rank deficient, add diagonal regularization NOTE: this will perturb the forward result
             # note that R can be rectangular here
-            R = R + torch.eye(R.size(0), R.size(1), dtype=R.dtype, device=R.device) * 1e-6
+            R = R + torch.eye(R.size(0), R.size(1), dtype=R.dtype, device=R.device) * 1e-7
         if fix_sign:
             sign = torch.sign(diag).reshape((1,-1))
             Q = Q * sign
