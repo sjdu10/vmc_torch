@@ -93,12 +93,19 @@ class SR(Preconditioner):
         """iter_step is for iterative solvers."""
         
         if self.exact:
-            assert SIZE == 1, "Exact SR preconditioner is not supported in MPI mode."
+            # assert SIZE == 1, "Exact SR preconditioner is not supported in MPI mode."
             if energy_grad is None:
                 return torch.zeros(state.Np, dtype=self.dtype)
-            parameter_amp_grad, amp_arr = state.get_logamp_grad_matrix()
+            parameter_amp_grad, amp_arr = state.parameter_logamp_grad, state.ampx_arr
             parameter_amp_grad = parameter_amp_grad.detach().numpy()
             amp_arr = amp_arr.detach().numpy()
+            # gather from all ranks to rank0
+            parameter_amp_grad = COMM.gather(parameter_amp_grad, root=0)
+            amp_arr = COMM.gather(amp_arr, root=0)
+            if RANK != 0:
+                return torch.zeros(state.Np, dtype=self.dtype)
+            parameter_amp_grad = np.concatenate(parameter_amp_grad, axis=1)
+            amp_arr = np.concatenate(amp_arr)
             norm_sqr = np.linalg.norm(amp_arr)**2
             S = np.sum([np.outer(amp_grad, amp_grad.conj()) for amp_grad in parameter_amp_grad.T], axis=0)/norm_sqr
             weighted_amp_grad = np.sum([amp_arr[i]*parameter_amp_grad[:, i] for i in range(amp_arr.shape[0])], axis=0)/norm_sqr

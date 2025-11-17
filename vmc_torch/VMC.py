@@ -159,6 +159,7 @@ class VMC:
                 state_MC_energy, state_MC_loss_grad = self._state.expect_and_grad(self._hamiltonian)
             else:
                 state_MC_energy, state_MC_loss_grad = self._state.expect_and_grad(self._hamiltonian, message_tag=step)
+
             state_MC_loss_grad = COMM.bcast(state_MC_loss_grad, root=0)
             
             MC_energy_stats['mean'].append(state_MC_energy['mean'])
@@ -172,7 +173,7 @@ class VMC:
             if torch.isnan(preconditioned_grad).any() or torch.isinf(preconditioned_grad).any():
                 raise ValueError("Preconditioned gradient contains NaN or Inf!")
 
-            if SIZE > 1:
+            if SIZE > 1 and self._state.sampler is not None:
                 # collect rank1 sample time in rank 0
                 if RANK==1:
                     sample_time = np.array(self._state.sampler.sample_time)
@@ -194,40 +195,45 @@ class VMC:
             COMM.Barrier() # Synchronize all ranks
             
             if RANK == 0:
-                # For debugging purposes, print out the sampler's sample time and local energy time on rank 1
-                # Note: this is only for debugging purposes, it can be removed in production runs
-                print(f"{'Metric':<30} | {'Time (s)':>12}")
-                print("-" * 44)
-                print(f"{'Burn-in time':<30} | {self._state.sampler.burn_in_time:>12.4f}")
-                print(f"{'Rank 1: Chain sample time':<30} | {self._state.sampler.sample_time:>12.4f}")
-                print(f"{'Rank 1: Local energy time':<30} | {self._state.sampler.local_energy_time:>12.4f}")
-                print(f"{'Rank 1: Gradient time':<30} | {self._state.sampler.grad_time:>12.4f}")
-                if self._state.MPI_communication_time is not None:
-                    print(f"{'MPI comm time':<30} | {self._state.MPI_communication_time:>12.4f}")
-                print(f"{'=':<30} | {'=':>12.4}")
-                
-                if self._state.eager_sampling_time is not None:
-                    print(f"{'Eager sampling time':<30} | {self._state.eager_sampling_time:>12.4f}")
-                elif self._state.equal_sampling_time is not None:
-                    print(f"{'Equal sampling time':<30} | {self._state.equal_sampling_time:>12.4f}")
-                if type(self.preconditioner) is SR:
-                    print(f"{f'SR solver time (conv={self.preconditioner.sr_convergence})':<30} | {self.preconditioner.sr_time:>12.4f}")
-                if type(self.preconditioner) is minSR:
-                    print(f"{'minSR solver time':<30} | {self.preconditioner.minSR_time:>12.4f}")
+                if self._state.sampler is not None:
+                    # For debugging purposes, print out the sampler's sample time and local energy time on rank 1
+                    # Note: this is only for debugging purposes, it can be removed in production runs
+                    print(f"{'Metric':<30} | {'Time (s)':>12}")
+                    print("-" * 44)
+                    print(f"{'Burn-in time':<30} | {self._state.sampler.burn_in_time:>12.4f}")
+                    print(f"{'Rank 1: Chain sample time':<30} | {self._state.sampler.sample_time:>12.4f}")
+                    print(f"{'Rank 1: Local energy time':<30} | {self._state.sampler.local_energy_time:>12.4f}")
+                    print(f"{'Rank 1: Gradient time':<30} | {self._state.sampler.grad_time:>12.4f}")
+                    if self._state.MPI_communication_time is not None:
+                        print(f"{'MPI comm time':<30} | {self._state.MPI_communication_time:>12.4f}")
+                    print(f"{'=':<30} | {'=':>12.4}")
+                    
+                    if self._state.eager_sampling_time is not None:
+                        print(f"{'Eager sampling time':<30} | {self._state.eager_sampling_time:>12.4f}")
+                    elif self._state.equal_sampling_time is not None:
+                        print(f"{'Equal sampling time':<30} | {self._state.equal_sampling_time:>12.4f}")
+                    if type(self.preconditioner) is SR:
+                        print(f"{f'SR solver time (conv={self.preconditioner.sr_convergence})':<30} | {self.preconditioner.sr_time:>12.4f}")
+                    if type(self.preconditioner) is minSR:
+                        print(f"{'minSR solver time':<30} | {self.preconditioner.minSR_time:>12.4f}")
                 
             # print(self._state.sampler.sample_time, self._state.sampler.local_energy_time)
-            self._state.sampler.sample_time = 0
-            self._state.sampler.local_energy_time = 0
-            self._state.sampler.grad_time = 0
+            if self._state.sampler is not None:
+                self._state.sampler.sample_time = 0
+                self._state.sampler.local_energy_time = 0
+                self._state.sampler.grad_time = 0
 
             if RANK == 0:
-                print('Energy: {}, Err: {}, \nMAX gi: {}, Max SR gi (optional): {}, Max param: {}\n'.format(
-                    state_MC_energy['mean'], 
-                    state_MC_energy['error'], 
-                    np.max(np.abs(state_MC_loss_grad)), 
-                    np.max(np.abs(preconditioned_grad.detach().numpy())), 
-                    np.max(np.abs(self._state.params_vec.detach().numpy())))
-                )
+                try:
+                    print('Energy: {}, Err: {}, \nMAX gi: {}, Max SR gi (optional): {}, Max param: {}\n'.format(
+                        state_MC_energy['mean'], 
+                        state_MC_energy['error'], 
+                        np.max(np.abs(state_MC_loss_grad)), 
+                        np.max(np.abs(preconditioned_grad.detach().numpy())), 
+                        np.max(np.abs(self._state.params_vec.detach().numpy())))
+                    )
+                except Exception:
+                    print('Energy: {}, Err: {}'.format(state_MC_energy['mean'], state_MC_energy['error']))
                 pbar.update(1)
                 # Compute the new parameter vector
                 new_param_vec = self._optimizer.compute_update_params(self._state.params_vec, preconditioned_grad) # Subroutine: rank 0 computes new parameter vector based on the gradient

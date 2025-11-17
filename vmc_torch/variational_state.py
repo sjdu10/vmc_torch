@@ -25,11 +25,13 @@ class Variational_State:
         self.sampler = sampler
         self.Np = vstate_func.num_params
         self.hi = sampler.hi if sampler is not None else hi
-        self.Ns = sampler.Ns if sampler is not None else self.hi.n_states
-        self.equal_partition = sampler.equal_partition
+        self.Ns = sampler.Ns if sampler is not None else self.hi.size
+        self.equal_partition = sampler.equal_partition if sampler is not None else True
         self.logamp_grad_matrix = None
         self.mean_logamp_grad = None
         self.local_op_vec = None
+        self.parameter_logamp_grad = None # used in full hi calculations
+        self.ampx_arr = None # used in full hi calculations
         self.dtype = dtype
         self.iprint = iprint
         self.eager_sampling_time = None
@@ -148,23 +150,28 @@ class Variational_State:
 
     def full_hi_logamp_grad_matrix(self):
         """Construct the full Np x Ns matrix of amplitude gradients."""
-        parameter_logamp_grad = torch.zeros((self.Np, self.hi.n_states), dtype=self.dtype)
         all_config = self.hi.all_states()
-        ampx_arr = torch.zeros((self.hi.n_states,), dtype=self.dtype)
+        # divide the full hi into batches to each MPI rank
+        period = self.hi.size // SIZE
+        local_configs = all_config[RANK*period : (RANK+1)*period]
+        parameter_logamp_grad = torch.zeros((self.Np, local_configs.shape[0]), dtype=self.dtype)
+        ampx_arr = torch.zeros((local_configs.shape[0],), dtype=self.dtype)
 
-        for i, config in enumerate(all_config):
+        for i, config in enumerate(local_configs):
             ampx, ampx_dp = self.amplitude_grad(config)
             parameter_logamp_grad[:, i] = ampx_dp
             ampx_arr[i] = ampx
-
-        return parameter_logamp_grad, ampx_arr
+        
+        self.parameter_logamp_grad = parameter_logamp_grad
+        self.ampx_arr = ampx_arr
+        
     
 
     def get_logamp_grad_matrix(self):
         """Return the amplitude gradient matrix."""
         if self.logamp_grad_matrix is None:
             if self.sampler is None and self.hi is not None:
-                return self.full_hi_logamp_grad_matrix()
+                return self.parameter_logamp_grad, self.ampx_arr
             else:
                 raise ValueError("Sampler must be provided for sampling!")
         else:
@@ -184,20 +191,51 @@ class Variational_State:
         """Full Hilbert space expectation value and gradient calculation.
         Only for sanity check on small systems.
         """
-        hi = op.hilbert # netket hilbert object
-        all_config = hi.all_states()
-        all_config = np.asarray(all_config)
-        psi = self.vstate_func(all_config)
-        psi = psi/do('linalg.norm', psi)
-        
-        op_dense = torch.tensor(op.to_dense(), dtype=self.dtype)
-        expect_op = psi.conj().T@(op_dense@psi)
+        self.full_hi_logamp_grad_matrix() # cache the psi_i(n)/psi(n) and psi(n)
+        # # old implementation: construct the full wavefunction and full operator matrix
+        # hi = op.hilbert
+        # all_config = hi.all_states()
+        # all_config = np.asarray(all_config)
+        # psi = self.vstate_func(all_config)
+        # psi = psi/do('linalg.norm', psi)
+        # op_dense = torch.tensor(op.to_dense(), dtype=self.dtype)
+        # expect_op = psi.conj().T@(op_dense@psi)
 
-        expect_op.backward()
-        op_grad = self.vstate_func.params_grad_to_vec()
-        stats_dict = {'mean': float(expect_op.detach().numpy()), 'variance': 0., 'error': 0.}
+        # Gather all local psi(n) and psi_i(n)/psi(n) from all ranks to rank 0
+        COMM.Barrier()
+        ampx_arr = COMM.gather(self.ampx_arr, root=0)
+        parameter_logamp_grad = COMM.gather(self.parameter_logamp_grad, root=0)
+        if RANK == 0:
+            ampx_arr = torch.cat(ampx_arr)
+            parameter_logamp_grad = torch.cat(parameter_logamp_grad, dim=1)
+            # new implementation: use the cached psi(n), psi_i(n)/psi(n)
+            weights = ampx_arr.abs()**2
+            E_loc_vec = []
+            for i, config in enumerate(self.hi.all_states()):
+                eta, O_etasigma = op.get_conn(config)
+                psi_eta = self.amplitude(eta)
+                psi_sigma = ampx_arr[i].cpu().detach().numpy()
+                psi_eta = psi_eta.cpu().detach().numpy()
+                E_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+                E_loc_vec.append(E_loc)
+
+            E_loc_vec = torch.tensor(E_loc_vec, dtype=self.dtype)
+            norm_sqr = torch.sum(weights)
+            expect_op = torch.sum(weights * E_loc_vec)/norm_sqr
+            op_grad = torch.zeros((self.Np,), dtype=self.dtype)
+
+            expect_amp_grad = torch.sum(weights.unsqueeze(0) * parameter_logamp_grad, dim=1)/norm_sqr # <dlnpsi/dp>
+            expect_E_loc_amp_grad = torch.sum(weights.unsqueeze(0) * E_loc_vec.unsqueeze(0) * parameter_logamp_grad, dim=1)/norm_sqr # <E_loc dlnpsi/dp>
+            op_grad = 2*(expect_E_loc_amp_grad - expect_op * expect_amp_grad)
+        else:
+            expect_op = None
+            op_grad = None
+
+        # op_grad = self.vstate_func.params_grad_to_vec()
+        stats_dict = {'mean': float(expect_op.detach().numpy()) if expect_op is not None else None, 'variance': 0., 'error': 0.}
         # Clear the gradient
         self.reset()
+        
         return stats_dict, op_grad
         
     def expect_and_grad(self, op, full_hi=False, message_tag=None):
@@ -213,7 +251,12 @@ class Variational_State:
             torch.tensor: The gradient of the loss function with respect to the parameters.
         """
         if full_hi or self.sampler is None:
-            return self.full_hi_expect_and_grad(op)
+            t0 = MPI.Wtime()
+            stats_dict, op_grad = self.full_hi_expect_and_grad(op)
+            t1 = MPI.Wtime()
+            if RANK == 0:
+                print('Full hi expect_and_grad time: {}'.format(t1-t0))
+            return stats_dict, op_grad
         
         if self.equal_partition:
             chain_length = self.Ns//SIZE # Number of samples per rank

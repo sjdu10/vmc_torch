@@ -45,7 +45,7 @@ def SVDforward(A):
         raise ValueError("input matrix to custom SVD is not finite")
     try:
         U, S, Vh = torch.linalg.svd(A,full_matrices=False)
-    except:
+    except Exception:
         if be_verbose:
             print('trouble in torch gesdd routine, falling back to gesvd')
         U, S, Vh = scipy.linalg.svd(A.detach().numpy(), full_matrices=False, lapack_driver='gesvd')
@@ -53,8 +53,8 @@ def SVDforward(A):
         S = torch.from_numpy(S)
         Vh = torch.from_numpy(Vh)
 
-    if is_one(S): # A is isometry
-        raise ValueError
+    # if is_one(S): # A is isometry
+    #     raise ValueError
 
     if fix_sign:
         # make SVD result sign-consistent across multiple runs
@@ -68,6 +68,7 @@ def SVDbackward(dU,dS,dVh,U,S,Vh):
     if not torch.all(torch.isfinite(dU)):
         raise ValueError("dU is not finite")
     if not torch.all(torch.isfinite(dS)):
+        print(dS, S)
         raise ValueError("dS is not finite")
     if not torch.all(torch.isfinite(dVh)):
         raise ValueError("dVh is not finite")

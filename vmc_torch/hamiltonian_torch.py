@@ -59,8 +59,12 @@ class SpinfulFermion(Hilbert):
     
     @property
     def size(self):
-        """Actually returns the number of orbitals.. TODO: change to a better name"""
-        return self.n_orbitals
+        """Number of states in the Hilbert space"""
+        # Use combinatorial formula to calculate size
+        from math import comb
+        size_up = comb(self.n_orbitals // 2, self.n_fermions_spin_up)
+        size_down = comb(self.n_orbitals // 2, self.n_fermions_spin_down)
+        return size_up * size_down
 
     
     def _all_states(self):
@@ -120,8 +124,18 @@ class Spin(Hilbert):
         self.N = N
         self.total_sz = total_sz
         if self.total_sz is not None:
-            assert type(self.total_sz) == int, "total_sz must be an integer for spin-1/2 sites"
-        self._size = int(2 * s + 1) ** N
+            assert isinstance(self.total_sz, int), "total_sz must be an integer for spin-1/2 sites"
+        self._size = int(2 * s + 1) ** N # total number of states in the Hilbert space without total_sz constraint
+    
+    @property
+    def size(self):
+        """Number of states in the Hilbert space"""
+        if self.total_sz is not None:
+            su = int(self.N/2 + self.total_sz/self.s/2)
+            from math import comb
+            return comb(self.N, su)
+        else:
+            return self._size
     
     def from_netket_to_quimb_spin_config(self, config):
         """From (-1,1) to (0,1) basis"""
@@ -456,6 +470,22 @@ class spin_Heisenberg_square_lattice_torch(Hamiltonian):
         H, hi, graph = square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=pbc, total_sz=total_sz)
         super().__init__(H, hi, graph)
     
+    def to_dense(self):
+        """Convert the Hamiltonian to a dense matrix representation."""
+        size = self.hilbert.size
+        H_matrix = np.zeros((size, size), dtype=np.float64)
+        all_states = self.hilbert.all_states()
+        state_index_map = {tuple(state): idx for idx, state in enumerate(all_states)}
+        
+        for idx, sigma in enumerate(all_states):
+            connected_configs, coeffs = self.get_conn(sigma)
+            for eta, coeff in zip(connected_configs, coeffs):
+                eta_tuple = tuple(eta)
+                jdx = state_index_map[eta_tuple]
+                H_matrix[jdx, idx] += coeff
+
+        return H_matrix
+    
     def get_conn(self, sigma_quimb):
         """
         Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
@@ -522,6 +552,22 @@ class spin_Heisenberg_chain_torch(Hamiltonian):
         """
         H, hi, graph = chain_spin_Heisenberg(L, J, pbc=pbc, total_sz=total_sz)
         super().__init__(H, hi, graph)
+    
+    def to_dense(self):
+        """Convert the Hamiltonian to a dense matrix representation."""
+        size = self.hilbert.size
+        H_matrix = np.zeros((size, size), dtype=np.float64)
+        all_states = self.hilbert.all_states()
+        state_index_map = {tuple(state): idx for idx, state in enumerate(all_states)}
+        
+        for idx, sigma in enumerate(all_states):
+            connected_configs, coeffs = self.get_conn(sigma)
+            for eta, coeff in zip(connected_configs, coeffs):
+                eta_tuple = tuple(eta)
+                jdx = state_index_map[eta_tuple]
+                H_matrix[jdx, idx] += coeff
+                
+        return H_matrix
     
     def get_conn(self, sigma_quimb):
         """
