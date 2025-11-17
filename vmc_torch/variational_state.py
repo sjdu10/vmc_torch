@@ -281,7 +281,7 @@ class Variational_State:
 
         return stats_dict, op_grad
     
-    def expect(self, op, full_hi=False, message_tag=None, vec_op=False):
+    def expect(self, op, full_hi=False, message_tag=None, vec_op=False, pgbar=True):
         """
         Compute the expectation value of the operator `op`.
 
@@ -311,7 +311,7 @@ class Variational_State:
 
             # use MPI for sampling, but sampler may have different number of samples per rank
             t0 = MPI.Wtime()
-            op_expect, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag, vec_op=vec_op)
+            op_expect, op_var, op_err = self.collect_samples_eager(op, message_tag=message_tag, vec_op=vec_op, pgbar=pgbar)
             t1 = MPI.Wtime()
             self.eager_sampling_time = t1 - t0
         
@@ -323,7 +323,7 @@ class Variational_State:
     
     
     
-    def collect_samples(self, op, chain_length=1, vec_op=False):
+    def collect_samples(self, op, chain_length=1, vec_op=False, pgbar=True):
         """
             Rank 0 returns the expectation value, variance, and error of the operator.
         """
@@ -334,7 +334,7 @@ class Variational_State:
         # this should be a list of local samples statistics:
         # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat, W_loc, chain_means_loc)
         t_sample_start = MPI.Wtime()
-        local_samples = self.sampler.sample(op=op, vstate=vstate, chain_length=chain_length, vec_op=vec_op)
+        local_samples = self.sampler.sample(op=op, vstate=vstate, chain_length=chain_length, vec_op=vec_op, pgbar=pgbar)
         self.clear_cache()
         t_sample_end = MPI.Wtime()
         # if DEBUG:
@@ -402,7 +402,7 @@ class Variational_State:
             return None, None, None
     
 
-    def collect_samples_eager(self, op, message_tag=None, vec_op=False):
+    def collect_samples_eager(self, op, message_tag=None, vec_op=False, pgbar=True):
         vstate = self
         
         # Sample on each rank
@@ -410,7 +410,7 @@ class Variational_State:
         # a tuple of (op_loc_sum, logpsi_sigma_grad_sum, op_logpsi_sigma_grad_product_sum, op_loc_var, logpsi_sigma_grad_mat)
 
         t_sample_start = MPI.Wtime()
-        local_samples = self.sampler.sample_eager(op=op, vstate=vstate, message_tag=message_tag, vec_op=vec_op)
+        local_samples = self.sampler.sample_eager(op=op, vstate=vstate, message_tag=message_tag, vec_op=vec_op, pgbar=pgbar)
         self.clear_cache()
         t_sample_end = MPI.Wtime()
         # if DEBUG:

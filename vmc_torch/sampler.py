@@ -236,7 +236,7 @@ class Sampler(AbstractSampler):
 
         
 
-    def sample(self, vstate, op, chain_length=1, vec_op=False):
+    def sample(self, vstate, op, chain_length=1, vec_op=False, pgbar=True, **kwargs):
         """
         Sample configurations and compute the local operator.
         
@@ -271,7 +271,8 @@ class Sampler(AbstractSampler):
         op_loc_var = 0
         op_loc_vec = np.zeros(chain_length)
 
-        if RANK == 0:
+        if RANK == 0 and pgbar:
+            pbar_dummy = tqdm(total=0, bar_format='MCMC sampling for <O>:', leave=False)
             pbar = tqdm(total=chain_length, desc='Sampling starts for rank 0...')
         
         for chain_step in range(chain_length):
@@ -311,7 +312,7 @@ class Sampler(AbstractSampler):
             op_loc_M2 += (op_loc - op_loc_mean_prev) * (op_loc - op_loc_mean)
 
             time1 = MPI.Wtime()
-            if RANK == 0:
+            if RANK == 0 and pgbar:
                 pbar.set_postfix({'Time per sample for each rank': (time1 - time0)})
 
             # update the sample variance
@@ -319,7 +320,7 @@ class Sampler(AbstractSampler):
                 op_loc_var = op_loc_M2 / (n - 1)
 
             # add a progress bar if rank == 0
-            if RANK == 0:
+            if RANK == 0 and pgbar:
                 pbar.update(1)
         
         vstate.clear_env_cache()
@@ -327,8 +328,9 @@ class Sampler(AbstractSampler):
         if self.reset_chain:
             self.reset()
 
-        if RANK == 0:
+        if RANK == 0 and pgbar:
             pbar.close()
+            pbar_dummy.close()
         
         if not vec_op:
             # The following is for computing the Rhat diagnostic using the Gelman-Rubin formula
@@ -347,7 +349,7 @@ class Sampler(AbstractSampler):
         return samples
     
     @torch.no_grad()
-    def sample_eager(self, vstate, op, message_tag=None, **kwargs):
+    def sample_eager(self, vstate, op, message_tag=None, pgbar=False, **kwargs):
         """Sample eagerly for the local energy and amplitude gradient for each configuration.
         return a tuple of (op_loc_sum, op_loc_var, n)"""
         assert not self.equal_partition, 'Must not use equal partition for eager sampling.'
@@ -370,7 +372,11 @@ class Sampler(AbstractSampler):
         terminate = np.array([0], dtype=np.int32)
 
         if RANK == 0:
-            pbar = tqdm(total=self.Ns, desc='Sampling starts...')
+            if pgbar:
+                pbar_dummy = tqdm(total=0, bar_format='MCMC sampling for <O>:', leave=False)
+                pbar = tqdm(total=self.Ns, desc='Sampling starts...')
+            else:
+                pbar = None
             for _ in range(2):
                 op_loc, _ = self._sample_expect(vstate, op, **kwargs)
                 op_loc_vec.append(op_loc)
@@ -378,7 +384,10 @@ class Sampler(AbstractSampler):
 
                 n += 1
                 n_total += 1
-                pbar.update(1)
+                if pgbar:
+                    pbar.update(1)
+                    pbar.set_postfix('')
+                    pbar.refresh()
             
             # Discard messages from previous steps
             while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1):
@@ -392,7 +401,11 @@ class Sampler(AbstractSampler):
                 COMM.Recv([buf, MPI.INT],source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET)
                 dest_rank = buf[0]
                 n_total += 1
-                pbar.update(1)
+                if pgbar:
+                    pbar.update(1)
+                    pbar.set_postfix('')
+                    pbar.refresh()
+
                 # Check if we have enough samples
                 if n_total >= self.Ns:
                     terminate = np.array([1], dtype=np.int32)
@@ -401,7 +414,9 @@ class Sampler(AbstractSampler):
                 # Send the termination signal to the rank
                 COMM.Send([terminate, MPI.INT], dest=dest_rank, tag=message_tag+1)
 
-            pbar.close()
+            if pgbar:
+                pbar.close()
+                pbar_dummy.close()
         
         else:
             while not terminate[0]:
@@ -423,9 +438,6 @@ class Sampler(AbstractSampler):
         
         if self.reset_chain:
             self.reset()
-        
-        if RANK == 0:
-            pbar.close()
         
         # convert the list to numpy array
         op_loc_vec = np.asarray(op_loc_vec)
