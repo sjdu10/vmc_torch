@@ -289,6 +289,22 @@ class Hamiltonian(Operator):
     def __init__(self, H, hi, graph):
         super().__init__(H, hi, graph)
     
+    def to_dense(self):
+        """Convert the Hamiltonian to a dense matrix representation."""
+        size = self.hilbert.size
+        H_matrix = np.zeros((size, size), dtype=np.float64)
+        all_states = self.hilbert.all_states()
+        state_index_map = {tuple(state): idx for idx, state in enumerate(all_states)}
+        
+        for idx, sigma in enumerate(all_states):
+            connected_configs, coeffs = self.get_conn(sigma)
+            for eta, coeff in zip(connected_configs, coeffs):
+                eta_tuple = tuple(eta)
+                jdx = state_index_map[eta_tuple]
+                H_matrix[jdx, idx] += coeff
+                
+        return H_matrix
+    
     @property
     def H(self):
         return self._H
