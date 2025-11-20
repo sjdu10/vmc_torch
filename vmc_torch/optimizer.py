@@ -111,7 +111,9 @@ class SR(Preconditioner):
             weighted_amp_grad = np.sum([amp_arr[i]*parameter_amp_grad[:, i] for i in range(amp_arr.shape[0])], axis=0)/norm_sqr
             S -= np.outer(weighted_amp_grad, weighted_amp_grad.conj())
             R = S + self.diag_eta*np.eye(S.shape[0])
-            dp = scipy.linalg.solve(R, energy_grad.detach().numpy())
+            # dp = scipy.linalg.solve(R, energy_grad.detach().numpy())
+            # use pseudo-inverse in case R is singular
+            dp = scipy.linalg.pinv(R, rtol=1e-12) @ energy_grad.detach().numpy()
             return torch.tensor(dp, dtype=self.dtype)
 
         if self.dense:

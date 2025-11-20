@@ -279,7 +279,7 @@ class circuit_TNF(wavefunctionModel):
         psi = self.get_state()
         batch_amps = []
         for x_i in x:
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
             
             amp = psi.get_amp(x_i)
@@ -310,10 +310,6 @@ class circuit_TNF(wavefunctionModel):
             
         return torch.stack(batch_amps)
 
-
-
-
-        
 
 class PEPS_model(wavefunctionModel):
     def __init__(self, peps, max_bond=None):
@@ -355,11 +351,16 @@ class PEPS_model(wavefunctionModel):
                 amp.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[peps.Ly//2, peps.Ly-1],canonize=True)
                 amp_val = amp.contract()
                 return amp_val
+            
+        batch_amps = []
+        for x_i in x:
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            amp_val = func(x_i)
+            batch_amps.append(amp_val)
         
-        if x.ndim == 1:
-            return func(x)
-        else:
-            return torch.stack([func(xi) for xi in x])
+        return torch.stack(batch_amps)
+
 
 class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
     """

@@ -602,3 +602,155 @@ class spin_Heisenberg_chain_torch(Hamiltonian):
                 connected_config_coeff[tuple(eta0)] += 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
 
         return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
+
+
+def chain_spin_transverse_Ising(L, J, h, pbc=False, total_sz=None):
+    # Build chain with nearest neighbor edges
+    N = L
+    hi = Spin(s=1/2, N=N, total_sz=total_sz)  # Spin-1/2 Hilbert space
+    graph = Chain(L, pbc)
+    # Ising with coupling J for nearest neighbors
+    H = dict()
+    for i, j in graph.edges():
+        # Add the Ising term for the edge (i, j)
+        # The transverse field Ising Hamiltonian is J * S_i^z S_j^z + h * S_i^x
+        # H = \sum_<i,j> J * S_i^z S_j^z + h * S_i^x
+        # Note S = 1/2\sigma
+        if type(J) is dict:
+            # If J is a dictionary, use the specific coupling for the edge (i,j)
+            J_value = J.get((i, j), 0)
+            H[(i, j), 'zz'] = J_value
+        else:
+            H[(i, j), 'zz'] = J
+    for i in range(N):
+        H[(i, 'x')] = h
+    
+    return H, hi, graph
+
+class spin_transverse_Ising_chain_torch(Hamiltonian):
+    def __init__(self, L, J, h, pbc=False, total_sz=None):
+        """
+        Implementation of spin-1/2 transverse field Ising model on a chain using torch.
+        Args:
+            J: Coupling constant (can be a dict for edge-specific couplings)
+            h: Transverse field strength
+            pbc: Whether to use periodic boundary conditions
+            total_sz: If given, constrains the total spin of system to a particular value.
+        """
+        H, hi, graph = chain_spin_transverse_Ising(L, J, h, pbc=pbc, total_sz=total_sz)
+        super().__init__(H, hi, graph)
+
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        connected_config_coeff = dict()
+        sigma = np.array(sigma_quimb)
+        for key, value in self._H.items():
+            if len(key) == 2 and key[1] == 'zz':
+                # ZZ interaction term
+                i, j = key[0]
+                J = value
+                eta0 = sigma.copy()
+                if tuple(eta0) not in connected_config_coeff:
+                    connected_config_coeff[tuple(eta0)] = 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
+                else:
+                    connected_config_coeff[tuple(eta0)] += 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
+            elif len(key) == 2 and key[1] == 'x':
+                # Transverse field term
+                i = key[0]
+                h = value
+                # H|sigma> = h * |eta>
+                eta = sigma.copy()
+                eta[i] = 1 - sigma[i]  # Flip the spin at site i
+                if tuple(eta) not in connected_config_coeff:
+                    connected_config_coeff[tuple(eta)] = 0.5*h
+                else:
+                    connected_config_coeff[tuple(eta)] += 0.5*h
+
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
+    
+
+def square_lattice_spin_transverse_Ising(Lx, Ly, J, h, pbc=False, total_sz=None):
+    # Build square lattice with nearest neighbor edges
+    N = Lx * Ly
+    hi = Spin(s=1/2, N=N, total_sz=total_sz)  # Spin-1/2 Hilbert space
+    graph = SquareLattice(Lx, Ly, pbc)
+    # Ising with coupling J for nearest neighbors
+    H = dict()
+    for i, j in graph.edges():
+        # Add the Ising term for the edge (i, j)
+        # The transverse field Ising Hamiltonian is J * S_i^z S_j^z + h * S_i^x
+        # H = \sum_<i,j> J * S_i^z S_j^z + h * S_i^x
+        # Note S = 1/2\sigma
+        if type(J) is dict:
+            # If J is a dictionary, use the specific coupling for the edge (i,j)
+            J_value = J.get((i, j), 0)
+            H[(i, j), 'zz'] = J_value
+        else:
+            H[(i, j), 'zz'] = J
+    for i in range(N):
+        H[(i, 'x')] = h
+    
+    return H, hi, graph
+
+class spin_transverse_Ising_square_lattice_torch(Hamiltonian):
+    def __init__(self, Lx, Ly, J, h, pbc=False, total_sz=None):
+        """
+        Implementation of spin-1/2 transverse field Ising model on a square lattice using torch.
+        Args:
+            J: Coupling constant (can be a dict for edge-specific couplings)
+            h: Transverse field strength
+            pbc: Whether to use periodic boundary conditions
+            total_sz: If given, constrains the total spin of system to a particular value.
+        """
+        H, hi, graph = square_lattice_spin_transverse_Ising(Lx, Ly, J, h, pbc=pbc, total_sz=total_sz)
+        super().__init__(H, hi, graph)
+    
+    def to_dense(self):
+        """Convert the Hamiltonian to a dense matrix representation."""
+        size = self.hilbert.size
+        H_matrix = np.zeros((size, size), dtype=np.float64)
+        all_states = self.hilbert.all_states()
+        state_index_map = {tuple(state): idx for idx, state in enumerate(all_states)}
+        
+        for idx, sigma in enumerate(all_states):
+            connected_configs, coeffs = self.get_conn(sigma)
+            for eta, coeff in zip(connected_configs, coeffs):
+                eta_tuple = tuple(eta)
+                jdx = state_index_map[eta_tuple]
+                H_matrix[jdx, idx] += coeff
+                
+        return H_matrix
+
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        connected_config_coeff = dict()
+        sigma = np.array(sigma_quimb)
+        for key, value in self._H.items():
+            if len(key) == 2 and key[1] == 'zz':
+                # ZZ interaction term
+                i, j = key[0]
+                J = value
+                eta0 = sigma.copy()
+                if tuple(eta0) not in connected_config_coeff:
+                    connected_config_coeff[tuple(eta0)] = 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
+                else:
+                    connected_config_coeff[tuple(eta0)] += 0.25*J*(-1)**(abs(sigma[i]-sigma[j]))
+            elif len(key) == 2 and key[1] == 'x':
+                # Transverse field term
+                i = key[0]
+                h = value
+                # H|sigma> = h * |eta>
+                eta = sigma.copy()
+                eta[i] = 1 - sigma[i]  # Flip the spin at site i
+                if tuple(eta) not in connected_config_coeff:
+                    connected_config_coeff[tuple(eta)] = 0.5*h
+                else:
+                    connected_config_coeff[tuple(eta)] += 0.5*h
+
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
