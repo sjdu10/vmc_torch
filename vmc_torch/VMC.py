@@ -233,7 +233,14 @@ class VMC:
                         np.max(np.abs(self._state.params_vec.detach().numpy())))
                     )
                 except Exception:
-                    print('Energy: {}, Err: {}'.format(state_MC_energy['mean'], state_MC_energy['error']))
+                    print(
+                        "Energy: {}, Err: {} \nMAX gi: {}, Max SR gi (optional): {}".format(
+                            state_MC_energy["mean"],
+                            state_MC_energy["error"],
+                            np.max(np.abs(state_MC_loss_grad.detach().numpy())),
+                            np.max(np.abs(preconditioned_grad.detach().numpy())),
+                        )
+                    )
                 pbar.update(1)
                 # Compute the new parameter vector
                 new_param_vec = self._optimizer.compute_update_params(self._state.params_vec, preconditioned_grad) # Subroutine: rank 0 computes new parameter vector based on the gradient

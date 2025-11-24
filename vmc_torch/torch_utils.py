@@ -269,13 +269,13 @@ class QR_tao_direct(torch.autograd.Function):
     def forward(self, A):
         Q, R = torch.linalg.qr(A)
         diag = R.diag()
-        if torch.any(diag.abs() < 1e-7): # rank deficient, add diagonal regularization NOTE: this will perturb the forward result
-            # note that R can be rectangular here
-            R = R + torch.eye(R.size(0), R.size(1), dtype=R.dtype, device=R.device) * 1e-7
         if fix_sign:
             sign = torch.sign(diag).reshape((1,-1))
             Q = Q * sign
             R = R * sign.t()
+        if torch.any(R.diag().abs() < 1e-7): # rank deficient, add diagonal regularization NOTE: this will perturb the forward result
+            # note that R can be rectangular here
+            R = R + torch.eye(R.size(0), R.size(1), dtype=R.dtype, device=R.device) * 1e-7
         self.save_for_backward(A, Q, R)
         return Q, R
 

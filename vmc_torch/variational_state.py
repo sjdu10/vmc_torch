@@ -118,7 +118,7 @@ class Variational_State:
             x = torch.tensor(np.asarray(x), dtype=self.dtype)
         self.reset()
         amp = self.vstate_func(x, grad=True)
-        if isinstance(self.vstate_func, fTNModel_reuse):
+        if isinstance(self.vstate_func, fTNModel_reuse) or isinstance(self.vstate_func, vmc_torch.experiment.tn_model.PEPS_model_reuse):
             try:
                 if self.vstate_func.debug:
                     amp.backward(retain_graph=retain_graph)
@@ -126,7 +126,8 @@ class Variational_State:
                 else:
                     self.vstate_func.get_grad()
                     vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
-            except Exception:
+            except Exception as e:
+                print(f"Rank {RANK} model grad debug fail: {e}")
                 raise ValueError("model grad debug fail")
 
             if DEBUG:

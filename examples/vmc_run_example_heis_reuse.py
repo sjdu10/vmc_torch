@@ -13,12 +13,12 @@ import torch
 import quimb.tensor as qtn
 import autoray as ar
 
-from vmc_torch.experiment.tn_model import PEPS_model, PEPS_NN_Model, init_weights_to_zero, PEPS_NNproj_Model, PEPS_delocalized_Model
-from vmc_torch.sampler import MetropolisSamplerSpinless
+from vmc_torch.experiment.tn_model import PEPS_model_reuse, PEPS_NN_Model, init_weights_to_zero, PEPS_NNproj_Model, PEPS_delocalized_Model
+from vmc_torch.sampler import MetropolisExchangeSamplerSpinless_2D_reusable
 from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import SGD, SR
+from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian_torch import spin_transverse_Ising_square_lattice_torch
+from vmc_torch.hamiltonian_torch import spin_Heisenberg_square_lattice_torch
 from vmc_torch.torch_utils import SVD,QR
 
 # Register safe SVD and QR functions to torch
@@ -34,8 +34,7 @@ RANK = COMM.Get_rank()
 Lx = int(4)
 Ly = int(2)
 J = 1.0
-h = 0.5
-H = spin_transverse_Ising_square_lattice_torch(Lx, Ly, J, -h, pbc=False, total_sz=None) 
+H = spin_Heisenberg_square_lattice_torch(Lx, Ly, J, total_sz=0) 
 graph = H.graph
 
 """TNS parameters"""
@@ -44,19 +43,19 @@ chi = 4*D
 dtype=torch.float64
 
 """Load Simple Update PEPS as the initial state"""
-skeleton = pickle.load(open(f"./example_data/{Lx}x{Ly}/J={J}_h={h}/D={D}/peps_skeleton.pkl", "rb"))
-peps_params = pickle.load(open(f"./example_data/{Lx}x{Ly}/J={J}_h={h}/D={D}/peps_su_params.pkl", "rb"))
+skeleton = pickle.load(open(f"./example_data/{Lx}x{Ly}/J={J}/D={D}/peps_skeleton.pkl", "rb"))
+peps_params = pickle.load(open(f"./example_data/{Lx}x{Ly}/J={J}/D={D}/peps_su_params.pkl", "rb"))
 peps = qtn.unpack(peps_params, skeleton)
 peps.apply_to_arrays(lambda x: torch.tensor(x, dtype=dtype))
 
 
 """Choose the torch model (you can create your own model of course)"""
-model = PEPS_model(peps, max_bond=chi)
+model = PEPS_model_reuse(peps, max_bond=chi)
 # model = PEPS_delocalized_Model(peps, max_bond=chi, diag=False)
 # model = PEPS_NN_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=Lx*Ly)
 # model = PEPS_NNproj_Model(peps, max_bond=chi_nn, nn_eta=1.0, nn_hidden_dim=Lx*Ly)
 model_names = {
-    PEPS_model: 'PEPS',
+    PEPS_model_reuse: 'PEPS_reuse',
     PEPS_delocalized_Model: 'PEPS_delocalized_diag='+str(model.diag) if isinstance(model, PEPS_delocalized_Model) else None,
     PEPS_NN_Model: 'PEPS_NN',
     PEPS_NNproj_Model: 'PEPS_NNproj'
@@ -85,7 +84,7 @@ N_samples = int(5e3)
 N_samples = N_samples - N_samples % SIZE + SIZE - 1
 
 """Choose the sampler""" 
-sampler = MetropolisSamplerSpinless(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=True, random_site=False, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinless_2D_reusable(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
 
 """Choose the optimizer and preconditioner"""
 optimizer = SGD(learning_rate=1e-2)

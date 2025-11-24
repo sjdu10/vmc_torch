@@ -361,6 +361,851 @@ class PEPS_model(wavefunctionModel):
         
         return torch.stack(batch_amps)
 
+class PEPS_model_reuse(wavefunctionModel):
+    def __init__(
+        self,
+        peps,
+        max_bond=None,
+        dtype=torch.float32,
+        debug=False,
+        contraction_kwargs={'mode':'mps'},
+    ):
+        super().__init__()
+        self.peps = peps
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.model_structure = {
+            'PEPS':{'D': peps.max_bond(), 'Lx': peps.Lx, 'Ly': peps.Ly},
+        }
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(peps)
+
+        self.torch_tn_params = {
+            str(tid): nn.Parameter(data)  # Convert Tensor to Parameter
+            for tid, data in params.items()
+        }
+        # register the torch tensors as parameters
+        for tid, param in self.torch_tn_params.items():
+            self.register_parameter(tid, param)
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+        self.Lx = peps.Lx
+        self.Ly = peps.Ly
+        self._env_x_cache = {}
+        self._env_y_cache = {}
+        self.config_ref = None
+        self.amp_ref = None
+        self.debug_amp_cache = []
+        self.contraction_kwargs = contraction_kwargs
+        self.debug = debug
+        self.param_dtype = dtype
+
+    def from_1d_to_2d(self, config, ordering="snake"):
+        if ordering == "snake":
+            config_2d = config.reshape((self.Lx, self.Ly))
+            return config_2d
+        else:
+            raise NotImplementedError(f"Ordering {ordering} is not implemented.")
+
+    def from_1dsite_to_2dsite(self, site, ordering="snake"):
+        """
+        Convert a 1d site index to a 2d site index.
+        site: 1d site index
+        """
+        if ordering == "snake":
+            return (site // self.Ly, site % self.Ly)
+        else:
+            raise ValueError(f"Unsupported ordering: {ordering}")
+
+    def from_2dsite_to_1dsite(self, site, ordering="snake"):
+        """
+        Convert a 2d site index to a 1d site index.
+        site: (row, col) tuple
+        """
+        if ordering == "snake":
+            return site[0] * self.Ly + site[1]
+        else:
+            raise ValueError(f"Unsupported ordering: {ordering}")
+
+    def transform_quimb_env_x_key_to_config_key(self, env_x, config):
+        """
+        Return a dictionary with the keys of of the config rows
+        """
+        config_2d = self.from_1d_to_2d(config)
+        env_x_row_config = {}
+        for key in env_x.keys():
+            if key[0] == "xmax":  # from bottom to top
+                row_n = key[1]
+                if row_n != self.Lx - 1:
+                    rows_config = tuple(
+                        torch.cat(tuple(config_2d[row_n + 1 :].to(torch.int))).tolist()
+                    )
+                    env_x_row_config[("xmax", rows_config)] = env_x[key]
+            elif key[0] == "xmin":  # from top to bottom
+                row_n = key[1]
+                if row_n != 0:
+                    rows_config = tuple(
+                        torch.cat(tuple(config_2d[:row_n].to(torch.int))).tolist()
+                    )
+                    env_x_row_config[("xmin", rows_config)] = env_x[key]
+        return env_x_row_config
+
+    def transform_quimb_env_y_key_to_config_key(self, env_y, config):
+        """
+        Return a dictionary with the keys of of the config rows
+        """
+        config_2d = self.from_1d_to_2d(config)
+        env_y_row_config = {}
+        for key in env_y.keys():
+            if key[0] == "ymax":
+                col_n = key[1]
+                if col_n != self.Ly - 1:
+                    cols_config = tuple(
+                        torch.cat(
+                            tuple(config_2d[:, col_n + 1 :].to(torch.int))
+                        ).tolist()
+                    )
+                    env_y_row_config[("ymax", cols_config)] = env_y[key]
+            elif key[0] == "ymin":
+                col_n = key[1]
+                if col_n != 0:
+                    cols_config = tuple(
+                        torch.cat(tuple(config_2d[:, :col_n].to(torch.int))).tolist()
+                    )
+                    env_y_row_config[("ymin", cols_config)] = env_y[key]
+        return env_y_row_config
+
+    @torch.no_grad()
+    def cache_env_x(self, amp, config):
+        """
+        Cache the environment x for the given configuration
+        """
+        env_x = amp.compute_x_environments(
+            max_bond=self.max_bond, cutoff=0.0, **self.contraction_kwargs
+        )
+        env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
+        self._env_x_cache = env_x_cache
+        self.config_ref = config
+        self.amp_ref = amp
+
+    @torch.no_grad()
+    def cache_env_y(self, amp, config):
+        """
+        Cache the environment y for the given configuration
+        """
+        env_y = amp.compute_y_environments(
+            max_bond=self.max_bond, cutoff=0.0, **self.contraction_kwargs
+        )
+        env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
+        self._env_y_cache = env_y_cache
+        self.config_ref = config
+        self.amp_ref = amp
+
+    def cache_env(self, amp, config):
+        """
+        Cache the environment x and y for the given configuration
+        """
+        self.cache_env_x(amp, config)
+        self.cache_env_y(amp, config)
+
+    @property
+    def env_x_cache(self):
+        """
+        Return the cached environment x
+        """
+        if hasattr(self, "_env_x_cache"):
+            return self._env_x_cache
+        else:
+            return None
+
+    @property
+    def env_y_cache(self):
+        """
+        Return the cached environment y
+        """
+        if hasattr(self, "_env_y_cache"):
+            return self._env_y_cache
+        else:
+            return None
+
+    def clear_env_x_cache(self, from_which=None):
+        """
+        Clear the cached environment x
+        """
+        if from_which is None:
+            self._env_x_cache = {}
+        else:
+            assert from_which in ["xmax", "xmin"], "from_which must be 'xmax' or 'xmin'"
+            for key in list(self._env_x_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_x_cache[key]
+
+    def clear_env_y_cache(self, from_which=None):
+        """
+        Clear the cached environment y
+        """
+        if from_which is None:
+            self._env_y_cache = {}
+        else:
+            assert from_which in ["ymax", "ymin"], "from_which must be 'ymax' or 'ymin'"
+            for key in list(self._env_y_cache.keys()):
+                if key[0] == from_which:
+                    del self._env_y_cache[key]
+
+    def clear_wavefunction_env_cache(self):
+        self.clear_env_x_cache()
+        self.clear_env_y_cache()
+        self.config_ref = None
+        self.amp_ref = None
+
+    def detect_changed_sites(self, config_ref, new_config):
+        """
+        Detect the sites that have changed in the new configuration,
+        written in 1d coordinate format.
+        """
+        changed_sites = set()
+        unchanged_sites = set()
+        for i in range(self.Lx * self.Ly):
+            if config_ref[i] != new_config[i]:
+                changed_sites.add(i)
+            else:
+                unchanged_sites.add(i)
+        changed_sites = sorted(changed_sites)
+        unchanged_sites = sorted(unchanged_sites)
+        if len(changed_sites) == 0:
+            return [], []
+        return changed_sites, unchanged_sites
+
+    def from_1d_sites_to_tids(self, sites):
+        """
+        Convert a list of 1d site indices to a list of tensor ids.
+        """
+        tids_list = list(self.skeleton.tensor_map.keys())
+        return [tids_list[site] for site in sites]
+
+    def detect_changed_rows(self, config_ref, new_config):
+        """
+        Detect the rows that have changed in the new configuration
+        """
+        config_ref_2d = self.from_1d_to_2d(config_ref)
+        new_config_2d = self.from_1d_to_2d(new_config)
+        changed_rows = []
+        for i in range(self.Lx):
+            if not torch.equal(config_ref_2d[i], new_config_2d[i]):
+                changed_rows.append(i)
+        if len(changed_rows) == 0:
+            return [], [], []
+        unchanged_rows_above = list(range(changed_rows[0]))
+        unchanged_rows_below = list(range(changed_rows[-1] + 1, self.Lx))
+        return changed_rows, unchanged_rows_above, unchanged_rows_below
+
+    def detect_changed_cols(self, config_ref, new_config):
+        """
+        Detect the columns that have changed in the new configuration
+        """
+        config_ref_2d = self.from_1d_to_2d(config_ref)
+        new_config_2d = self.from_1d_to_2d(new_config)
+        changed_cols = []
+        for i in range(self.Ly):
+            if not torch.equal(config_ref_2d[:, i], new_config_2d[:, i]):
+                changed_cols.append(i)
+        if len(changed_cols) == 0:
+            return [], [], []
+        unchanged_cols_left = list(range(changed_cols[0]))
+        unchanged_cols_right = list(range(changed_cols[-1] + 1, self.Ly))
+        return changed_cols, unchanged_cols_left, unchanged_cols_right
+
+    @torch.no_grad()
+    def update_env_x_cache(self, config):
+        """
+        Update the cached environment x for the given configuration
+        """
+        if self.env_x_cache:
+            self.clear_env_x_cache()
+        amp_tn = self.get_amp_tn(config)
+        self.cache_env_x(amp_tn, config, **self.contraction_kwargs)
+        self.config_ref = config
+        self.amp_ref = amp_tn
+
+    def get_cache_key(self, config, from_which, row_id=None, col_id=None):
+        if row_id is None and col_id is None:
+            raise ValueError("Either row_id or col_id must be provided")
+        if row_id is not None:
+            assert from_which in ["xmax", "xmin"], (
+                "from_which must be 'xmax' or 'xmin' when row_id is provided"
+            )
+            config_2d = self.from_1d_to_2d(config)
+            rows_config = (
+                tuple(torch.cat(tuple(config_2d[row_id + 1 :].to(torch.int))).tolist())
+                if from_which == "xmax"
+                else tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())
+            )
+            return (from_which, rows_config)
+        if col_id is not None:
+            assert from_which in ["ymax", "ymin"], (
+                "from_which must be 'ymax' or 'ymin' when col_id is provided"
+            )
+            config_2d = self.from_1d_to_2d(config)
+            cols_config = (
+                tuple(
+                    torch.cat(tuple(config_2d[:, col_id + 1 :].to(torch.int))).tolist()
+                )
+                if from_which == "ymax"
+                else tuple(
+                    torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist()
+                )
+            )
+            return (from_which, cols_config)
+
+    @torch.no_grad()
+    def update_env_x_cache_to_row(
+        self, config, row_id, from_which="xmin", mode="reuse"
+    ):
+        amp_tn = self.get_amp_tn(config)
+        self.config_ref = config
+        self.amp_ref = amp_tn
+
+        # add the new env_x to the cache
+        if not self.env_x_cache:
+            if from_which == "xmin" and row_id == self.Lx - 1:
+                row_id = self.Lx - 2
+            if from_which == "xmax" and row_id == 0:
+                row_id = 1
+            new_env_x = amp_tn.compute_environments(
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                xrange=(0, row_id + 1)
+                if from_which == "xmin"
+                else (row_id - 1, self.Lx - 1),
+                from_which=from_which,
+                **self.contraction_kwargs,
+            )
+            new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(
+                new_env_x, config
+            )
+            self._env_x_cache.update(new_env_x_cache)
+            return
+        else:
+            if (
+                (from_which == "xmin" and row_id == 0)
+                or (from_which == "xmax" and row_id == self.Lx - 1)
+                or mode == "force"
+            ):
+                if from_which == "xmin" and row_id == self.Lx - 1:
+                    row_id = self.Lx - 2
+                if from_which == "xmax" and row_id == 0:
+                    row_id = 1
+                new_env_x = amp_tn.compute_environments(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    xrange=(0, row_id + 1)
+                    if from_which == "xmin"
+                    else (row_id - 1, self.Lx - 1),
+                    from_which=from_which,
+                    **self.contraction_kwargs,
+                )
+                new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(
+                    new_env_x, config
+                )
+                self._env_x_cache.update(new_env_x_cache)
+                return
+
+            else:
+                assert mode == "reuse"
+                row_tn = amp_tn.select(amp_tn.x_tag(row_id))
+                cache_mps = self.env_x_cache[
+                    self.get_cache_key(config, from_which, row_id=row_id)
+                ]
+                new_cache_key = self.get_cache_key(
+                    config,
+                    from_which,
+                    row_id=row_id + 1 if from_which == "xmin" else row_id - 1,
+                )
+                new_cache_mps = row_tn | cache_mps
+
+                new_cache_mps.contract_boundary_from_(
+                    from_which=from_which,
+                    # xrange=(0, self.Lx - 1),
+                    xrange=(row_id-1, row_id) if from_which=='xmin' else (row_id, row_id+1), # more precisely contract the 2-row TN
+                    yrange=(0, self.Ly - 1),
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    **self.contraction_kwargs,
+                )
+                new_env_x_cache = {new_cache_key: new_cache_mps}
+                self._env_x_cache.update(new_env_x_cache)
+                return
+
+    @torch.no_grad()
+    def update_env_y_cache(self, config):
+        """
+        Update the cached environment y for the given configuration
+        """
+        if self.env_y_cache:
+            self.clear_env_y_cache()
+        amp_tn = self.get_amp_tn(config)
+        self.cache_env_y(amp_tn, config)
+        self.config_ref = config
+        self.amp_ref = amp_tn
+
+    @torch.no_grad()
+    def update_env_y_cache_to_col(
+        self, config, col_id, from_which="ymin", mode="reuse"
+    ):
+        amp_tn = self.get_amp_tn(config)
+        self.config_ref = config
+        self.amp_ref = amp_tn
+        # add the new env_y to the cache
+        if not self.env_y_cache:
+            new_env_y = amp_tn.compute_environments(
+                max_bond=self.max_bond,
+                cutoff=0.0,
+                yrange=(0, col_id + 1)
+                if from_which == "ymin"
+                else (col_id - 1, self.Ly - 1),
+                from_which=from_which,
+                **self.contraction_kwargs,
+            )
+            new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(
+                new_env_y, config
+            )
+            self._env_y_cache.update(new_env_y_cache)
+            return
+        else:
+            if (
+                (from_which == "ymin" and col_id == 0)
+                or (from_which == "ymax" and col_id == self.Ly - 1)
+                or mode == "force"
+            ):
+                new_env_y = amp_tn.compute_environments(
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    yrange=(0, col_id + 1)
+                    if from_which == "ymin"
+                    else (col_id - 1, self.Ly - 1),
+                    from_which=from_which,
+                    **self.contraction_kwargs,
+                )
+                new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(
+                    new_env_y, config
+                )
+                self._env_y_cache.update(new_env_y_cache)
+                return
+            else:
+                assert mode == "reuse"
+                col_tn = amp_tn.select(amp_tn.y_tag(col_id))
+                cache_mps = self.env_y_cache[
+                    self.get_cache_key(config, from_which, col_id=col_id)
+                ]
+                new_cache_key = self.get_cache_key(
+                    config,
+                    from_which,
+                    col_id=col_id + 1 if from_which == "ymin" else col_id - 1,
+                )
+                new_cache_mps = col_tn | cache_mps
+                new_cache_mps.contract_boundary_from_(
+                    from_which=from_which,
+                    xrange=(0, self.Lx - 1),
+                    # yrange=(0, self.Ly - 1),
+                    yrange=(col_id-1, col_id) if from_which=='ymin' else (col_id, col_id+1), # more precisely contract the 2-col TN
+                    max_bond=self.max_bond,
+                    cutoff=0.0,
+                    **self.contraction_kwargs,
+                )
+                new_env_y_cache = {new_cache_key: new_cache_mps}
+                self._env_y_cache.update(new_env_y_cache)
+                return
+
+    def psi(self):
+        """
+        Return the wavefunction (fPEPS)
+        """
+        # Reconstruct the original parameter structure
+        params ={
+            int(tid): data
+            for tid, data in self.torch_tn_params.items()
+        }
+        
+        # Reconstruct the TN with the new parameters
+        psi = qtn.unpack(params, self.skeleton)
+        return psi
+
+    def get_local_amp_tensors(self, sites: list, config: torch.Tensor):
+        """
+        Get the local tensors for the given tensor ids and configuration.
+        config: the input configuration.
+        sites: a list of 1d site/2d site indices.
+        """
+        # first pick out the tensor parameters and form the local tn parameters vector
+        local_ts_params = {}
+
+        tids = (
+            self.from_1d_sites_to_tids(
+                [self.from_2dsite_to_1dsite(site) for site in sites]
+            )
+            if isinstance(sites[0], tuple)
+            else self.from_1d_sites_to_tids(sites)
+        )
+        for tid in tids:
+            local_ts_params[tid] = self.torch_tn_params[str(tid)]
+
+        # Get sites corresponding to the tids
+        sites_1d = (
+            [self.from_2dsite_to_1dsite(site) for site in sites]
+            if isinstance(sites[0], tuple)
+            else sites
+        )
+        sites_2d = (
+            sites
+            if isinstance(sites[0], tuple)
+            else [self.from_1dsite_to_2dsite(site) for site in sites]
+        )
+
+        # Select the corresponding tensor skeleton
+        local_ts_skeleton = self.skeleton.select(
+            [self.skeleton.site_tag_id.format(*site) for site in sites_2d], which="any"
+        )
+
+        # Reconstruct the TN with the new parameters
+        local_ftn = qtn.unpack(local_ts_params, local_ts_skeleton)
+
+        # Fix the physical indices
+        local_ftn.isel_({self.peps.site_ind_id.format(*site): int(config[site_1d]) for site_1d, site in zip(sites_1d, sites_2d)})
+
+        return local_ftn
+
+    def get_amp_tn(self, config, reconstruct=False):
+        if self.amp_ref is None or reconstruct:
+            psi = self.psi()
+            amp_tn = psi.isel({psi.site_inds[i]: int(s) for i, s in enumerate(config)})
+            return amp_tn
+
+        else:
+            # detect the sites that have changed
+            changed_sites, unchanged_sites = self.detect_changed_sites(
+                self.config_ref, config
+            )
+
+            if len(changed_sites) == 0:
+                return self.amp_ref
+            else:
+                # substitute the changed sites tensors
+                local_amp_tn = self.get_local_amp_tensors(changed_sites, config)
+                unchanged_sites_2d = [
+                    self.from_1dsite_to_2dsite(site) for site in unchanged_sites
+                ]
+                unchanged_sites_tags = [
+                    self.skeleton.site_tag_id.format(*site)
+                    for site in unchanged_sites_2d
+                ]
+                unchanged_amp_tn = self.amp_ref.select(
+                    unchanged_sites_tags, which="any"
+                )
+                # merge the local_amp_tn and unchanged_amp_tn
+                amp_tn = local_amp_tn | unchanged_amp_tn
+                amp_tn.exponent = self.skeleton.exponent
+
+                return amp_tn
+
+    def amplitude(self, x, **kwargs):
+        psi = self.psi()
+        # `x` is expected to be batched as (batch_size, input_dim)
+        # Loop through the batch and compute amplitude for each sample
+        batch_amps = []
+        for x_i in x:
+            # Check x_i type
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            # Get the amplitude
+            amp_tn = self.get_amp_tn(x_i)
+
+            if self.max_bond is None:
+                amp = amp_tn
+                if self.tree is None:
+                    opt = ctg.HyperOptimizer(
+                        progbar=True, max_repeats=10, parallel=True
+                    )
+                    self.tree = amp.contraction_tree(optimize=opt)
+                amp_val = amp.contract(
+                    optimize=self.tree
+                )  # quimb will address the cached exponent automatically
+
+            else:
+                if self.cache_env_mode:
+                    self.cache_env_x(amp_tn, x_i)
+                    self.config_ref = x_i
+                    config_2d = self.from_1d_to_2d(x_i)
+                    key_bot = (
+                        "xmax",
+                        tuple(
+                            torch.cat(
+                                tuple(config_2d[self.Lx // 2 :].to(torch.int))
+                            ).tolist()
+                        ),
+                    )
+                    key_top = (
+                        "xmin",
+                        tuple(
+                            torch.cat(
+                                tuple(config_2d[: self.Lx // 2].to(torch.int))
+                            ).tolist()
+                        ),
+                    )
+                    amp_bot = self.env_x_cache[key_bot]
+                    amp_top = self.env_x_cache[key_top]
+                    amp_val = (
+                        (amp_bot | amp_top).contract() * 10 ** (self.skeleton.exponent)
+                    )  # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
+
+                else:
+                    if not self.env_x_cache and not self.env_y_cache:
+                        # check whether we can reuse the cached environment
+                        amp = amp_tn.contract_boundary_from_ymin(
+                            max_bond=self.max_bond,
+                            cutoff=0.0,
+                            yrange=[0, psi.Ly // 2 - 1],
+                        )
+                        amp = amp.contract_boundary_from_ymax(
+                            max_bond=self.max_bond,
+                            cutoff=0.0,
+                            yrange=[psi.Ly // 2, psi.Ly - 1],
+                        )
+                        amp_val = (
+                            amp.contract()
+                        )  # quimb will address the cached exponent automatically
+                    else:
+                        config_2d = self.from_1d_to_2d(x_i)
+                        # detect the rows that have changed
+                        changed_rows, unchanged_rows_above, unchanged_rows_below = (
+                            self.detect_changed_rows(self.config_ref, x_i)
+                        )
+                        # detect the columns that have changed
+                        changed_cols, unchanged_cols_left, unchanged_cols_right = (
+                            self.detect_changed_cols(self.config_ref, x_i)
+                        )
+                        if len(changed_rows) == 0:
+                            key_bot = (
+                                "xmax",
+                                tuple(
+                                    torch.cat(
+                                        tuple(config_2d[self.Lx // 2 :].to(torch.int))
+                                    ).tolist()
+                                ),
+                            )
+                            key_top = (
+                                "xmin",
+                                tuple(
+                                    torch.cat(
+                                        tuple(config_2d[: self.Lx // 2].to(torch.int))
+                                    ).tolist()
+                                ),
+                            )
+                            amp_bot = self.env_x_cache[key_bot]
+                            amp_top = self.env_x_cache[key_top]
+                            amp_val = (amp_bot | amp_top).contract() * 10 ** (
+                                self.skeleton.exponent
+                            )
+                        else:
+                            if len(changed_rows) <= len(changed_cols):
+                                # for bottom envs, until the last row in the changed rows, we can reuse the env
+                                # for top envs, until the first row in the changed rows, we can reuse the env
+                                amp_changed_rows = qtn.TensorNetwork(
+                                    [
+                                        amp_tn.select(amp_tn.x_tag_id.format(row_n))
+                                        for row_n in changed_rows
+                                    ]
+                                )
+                                amp_unchanged_bottom_env = qtn.TensorNetwork()
+                                amp_unchanged_top_env = qtn.TensorNetwork()
+                                if len(unchanged_rows_below) != 0:
+                                    amp_unchanged_bottom_env = self.env_x_cache[
+                                        (
+                                            "xmax",
+                                            tuple(
+                                                torch.cat(
+                                                    tuple(
+                                                        config_2d[
+                                                            unchanged_rows_below
+                                                        ].to(torch.int)
+                                                    )
+                                                ).tolist()
+                                            ),
+                                        )
+                                    ]
+                                if len(unchanged_rows_above) != 0:
+                                    amp_unchanged_top_env = self.env_x_cache[
+                                        (
+                                            "xmin",
+                                            tuple(
+                                                torch.cat(
+                                                    tuple(
+                                                        config_2d[
+                                                            unchanged_rows_above
+                                                        ].to(torch.int)
+                                                    )
+                                                ).tolist()
+                                            ),
+                                        )
+                                    ]
+                                amp_val = (
+                                    amp_unchanged_bottom_env
+                                    | amp_unchanged_top_env
+                                    | amp_changed_rows
+                                ).contract() * 10 ** (self.skeleton.exponent)
+                            else:
+                                # for left envs, until the first column in the changed columns, we can reuse the env
+                                # for right envs, until the last column in the changed columns, we can reuse the env
+                                amp_changed_cols = qtn.TensorNetwork(
+                                    [
+                                        amp_tn.select(amp_tn.y_tag_id.format(col_n))
+                                        for col_n in changed_cols
+                                    ]
+                                )
+                                amp_unchanged_left_env = qtn.TensorNetwork()
+                                amp_unchanged_right_env = qtn.TensorNetwork()
+                                if len(unchanged_cols_left) != 0:
+                                    amp_unchanged_left_env = self.env_y_cache[
+                                        (
+                                            "ymin",
+                                            tuple(
+                                                torch.cat(
+                                                    tuple(
+                                                        config_2d[
+                                                            :, unchanged_cols_left
+                                                        ].to(torch.int)
+                                                    )
+                                                ).tolist()
+                                            ),
+                                        )
+                                    ]
+                                if len(unchanged_cols_right) != 0:
+                                    amp_unchanged_right_env = self.env_y_cache[
+                                        (
+                                            "ymax",
+                                            tuple(
+                                                torch.cat(
+                                                    tuple(
+                                                        config_2d[
+                                                            :, unchanged_cols_right
+                                                        ].to(torch.int)
+                                                    )
+                                                ).tolist()
+                                            ),
+                                        )
+                                    ]
+                                amp_val = (
+                                    amp_unchanged_left_env
+                                    | amp_unchanged_right_env
+                                    | amp_changed_cols
+                                ).contract() * 10 ** (self.skeleton.exponent)
+
+            if amp_val == 0.0:
+                amp_val = torch.tensor(0.0)
+
+            batch_amps.append(amp_val)
+
+        # Return the batch of amplitudes stacked as a tensor
+        return torch.stack(batch_amps)
+
+    def get_grad(self):
+        """ "Compute the amplitude gradient by contracting TN without the on-site tensor."""
+        if self.debug:
+            print(
+                "Computing the amplitude gradient by contracting TN without the on-site tensor."
+            )
+        self.zero_grad()
+        sampled_x = self.config_ref
+        amp_tn = self.amp_ref
+        # index_map = {0: 0, 1: 1}
+        array_map = {
+            0: torch.tensor([1.0, 0.0]),
+            1: torch.tensor([0.0, 1.0]),
+        }
+        config_2d = self.from_1d_to_2d(sampled_x)
+        for tid, model_ts_params in self.torch_tn_params.items():
+            with torch.no_grad():
+                # utils numbers
+                site_2d = self.from_1dsite_to_2dsite(int(tid))
+
+                p_ind = self.skeleton.site_ind_id.format(*site_2d)
+                p_ind_order = self.skeleton.tensor_map[int(tid)].inds.index(p_ind)
+                on_site_config = int(sampled_x[int(tid)])
+                site_tag = self.skeleton.site_tag_id.format(*site_2d)
+                input_vec = array_map[on_site_config]
+
+                ts0 = amp_tn.select(site_tag).contract()
+
+                # Reuse cached environment to compute grad_ts
+                row_id = site_2d[0]
+                # select the cached_env on both sides of the site tensor along the row
+                rows_above = list(range(row_id + 1, self.Lx))
+                rows_below = list(range(0, row_id))
+                cached_amp_tn_above = (
+                    self.env_x_cache[
+                        (
+                            "xmax",
+                            tuple(
+                                torch.cat(
+                                    tuple(config_2d[rows_above].to(torch.int))
+                                ).tolist()
+                            ),
+                        )
+                    ]
+                    if rows_above
+                    else qtn.TensorNetwork([])
+                )
+                cached_amp_tn_below = (
+                    self.env_x_cache[
+                        (
+                            "xmin",
+                            tuple(
+                                torch.cat(
+                                    tuple(config_2d[rows_below].to(torch.int))
+                                ).tolist()
+                            ),
+                        )
+                    ]
+                    if rows_below
+                    else qtn.TensorNetwork([])
+                )
+                within_row_sites = list(
+                    (site_2d[0], col_id)
+                    for col_id in range(self.Ly)
+                    if col_id != site_2d[1]
+                )
+                within_row_hole_tn = self.get_local_amp_tensors(
+                    within_row_sites, config=sampled_x
+                )
+                grad_ts = (
+                    within_row_hole_tn | cached_amp_tn_above | cached_amp_tn_below
+                ).contract()
+
+            # # Exact contraction of the TN without the site tensor, naive calculation, expensive baseline.
+            # ts_left = [ts for ts in amp_tn.tensors if site_tag not in ts.tags]
+            # tn_left = qtn.TensorNetwork(ts_left)
+            # grad_ts = tn_left.contract()
+
+            # Back propagate through the final contraction
+            ts0.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(True))
+            grad_ts.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(False))
+            amp_temp = (ts0 | grad_ts).contract() * 10 ** (self.skeleton.exponent)
+            amp_temp.backward()
+
+            grad_ts_backprop_params = ts0.get_params().grad # obtain the gradient w.r.t. ts0 parameters
+            # print(grad_ts_backprop_params.shape, model_ts_params.shape, model_ts_params, ts0.get_params())
+            
+
+            # for sliced_blk, blk in zip(remaining_sliced_sectors, remaining_sectors):
+            data = model_ts_params
+            select_index = torch.argmax(input_vec).item()
+            slicer = [slice(None)] * data.ndim
+            slicer[p_ind_order] = select_index
+            reconstructed_grad_tensor = torch.zeros_like(data)
+            reconstructed_grad_tensor[tuple(slicer)] = grad_ts_backprop_params
+            data.grad = reconstructed_grad_tensor
+
 
 class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
     """
@@ -3172,598 +4017,6 @@ class fTNModel_reuse(wavefunctionModel):
                     sliced_blk
                 ]
                 data.grad = reconstructed_grad_tensor
-
-# class fTNModel_reuse(wavefunctionModel):
-#     def __init__(self, ftn, max_bond=None, dtype=torch.float32, functional=False, debug=False):
-#         super().__init__()
-#         self.param_dtype = dtype
-#         self.functional = functional
-#         self.debug = debug
-#         # extract the raw arrays and a skeleton of the TN
-#         params, self.skeleton = qtn.pack(ftn)
-#         # self.skeleton.exponent = 0
-
-#         # Flatten the dictionary structure and assign each parameter as a part of a ModuleDict
-#         # NOTE: pytorch nn.ParameterDict automatically sorts the keys (as sorted(dict))
-#         self.torch_tn_params = nn.ModuleDict({
-#             str(tid): nn.ParameterDict({
-#                 str(sector): nn.Parameter(data)
-#                 for sector, data in blk_array.items()
-#             })
-#             for tid, blk_array in params.items()
-#         })
-#         self.tn_param_key_id = 'torch_tn_params.{}.{}'
-
-#         # Get symmetry
-#         self.symmetry = ftn.arrays[0].symmetry
-
-#         # Store the shapes of the parameters
-#         self.param_shapes = [param.shape for param in self.parameters()]
-
-#         self.model_structure = {
-#             f'fPEPS (chi={max_bond})':{'D': ftn.max_bond(), 'Lx': ftn.Lx, 'Ly': ftn.Ly, 'symmetry': self.symmetry},
-#         }
-#         if max_bond is None or max_bond <= 0:
-#             max_bond = None
-#         self.max_bond = max_bond
-#         self.tree = None
-#         self.Lx = ftn.Lx
-#         self.Ly = ftn.Ly
-#         self._env_x_cache = {}
-#         self._env_y_cache = {}
-#         self.config_ref = None
-#         self.amp_ref = None
-#         self.debug_amp_cache = []
-    
-#     def from_1d_to_2d(self, config, ordering='snake'):
-#         if ordering == 'snake':
-#             config_2d = config.reshape((self.Lx, self.Ly))
-#             return config_2d
-#         else:
-#             raise NotImplementedError(f'Ordering {ordering} is not implemented.')
-        
-#     def from_1dsite_to_2dsite(self, site, ordering='snake'):
-#         """
-#             Convert a 1d site index to a 2d site index.
-#             site: 1d site index
-#         """
-#         if ordering == 'snake':
-#             return (site // self.Ly, site % self.Ly)
-#         else:
-#             raise ValueError(f"Unsupported ordering: {ordering}")
-    
-#     def from_2dsite_to_1dsite(self, site, ordering='snake'):
-#         """
-#             Convert a 2d site index to a 1d site index.
-#             site: (row, col) tuple
-#         """
-#         if ordering == 'snake':
-#             return site[0] * self.Ly + site[1]
-#         else:
-#             raise ValueError(f"Unsupported ordering: {ordering}")
-    
-#     def transform_quimb_env_x_key_to_config_key(self, env_x, config):
-#         """
-#             Return a dictionary with the keys of of the config rows
-#         """
-#         config_2d = self.from_1d_to_2d(config)
-#         env_x_row_config = {}
-#         for key in env_x.keys():
-#             if key[0] == 'xmax': # from bottom to top
-#                 row_n = key[1]
-#                 if row_n != self.Lx-1:
-#                     rows_config = tuple(torch.cat(tuple(config_2d[row_n+1:].to(torch.int))).tolist())
-#                     env_x_row_config[('xmax', rows_config)] = env_x[key]
-#             elif key[0] == 'xmin': # from top to bottom
-#                 row_n = key[1]
-#                 if row_n != 0:
-#                     rows_config = tuple(torch.cat(tuple(config_2d[:row_n].to(torch.int))).tolist())
-#                     env_x_row_config[('xmin', rows_config)] = env_x[key]
-#         return env_x_row_config
-    
-#     def transform_quimb_env_y_key_to_config_key(self, env_y, config):
-#         """
-#             Return a dictionary with the keys of of the config rows
-#         """
-#         config_2d = self.from_1d_to_2d(config)
-#         env_y_row_config = {}
-#         for key in env_y.keys():
-#             if key[0] == 'ymax':
-#                 col_n = key[1]
-#                 if col_n != self.Ly-1:
-#                     cols_config = tuple(torch.cat(tuple(config_2d[:, col_n+1:].to(torch.int))).tolist())
-#                     env_y_row_config[('ymax', cols_config)] = env_y[key]
-#             elif key[0] == 'ymin':
-#                 col_n = key[1]
-#                 if col_n != 0:
-#                     cols_config = tuple(torch.cat(tuple(config_2d[:, :col_n].to(torch.int))).tolist())
-#                     env_y_row_config[('ymin', cols_config)] = env_y[key]
-#         return env_y_row_config
-
-#     @torch.no_grad()
-#     def cache_env_x(self, amp, config):
-#         """
-#             Cache the environment x for the given configuration
-#         """
-#         env_x = amp.compute_x_environments(max_bond=self.max_bond, cutoff=0.0)
-#         env_x_cache = self.transform_quimb_env_x_key_to_config_key(env_x, config)
-#         self._env_x_cache = env_x_cache
-#         self.config_ref = config
-#         self.amp_ref = amp
-    
-#     @torch.no_grad()
-#     def cache_env_y(self, amp, config):
-#         env_y = amp.compute_y_environments(max_bond=self.max_bond, cutoff=0.0)
-#         env_y_cache = self.transform_quimb_env_y_key_to_config_key(env_y, config)
-#         self._env_y_cache = env_y_cache
-#         self.config_ref = config
-#         self.amp_ref = amp
-    
-#     def cache_env(self, amp, config):
-#         """
-#             Cache the environment x and y for the given configuration
-#         """
-#         self.cache_env_x(amp, config)
-#         self.cache_env_y(amp, config)
-        
-#     @property
-#     def env_x_cache(self):
-#         """
-#             Return the cached environment x
-#         """
-#         if hasattr(self, '_env_x_cache'):
-#             return self._env_x_cache
-#         else:
-#             return None
-        
-#     @property
-#     def env_y_cache(self):
-#         """
-#             Return the cached environment y
-#         """
-#         if hasattr(self, '_env_y_cache'):
-#             return self._env_y_cache
-#         else:
-#             return None
-    
-#     def clear_env_x_cache(self, from_which=None):
-#         """
-#             Clear the cached environment x
-#         """
-#         if from_which is None:
-#             self._env_x_cache = {}
-#         else:
-#             assert from_which in ['xmax', 'xmin'], "from_which must be 'xmax' or 'xmin'"
-#             for key in list(self._env_x_cache.keys()):
-#                 if key[0] == from_which:
-#                     del self._env_x_cache[key]
-
-#     def clear_env_y_cache(self, from_which=None):
-#         """
-#             Clear the cached environment y
-#         """
-#         if from_which is None:
-#             self._env_y_cache = {}
-#         else:
-#             assert from_which in ['ymax', 'ymin'], "from_which must be 'ymax' or 'ymin'"
-#             for key in list(self._env_y_cache.keys()):
-#                 if key[0] == from_which:
-#                     del self._env_y_cache[key]
-
-#     def clear_wavefunction_env_cache(self):
-#         self.clear_env_x_cache()
-#         self.clear_env_y_cache()
-#         self.config_ref = None
-#         self.amp_ref = None
-    
-#     def detect_changed_sites(self, config_ref, new_config):
-#         """
-#             Detect the sites that have changed in the new configuration,
-#             written in 1d coordinate format.
-#         """
-#         changed_sites = set()
-#         unchanged_sites = set()
-#         for i in range(self.Lx * self.Ly):
-#             if config_ref[i] != new_config[i]:
-#                 changed_sites.add(i)
-#             else:
-#                 unchanged_sites.add(i)
-#         changed_sites = sorted(changed_sites)
-#         unchanged_sites = sorted(unchanged_sites)
-#         if len(changed_sites) == 0:
-#             return [], []
-#         return changed_sites, unchanged_sites
-
-#     def from_1d_sites_to_tids(self, sites):
-#         """
-#             Convert a list of 1d site indices to a list of tensor ids.
-#         """
-#         tids_list = list(self.skeleton.tensor_map.keys())
-#         return [tids_list[site] for site in sites]
-    
-#     def detect_changed_rows(self, config_ref, new_config):
-#         """
-#             Detect the rows that have changed in the new configuration
-#         """
-#         config_ref_2d = self.from_1d_to_2d(config_ref)
-#         new_config_2d = self.from_1d_to_2d(new_config)
-#         changed_rows = []
-#         for i in range(self.Lx):
-#             if not torch.equal(config_ref_2d[i], new_config_2d[i]):
-#                 changed_rows.append(i)
-#         if len(changed_rows) == 0:
-#             return [], [], []
-#         unchanged_rows_above = list(range(changed_rows[0]))
-#         unchanged_rows_below = list(range(changed_rows[-1]+1, self.Lx))
-#         return changed_rows, unchanged_rows_above, unchanged_rows_below
-    
-#     def detect_changed_cols(self, config_ref, new_config):
-#         """
-#             Detect the columns that have changed in the new configuration
-#         """
-#         config_ref_2d = self.from_1d_to_2d(config_ref)
-#         new_config_2d = self.from_1d_to_2d(new_config)
-#         changed_cols = []
-#         for i in range(self.Ly):
-#             if not torch.equal(config_ref_2d[:, i], new_config_2d[:, i]):
-#                 changed_cols.append(i)
-#         if len(changed_cols) == 0:
-#             return [], [], []
-#         unchanged_cols_left = list(range(changed_cols[0]))
-#         unchanged_cols_right = list(range(changed_cols[-1]+1, self.Ly))
-#         return changed_cols, unchanged_cols_left, unchanged_cols_right
-    
-#     @torch.no_grad()
-#     def update_env_x_cache(self, config):
-#         """
-#             Update the cached environment x for the given configuration
-#         """
-#         if self.env_x_cache:
-#             self.clear_env_x_cache()
-#         amp_tn = self.get_amp_tn(config)
-#         self.cache_env_x(amp_tn, config)
-#         self.config_ref = config
-#         self.amp_ref = amp_tn
-
-#     def get_cache_key(self, config, from_which, row_id=None, col_id=None):
-#         if row_id is None and col_id is None:
-#             raise ValueError("Either row_id or col_id must be provided")
-#         if row_id is not None:
-#             assert from_which in ['xmax', 'xmin'], "from_which must be 'xmax' or 'xmin' when row_id is provided"
-#             config_2d = self.from_1d_to_2d(config)
-#             rows_config = tuple(torch.cat(tuple(config_2d[row_id+1:].to(torch.int))).tolist()) if from_which=='xmax' else tuple(torch.cat(tuple(config_2d[:row_id].to(torch.int))).tolist())
-#             return (from_which, rows_config)
-#         if col_id is not None:
-#             assert from_which in ['ymax', 'ymin'], "from_which must be 'ymax' or 'ymin' when col_id is provided"
-#             config_2d = self.from_1d_to_2d(config)
-#             cols_config = tuple(torch.cat(tuple(config_2d[:, col_id+1:].to(torch.int))).tolist()) if from_which=='ymax' else tuple(torch.cat(tuple(config_2d[:, :col_id].to(torch.int))).tolist())
-#             return (from_which, cols_config)
-    
-#     @torch.no_grad()
-#     def update_env_x_cache_to_row(self, config, row_id, from_which='xmin', mode='reuse'):
-#         amp_tn = self.get_amp_tn(config)
-#         self.config_ref = config
-#         self.amp_ref = amp_tn
-
-#         # add the new env_x to the cache
-#         if not self.env_x_cache:
-#             new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
-#             new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
-#             self._env_x_cache.update(new_env_x_cache)
-#             return
-#         else:
-#             if (from_which is 'xmin' and row_id == 0) or (from_which is 'xmax' and row_id == self.Lx-1) or mode is 'force':
-#                 new_env_x = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, xrange=(0, row_id+1) if from_which=='xmin' else (row_id-1, self.Lx-1), from_which=from_which)
-#                 new_env_x_cache = self.transform_quimb_env_x_key_to_config_key(new_env_x, config)
-#                 self._env_x_cache.update(new_env_x_cache)
-#                 return
-                
-#             else:
-#                 assert mode is 'reuse'
-#                 row_tn = amp_tn.select(amp_tn.x_tag(row_id))
-#                 cache_mps = self.env_x_cache[self.get_cache_key(config, from_which, row_id=row_id)]
-#                 new_cache_key = self.get_cache_key(config, from_which, row_id=row_id+1 if from_which=='xmin' else row_id-1)
-#                 new_cache_mps = (row_tn | cache_mps)
-#                 new_cache_mps.contract_boundary_from_(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
-#                 new_env_x_cache = {new_cache_key: new_cache_mps}
-#                 self._env_x_cache.update(new_env_x_cache)
-#                 return
-        
-#     @torch.no_grad()
-#     def update_env_y_cache(self, config):
-#         """
-#             Update the cached environment y for the given configuration
-#         """
-#         if self.env_y_cache:
-#             self.clear_env_y_cache()
-#         amp_tn = self.get_amp_tn(config)
-#         self.cache_env_y(amp_tn, config)
-#         self.config_ref = config
-#         self.amp_ref = amp_tn
-
-#     @torch.no_grad()
-#     def update_env_y_cache_to_col(self, config, col_id, from_which='ymin', mode='reuse'):
-#         amp_tn = self.get_amp_tn(config)
-#         self.config_ref = config
-#         self.amp_ref = amp_tn
-#         # add the new env_y to the cache
-#         if not self.env_y_cache:
-#             new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
-#             new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
-#             self._env_y_cache.update(new_env_y_cache)
-#             return
-#         else:
-#             if (from_which is 'ymin' and col_id == 0) or (from_which is 'ymax' and col_id == self.Ly-1) or mode is 'force':
-#                 new_env_y = amp_tn.compute_environments(max_bond=self.max_bond, cutoff=0.0, yrange=(0, col_id+1) if from_which=='ymin' else (col_id-1, self.Ly-1), from_which=from_which)
-#                 new_env_y_cache = self.transform_quimb_env_y_key_to_config_key(new_env_y, config)
-#                 self._env_y_cache.update(new_env_y_cache)
-#                 return
-#             else:
-#                 assert mode is 'reuse'
-#                 col_tn = amp_tn.select(amp_tn.y_tag(col_id))
-#                 cache_mps = self.env_y_cache[self.get_cache_key(config, from_which, col_id=col_id)]
-#                 new_cache_key = self.get_cache_key(config, from_which, col_id=col_id+1 if from_which=='ymin' else col_id-1)
-#                 new_cache_mps = (col_tn | cache_mps)
-#                 new_cache_mps.contract_boundary_from_(from_which=from_which, xrange=(0, self.Lx-1), yrange=(0, self.Ly-1), max_bond=self.max_bond, mode='mps', cutoff=0.0)
-#                 new_env_y_cache = {new_cache_key: new_cache_mps}
-#                 self._env_y_cache.update(new_env_y_cache)
-#                 return
-        
-    
-#     def psi(self):
-#         """
-#             Return the wavefunction (fPEPS)
-#         """
-#         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-#         params = {
-#             int(tid): {
-#                 ast.literal_eval(sector): data
-#                 for sector, data in blk_array.items()
-#             }
-#             for tid, blk_array in self.torch_tn_params.items()
-#         }
-#         # Reconstruct the TN with the new parameters
-#         psi = qtn.unpack(params, self.skeleton)
-#         return psi
-
-#     def get_local_amp_tensors(self, sites:list, config:torch.Tensor):
-#         """
-#             Get the local tensors for the given tensor ids and configuration.
-#             config: the input configuration.
-#             sites: a list of 1d site/2d site indices.
-#         """
-#         # first pick out the tensor parameters and form the local tn parameters vector
-#         local_ts_params = {}
-#         # tids = self.from_1d_sites_to_tids(sites)
-#         tids = self.from_1d_sites_to_tids([self.from_2dsite_to_1dsite(site) for site in sites]) if isinstance(sites[0], tuple) else self.from_1d_sites_to_tids(sites)
-#         for tid in tids:
-#             local_ts_params[tid] = {
-#                 ast.literal_eval(sector): data
-#                 for sector, data in self.torch_tn_params[str(tid)].items()
-#             }
-        
-#         # Get sites corresponding to the tids
-#         sites_1d = [self.from_2dsite_to_1dsite(site) for site in sites] if isinstance(sites[0], tuple) else sites
-#         sites_2d = sites if isinstance(sites[0], tuple) else [self.from_1dsite_to_2dsite(site) for site in sites]
-
-#         # Select the corresponding tensor skeleton
-#         local_ts_skeleton = self.skeleton.select([self.skeleton.site_tag_id.format(*site) for site in sites_2d], which='any')
-
-#         # Reconstruct the TN with the new parameters
-#         local_ftn = qtn.unpack(local_ts_params, local_ts_skeleton)
-
-#         # Fix the physical indices
-#         return local_ftn.fix_phys_inds(sites_2d, config[sites_1d])
-    
-#     def get_amp_tn(self, config, reconstruct=False):
-
-#         if self.amp_ref is None or reconstruct:
-#             psi = self.psi()
-#             # Check config type
-#             if not type(config) == torch.Tensor:
-#                 config = torch.tensor(config, dtype=torch.int if self.functional else self.param_dtype)
-#             else:
-#                 if config.dtype != self.param_dtype:
-#                     config = config.to(torch.int if self.functional else self.param_dtype)
-#             # Get the amplitude
-#             amp_tn = psi.get_amp(config, conj=True, functional=self.functional)
-#             # if self.debug:
-#             #     print(f'Efficient amp tn construction (full), amp_tn exponent: {amp_tn.exponent}')
-#             return amp_tn
-        
-#         else:
-#             # detect the sites that have changed
-#             changed_sites, unchanged_sites = self.detect_changed_sites(self.config_ref, config)
-
-#             if len(changed_sites) == 0:
-#                 return self.amp_ref
-#             else:
-#                 # substitute the changed sites tensors
-#                 local_amp_tn = self.get_local_amp_tensors(changed_sites, config)
-#                 unchanged_sites_2d = [self.from_1dsite_to_2dsite(site) for site in unchanged_sites]
-#                 unchanged_sites_tags = [self.skeleton.site_tag_id.format(*site) for site in unchanged_sites_2d]
-#                 unchanged_amp_tn = self.amp_ref.select(unchanged_sites_tags, which='any')
-#                 # merge the local_amp_tn and unchanged_amp_tn
-#                 amp_tn = local_amp_tn | unchanged_amp_tn
-#                 amp_tn.exponent = self.skeleton.exponent
-#                 # if self.debug:
-#                 #     print(f'Efficient amp tn construction (local), amp_tn exponent: {amp_tn.exponent}')
-#                 return amp_tn
-    
-#     def amplitude(self, x, **kwargs):
-#         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
-#         params = {
-#             int(tid): {
-#                 ast.literal_eval(sector): data
-#                 for sector, data in blk_array.items()
-#             }
-#             for tid, blk_array in self.torch_tn_params.items()
-#         }
-#         # Reconstruct the TN with the new parameters
-#         psi = qtn.unpack(params, self.skeleton)
-#         # `x` is expected to be batched as (batch_size, input_dim)
-#         # Loop through the batch and compute amplitude for each sample
-#         batch_amps = []
-#         for x_i in x:
-#             # Check x_i type
-#             if not type(x_i) == torch.Tensor:
-#                 x_i = torch.tensor(x_i, dtype=torch.int if self.functional else self.param_dtype)
-#             else:
-#                 if x_i.dtype != self.param_dtype:
-#                     x_i = x_i.to(torch.int if self.functional else self.param_dtype)
-#             # Get the amplitude
-#             # amp = psi.get_amp(x_i, conj=True, functional=self.functional)
-#             amp_tn = self.get_amp_tn(x_i)
-
-#             if self.max_bond is None:
-#                 amp = amp_tn
-#                 if self.tree is None:
-#                     opt = ctg.HyperOptimizer(progbar=True, max_repeats=10, parallel=True)
-#                     self.tree = amp.contraction_tree(optimize=opt)
-#                 amp_val = amp.contract(optimize=self.tree) # quimb will address the cached exponent automatically
-
-#             else:
-#                 if self.cache_env_mode:
-#                     self.cache_env_x(amp_tn, x_i)
-#                     # self.cache_env_y(amp, x_i)
-#                     self.config_ref = x_i
-#                     config_2d = self.from_1d_to_2d(x_i)
-#                     key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
-#                     key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
-#                     amp_bot = self.env_x_cache[key_bot]
-#                     amp_top = self.env_x_cache[key_top]
-#                     amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent) # quimb cannot address the cached exponent automatically when TN reuses the cached environment, so we need to multiply it manually
-#                     if self.debug:
-#                         amp_val1 = psi.get_amp(x_i).contract()
-#                         print(f'Reused Amp val: {amp_val}, Exact Amp val: {amp_val1}, Rel error: {torch.abs(amp_val1 - amp_val) / torch.abs(amp_val1)}')
-#                         amp_val = amp_val1
-
-#                 else:
-#                     if not self.env_x_cache and not self.env_y_cache:
-#                         # check whether we can reuse the cached environment
-#                         amp = amp_tn.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
-#                         amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
-#                         amp_val = amp.contract() # quimb will address the cached exponent automatically
-#                     else:
-#                         config_2d = self.from_1d_to_2d(x_i)
-#                         # detect the rows that have changed
-#                         changed_rows, unchanged_rows_above, unchanged_rows_below = self.detect_changed_rows(self.config_ref, x_i)
-#                         # detect the columns that have changed
-#                         changed_cols, unchanged_cols_left, unchanged_cols_right = self.detect_changed_cols(self.config_ref, x_i)
-#                         if len(changed_rows) == 0:
-#                             key_bot = ('xmax', tuple(torch.cat(tuple(config_2d[self.Lx//2:].to(torch.int))).tolist()))
-#                             key_top = ('xmin', tuple(torch.cat(tuple(config_2d[:self.Lx//2].to(torch.int))).tolist()))
-#                             amp_bot = self.env_x_cache[key_bot]
-#                             amp_top = self.env_x_cache[key_top]
-#                             amp_val = (amp_bot|amp_top).contract()*10**(self.skeleton.exponent)
-#                         else:
-#                             if len(changed_rows) <= len(changed_cols):
-#                                 # for bottom envs, until the last row in the changed rows, we can reuse the env
-#                                 # for top envs, until the first row in the changed rows, we can reuse the env
-#                                 amp_changed_rows = qtn.TensorNetwork([amp_tn.select(amp_tn.x_tag_id.format(row_n)) for row_n in changed_rows])
-#                                 amp_unchanged_bottom_env = qtn.TensorNetwork()
-#                                 amp_unchanged_top_env = qtn.TensorNetwork()
-#                                 if len(unchanged_rows_below) != 0:
-#                                     amp_unchanged_bottom_env = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[unchanged_rows_below].to(torch.int))).tolist()))]
-#                                 if len(unchanged_rows_above) != 0:
-#                                     amp_unchanged_top_env = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[unchanged_rows_above].to(torch.int))).tolist()))]
-#                                 amp_val = (amp_unchanged_bottom_env|amp_unchanged_top_env|amp_changed_rows).contract() * 10**(self.skeleton.exponent)
-#                             else:
-#                                 # for left envs, until the first column in the changed columns, we can reuse the env
-#                                 # for right envs, until the last column in the changed columns, we can reuse the env
-#                                 amp_changed_cols = qtn.TensorNetwork([amp_tn.select(amp_tn.y_tag_id.format(col_n)) for col_n in changed_cols])
-#                                 amp_unchanged_left_env = qtn.TensorNetwork()
-#                                 amp_unchanged_right_env = qtn.TensorNetwork()
-#                                 if len(unchanged_cols_left) != 0:
-#                                     amp_unchanged_left_env = self.env_y_cache[('ymin', tuple(torch.cat(tuple(config_2d[:, unchanged_cols_left].to(torch.int))).tolist()))]
-#                                 if len(unchanged_cols_right) != 0:
-#                                     amp_unchanged_right_env = self.env_y_cache[('ymax', tuple(torch.cat(tuple(config_2d[:, unchanged_cols_right].to(torch.int))).tolist()))]
-#                                 amp_val = (amp_unchanged_left_env|amp_unchanged_right_env|amp_changed_cols).contract()*10**(self.skeleton.exponent)
-
-#             if amp_val==0.0:
-#                 amp_val = torch.tensor(0.0)
-            
-#             # if self.debug:
-#             #     amp_val_exact = psi.get_amp(x_i).contract()
-#             #     if (amp_val - amp_val_exact).abs() > 1e-4:
-#             #         print(f'Warning: Reused Amp val and Exact Amp val differ significantly! Reused Amp val: {amp_val}, Exact Amp val: {amp_val_exact}, Rel error: {torch.abs(amp_val_exact - amp_val) / torch.abs(amp_val_exact)}')
-                
-
-#             batch_amps.append(amp_val)
-
-#         # Return the batch of amplitudes stacked as a tensor
-#         return torch.stack(batch_amps)
-    
-#     def get_grad(self):
-#         """"Compute the amplitude gradient by contracting TN without the on-site tensor."""
-#         if self.debug:
-#             print('Computing the amplitude gradient by contracting TN without the on-site tensor.')
-#         self.zero_grad()
-#         sampled_x = self.config_ref
-#         amp_tn = self.amp_ref
-#         index_map = {0: 0, 1: 1, 2: 1, 3: 0}
-#         array_map = {
-#             0: torch.tensor([1.0, 0.0]),
-#             1: torch.tensor([1.0, 0.0]),
-#             2: torch.tensor([0.0, 1.0]),
-#             3: torch.tensor([0.0, 1.0])
-#         }
-#         config_2d = self.from_1d_to_2d(sampled_x)
-#         for tid, model_ts_params in self.torch_tn_params.items():
-#             with torch.no_grad():
-#                 # utils numbers
-#                 site_2d = self.from_1dsite_to_2dsite(int(tid))
-
-#                 p_ind = self.skeleton.site_ind_id.format(*site_2d)
-#                 p_ind_order = self.skeleton.tensor_map[int(tid)].inds.index(p_ind)
-#                 on_site_config = int(sampled_x[int(tid)])
-#                 on_site_config_parity = index_map[on_site_config]
-#                 site_tag = self.skeleton.site_tag_id.format(*site_2d)
-#                 input_vec = array_map[on_site_config]
-
-#                 ts0 = amp_tn.select(site_tag).contract()
-#                 ts_params = ts0.get_params()
-
-#                 # Reuse cached environment to compute grad_ts
-#                 row_id = site_2d[0]
-#                 # select the cached_env on both sides of the site tensor along the row
-#                 rows_above = list(range(row_id+1, self.Lx))
-#                 rows_below = list(range(0, row_id))
-#                 cached_amp_tn_above = self.env_x_cache[('xmax', tuple(torch.cat(tuple(config_2d[rows_above].to(torch.int))).tolist()))] if rows_above else qtn.TensorNetwork([])
-#                 cached_amp_tn_below = self.env_x_cache[('xmin', tuple(torch.cat(tuple(config_2d[rows_below].to(torch.int))).tolist()))] if rows_below else qtn.TensorNetwork([])
-#                 within_row_sites = list((site_2d[0], col_id) for col_id in range(self.Ly) if col_id != site_2d[1])
-#                 within_row_hole_tn = self.get_local_amp_tensors(within_row_sites, config=sampled_x)
-#                 grad_ts = (within_row_hole_tn | cached_amp_tn_above | cached_amp_tn_below).contract()
-#                 grad_ts.data.phase_sync(inplace=True)
-            
-#             # # Exact contraction of the TN without the site tensor, naive calculation, expensive baseline.
-#             # ts_left = [ts for ts in amp_tn.tensors if site_tag not in ts.tags]
-#             # tn_left = qtn.TensorNetwork(ts_left)
-#             # grad_ts = tn_left.contract()
-
-#             # Back propagate through the final contraction
-#             ts0.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(True))
-#             grad_ts.apply_to_arrays(lambda x: x.clone().detach().requires_grad_(False))
-#             amp_temp = (ts0|grad_ts).contract()*10**(self.skeleton.exponent)
-#             amp_temp.backward()
-
-#             grad_ts_backprop_params = ts0.get_params().copy() # correct gradients
-#             for blk, ts_temp in ts0.get_params().items():
-#                 grad_ts_backprop_params[blk] = ts_temp.grad
-
-#             # select the remaining sectors in model_ts_params
-#             remaining_sliced_sectors = [sector for sector in sorted(ts_params)]
-#             remaining_sectors = [sector + (on_site_config_parity,) for sector in sorted(ts_params)]
-
-#             for sliced_blk, blk in zip(remaining_sliced_sectors, remaining_sectors):
-#                 data = model_ts_params[str(blk)]
-#                 select_index = torch.argmax(input_vec).item()
-#                 slicer = [slice(None)] * data.ndim
-#                 slicer[p_ind_order] = select_index
-#                 reconstructed_grad_tensor = torch.zeros_like(data)
-#                 reconstructed_grad_tensor[tuple(slicer)] = grad_ts_backprop_params[sliced_blk]
-#                 data.grad = reconstructed_grad_tensor
-
 
 
 class fTNModel_test(wavefunctionModel):

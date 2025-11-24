@@ -1306,6 +1306,141 @@ class MetropolisSamplerSpinless(Sampler):
         return self.current_config, current_amp
 
 
+class MetropolisExchangeSamplerSpinless_2D_reusable(Sampler):
+    def __init__(
+        self,
+        hi,
+        graph,
+        N_samples=2**8,
+        burn_in_steps=100,
+        reset_chain=False,
+        random_edge=False,
+        subchain_length=None,
+        equal_partition=True,
+        dtype=torch.float32,
+    ):
+        """
+        Parameters
+        ----------
+        hi : Hilbert
+            The Hilbert space.
+        graph : Graph
+            Lattice graph.
+        N_samples : int
+            The number of samples.
+        burn_in_steps : int
+            The number of burn-in steps.
+        reset_chain : bool
+            Whether to reset the chain after each VMC step.
+        random_edge : bool
+            Whether to randomly select the edges in the exchange move.
+        subchain_length : int
+            The number of samples we discard before collecting two samples.
+        equal_partition : bool
+            Whether the number of samples is equal for all MPI processes. If False, we use eager sampling and must have SIZE > 1.
+        dtype : torch.dtype
+
+        """
+        super().__init__(
+            hi,
+            graph,
+            N_samples,
+            burn_in_steps,
+            reset_chain,
+            random_edge,
+            subchain_length,
+            equal_partition,
+            dtype,
+        )
+
+    @torch.no_grad()
+    def _sample_next(self, vstate, burn_in=False):
+        """Sample the next configuration. Change the current configuration in place."""
+
+        def exchange_propose(i, j):
+            if self.current_config[i] == self.current_config[j]:
+                self.attempts += 1
+                self.accepts += 1  # exchange must be accepted, no hopping is allowed
+                return
+            self.attempts += 1
+            proposed_config = self.current_config.clone()
+            config_i = self.current_config[i].item()
+            config_j = self.current_config[j].item()
+            # exchange
+            proposed_config[i] = config_j
+            proposed_config[j] = config_i
+            proposed_amp = vstate.amplitude(proposed_config).cpu()
+            proposed_prob = abs(proposed_amp) ** 2
+            try:
+                acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+            except ZeroDivisionError:
+                acceptance_ratio = 1 if proposed_prob > 0 else 0
+            if random.random() < acceptance_ratio or (self.current_prob == 0):
+                self.current_config = proposed_config
+                self.current_amp = proposed_amp
+                self.current_prob = proposed_prob
+                self.accepts += 1
+
+        acceptance_rate = 0
+
+        while acceptance_rate < 0.05:
+            self.current_amp = vstate.amplitude(self.current_config).cpu()
+            self.current_prob = abs(self.current_amp) ** 2
+            proposed_config = self.current_config.clone()
+
+            # initial cache of env_x for current configuration
+            vstate.vstate_func.update_env_x_cache_to_row(
+                self.current_config, 0, from_which="xmax", mode="force"
+            )
+            for row_index, row_edges in self.graph.row_edges.items():
+                for i, j in row_edges:
+                    exchange_propose(i, j)
+                if row_index < self.graph.Lx - 1:
+                    vstate.vstate_func.update_env_x_cache_to_row(
+                        self.current_config, row_index, from_which="xmin", mode="reuse"
+                    )
+            vstate.vstate_func.clear_env_x_cache()
+
+            vstate.vstate_func.clear_env_y_cache()
+            vstate.vstate_func.update_env_y_cache_to_col(
+                self.current_config, 1, from_which="ymax", mode="force"
+            )
+            for col_index, col_edges in self.graph.col_edges.items():
+                for i, j in col_edges:
+                    exchange_propose(i, j)
+                if col_index < self.graph.Ly - 1:
+                    vstate.vstate_func.update_env_y_cache_to_col(
+                        self.current_config, col_index, from_which="ymin", mode="reuse"
+                    )
+            vstate.vstate_func.clear_env_y_cache(from_which="ymax")
+            vstate.vstate_func.update_env_y_cache_to_col(
+                self.current_config, 1, from_which="ymax", mode="force"
+            )
+            if burn_in:
+                vstate.vstate_func.clear_env_y_cache()
+
+            if self.current_amp == 0 and DEBUG:
+                print(
+                    f"Rank{RANK}: Warning: psi_sigma is zero for configuration {self.current_config}, proposed_config {proposed_config}, proposed_prob {abs(vstate.amplitude(proposed_config))}**2"
+                )
+
+            acceptance_rate = self.accepts / self.attempts
+
+            if self.debug:
+                print(f"Rank {RANK}: acceptance rate {acceptance_rate} in one sweep")
+
+            if acceptance_rate < 0.05:
+                print(f"Rank {RANK}: acceptance rate {acceptance_rate} < 0.05")
+                self.reset()
+                self.accepts = 0
+                self.attempts = 0
+                vstate.vstate_func.clear_wavefunction_env_cache()  # Remember to clear the TN contraction cache if need to resample
+                if DEBUG:
+                    print(f"    Rank {RANK}: acceptance rate {acceptance_rate}")
+
+        return self.current_config, self.current_amp
+
+
 class MetropolisExchangeSamplerSpinful(Sampler):
     def __init__(
         self,

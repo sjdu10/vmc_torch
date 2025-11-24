@@ -8,8 +8,6 @@ ndim = 2
 Lx = 4
 Ly = 2
 pbc = False
-total_sz = 0.0
-print(f"Total Sz = {total_sz}")
 D = 2
 
 # PEPS tensor network
@@ -18,10 +16,11 @@ J=1.0
 ham = qtn.ham_2d_heis(Lx=Lx, Ly=Ly, j=J)
 
 # ED
-ham_dense =  qu.ham_heis_2D(Lx, Ly, j=J, cyclic=pbc)
-evals, evecs = scipy.linalg.eigh(ham_dense)
-exact_energy = evals[0]/(Lx*Ly)
-print(f"Exact ground state energy per site: {exact_energy}")
+if Lx*Ly <= 16:
+    ham_dense =  qu.ham_heis_2D(Lx, Ly, j=J, cyclic=pbc)
+    evals, evecs = scipy.linalg.eigh(ham_dense)
+    exact_energy = evals[0]/(Lx*Ly)
+    print(f"Exact ground state energy per site: {exact_energy}")
 
 su = qtn.tensor_arbgeom_tebd.SimpleUpdateGen(
     psi, 
