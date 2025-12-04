@@ -178,6 +178,64 @@ class QR(torch.autograd.Function):
         #     print(R)
         #     raise ValueError
         
+        inds = torch.abs(diag) < 1e-6
+        if sum(inds) > 0: # rank deficient, revert to svd if require gradient
+            # print(f"QRforward: rank deficient, using SVD, {sum(inds)} out of {len(inds)} diagonals are zero: {R}")
+            U,S,Vh = SVDforward(A)
+            SVh = S.reshape((S.size(0),1)) * Vh
+            self.save_for_backward(U, S, Vh)
+            return U, SVh
+
+        if fix_sign:
+            sign = torch.sign(diag).reshape((1,-1))
+            Q = Q * sign
+            R = R * sign.t()
+        self.save_for_backward(A,Q,R)
+        return Q,R
+        
+    @staticmethod
+    def backward(self, dQ, dR):
+        M1,M2,M3 = self.saved_tensors
+        # if len(M2.size())==1:
+        if M2.ndim==1: # in the forward we used SVD instead of QR due to rank deficiency (zeros on R's diagonal), and M2 is S here
+            U,S,Vh = M1,M2,M3
+            dU,dSVh = dQ,dR
+            dS = torch.diag(dSVh @ Vh.t()) # dU is actually \partial(L)/\partial(U)
+            dVh = S.reshape((S.size(0),1)) * dSVh # Chain rule to get dVh, as d(SVh) = \partial(L)/\partial(SVh)
+            return SVDbackward(dU,dS,dVh,U,S,Vh)
+        if not torch.all(torch.isfinite(dQ)):
+            raise ValueError("dQ is not finite")
+        if not torch.all(torch.isfinite(dR)):
+            raise ValueError("dR is not finite")
+        A,Q,R = M1,M2,M3
+        M,N = A.size()
+        if M>=N:
+            return QRbackward_deep(Q,R,dQ,dR)
+        else:
+            return QRbackward_wide(A,Q,R,dQ,dR)
+
+class QR_faster(torch.autograd.Function):
+    @staticmethod
+    def forward(self, A):
+        M,N = A.size()
+        if M * N == 0:
+            raise ValueError(f"input matrix to custom QR is size {(M,N)}")
+        if not torch.all(torch.isfinite(A)): # A not finite
+            raise ValueError("input matrix to custom QR is not finite")
+        try:
+            Q, R = torch.linalg.qr(A,mode='reduced')
+        except Exception:
+            if be_verbose:
+                print('trouble in torch gesdd routine, falling back to scipy')
+            Q, R = scipy.linalg.svd(A.detach().numpy(), mode='economic')
+            Q = torch.from_numpy(Q)
+            R = torch.from_numpy(R)
+
+        diag = R.diag()
+        # if is_one(diag):
+        #     print(R)
+        #     raise ValueError
+        
         if A.requires_grad: #NOTE: RISK!: the final contraction using forward QR and forward SVD may give different results due to numerical errors
             inds = torch.abs(diag) < 1e-6
             if sum(inds) > 0: # rank deficient, revert to svd if require gradient

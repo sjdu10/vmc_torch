@@ -149,7 +149,7 @@ class Variational_State:
         self.reset()
         return amp, vec_log_grad
 
-    def full_hi_logamp_grad_matrix(self):
+    def full_hi_logamp_grad_matrix(self, grad=True):
         """Construct the full Np x Ns matrix of amplitude gradients."""
         all_config = self.hi.all_states()
         # divide the full hi into batches to each MPI rank
@@ -158,10 +158,15 @@ class Variational_State:
         parameter_logamp_grad = torch.zeros((self.Np, local_configs.shape[0]), dtype=self.dtype)
         ampx_arr = torch.zeros((local_configs.shape[0],), dtype=self.dtype)
 
-        for i, config in enumerate(local_configs):
-            ampx, ampx_dp = self.amplitude_grad(config)
-            parameter_logamp_grad[:, i] = ampx_dp
-            ampx_arr[i] = ampx
+        if grad:
+            for i, config in enumerate(local_configs):
+                ampx, ampx_dp = self.amplitude_grad(config)
+                parameter_logamp_grad[:, i] = ampx_dp
+                ampx_arr[i] = ampx
+        else:
+            for i, config in enumerate(local_configs):
+                ampx = self.amplitude(config)
+                ampx_arr[i] = ampx
         
         self.parameter_logamp_grad = parameter_logamp_grad
         self.ampx_arr = ampx_arr
@@ -187,12 +192,43 @@ class Variational_State:
             # should be computed during sampling
             return self.local_op_vec
     
+    def full_hi_expect(self, op):
+        """Full Hilbert space expectation value calculation.
+        Only for sanity check on small systems.
+        """
+        self.full_hi_logamp_grad_matrix(grad=False) # cache the psi_i(n)/psi(n) and psi(n)
+
+        # Gather all local psi(n) and psi_i(n)/psi(n) from all ranks to rank 0
+        COMM.Barrier()
+        ampx_arr = COMM.gather(self.ampx_arr, root=0)
+        if RANK == 0:
+            ampx_arr = torch.cat(ampx_arr)
+            # new implementation: use the cached psi(n), psi_i(n)/psi(n)
+            weights = ampx_arr.abs()**2
+            E_loc_vec = []
+            for i, config in enumerate(self.hi.all_states()):
+                eta, O_etasigma = op.get_conn(config)
+                psi_eta = self.amplitude(eta)
+                psi_sigma = ampx_arr[i].cpu().detach().numpy()
+                psi_eta = psi_eta.cpu().detach().numpy()
+                E_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+                E_loc_vec.append(E_loc)
+
+            E_loc_vec = torch.tensor(E_loc_vec, dtype=self.dtype)
+            norm_sqr = torch.sum(weights)
+            expect_op = torch.sum(weights * E_loc_vec)/norm_sqr
+        else:
+            expect_op = None
+
+        stats_dict = {'mean': float(expect_op.detach().numpy()) if expect_op is not None else None, 'variance': 0., 'error': 0.}
+        
+        return stats_dict
 
     def full_hi_expect_and_grad(self, op):
         """Full Hilbert space expectation value and gradient calculation.
         Only for sanity check on small systems.
         """
-        self.full_hi_logamp_grad_matrix() # cache the psi_i(n)/psi(n) and psi(n)
+        self.full_hi_logamp_grad_matrix(grad=True) # cache the psi_i(n)/psi(n) and psi(n)
         # # old implementation: construct the full wavefunction and full operator matrix
         # hi = op.hilbert
         # all_config = hi.all_states()
@@ -294,7 +330,9 @@ class Variational_State:
             dictionary: A dictionary containing the expectation value, variance, and error of the operator.
         """
         if full_hi or self.sampler is None:
-            raise NotImplementedError
+            # Exactly evaluate the expectation value
+            stats_dict = self.full_hi_expect(op)
+            return stats_dict
         
         if self.equal_partition:
             chain_length = self.Ns//SIZE # Number of samples per rank
