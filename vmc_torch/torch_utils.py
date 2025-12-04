@@ -322,6 +322,7 @@ def _simple_qr_backward(q, r, dq, dr):
         print(q.shape, r.shape, q@r)
     return grad_a + grad_b
 
+
 class QR_tao_direct(torch.autograd.Function):
     @staticmethod
     def forward(self, A):
@@ -331,9 +332,9 @@ class QR_tao_direct(torch.autograd.Function):
             sign = torch.sign(diag).reshape((1,-1))
             Q = Q * sign
             R = R * sign.t()
-        if torch.any(R.diag().abs() < 1e-7): # rank deficient, add diagonal regularization NOTE: this will perturb the forward result
-            # note that R can be rectangular here
-            R = R + torch.eye(R.size(0), R.size(1), dtype=R.dtype, device=R.device) * 1e-7
+        # if torch.any(R.diag().abs() < 1e-7): # rank deficient, add diagonal regularization NOTE: this will perturb the forward result
+        #     # note that R can be rectangular here
+        #     R = R + torch.eye(R.size(0), R.size(1), dtype=R.dtype, device=R.device) * 1e-7
         self.save_for_backward(A, Q, R)
         return Q, R
 
@@ -366,13 +367,19 @@ def _simple_qr_backward_direct(q, r, dq, dr):
         res = torch.linalg.solve_triangular(r, x.t(), upper=True).t()
         return res
     
+    def _LeastSquareSolve(x, r):
+        """ Solve the least square problem min ||xr - A|| """
+        res,_,_,_ = torch.linalg.lstsq(r, x.t(), driver='gelsy')
+        return res.t()
+    
     grad = _TriangularSolve(dq + q @ M, r)
     if torch.any(torch.isnan(grad)):
         # print('Solving the QR backward linear system gives NaN!')
         # print(f'Solving xR=A with R={r}, A={dq + q @ M}')
         # print(f'Get grad={grad}')
-        new_grad = _TriangularSolve(dq + q @ M, r+torch.eye(r.size(0),dtype=r.dtype)*r.diag().abs().max()*1e-3)
-        # print(f'With regularization, get grad={new_grad}')
+        # new_grad = _TriangularSolve(dq + q @ M, r+torch.eye(r.size(0),dtype=r.dtype)*r.diag().abs().max()*1e-3)
+        # Use least square with initial guess zero instead
+        new_grad = _LeastSquareSolve(dq + q @ M, r)
         grad = new_grad
     return grad
 
