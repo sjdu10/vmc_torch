@@ -1,11 +1,15 @@
-import os
 import itertools
-import random
 import quimb.tensor as qtn
 import numpy as np
 from autoray import do
 
-from vmc_torch.fermion_utils import from_netket_config_to_quimb_config, from_quimb_config_to_netket_config, calc_phase_symmray
+from vmc_torch.fermion_utils import (
+    from_netket_config_to_quimb_config,
+    from_quimb_config_to_netket_config,
+    calc_phase_symmray,
+    calc_phase_netket,
+    calc_phase_correction_netket_symmray,
+)
 
 
 def generate_binary_vectors(N, m):
@@ -40,37 +44,60 @@ class Hilbert:
         raise NotImplementedError
 
 class SpinfulFermion(Hilbert):
-    def __init__(self, n_orbitals, n_fermions=None, n_fermions_per_spin=None):
+    def __init__(self, n_orbitals, n_fermions=None, n_fermions_per_spin=None, no_u1_symmetry=False):
         """
-        Spin-1/2 fermionic Hilbert space with n_orbitals orbitals and n_fermions fermions.
-        n_fermions_per_spin is the number of fermions per spin, if not provided, it will be set to n_fermions // 2.
+        Spin-1/2 fermionic Hilbert space with n_orbitals orbitals per spin.
+
+        Args:
+            n_orbitals (int): Number of orbitals (sites) for each spin species.
+            n_fermions (int, optional): Total number of fermions (default: None).
+            n_fermions_per_spin (tuple, optional): Number of fermions per spin (n_up, n_down) (default: None).
+            no_u1_symmetry (bool, optional): If True, no U1 symmetry on the Hilbert space (default: False).
 
         Configuration structure: [nu1,...,nuN, nd1,...,ndN]
         where nu1,...,nuN are the spin-up fermions and nd1,...,ndN are the spin-down fermions.
-        The total number of fermions is n_fermions = n_fermions_up + n_fermions_down.
-        The total number of orbitals is n_orbitals = n_up + n_down.
+        The total number of orbitals is n_up + n_down.
         
         """
         self.n_orbitals = n_orbitals*2  # Total number of orbitals (spin up + spin down)
+        self.no_u1_symmetry = no_u1_symmetry # By default the Hilbert space has even Z2 symmetry
+        # If fermion numbers are provided, set them.
         self.n_fermions = n_fermions if n_fermions is not None else n_fermions_per_spin[0] + n_fermions_per_spin[1]
-        self.n_fermions_spin_up = n_fermions_per_spin[0] if n_fermions_per_spin is not None else n_fermions // 2
-        self.n_fermions_spin_down = n_fermions_per_spin[1] if n_fermions_per_spin is not None else n_fermions // 2
-        self.n_fermions_per_spin = n_fermions_per_spin if n_fermions_per_spin is not None else (self.n_fermions_spin_up, self.n_fermions_spin_down)
+        self.n_fermions_spin_up = n_fermions_per_spin[0] if n_fermions_per_spin is not None else None
+        self.n_fermions_spin_down = n_fermions_per_spin[1] if n_fermions_per_spin is not None else None
+        self.n_fermions_per_spin = n_fermions_per_spin if n_fermions_per_spin is not None else None
     
     @property
     def size(self):
         """Number of states in the Hilbert space"""
         # Use combinatorial formula to calculate size
         from math import comb
-        size_up = comb(self.n_orbitals // 2, self.n_fermions_spin_up)
-        size_down = comb(self.n_orbitals // 2, self.n_fermions_spin_down)
-        return size_up * size_down
-
+        if self.no_u1_symmetry:
+            size = 0
+            for n in range(0, self.n_orbitals+1, 2):
+                size += comb(self.n_orbitals, n)
+            return size
+        
+        if self.n_fermions_per_spin is not None:
+            size_up = comb(self.n_orbitals // 2, self.n_fermions_spin_up)
+            size_down = comb(self.n_orbitals // 2, self.n_fermions_spin_down)
+            return size_up * size_down
+        else:
+            return comb(self.n_orbitals, self.n_fermions)
     
     def _all_states(self):
-        spin_up_states = generate_binary_vectors(self.n_orbitals // 2, self.n_fermions_spin_up)
-        spin_down_states = generate_binary_vectors(self.n_orbitals // 2, self.n_fermions_spin_down)
-        return (up + down for up, down in itertools.product(spin_up_states, spin_down_states))
+        if self.no_u1_symmetry:
+            all_states = []
+            for n in range(0, self.n_orbitals+1, 2):
+                all_states.extend(generate_binary_vectors(self.n_orbitals, n))
+            return all_states
+
+        if self.n_fermions_per_spin is not None:
+            spin_up_states = generate_binary_vectors(self.n_orbitals // 2, self.n_fermions_spin_up)
+            spin_down_states = generate_binary_vectors(self.n_orbitals // 2, self.n_fermions_spin_down)
+            return (up + down for up, down in itertools.product(spin_up_states, spin_down_states))
+        else:
+            return generate_binary_vectors(self.n_orbitals, self.n_fermions)
     
     def all_states(self):
         """Generate all states in the Hilbert space.
@@ -78,7 +105,9 @@ class SpinfulFermion(Hilbert):
         Returns:
             list: All possible configurations of the Hilbert space.
         """
-        return do('array', list(self._all_states()))
+        all_states_netket = do('array', list(self._all_states()))
+        all_states = from_netket_config_to_quimb_config(all_states_netket)
+        return all_states
     
     def random_state(self, key=None):
         """Generate a random state in the Hilbert space.
@@ -90,23 +119,44 @@ class SpinfulFermion(Hilbert):
             np.ndarray: A random binary state of shape (n_orbitals,).
         """
         rng = np.random.default_rng(key)
-    
-        n_up = self.n_fermions_spin_up
-        n_down = self.n_fermions_spin_down
-        n_half = self.n_orbitals // 2
+        if self.no_u1_symmetry:
+            n = self.n_orbitals
+            # Randomly choose an even number of fermions
+            m = rng.choice(np.arange(0, n+1, 2))
+            # Randomly select positions for fermions
+            positions = rng.choice(n, size=m, replace=False)
+            state = np.zeros(n, dtype=np.int32)
+            state[positions] = 1
+            return from_netket_config_to_quimb_config(state)
 
-        # Randomly select positions for spin-up fermions
-        up_positions = rng.choice(n_half, size=n_up, replace=False)
-        up_state = np.zeros(n_half, dtype=np.int32)
-        up_state[up_positions] = 1
+        if self.n_fermions_per_spin is not None:
+            n_up = self.n_fermions_spin_up
+            n_down = self.n_fermions_spin_down
+            n_half = self.n_orbitals // 2
 
-        # Randomly select positions for spin-down fermions
-        down_positions = rng.choice(n_half, size=n_down, replace=False)
-        down_state = np.zeros(n_half, dtype=np.int32)
-        down_state[down_positions] = 1
+            # Randomly select positions for spin-up fermions
+            up_positions = rng.choice(n_half, size=n_up, replace=False)
+            up_state = np.zeros(n_half, dtype=np.int32)
+            up_state[up_positions] = 1
 
-        # Concatenate spin-up and spin-down states
-        return from_netket_config_to_quimb_config(np.concatenate([up_state, down_state]))
+            # Randomly select positions for spin-down fermions
+            down_positions = rng.choice(n_half, size=n_down, replace=False)
+            down_state = np.zeros(n_half, dtype=np.int32)
+            down_state[down_positions] = 1
+
+            # Concatenate spin-up and spin-down states
+            return from_netket_config_to_quimb_config(np.concatenate([up_state, down_state]))
+
+        else:
+            n = self.n_orbitals
+            m = self.n_fermions
+
+            # Randomly select positions for fermions
+            positions = rng.choice(n, size=m, replace=False)
+            state = np.zeros(n, dtype=np.int32)
+            state[positions] = 1
+
+            return from_netket_config_to_quimb_config(state)
 
 
 class Spin(Hilbert):
@@ -381,15 +431,15 @@ class spinful_Fermi_Hubbard_chain_torch(Hamiltonian):
 
 
 
-def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
     """Implementation of spinful Fermi-Hubbard model on a square lattice"""
     if pbc:
         raise NotImplementedError("PBC not implemented yet")
     N = Lx * Ly
     if n_fermions_per_spin is None:
-        hi = SpinfulFermion(n_orbitals=N, n_fermions=N_f)
+        hi = SpinfulFermion(n_orbitals=N, n_fermions=N_f, no_u1_symmetry=no_u1_symmetry)
     else:
-        hi = SpinfulFermion(n_orbitals=N, n_fermions_per_spin=n_fermions_per_spin)
+        hi = SpinfulFermion(n_orbitals=N, n_fermions_per_spin=n_fermions_per_spin, no_u1_symmetry=no_u1_symmetry)
     
     graph = SquareLattice(Lx, Ly, pbc)
 
@@ -404,14 +454,66 @@ def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermion
     return H, hi, graph
 
 class spinful_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
-    def __init__(self, Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+    def __init__(self, Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
         """
         Implementation of spinful Fermi-Hubbard model on a square lattice using torch.
         Args:
             N_f is used to restrict the Hilbert space.
         """
-        H, hi, graph = square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=pbc, n_fermions_per_spin=n_fermions_per_spin)
+        H, hi, graph = square_lattice_spinful_Fermi_Hubbard(
+            Lx,
+            Ly,
+            t,
+            U,
+            N_f,
+            pbc=pbc,
+            n_fermions_per_spin=n_fermions_per_spin,
+            no_u1_symmetry=no_u1_symmetry,
+        )
         super().__init__(H, hi, graph)
+
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        sigma = from_quimb_config_to_netket_config(sigma_quimb)
+        connected_config_coeff = dict()
+        for key, value in self._H.items():
+            if len(key) == 3:
+                # hopping term
+                i0, j0, spin = key
+                i = i0 if spin == 1 else i0 + self.hilbert.n_orbitals // 2
+                j = j0 if spin == 1 else j0 + self.hilbert.n_orbitals // 2
+                # Check if the two sites are different
+                if sigma[i] != sigma[j]:
+                    # H|sigma> = -t * |eta>
+                    eta = sigma.copy()
+                    eta[i], eta[j] = sigma[j], sigma[i]
+                    eta_quimb0 = from_netket_config_to_quimb_config(eta)
+                    eta_quimb = tuple(np.array(eta_quimb0))
+                    # Calculate the phase correction
+                    phase = calc_phase_symmray(from_netket_config_to_quimb_config(sigma), eta_quimb0)
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value*phase
+                    else:
+                        connected_config_coeff[eta_quimb] += value*phase
+            elif len(key) == 1:
+                # on-site term
+                i = key[0]
+                if sigma_quimb[i] == 3:
+                    eta_quimb = tuple(np.array(sigma_quimb))
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value
+                    else:
+                        connected_config_coeff[eta_quimb] += value
+        
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
+
+# Customized Hamiltonian elements to match with Ao's initial SD's definition
+class spinful_Fermi_Hubbard_square_lattice_torch_Ao(spinful_Fermi_Hubbard_square_lattice_torch):
+    def __init__(self, Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
+        super().__init__(Lx, Ly, t, U, N_f, pbc=pbc, n_fermions_per_spin=n_fermions_per_spin, no_u1_symmetry=no_u1_symmetry)
 
     def get_conn(self, sigma_quimb):
         """
@@ -434,7 +536,7 @@ class spinful_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
                     eta_quimb0 = from_netket_config_to_quimb_config(eta)
                     eta_quimb = tuple(eta_quimb0)
                     # Calculate the phase correction
-                    phase = calc_phase_symmray(from_netket_config_to_quimb_config(sigma), eta_quimb0)
+                    phase = calc_phase_netket(from_netket_config_to_quimb_config(sigma), eta_quimb0)
                     if eta_quimb not in connected_config_coeff:
                         connected_config_coeff[eta_quimb] = value*phase
                     else:

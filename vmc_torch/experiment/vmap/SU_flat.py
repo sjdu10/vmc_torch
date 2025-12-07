@@ -5,8 +5,8 @@ import quimb.tensor as qtn
 
 symmetry = "Z2"
 
-Lx = 6
-Ly = 6
+Lx = 2
+Ly = 2
 D = 4
 seed = 1
 

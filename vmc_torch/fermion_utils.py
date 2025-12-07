@@ -1407,6 +1407,48 @@ def from_quimb_config_to_netket_config(quimb_config):
         # batched
         return np.array([func(quimb_config) for quimb_config in quimb_config])
 
+def from_quimb_biniary_config_to_netket_config(quimb_binary_config):
+    """
+        quimb binary config: (01)(10)(00)(11)..., grouped by 2 bits per site
+        netket config: (0101..)(1010..), grouped by spin species
+        local basis for quimb binary config is (|down, up>)
+    """
+    # for quimb binary config, even index -> spin down, odd index -> spin up
+    def func(quimb_binary_config):
+        total_sites = len(quimb_binary_config)//2
+        spin_up = np.zeros(total_sites, dtype=int)
+        spin_down = np.zeros(total_sites, dtype=int)
+        for i in range(total_sites):
+            spin_up[i] = quimb_binary_config[2*i+1]
+            spin_down[i] = quimb_binary_config[2*i]
+        return do('concatenate', (spin_up, spin_down))
+    if len(quimb_binary_config.shape) == 1:
+        return func(quimb_binary_config)
+    else:
+        # batched
+        return np.array([func(quimb_binary_config) for quimb_binary_config in quimb_binary_config])
+
+def from_netket_config_to_quimb_binary_config(netket_config):
+    """
+        netket config: (0101..)(1010..), grouped by spin species
+        quimb binary config: (01)(10)(00)(11)..., grouped by 2 bits per site
+        local basis for quimb binary config is (|down, up>)
+    """
+    def func(netket_config):
+        total_sites = len(netket_config)//2
+        spin_up = netket_config[:total_sites]
+        spin_down = netket_config[total_sites:]
+        quimb_binary_config = np.zeros(2*total_sites, dtype=int)
+        for i in range(total_sites):
+            quimb_binary_config[2*i] = spin_down[i]
+            quimb_binary_config[2*i+1] = spin_up[i]
+        return quimb_binary_config
+    if len(netket_config.shape) == 1:
+        return func(netket_config)
+    else:
+        # batched
+        return np.array([func(netket_config) for netket_config in netket_config])
+
 def detect_hopping(configi, configj):
     """Detect the hopping between two configurations"""
     site_ls = np.asarray(configi-configj).nonzero()[0]
@@ -1430,17 +1472,17 @@ def calc_phase_netket(configi, configj):
         return 1
 
 def calc_phase_symmray(configi, configj):
-    """Calculate the operator matrix element phase in symmray, assuming local basis convention for spinful fermion is (|up, down>).
+    """Calculate the operator matrix element phase in symmray, assuming local basis convention for spinful fermion is (|down, up>).
     Globally, this convention gives a staggered spin configuration (|dududu...>) when the configuration is flattened to 1D.
-    Physically, the basis is written as a^d_1d a^d_1u... a^d_nu a^d_nd |0>."""
+    Physically, the basis is written as a^d_1d a^d_1u... a^d_nd a^d_nu |0>."""
     hopping = detect_hopping(configi, configj)
     if hopping is not None:
         netket_config_i = from_quimb_config_to_netket_config(configi)
         netket_config_j = from_quimb_config_to_netket_config(configj)
-        config_i_spin_up =netket_config_i[:len(netket_config_i)//2]
-        config_i_spin_down =netket_config_i[len(netket_config_i)//2:]
-        config_j_spin_up =netket_config_j[:len(netket_config_j)//2]
-        config_j_spin_down =netket_config_j[len(netket_config_j)//2:]
+        config_i_spin_up = netket_config_i[:len(netket_config_i)//2]
+        config_i_spin_down = netket_config_i[len(netket_config_i)//2:]
+        config_j_spin_up = netket_config_j[:len(netket_config_j)//2]
+        config_j_spin_down = netket_config_j[len(netket_config_j)//2:]
         symmray_config_i = tuple()
         symmray_config_j = tuple()
         for i in range(len(config_i_spin_up)):
