@@ -19,7 +19,4 @@ __pycache__/
 vmc_torch.egg-info/
 *.sqlite
 *.nsys-rep
-# vmc_torch/experiment/circuitTNF/1D
-# vmc_torch/experiment/circuitTNF/2D
-vmc_torch/experiment/circuitTNF/data
-vmc_torch/experiment/vmap
+vmc_torch/experiment/vmap/
