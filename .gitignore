@@ -14,7 +14,7 @@
 data/*
 symmray/
 scripts/
-# local/
+local/
 __pycache__/
 vmc_torch.egg-info/
 *.sqlite
@@ -22,3 +22,4 @@ vmc_torch.egg-info/
 # vmc_torch/experiment/circuitTNF/1D
 # vmc_torch/experiment/circuitTNF/2D
 vmc_torch/experiment/circuitTNF/data
+vmc_torch/experiment/vmap
