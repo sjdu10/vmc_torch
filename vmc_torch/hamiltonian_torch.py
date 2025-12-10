@@ -425,7 +425,7 @@ class Hamiltonian(Operator):
     def H(self):
         return self._H
 
-def chain_spinless_free_fermion(L, t, N_f, pbc=False):
+def chain_spinless_Fermi_Hubbard(L, t, V, N_f, pbc=False):
     """Implementation of spinless free fermion model on a 1D chain"""
     if pbc:
         raise NotImplementedError("PBC not implemented yet")
@@ -436,18 +436,19 @@ def chain_spinless_free_fermion(L, t, N_f, pbc=False):
 
     H = dict()
     for i, j in graph.edges():
-        H[(i, j)] = -t
+        H[(i, j, 't')] = -t
+        H[(i, j, 'V')] = V
 
     return H, hi, graph
 
-class spinless_free_fermion_chain_torch(Hamiltonian):
-    def __init__(self, L, t, N_f, pbc=False):
+class spinless_Fermi_Hubbard_chain_torch(Hamiltonian):
+    def __init__(self, L, t, V, N_f, pbc=False):
         """
         Implementation of spinless free fermion model on a chain using torch.
         Args:
             N_f is used to restrict the Hilbert space.
         """
-        H, hi, graph = chain_spinless_free_fermion(L, t, N_f, pbc)
+        H, hi, graph = chain_spinless_Fermi_Hubbard(L, t, V, N_f, pbc)
         super().__init__(H, hi, graph)
     def get_conn(self, sigma_quimb):
         """
@@ -457,21 +458,28 @@ class spinless_free_fermion_chain_torch(Hamiltonian):
         sigma = sigma_quimb
         connected_config_coeff = dict()
         for key, value in self._H.items():
-            if len(key) == 2:
+            i, j, term_type = key
+            if term_type == 't':
                 # hopping term
-                i, j = key
-                # Check if the two sites are different
                 if sigma[i] != sigma[j]:
                     # H|sigma> = -t * |eta>
                     eta = sigma.copy()
                     eta[i], eta[j] = sigma[j], sigma[i]
                     eta_quimb = tuple(eta)
                     # Calculate the phase correction
-                    phase = ... #TODO
+                    phase = (-1)**(sum(sigma[min(i,j)+1:max(i,j)]))  # Jordan-Wigner phase
                     if eta_quimb not in connected_config_coeff:
                         connected_config_coeff[eta_quimb] = value*phase
                     else:
                         connected_config_coeff[eta_quimb] += value*phase
+            elif term_type == 'V':
+                # interaction term
+                if sigma[i] == 1 and sigma[j] == 1:
+                    eta_quimb = tuple(sigma)
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value
+                    else:
+                        connected_config_coeff[eta_quimb] += value
         
         return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
 
