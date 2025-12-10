@@ -62,5 +62,6 @@ This code is the result of the research detailed in:
 `vmc_torch` builds on and interoperates with leading libraries in Tensor Networks and quantum many-body calculations:
 
 [2] `symmray` - *Johnnie Gray* - https://github.com/jcmgray/symmray
+
 [3] `quimb` - *Johnnie Gray* - https://github.com/jcmgray/quimb
 
