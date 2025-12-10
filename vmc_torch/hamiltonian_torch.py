@@ -483,7 +483,7 @@ class spinless_Fermi_Hubbard_chain_torch(Hamiltonian):
         
         return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
 
-def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc=False):
+def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, mu, N_f, pbc=False):
     """Implementation of spinless Fermi-Hubbard model on a square lattice"""
     if pbc:
         raise NotImplementedError("PBC not implemented yet")
@@ -496,17 +496,19 @@ def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc=False):
     for i, j in graph.edges():
         H[(i, j, 't')] = -t
         H[(i, j, 'V')] = V
+    for i in range(N):
+        H[(i,)] = -mu
     
     return H, hi, graph
 
 class spinless_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
-    def __init__(self, Lx, Ly, t, V, N_f, pbc=False):
+    def __init__(self, Lx, Ly, t, V, mu, N_f, pbc=False):
         """
         Implementation of spinless Fermi-Hubbard model on a square lattice using torch.
         Args:
             N_f is used to restrict the Hilbert space.
         """
-        H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc)
+        H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, mu, N_f, pbc)
         super().__init__(H, hi, graph)
     def get_conn(self, sigma_quimb):
         """
@@ -516,28 +518,38 @@ class spinless_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
         sigma = np.array(sigma_quimb)
         connected_config_coeff = dict()
         for key, value in self._H.items():
-            i, j, term_type = key
-            if term_type == 't':
-                # hopping term
-                if sigma[i] != sigma[j]:
-                    # H|sigma> = -t * |eta>
-                    eta = sigma.copy()
-                    eta[i], eta[j] = sigma[j], sigma[i]
-                    eta_quimb = tuple(eta)
-                    # Calculate the phase correction
-                    phase = (-1)**(sum(sigma[min(i,j)+1:max(i,j)]))  # Jordan-Wigner phase
-                    if eta_quimb not in connected_config_coeff:
-                        connected_config_coeff[eta_quimb] = value*phase
-                    else:
-                        connected_config_coeff[eta_quimb] += value*phase
-            elif term_type == 'V':
-                # interaction term
-                if sigma[i] == 1 and sigma[j] == 1:
+            if len(key) == 3:
+                i, j, term_type = key
+                if term_type == 't':
+                    # hopping term
+                    if sigma[i] != sigma[j]:
+                        # H|sigma> = -t * |eta>
+                        eta = sigma.copy()
+                        eta[i], eta[j] = sigma[j], sigma[i]
+                        eta_quimb = tuple(eta)
+                        # Calculate the phase correction
+                        phase = (-1)**(sum(sigma[min(i,j)+1:max(i,j)]))  # Jordan-Wigner phase
+                        if eta_quimb not in connected_config_coeff:
+                            connected_config_coeff[eta_quimb] = value*phase
+                        else:
+                            connected_config_coeff[eta_quimb] += value*phase
+                elif term_type == 'V':
+                    # interaction term
+                    if sigma[i] == 1 and sigma[j] == 1:
+                        eta_quimb = tuple(sigma)
+                        if eta_quimb not in connected_config_coeff:
+                            connected_config_coeff[eta_quimb] = value
+                        else:
+                            connected_config_coeff[eta_quimb] += value
+            elif len(key) == 1:
+                # on-site term
+                i = key[0]
+                if sigma_quimb[i] == 1:
                     eta_quimb = tuple(sigma)
                     if eta_quimb not in connected_config_coeff:
-                        connected_config_coeff[eta_quimb] = value
+                        connected_config_coeff[eta_quimb] = value * sigma[i]
                     else:
-                        connected_config_coeff[eta_quimb] += value
+                        connected_config_coeff[eta_quimb] += value * sigma[i]
         
         return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
 
