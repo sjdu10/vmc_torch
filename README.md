@@ -1,10 +1,22 @@
-# vmc_torch
+# ⚛️ vmc_torch: High-Performance Variational Monte Carlo with PyTorch
 
-A quantum variational Monte Carlo (VMC) code based on pyTorch for solving ground-state properties of quantum many-body lattice Hamiltonians.
+## Overview
 
-`vmc_torch` currently supports a wide range of variational ansatz, including bosonic/fermionic tensor network states (TNS) (e.g. MPS, PEPS) defined using `quimb` and `symmray`, and neural quantum states (NQS).
+`vmc_torch` is a **high-performance, parallelized implementation of Variational Monte Carlo (VMC)** designed to accurately determine the **ground-state properties** of quantum many-body lattice Hamiltonians.
 
-## Installation
+Built upon **PyTorch**, this library offers unparalleled flexibility, enabling researchers to seamlessly integrate and train cutting-edge quantum *Ansätze*, including Neural Quantum States (NQS) and sophisticated Tensor Network States (TNS), and hybrid TN-NN models such as NN-fTNS [1].
+
+### Key Features and Capabilities
+
+* **Diverse Variational Ansätze Support:** Supports a wide spectrum of modern wavefunctions:
+    * **Neural Quantum States (NQS):** Leveraging PyTorch's native capabilities for large-scale, trainable neural network models.
+    * **Tensor Network States (TNS):** Integrates with state-of-the-art TN libraries (`quimb`, `symmray`) for handling Matrix Product States (MPS), Projected Entangled Pair States (PEPS), and more, bosonic or fermionic.
+    * **Neuralized fermionic TNS (NN-fTNS):** Hybrid TN-NN model that improves over both fermionic TNS and NQS, see [1] for details.
+* **Massively Parallel VMC Sampling:** Utilizes **`mpi4py`** to distribute the Markov Chain Monte Carlo (MCMC) sampling process, suitable on high-performance computing (HPC) clusters.
+* **HPC Ready:** Built for large-scale VMC calculations, suitable for deployment across **thousands of CPU cores**. **Note:** *Current implementation is optimized for CPU cores via MPI. GPU acceleration is actively under development.*
+* **Auto-differentiation for Optimization:** Leverages PyTorch's automatic differentiation engine for efficient, large-scale energy minimization using techniques like Stochastic Reconfiguration (SR) and other state-of-the-art ML optimizers.
+
+## 🚀 Installation
 
 **Installing the latest version directly from github:**
 
@@ -19,7 +31,7 @@ git clone https://github.com/sjdu10/vmc_torch.git
 pip install --no-deps -U -e vmc_torch/
 ```
 
-## Usage
+## 📖 Usage Example
 
 **Fermionic neural network quantum state example:**
 
@@ -37,11 +49,18 @@ An example plot (from Ref.[1]) of the VMC training curves for various Ans\"atze 
 ![VMC training curves from Ref.[1]](./docs/pics/vmc_curves.png)
 
 
-## References
+## 📚 References
 
-[1] "Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems" - *Si-Jing Du*, *Ao Chen* and *Garnet Kin-Lic Chan* - [arXiv:2506.08329](https://doi.org/10.48550/arXiv.2506.08329)
+### Research Publication
+
+This code is the result of the research detailed in:
+
+[1] **"Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems"** - *Si-Jing Du*, *Ao Chen*, and *Garnet Kin-Lic Chan* - [arXiv:2506.08329](https://doi.org/10.48550/arXiv:2506.08329)
+
+### Core Dependencies
+
+`vmc_torch` builds on and interoperates with leading libraries in Tensor Networks and quantum many-body calculations:
 
 [2] `symmray` - *Johnnie Gray* - https://github.com/jcmgray/symmray
-
 [3] `quimb` - *Johnnie Gray* - https://github.com/jcmgray/quimb
 

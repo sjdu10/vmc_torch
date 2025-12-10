@@ -401,8 +401,8 @@ class fPEPS(qtn.PEPS):
                 elif int(n) == 3 or int(n) == 0:
                     new_oddpos = ()
 
-                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos is not () else ()
-                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
+                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos else ()
+                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if isinstance(new_oddpos1, FermionicOperator) else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
                 
                 new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
@@ -444,6 +444,8 @@ class fPEPS(qtn.PEPS):
     def get_amp_efficient(self, config, inplace=False):
         """Slicing to get the amplitude, faster than contraction with a tensor product state."""
         peps = self if inplace else self.copy()
+        has_oddpos = hasattr(self.tensors[0].data, 'oddpos')
+        has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
         backend = self.tensors[0].data.backend
         dtype = eval(backend + '.' + self.tensors[0].data.dtype)
         if isinstance(config, numpy.ndarray):
@@ -538,30 +540,58 @@ class fPEPS(qtn.PEPS):
                     new_charge_sec_data_dict[new_charge_blk] = new_data # new charge block and its corresponding data in a dictionary
 
             new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order + 1:]
+            # if ftsdata has attibute oddpos:
+            if has_oddpos:
+                if int(n) == 1:
+                    new_oddpos = (3 * site_id + 1) * (-1)
+                elif int(n) == 2:
+                    new_oddpos = (3 * site_id + 2) * (-1)
+                elif int(n) == 3 or int(n) == 0:
+                    new_oddpos = ()
+                
+                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos else ()
+                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if isinstance(new_oddpos1, FermionicOperator) else ftsdata.oddpos
+                oddpos = list(new_oddpos)[::-1]
+                try:
+                    if self.symmetry == 'U1':
+                        new_charge = charge + ftsdata.charge
+                    elif self.symmetry == 'Z2':
+                        new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
+                    elif self.symmetry == 'U1U1':
+                        new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
+                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=self.symmetry)
+                except Exception as e:
+                    print("Error in constructing new f-tensor data:")
+                    print(e)
+                    # Error when constructing the new f-tensor
+                    print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
+            elif has_dummy_modes:
+                if int(n) == 1:
+                    new_dummy_modes = (3 * site_id + 1) * (-1)
+                elif int(n) == 2:
+                    new_dummy_modes = (3 * site_id + 2) * (-1)
+                elif int(n) == 3 or int(n) == 0:
+                    new_dummy_modes = ()
+                
+                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
+                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
+                dummy_modes = list(new_dummy_modes)[::-1]
+                try:
+                    if self.symmetry == 'U1':
+                        new_charge = charge + ftsdata.charge
+                    elif self.symmetry == 'Z2':
+                        new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
+                    elif self.symmetry == 'U1U1':
+                        new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
+                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, symmetry=self.symmetry, dummy_modes=dummy_modes)
+                except Exception as e:
+                    print("Error in constructing new f-tensor data:")
+                    print(e)
+                    # Error when constructing the new f-tensor
+                    print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
+            else:
+                raise ValueError("FermionicArray has neither 'oddpos' nor 'dummy_modes' attribute to keep track of odd parity tensor ordering.")
 
-            if int(n) == 1:
-                new_oddpos = (3 * site_id + 1) * (-1)
-            elif int(n) == 2:
-                new_oddpos = (3 * site_id + 2) * (-1)
-            elif int(n) == 3 or int(n) == 0:
-                new_oddpos = ()
-
-            new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos != () else ()
-            new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
-            oddpos = list(new_oddpos)[::-1]
-            try:
-                if self.symmetry == 'U1':
-                    new_charge = charge + ftsdata.charge
-                elif self.symmetry == 'Z2':
-                    new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
-                elif self.symmetry == 'U1U1':
-                    new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=self.symmetry)
-            except Exception as e:
-                print("Error in constructing new f-tensor data:")
-                print(e)
-                # Error when constructing the new f-tensor
-                print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
                 
             fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
@@ -797,9 +827,9 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
     backend = psi.tensors[0].data.backend
     device = config.device
     dtype = eval(backend+'.'+psi.tensors[0].data.dtype)
-    if type(config) == numpy.ndarray:
+    if isinstance(config, numpy.ndarray):
         kwargs = {'like':config, 'dtype':dtype}
-    elif type(config) == torch.Tensor:
+    elif isinstance(config, torch.Tensor):
         kwargs = {'like':config, 'device':device, 'dtype':dtype}
     if psi.spinless:
         index_map = {0: 0, 1: 1}
@@ -941,9 +971,9 @@ class fMPS(qtn.MatrixProductState):
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
-        if type(config) == numpy.ndarray:
+        if isinstance(config, numpy.ndarray):
             kwargs = {'like':config, 'dtype':dtype}
-        elif type(config) == torch.Tensor:
+        elif isinstance(config, torch.Tensor):
             device = list(self.tensors[0].data.blocks.values())[0].device
             kwargs = {'like':config, 'device':device, 'dtype':dtype}
         if self.spinless:
@@ -1031,9 +1061,9 @@ class fMPS(qtn.MatrixProductState):
         mps = self if inplace else self.copy()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
-        if type(config) == numpy.ndarray:
+        if isinstance(config, numpy.ndarray):
             kwargs = {'like':config, 'dtype':dtype}
-        elif type(config) == torch.Tensor:
+        elif isinstance(config, torch.Tensor):
             device = list(self.tensors[0].data.blocks.values())[0].device
             kwargs = {'like':config, 'device':device, 'dtype':dtype}
         if self.spinless:
@@ -1083,8 +1113,8 @@ class fMPS(qtn.MatrixProductState):
                 elif int(n) == 3 or int(n) == 0:
                     new_oddpos = ()
 
-                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos is not () else ()
-                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
+                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos else ()
+                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if isinstance(new_oddpos1, FermionicOperator) else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
                 
                 new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
@@ -1099,9 +1129,9 @@ class fMPS(qtn.MatrixProductState):
         mps = self if inplace else self.copy()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
-        if type(config) == numpy.ndarray:
+        if isinstance(config, numpy.ndarray):
             kwargs = {'like':config, 'dtype':dtype}
-        elif type(config) == torch.Tensor:
+        elif isinstance(config, torch.Tensor):
             device = list(self.tensors[0].data.blocks.values())[0].device
             kwargs = {'like':config, 'device':device, 'dtype':dtype}
         if self.spinless:
@@ -1153,8 +1183,8 @@ class fMPS(qtn.MatrixProductState):
                 elif int(n) == 3 or int(n) == 0:
                     new_oddpos = ()
 
-                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos is not () else ()
-                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if new_oddpos1 is not () else ftsdata.oddpos
+                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos else ()
+                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if isinstance(new_oddpos1, FermionicOperator) else ftsdata.oddpos
                 oddpos = list(new_oddpos)[::-1]
                 
                 new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
