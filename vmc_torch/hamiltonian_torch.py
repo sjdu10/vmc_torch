@@ -25,6 +25,7 @@ def generate_binary_vectors(N, m):
         vectors.append(vec)
     return vectors
 
+# ==== Hilbert Space Definitions ====
 class Hilbert:
 
     @property
@@ -42,6 +43,69 @@ class Hilbert:
     def random_state(self, key):
         """Generate a random state in the Hilbert space"""
         raise NotImplementedError
+
+class SpinlessFermion(Hilbert):
+    def __init__(self, n_orbitals, n_fermions=None):
+        """Hilbert space of spinless fermions.
+
+        Args:
+           n_orbitals: Number of orbitals (sites).
+           n_fermions: If given, constrains the number of fermions to a particular value.
+
+        """
+        self.n_orbitals = n_orbitals
+        self.n_fermions = n_fermions
+        if self.n_fermions is not None:
+            assert 0 <= self.n_fermions <= self.n_orbitals, "n_fermions must be between 0 and n_orbitals"
+    
+    @property
+    def size(self):
+        """Number of states in the Hilbert space"""
+        if self.n_fermions is not None:
+            from math import comb
+            return comb(self.n_orbitals, self.n_fermions)
+        else:
+            return 2 ** self.n_orbitals
+    
+    def _all_states(self):
+        if self.n_fermions is not None:
+            return generate_binary_vectors(self.n_orbitals, self.n_fermions)
+        else:
+            all_states = []
+            for n in range(self.n_orbitals + 1):
+                all_states.extend(generate_binary_vectors(self.n_orbitals, n))
+            return all_states
+    
+    def all_states(self):
+        """Generate all states in the Hilbert space.
+
+        Returns:
+            list: All possible configurations of the Hilbert space.
+        """
+        all_states = do('array', list(self._all_states()))
+        return all_states
+    
+    def random_state(self, key=None):
+        """Generate a random state in the Hilbert space.
+
+        Args:
+            key (int, optional): Random seed for reproducibility.
+        Returns:
+            np.ndarray: A random binary state of shape (n_orbitals,).
+        """
+        rng = np.random.default_rng(key)
+        n = self.n_orbitals
+        if self.n_fermions is not None:
+            m = self.n_fermions
+        else:
+            # Randomly choose number of fermions
+            m = rng.integers(0, n + 1)
+        
+        # Randomly select positions for fermions
+        positions = rng.choice(n, size=m, replace=False)
+        state = np.zeros(n, dtype=np.int32)
+        state[positions] = 1
+        return state
 
 class SpinfulFermion(Hilbert):
     def __init__(self, n_orbitals, n_fermions=None, n_fermions_per_spin=None, no_u1_symmetry=False):
@@ -255,6 +319,7 @@ class Spin(Hilbert):
         return do('array', random_state)
     
 
+# ==== Graph Definitions ====
 class Graph:
     def __init__(self):
         self._edges = None
@@ -316,6 +381,7 @@ class Chain(Graph):
         self.n_nodes = L
 
 
+# ==== Hamiltonian Definitions ====
 class Operator:
     def __init__(self, H, hi, graph):
         self._H = H
@@ -359,15 +425,125 @@ class Hamiltonian(Operator):
     def H(self):
         return self._H
 
-def chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+def chain_spinless_free_fermion(L, t, N_f, pbc=False):
+    """Implementation of spinless free fermion model on a 1D chain"""
+    if pbc:
+        raise NotImplementedError("PBC not implemented yet")
+    N = L
+    hi = SpinlessFermion(n_orbitals=N, n_fermions=N_f)
+    
+    graph = Chain(L, pbc)
+
+    H = dict()
+    for i, j in graph.edges():
+        H[(i, j)] = -t
+
+    return H, hi, graph
+
+class spinless_free_fermion_chain_torch(Hamiltonian):
+    def __init__(self, L, t, N_f, pbc=False):
+        """
+        Implementation of spinless free fermion model on a chain using torch.
+        Args:
+            N_f is used to restrict the Hilbert space.
+        """
+        H, hi, graph = chain_spinless_free_fermion(L, t, N_f, pbc)
+        super().__init__(H, hi, graph)
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        sigma = sigma_quimb
+        connected_config_coeff = dict()
+        for key, value in self._H.items():
+            if len(key) == 2:
+                # hopping term
+                i, j = key
+                # Check if the two sites are different
+                if sigma[i] != sigma[j]:
+                    # H|sigma> = -t * |eta>
+                    eta = sigma.copy()
+                    eta[i], eta[j] = sigma[j], sigma[i]
+                    eta_quimb = tuple(eta)
+                    # Calculate the phase correction
+                    phase = ... #TODO
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value*phase
+                    else:
+                        connected_config_coeff[eta_quimb] += value*phase
+        
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
+
+def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc=False):
+    """Implementation of spinless Fermi-Hubbard model on a square lattice"""
+    if pbc:
+        raise NotImplementedError("PBC not implemented yet")
+    N = Lx * Ly
+    hi = SpinlessFermion(n_orbitals=N, n_fermions=N_f)
+    
+    graph = SquareLattice(Lx, Ly, pbc)
+
+    H = dict()
+    for i, j in graph.edges():
+        H[(i, j, 't')] = -t
+        H[(i, j, 'V')] = V
+    
+    return H, hi, graph
+
+class spinless_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
+    def __init__(self, Lx, Ly, t, V, N_f, pbc=False):
+        """
+        Implementation of spinless Fermi-Hubbard model on a square lattice using torch.
+        Args:
+            N_f is used to restrict the Hilbert space.
+        """
+        H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, N_f, pbc)
+        super().__init__(H, hi, graph)
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        sigma = sigma_quimb
+        connected_config_coeff = dict()
+        for key, value in self._H.items():
+            i, j, term_type = key
+            if term_type == 't':
+                # hopping term
+                if sigma[i] != sigma[j]:
+                    # H|sigma> = -t * |eta>
+                    eta = sigma.copy()
+                    eta[i], eta[j] = sigma[j], sigma[i]
+                    eta_quimb = tuple(eta)
+                    # Calculate the phase correction
+                    phase = (-1)**(sum(sigma[min(i,j)+1:max(i,j)]))  # Jordan-Wigner phase
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value*phase
+                    else:
+                        connected_config_coeff[eta_quimb] += value*phase
+            elif term_type == 'V':
+                # interaction term
+                if sigma[i] == 1 and sigma[j] == 1:
+                    eta_quimb = tuple(sigma)
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value
+                    else:
+                        connected_config_coeff[eta_quimb] += value
+        
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
+
+
+
+def chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
     """Implementation of spinful Fermi-Hubbard model on a 1D chain"""
     if pbc:
         raise NotImplementedError("PBC not implemented yet")
     N = L
     if n_fermions_per_spin is None:
-        hi = SpinfulFermion(n_orbitals=N, n_fermions=N_f)
+        hi = SpinfulFermion(n_orbitals=N, n_fermions=N_f, no_u1_symmetry=no_u1_symmetry)
     else:
-        hi = SpinfulFermion(n_orbitals=N, n_fermions_per_spin=n_fermions_per_spin)
+        hi = SpinfulFermion(n_orbitals=N, n_fermions_per_spin=n_fermions_per_spin, no_u1_symmetry=no_u1_symmetry)
     
     graph = Chain(L, pbc)
 
@@ -382,13 +558,13 @@ def chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc=False, n_fermions_per_spin=Non
     return H, hi, graph
 
 class spinful_Fermi_Hubbard_chain_torch(Hamiltonian):
-    def __init__(self, L, t, U, N_f, pbc=False, n_fermions_per_spin=None):
+    def __init__(self, L, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
         """
         Implementation of spinful Fermi-Hubbard model on a square lattice using torch.
         Args:
             N_f is used to restrict the Hilbert space.
         """
-        H, hi, graph = chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc, n_fermions_per_spin)
+        H, hi, graph = chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc, n_fermions_per_spin, no_u1_symmetry=no_u1_symmetry)
         super().__init__(H, hi, graph)
 
     def get_conn(self, sigma_quimb):
