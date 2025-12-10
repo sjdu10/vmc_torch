@@ -1,4 +1,4 @@
-# ⚛️ vmc_torch: High-Performance Variational Monte Carlo with PyTorch
+# ⚛️ vmc_torch: Flexible Variational Monte Carlo with PyTorch
 
 ## Overview
 
