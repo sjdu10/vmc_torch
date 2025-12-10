@@ -455,7 +455,7 @@ class spinless_Fermi_Hubbard_chain_torch(Hamiltonian):
         Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
         and their corresponding coefficients <eta|H|sigma>.
         """
-        sigma = sigma_quimb
+        sigma = np.array(sigma_quimb)
         connected_config_coeff = dict()
         for key, value in self._H.items():
             i, j, term_type = key
@@ -513,7 +513,7 @@ class spinless_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
         Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
         and their corresponding coefficients <eta|H|sigma>.
         """
-        sigma = sigma_quimb
+        sigma = np.array(sigma_quimb)
         connected_config_coeff = dict()
         for key, value in self._H.items():
             i, j, term_type = key
