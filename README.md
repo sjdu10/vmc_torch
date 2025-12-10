@@ -12,6 +12,7 @@ Built upon **PyTorch**, this library offers unparalleled flexibility, enabling r
     * **Neural Quantum States (NQS):** Leveraging PyTorch's native capabilities for large-scale, trainable neural network models.
     * **Tensor Network States (TNS):** Integrates with state-of-the-art TN libraries (`quimb`, `symmray`) for handling Matrix Product States (MPS), Projected Entangled Pair States (PEPS), and more, bosonic or fermionic.
     * **Neuralized fermionic TNS (NN-fTNS):** Hybrid TN-NN model that improves over both fermionic TNS and NQS, see [1] for details.
+    * **Tensor Network Functions (TNF):** Function defined by tensor networks with arbitrary geometry. E.g. TNF derived from (1+1)D quantum circuit that supports volume-law entanglement structure, see [2] for details.
 * **Massively Parallel VMC Sampling:** Utilizes **`mpi4py`** to distribute the Markov Chain Monte Carlo (MCMC) sampling process, suitable on high-performance computing (HPC) clusters.
 * **HPC Ready:** Built for large-scale VMC calculations, suitable for deployment across **thousands of CPU cores**. **Note:** *Current implementation is optimized for CPU cores via MPI. GPU acceleration is actively under development.*
 * **Auto-differentiation for Optimization:** Leverages PyTorch's automatic differentiation engine for efficient, large-scale energy minimization using techniques like Stochastic Reconfiguration (SR) and other state-of-the-art ML optimizers.
@@ -55,13 +56,17 @@ An example plot (from Ref.[1]) of the VMC training curves for various Ans\"atze 
 
 This code is the result of the research detailed in:
 
-[1] **"Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems"** - *Si-Jing Du*, *Ao Chen*, and *Garnet Kin-Lic Chan* - [arXiv:2506.08329](https://arxiv.org/abs/2506.08329)
+[1] **"Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems"** - Si-Jing Du, Ao Chen, and Garnet Kin-Lic Chan - [arXiv:2506.08329](https://arxiv.org/abs/2506.08329)
+
+[2] **Tensor Network Computations That Capture Strict Variationality, Volume Law Behavior, and the Efficient Representation of Neural Network States** - Wen-Yuan Liu*, Si-Jing Du*, Ruojing Peng, Johnnie Gray and Garnet Kin-Lic Chan - [Phys. Rev. Lett. 133, 260404](https://doi.org/10.1103/PhysRevLett.133.260404)
+
+
 
 ### Core Dependencies
 
 `vmc_torch` builds on and interoperates with leading libraries in Tensor Networks and quantum many-body calculations:
 
-[2] `symmray` - *Johnnie Gray* - https://github.com/jcmgray/symmray
+[3] `symmray` - *Johnnie Gray* - https://github.com/jcmgray/symmray
 
-[3] `quimb` - *Johnnie Gray* - https://github.com/jcmgray/quimb
+[4] `quimb` - *Johnnie Gray* - https://github.com/jcmgray/quimb
 
