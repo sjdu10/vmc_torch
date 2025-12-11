@@ -224,6 +224,7 @@ class fPEPS(qtn.PEPS):
                     3: do('array',[1.0],**kwargs)
                 }
 
+        cls = sr.utils.get_array_cls(symmetry=self.symmetry, fermionic=True)
         for n, site in zip(config, self.sites):
             p_ind = self.site_ind_id.format(*site)
             p_tag = self.site_tag_id.format(*site)
@@ -245,7 +246,7 @@ class fPEPS(qtn.PEPS):
             else:
                 oddpos = (3*tid+1)*(-1)**reverse
 
-            tsr_data = sr.FermionicArray.from_blocks(
+            tsr_data = cls.from_blocks(
                 blocks={(n_charge,):n_array}, 
                 duals=(True,),
                 symmetry=self.symmetry, 
