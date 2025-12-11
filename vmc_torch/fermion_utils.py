@@ -224,6 +224,7 @@ class fPEPS(qtn.PEPS):
                     3: do('array',[1.0],**kwargs)
                 }
 
+        cls = sr.utils.get_array_cls(symmetry=self.symmetry, fermionic=True)
         for n, site in zip(config, self.sites):
             p_ind = self.site_ind_id.format(*site)
             p_tag = self.site_tag_id.format(*site)
@@ -245,7 +246,7 @@ class fPEPS(qtn.PEPS):
             else:
                 oddpos = (3*tid+1)*(-1)**reverse
 
-            tsr_data = sr.FermionicArray.from_blocks(
+            tsr_data = cls.from_blocks(
                 blocks={(n_charge,):n_array}, 
                 duals=(True,),
                 symmetry=self.symmetry, 
@@ -318,8 +319,6 @@ class fPEPS(qtn.PEPS):
         """Slicing to get the amplitude locally, faster than contraction with a tensor product state.
         Note here sites is a list of tuples (x, y) for the sites to be fixed, and config is a 1D array of integers representing the fermion occupation numbers at those sites."""
         peps = self if inplace else self.copy()
-        has_oddpos = hasattr(self.tensors[0].data, 'oddpos')
-        has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
         if isinstance(config, numpy.ndarray):
@@ -328,11 +327,7 @@ class fPEPS(qtn.PEPS):
             device = list(self.tensors[0].data.blocks.values())[0].device
             kwargs = {'like':config, 'device':device, 'dtype':dtype}
         if self.spinless:
-            index_map = {0: 0, 1: 1}
-            array_map = {
-                0: do('array', [1.0, ], **kwargs),
-                1: do('array', [1.0, ], **kwargs)
-            }
+            raise NotImplementedError("Efficient amplitude calculation is not implemented for spinless fermions.")
         else:
             if self.symmetry == 'Z2':
                 index_map = {0:0, 1:1, 2:1, 3:0}
@@ -351,57 +346,55 @@ class fPEPS(qtn.PEPS):
                     3: do('array',[1.0,],**kwargs)
                 }
 
-        for n, site in zip(config, sites):
-            p_ind = peps.site_ind_id.format(*site)
-            tid = peps.sites.index(site)
-            fts = peps.tensor_map[tid]
-            ftsdata = fts.data
-            ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
-            phys_ind_order = fts.inds.index(p_ind)
-            charge = index_map[int(n)]
-            input_vec = array_map[int(n)]
-            charge_sec_data_dict = ftsdata.blocks
-            new_fts_inds = fts.inds[:phys_ind_order] + fts.inds[phys_ind_order+1:]
-            new_charge_sec_data_dict = {}
-            for charge_blk, data in charge_sec_data_dict.items():
-                if charge_blk[phys_ind_order] == charge:
-                    # ------------------------------------------------------------------
-                    # Replacement for: 
-                    # new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
-                    # ------------------------------------------------------------------
+            for n, site in zip(config, sites):
+                p_ind = peps.site_ind_id.format(*site)
+                tid = peps.sites.index(site)
+                fts = peps.tensor_map[tid]
+                ftsdata = fts.data
+                ftsdata.phase_sync(inplace=True) # explicitly apply all lazy phases that are stored and not yet applied
+                phys_ind_order = fts.inds.index(p_ind)
+                charge = index_map[int(n)]
+                input_vec = array_map[int(n)]
+                charge_sec_data_dict = ftsdata.blocks
+                new_fts_inds = fts.inds[:phys_ind_order] + fts.inds[phys_ind_order+1:]
+                new_charge_sec_data_dict = {}
+                for charge_blk, data in charge_sec_data_dict.items():
+                    if charge_blk[phys_ind_order] == charge:
+                        # ------------------------------------------------------------------
+                        # Replacement for: 
+                        # new_data = do('tensordot', data, input_vec, axes=([phys_ind_order], [0]))
+                        # ------------------------------------------------------------------
 
-                    # 1. Determine which index to select (0 or 1) from the input vector.
-                    #    `argmax` finds the position of the '1.0'.
-                    # select_index = torch.argmax(input_vec).item()
-                    select_index = do('argmax', input_vec)
+                        # 1. Determine which index to select (0 or 1) from the input vector.
+                        #    `argmax` finds the position of the '1.0'.
+                        # select_index = torch.argmax(input_vec).item()
+                        select_index = do('argmax', input_vec)
 
-                    # 2. Build the slicer tuple dynamically.
-                    #    This creates a list of `slice(None)` (which is equivalent to `:`)
-                    #    and inserts the `select_index` at the correct position.
-                    slicer = [slice(None)] * data.ndim
-                    slicer[phys_ind_order] = select_index
+                        # 2. Build the slicer tuple dynamically.
+                        #    This creates a list of `slice(None)` (which is equivalent to `:`)
+                        #    and inserts the `select_index` at the correct position.
+                        slicer = [slice(None)] * data.ndim
+                        slicer[phys_ind_order] = select_index
 
-                    # 3. Apply the slice to get the new data.
-                    new_data = data[tuple(slicer)]
+                        # 3. Apply the slice to get the new data.
+                        new_data = data[tuple(slicer)]
 
-                    # 4. Fermionic sign correction due to potential permutation of odd indices.
-                    #     (In our convention the physical ind should be the last ind during contraction)
-                    if charge % 2 != 0 and phys_ind_order != len(charge_blk) - 1:
-                        # Count how many odd indices are to the right of the physical index.
-                        # Check if odd physical ind permutes through odd number of odd indices.
-                        num_odd_right_blk = sum(1 for i in charge_blk[phys_ind_order + 1:] if i % 2 == 1)
-                        if num_odd_right_blk % 2 == 1:
-                            # local fermionic sign change due to odd parity inds + odd permutation
-                            new_data = -new_data
-                    # ------------------------------------------------------------------
-                    
-                    new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order+1:]
-                    new_charge_sec_data_dict[new_charge_blk]=new_data
-                    
-            new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order+1:]
+                        # 4. Fermionic sign correction due to potential permutation of odd indices.
+                        #     (In our convention the physical ind should be the last ind during contraction)
+                        if charge % 2 != 0 and phys_ind_order != len(charge_blk) - 1:
+                            # Count how many odd indices are to the right of the physical index.
+                            # Check if odd physical ind permutes through odd number of odd indices.
+                            num_odd_right_blk = sum(1 for i in charge_blk[phys_ind_order + 1:] if i % 2 == 1)
+                            if num_odd_right_blk % 2 == 1:
+                                # local fermionic sign change due to odd parity inds + odd permutation
+                                new_data = -new_data
+                        # ------------------------------------------------------------------
+                        
+                        new_charge_blk = charge_blk[:phys_ind_order] + charge_blk[phys_ind_order+1:]
+                        new_charge_sec_data_dict[new_charge_blk]=new_data
+                        
+                new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order+1:]
 
-            # XXX: Implementation could be written more elegantly here...
-            if has_oddpos:
                 if int(n) == 1:
                     new_oddpos = (3*tid+1)*(-1)
                 elif int(n) == 2:
@@ -415,24 +408,8 @@ class fPEPS(qtn.PEPS):
                 
                 new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
-            elif has_dummy_modes:
-                if int(n) == 1:
-                    new_dummy_modes = (3*tid+1)*(-1)
-                elif int(n) == 2:
-                    new_dummy_modes = (3*tid+2)*(-1)
-                elif int(n) == 3 or int(n) == 0:
-                    new_dummy_modes = ()
 
-                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
-                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
-                dummy_modes = list(new_dummy_modes)[::-1]
-                
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, symmetry=self.symmetry, dummy_modes=dummy_modes)
-                fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
-            else:
-                raise ValueError("FermionicArray has neither 'oddpos' nor 'dummy_modes' attribute to keep track of odd parity tensor ordering.")
-
-        amp = qtn.PEPS(peps)
+            amp = qtn.PEPS(peps)
 
         return amp
     
@@ -794,52 +771,28 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
                 sr.BlockIndex({(0, 0): p//4, (0, 1): p//4, (1, 0): p//4, (1, 1): p//4}, dual=info["duals"][-1])
             )
         
-        try:
-            # random fermionic array
-            if symmetry == 'Z2':
-                data = sr.Z2FermionicArray.random(
-                    block_indices,
-                    charge=1 if parity_config[tid] else 0,
-                    seed=rng,
-                    oddpos=3*tid,
-                )
-            elif symmetry == 'U1':
-                data = sr.U1FermionicArray.random(
-                    block_indices,
-                    charge=int(charge_config[tid]),
-                    seed=rng,
-                    oddpos=3*tid,
-                )
-            elif symmetry == 'U1U1':
-                data = sr.U1U1FermionicArray.random(
-                    block_indices,
-                    charge=charge_config[tid],
-                    seed=rng,
-                    oddpos=3*tid,
-                )
-        except Exception:
-            # random fermionic array
-            if symmetry == 'Z2':
-                data = sr.Z2FermionicArray.random(
-                    block_indices,
-                    charge=1 if parity_config[tid] else 0,
-                    seed=rng,
-                    dummy_modes=(FermionicOperator((3*tid)),),
-                )
-            elif symmetry == 'U1':
-                data = sr.U1FermionicArray.random(
-                    block_indices,
-                    charge=int(charge_config[tid]),
-                    seed=rng,
-                    dummy_modes=(FermionicOperator((3*tid)),),
-                )
-            elif symmetry == 'U1U1':
-                data = sr.U1U1FermionicArray.random(
-                    block_indices,
-                    charge=charge_config[tid],
-                    seed=rng,
-                    dummy_modes=(FermionicOperator((3*tid)),),
-                )
+        # random fermionic array
+        if symmetry == 'Z2':
+            data = sr.Z2FermionicArray.random(
+                block_indices,
+                charge=1 if parity_config[tid] else 0,
+                seed=rng,
+                oddpos=3*tid,
+            )
+        elif symmetry == 'U1':
+            data = sr.U1FermionicArray.random(
+                block_indices,
+                charge=int(charge_config[tid]),
+                seed=rng,
+                oddpos=3*tid,
+            )
+        elif symmetry == 'U1U1':
+            data = sr.U1U1FermionicArray.random(
+                block_indices,
+                charge=charge_config[tid],
+                seed=rng,
+                oddpos=3*tid,
+            )
 
         peps |= qtn.Tensor(
             data=data,
