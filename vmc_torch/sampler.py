@@ -704,7 +704,6 @@ class Sampler(AbstractSampler):
                     source=MPI.ANY_SOURCE,
                     tag=message_tag + TAG_OFFSET - 1,
                 )
-                # redundant_message = COMM.recv(source=MPI.ANY_SOURCE, tag=message_tag+TAG_OFFSET-1)
                 del redundant_message
 
             while not terminate[0]:
@@ -742,7 +741,7 @@ class Sampler(AbstractSampler):
                     )
                     op_loc, logpsi_sigma_grad = 0, np.zeros(vstate.Np)
 
-                if abs(op_loc) > 1e8:  # discard the extreme samples
+                if abs(op_loc) > 1e8:  # discard the extreme samples #NOTE: only for local energy
                     continue
                 n += 1
                 op_loc_vec.append(op_loc)
@@ -754,13 +753,10 @@ class Sampler(AbstractSampler):
                 # collect the log-amplitude gradient
                 logpsi_sigma_grad_mat.append(logpsi_sigma_grad)
 
-                # buf = (RANK,)
                 buf = np.array([RANK], dtype=np.int32)
-                # Send the local sample count to rank 0
-                # COMM.send(buf, dest=0, tag=message_tag+TAG_OFFSET)
+                # Send a signal to RANK 0 that we have new samples
                 COMM.Send([buf, MPI.INT], dest=0, tag=message_tag + TAG_OFFSET)
                 # Receive the termination signal from rank 0
-                # terminate = COMM.recv(source=0, tag=message_tag+1)
                 terminate = np.empty(1, dtype=np.int32)
                 COMM.Recv([terminate, MPI.INT], source=0, tag=message_tag + 1)
 

@@ -23,7 +23,7 @@ from vmc_torch.sampler import MetropolisExchangeSamplerSpinful
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SignedSGD, SignedRandomSGD, SR, TrivialPreconditioner, Adam, SGD_momentum, DecayScheduler
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import spinful_Fermi_Hubbard_square_lattice
+from vmc_torch.experiment.tests.dev.hamiltonian_old import spinful_Fermi_Hubbard_square_lattice
 from vmc_torch.torch_utils import SVD,QR
 from vmc_torch.fermion_utils import generate_random_fpeps
 

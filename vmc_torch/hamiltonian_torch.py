@@ -502,7 +502,7 @@ def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, mu, N_f, pbc=False):
     return H, hi, graph
 
 class spinless_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
-    def __init__(self, Lx, Ly, t, V, mu, N_f, pbc=False):
+    def __init__(self, Lx, Ly, t=1.0, V=0.0, mu=0.0, N_f=None, pbc=False):
         """
         Implementation of spinless Fermi-Hubbard model on a square lattice using torch.
         Args:

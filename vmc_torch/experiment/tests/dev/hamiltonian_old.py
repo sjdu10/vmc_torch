@@ -11,7 +11,7 @@ from netket.experimental.operator.fermion import destroy as c
 from netket.experimental.operator.fermion import create as cdag
 from netket.experimental.operator.fermion import number as nc
 
-from .fermion_utils import from_netket_config_to_quimb_config, from_quimb_config_to_netket_config, calc_phase_correction_netket_symmray
+from ....fermion_utils import from_netket_config_to_quimb_config, from_quimb_config_to_netket_config, calc_phase_correction_netket_symmray
 
 
 

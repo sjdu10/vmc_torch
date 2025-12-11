@@ -25,7 +25,7 @@ from vmc_torch.sampler import MetropolisExchangeSamplerSpinless
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR, DecayScheduler
 from vmc_torch.VMC import VMC
-from vmc_torch.hamiltonian import square_lattice_spinless_Fermi_Hubbard, spinful_Fermi_Hubbard_square_lattice, spinless_Fermi_Hubbard_square_lattice
+from vmc_torch.experiment.tests.dev.hamiltonian_old import square_lattice_spinless_Fermi_Hubbard, spinful_Fermi_Hubbard_square_lattice, spinless_Fermi_Hubbard_square_lattice
 from vmc_torch.torch_utils import SVD,QR
 from vmc_torch.utils import closest_divisible
 
