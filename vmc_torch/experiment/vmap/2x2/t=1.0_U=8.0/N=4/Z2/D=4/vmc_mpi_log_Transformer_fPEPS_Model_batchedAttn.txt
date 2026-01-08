@@ -1,0 +1,36 @@
+STEP 0:
+Energy per site: 0.28737344090692235
+Energy variance square root: 0.024255302229802978
+Sample size: 1280
+Time elapsed: 0.743890461 seconds
+
+STEP 1:
+Energy per site: 0.24535551031565941
+Energy variance square root: 0.021577753093123705
+Sample size: 1280
+Time elapsed: 0.7232880799999999 seconds
+
+STEP 2:
+Energy per site: 0.009634783888674166
+Energy variance square root: 0.015018522665949254
+Sample size: 1280
+Time elapsed: 0.7280457340000002 seconds
+
+STEP 3:
+Energy per site: -0.0683206247904897
+Energy variance square root: 0.005095233797375207
+Sample size: 1280
+Time elapsed: 0.7117438669999996 seconds
+
+STEP 4:
+Energy per site: -0.08024532116071022
+Energy variance square root: 0.015557060543948148
+Sample size: 1280
+Time elapsed: 0.714089306 seconds
+
+STEP 5:
+Energy per site: -0.12754841054985222
+Energy variance square root: 0.006345081743121406
+Sample size: 1280
+Time elapsed: 0.7047614490000003 seconds
+

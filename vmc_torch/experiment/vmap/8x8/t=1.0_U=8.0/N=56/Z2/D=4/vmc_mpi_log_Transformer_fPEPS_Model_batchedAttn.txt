@@ -1,0 +1,12 @@
+STEP 0:
+Energy per site: -0.18644663277675863
+Energy variance square root: 0.018528119238941047
+Sample size: 128
+Time elapsed: 848.696555786 seconds
+
+STEP 1:
+Energy per site: -0.18587880298144455
+Energy variance square root: 0.011562017292132904
+Sample size: 128
+Time elapsed: 858.790530366 seconds
+

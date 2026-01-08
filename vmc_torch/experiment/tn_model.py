@@ -5504,8 +5504,8 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
                     self.tree = amp.contraction_tree(optimize=opt)
                 amp_val = amp.contract(optimize=self.tree)
             else:
-                amp = amp.contract_boundary_from_ymin(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
-                amp = amp.contract_boundary_from_ymax(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
+                amp.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, psi.Ly//2-1])
+                amp.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[psi.Ly//2, psi.Ly-1])
                 amp_val = amp.contract()
                 
             if amp_val==0.0:

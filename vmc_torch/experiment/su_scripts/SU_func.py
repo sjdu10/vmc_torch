@@ -236,7 +236,8 @@ def run_u1SU_w_pinning_field(
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params_cpf={cpf}_spf={spf}.pkl', 'wb') as f:
             pickle.dump(params, f)
         fig, _ = u1su.plot()
-        fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution_cpf={cpf}_spf={spf}.png')
+        if fig is not None:
+            fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution_cpf={cpf}_spf={spf}.png')
     print('===================================')
     return u1peps
 
@@ -461,7 +462,8 @@ def run_z2SU(
         with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_su_params.pkl', 'wb') as f:
             pickle.dump(params, f)
         fig, _ = z2su.plot()
-        fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution.png')
+        if fig is not None:
+            fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution.png')
     print('===================================')
     return z2peps
 

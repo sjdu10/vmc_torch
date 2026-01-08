@@ -445,7 +445,9 @@ class Transformer_fPEPS_Model_batchedAttn(nn.Module):
 
 #=== Utility functions for Metropolis-Hastings sampling ===#
 
-def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25):
+def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25, seed=None):
+    if seed is not None:
+        random.seed(seed)
     ind_n_map = {0: 0, 1: 1, 2: 1, 3: 2}
     if current_config[i] == current_config[j]:
         return current_config, 0
@@ -484,7 +486,7 @@ def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25):
 
 # Batched Metropolis-Hastings updates
 @torch.inference_mode()
-def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False):
+def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False, seed=None):
     current_amps = fpeps_model(fxs)
     B = len(fxs)
     n = 0
@@ -498,10 +500,18 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False):
             proposed_fxs = []
             new_flags = []
             # t0 = time.time()
+            fx_id = 0
             for fx in fxs:
-                proposed_fx, new = propose_exchange_or_hopping(i, j, fx, hopping_rate=hopping_rate)
+                proposed_fx, new = propose_exchange_or_hopping(
+                    i,
+                    j,
+                    fx,
+                    hopping_rate=hopping_rate,
+                    seed=seed + fx_id if seed is not None else None,
+                )
                 proposed_fxs.append(proposed_fx)
                 new_flags.append(new)
+                fx_id += 1
             # t1 = time.time()
             # print(f"Propose time: {t1 - t0}")
             proposed_fxs = torch.stack(proposed_fxs, dim=0)
@@ -528,10 +538,18 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False):
             i, j = edge
             proposed_fxs = []
             new_flags = []
+            fx_id = 0
             for fx in fxs:
-                proposed_fx, new = propose_exchange_or_hopping(i, j, fx, hopping_rate=hopping_rate)
+                proposed_fx, new = propose_exchange_or_hopping(
+                    i,
+                    j,
+                    fx,
+                    hopping_rate=hopping_rate,
+                    seed=seed + fx_id if seed is not None else None,
+                )
                 proposed_fxs.append(proposed_fx)
                 new_flags.append(new)
+                fx_id += 1
             proposed_fxs = torch.stack(proposed_fxs, dim=0)
             if not any(new_flags):
                 continue
@@ -647,19 +665,13 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             if verbose:
                 if RANK == 1:
                     print(f"Batched Vectorized jacobian time: {t1 - t0}")
+                    
         # jac_pytree has shape same as params_pytree, each leaf has shape (B, )
 
         # Get per-sample batched grads in list of pytree format
-        batched_grads_vec = []
-        for b in range(fxs.shape[0]):
-            if isinstance(jac_pytree, dict):
-                grad_b_iter = [jac_pytree[k][b] for k in jac_pytree.keys()]
-            elif isinstance(jac_pytree, list):
-                grad_b_iter = [jac_pytree[k][b] for k in range(len(jac_pytree))]
-
-            batched_grads_vec.append(flatten_params(grad_b_iter))
-
-        batched_grads_vec = torch.stack(batched_grads_vec, dim=0)  # shape (B, Np), Np is number of parameters
+        leaves, _ = tree_flatten(jac_pytree) # list of leaves in jac_pytree, each leaf shape (B, param_shape)
+        leaves_flattend = [leaf.flatten(start_dim=1) for leaf in leaves]  # each leaf shape (B, param_size)
+        batched_grads_vec = torch.cat(leaves_flattend, dim=1) # shape (B, Np), Np is number of parameters
         amps.unsqueeze_(1)  # shape (B, 1)
         return batched_grads_vec, amps
     
@@ -684,7 +696,9 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
         return batched_grads_vec, amps
 
 
-def random_initial_config(N_f, N_sites):
+def random_initial_config(N_f, N_sites, seed=None):
+    if seed is not None:
+        torch.manual_seed(seed)
     half_filled_config = torch.tensor(
         [1,2] * (N_sites // 2)
     )

@@ -650,7 +650,7 @@ def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermion
     return H, hi, graph
 
 class spinful_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
-    def __init__(self, Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
+    def __init__(self, Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False, gpu=False):
         """
         Implementation of spinful Fermi-Hubbard model on a square lattice using torch.
         Args:
@@ -667,6 +667,7 @@ class spinful_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
             no_u1_symmetry=no_u1_symmetry,
         )
         super().__init__(H, hi, graph)
+        self.gpu = gpu
 
     def get_conn(self, sigma_quimb):
         """
@@ -698,7 +699,10 @@ class spinful_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
                 # on-site term
                 i = key[0]
                 if sigma_quimb[i] == 3:
-                    eta_quimb = tuple(np.array(sigma_quimb))
+                    if self.gpu:
+                        eta_quimb = tuple(sigma_quimb.cpu().numpy())
+                    else:
+                        eta_quimb = tuple(np.array(sigma_quimb))
                     if eta_quimb not in connected_config_coeff:
                         connected_config_coeff[eta_quimb] = value
                     else:

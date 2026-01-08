@@ -25,12 +25,11 @@ SIZE = COMM.Get_size()
 torch.set_default_device("cpu") # CPU
 torch.random.manual_seed(42 + RANK)
 
-Lx = 4
-Ly = 2
-nsites = Lx * Ly
-N_f = nsites - 2  # filling
+Lx = 8
+Ly = 8
+N_f = Lx * Ly - 8 # filling
 D = 4
-chi = -1
+chi = D
 seed = RANK + 42
 # only the flat backend is compatible with jax.jit
 flat = True
@@ -40,6 +39,7 @@ appendix = '_U1SU' if u1z2 else ''
 params = pickle.load(open(pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/peps_su_params{appendix}.pkl', 'rb'))
 skeleton = pickle.load(open(pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/peps_skeleton{appendix}.pkl', 'rb'))
 peps = qtn.unpack(params, skeleton)
+nsites = peps.nsites
 for ts in peps.tensors:
     # print(ts.data)
     ts.modify(data=ts.data.to_flat()*10)
@@ -53,9 +53,9 @@ for site in peps.sites:
 fpeps_model = Transformer_fPEPS_Model_batchedAttn(
     tn=peps,
     max_bond=chi,
-    embed_dim=8,
+    embed_dim=16,
     attn_heads=4,
-    nn_hidden_dim=16,
+    nn_hidden_dim=4*peps.nsites,
     nn_eta=1,
     dtype=torch.float64,
 )
@@ -65,12 +65,13 @@ fpeps_model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 # fpeps_model = fPEPS_Model(
 #     peps, max_bond=chi, dtype=torch.float64
 # )
+
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0:
     # print model size
     print(f'fPEPS-based model number of parameters: {n_params}')
 
-# generate Hamiltonian graph
+# Hamiltonian definition
 t=1.0
 U=8.0
 n_fermions_per_spin = (N_f // 2, N_f // 2)
@@ -108,20 +109,22 @@ if Lx*Ly <= 6 and RANK == 0:
 
 
 # Prepare initial samples
-Ns = int(5e3) # total sample size
+# Total sample size
+Ns = int(128) 
 # batchsize per rank
-B = 96
+B = 16
+B_grad = 4
 fxs = []
 for _ in range(B):
     fxs.append(random_initial_config(N_f, nsites))
 fxs = torch.stack(fxs)
 # burn-in for each rank
-for _ in range(2):
-    t0 = time.time()
+t0 = MPI.Wtime()
+for _ in range(0):
     fxs, current_amps = sample_next(fxs, fpeps_model, graph)
-    t1 = time.time()
-    if RANK == 0:
-        print(f'Burn-in sampling time: {t1-t0:.4f} s')
+t1 = MPI.Wtime()
+if RANK == 0:
+    print(f'Burn-in sampling time: {t1-t0:.4f} s')
 
 vmc_steps = 50
 TAG_OFFSET = 424242
@@ -129,7 +132,7 @@ vmc_pbar = tqdm(total=vmc_steps, desc="VMC steps")
 minSR=False
 learning_rate = 0.1
 
-stats_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/vmc_mpi_stats_{fpeps_model._get_name()}.json'
+stats_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/vmc_mpi_stats_{fpeps_model._get_name()+str(chi)}.json'
 stats = {
     'Np': n_params,
     'sample size': Ns,
@@ -207,7 +210,7 @@ for _ in range(vmc_steps):
             t11 = MPI.Wtime()
             energy, local_energies = evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False)
             t22 = MPI.Wtime()
-            grads_vec, amps = compute_grads(fxs, fpeps_model, vectorize=True, batch_size=32, verbose=False)
+            grads_vec, amps = compute_grads(fxs, fpeps_model, vectorize=True, batch_size=B_grad, verbose=False)
             t33 = MPI.Wtime()
             sample_time += t11 - t00
             local_energy_time += t22 - t11
@@ -266,6 +269,8 @@ for _ in range(vmc_steps):
 
                 O_sk = (all_logamp_grads_vec - log_grads_vec_mean[None, :]) / (N_total**0.5)  # shape (N_total, Np)
                 T = (O_sk @ O_sk.T.conj())  # shape (N_total, N_total)
+                diag_shift = 1e-4
+                T += diag_shift * torch.eye(N_total, device=T.device, dtype=T.dtype)
                 E_s = (all_energies - all_energies_mean) / (N_total**0.5)  # shape (N_total,)
 
                 # minSR: need to solve O_sk * dp = E_s in the least square sense, using the pseudo-inverse of O_sk to get the minimum norm solution
@@ -328,12 +333,12 @@ for _ in range(vmc_steps):
     if RANK == 0:
         # save step, energy, energy variance to a file (if exists, delete and create a new one)
         
-        log_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/vmc_mpi_log_{fpeps_model._get_name()}.txt'
+        log_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/vmc_mpi_log_{fpeps_model._get_name()+str(chi)}.txt'
         if os.path.exists(log_file) and _ == 0:
             os.remove(log_file)
         with open(log_file, 'a') as f:
             f.write(f'STEP {_}:\nEnergy per site: {energy/nsites}\nEnergy variance square root: {np.sqrt(energy_var)/nsites}\nSample size: {N_total}\nTime elapsed: {t1 - t0} seconds\n\n')
-        
+        # print(f'STEP {_}:\nEnergy per site: {energy/nsites}\nEnergy variance square root: {np.sqrt(energy_var)/nsites}\nSample size: {N_total}\nTime elapsed: {t1 - t0} seconds\n\n')
         # save Np, sample size, mean, error, variance to a json file
         stats['mean'].append(energy/nsites)
         stats['error'].append(np.sqrt(energy_var)/nsites)
@@ -345,7 +350,7 @@ for _ in range(vmc_steps):
         
         # save model checkpoint every few steps
         if (_ + 1) % save_state_every == 0:
-            checkpoint_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/checkpoint_step_{fpeps_model._get_name()}_{_+1}.pt'
+            checkpoint_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/checkpoint_step_{fpeps_model._get_name()+str(chi)}_{_+1}.pt'
             torch.save(fpeps_model.state_dict(), checkpoint_file)
     
 

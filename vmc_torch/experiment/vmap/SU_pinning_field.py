@@ -6,9 +6,9 @@ from SU_func import (
     run_z2SU_from_u1SU,
 )
 
-Lx, Ly = 4, 2
+Lx, Ly = 4, 8
 D0 = 4
-N_f = Lx*Ly - 2
+N_f = Lx*Ly
 t = 1.0
 U = 8.0
 mu = 0.0
@@ -31,8 +31,8 @@ seed = 42
 #     'gate_opts':{'cutoff':0}
 # }
 # su_evolve_schedule = [
-#     (50, 0.05),
-#     (50, 0.01),
+#     (2, 0.05),
+#     (2, 0.01),
 # ]
 # u1peps_w_pf = run_u1SU_w_pinning_field(
 #     Lx=Lx,
