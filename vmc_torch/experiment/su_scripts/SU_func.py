@@ -586,16 +586,16 @@ def run_z2SU_from_u1SU(
     z2peps = z2su.get_state()
     z2peps.equalize_norms_(value=1)
     z2peps.exponent = 0.0
-    # correct the format of oddpos
+    # correct the format of dummy_modes
     for ts in z2peps.tensors:
         ts.data.phase_sync(inplace=True)
-        # for Z2 fPEPS converted from U1 fPEPS, need to correct the format of oddpos
-        if ts.data.oddpos:
-            oddpos = ts.data.oddpos
-            if isinstance(oddpos[0].label, tuple):
-                nested_oddpos = oddpos[0].label[0]
-                if isinstance(nested_oddpos, FermionicOperator):
-                    ts.data._oddpos = (nested_oddpos,)
+        # for Z2 fPEPS converted from U1 fPEPS, need to correct the format of dummy_modes
+        if ts.data.dummy_modes:
+            dummy_modes = ts.data.dummy_modes
+            if isinstance(dummy_modes[0].label, tuple):
+                nested_dummy_modes = dummy_modes[0].label[0]
+                if isinstance(nested_dummy_modes, FermionicOperator):
+                    ts.data._dummy_modes = (nested_dummy_modes,)
                     
     # save the state
     params, skeleton = qtn.pack(z2peps)

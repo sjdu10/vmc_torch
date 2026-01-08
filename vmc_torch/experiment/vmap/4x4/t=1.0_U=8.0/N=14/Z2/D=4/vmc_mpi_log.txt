@@ -1,0 +1,5 @@
+STEP 0:
+Energy per site: nan
+Energy variance square root: nan
+Sample size: 560
+

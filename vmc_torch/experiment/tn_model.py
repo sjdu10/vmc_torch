@@ -3,6 +3,7 @@ import cotengra as ctg
 
 # quimb
 import quimb.tensor as qtn
+import quimb as qu
 
 # torch
 import torch
@@ -24,7 +25,7 @@ from vmc_torch.fermion_utils import (
 )
 from vmc_torch.global_var import DEBUG, set_debug
 
-from .nn_sublayers import *
+from vmc_torch.nn_sublayers import *
 
 flatten_tn_params = flatten_proj_params
 reconstruct_tn_params = reconstruct_proj_params
@@ -125,16 +126,21 @@ class wavefunctionModel(torch.nn.Module):
     def get_tn_params_vec(self):
         if not hasattr(self, 'torch_tn_params'):
             pass
-        # get the current TN parameters as a flattened vector
-        params = {
-            int(tid): {
-                ast.literal_eval(sector): data
-                for sector, data in blk_array.items()
+        try:
+            # get the current TN parameters as a flattened vector
+            params = {
+                int(tid): {
+                    ast.literal_eval(sector): data
+                    for sector, data in blk_array.items()
+                }
+                for tid, blk_array in self.torch_tn_params.items()
             }
-            for tid, blk_array in self.torch_tn_params.items()
-        }
-        params_vec = flatten_tn_params(params)
-        return params_vec
+            params_vec = flatten_tn_params(params)
+            return params_vec
+        except Exception:
+            ftn_params = self.params[:len(self.ftn_params)]
+            params_vec = torch.cat([param.reshape(-1) for param in ftn_params])
+            return params_vec
 
     def update_cached_cache(self):
         pass
@@ -5196,7 +5202,7 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
     """
         For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
         This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
-        Positional encoding is added to the input of the attention block in this model.
+        Trainable positional encoding is added to the input of the attention block in this model.
         Update from v1: use positional encoding in the attention block and use tanh instead of LeakyReLU in the last MLPs.
     """
     def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32, eps=5e-3):
@@ -5236,7 +5242,7 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
             tn_params_vec = flatten_tn_params(tn_params_dict)
             self.mlp[tid] = nn.Sequential(
                 nn.Linear(mlp_input_dim, nn_final_dim),
-                nn.Tanh(),
+                nn.GELU(),
                 nn.Linear(nn_final_dim, tn_params_vec.numel()),
             )
             self.mlp[tid].to(self.param_dtype)
@@ -5254,7 +5260,6 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
 
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
-
 
         self.model_structure = {
             'fPEPS_backflow_attn_Tensorwise':
@@ -5328,7 +5333,41 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
     
+class PointwiseBackflow(nn.Module):
+    """
+    一个替换全连接 MLP 的高效模块。
+    它对每个 site 独立应用相同的 MLP (Shared Weights),
+    然后根据每个 site 实际需要的 TN 参数量进行裁剪和拼接。
+    """
+    def __init__(self, n_sites, embed_dim, hidden_dim, param_sizes, dtype):
+        super().__init__()
+        self.param_sizes = param_sizes  # list, e.g., [32, 32, 128, 128, ...]
+        self.max_size = max(param_sizes) # e.g., 128
+        
+        # 这是一个 "Local" MLP，作用于 (Batch, N, embed_dim)
+        # 参数量只与 hidden_dim 和 max_size 有关，与 n_sites 无关！
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.max_size, dtype=dtype)
+        )
 
+    def forward(self, x):
+        # x shape: (Batch, n_sites, embed_dim)
+        
+        # 1. 生成最大可能需要的参数 (Batch, n_sites, max_size)
+        raw_out = self.net(x) # Linear layer automatically applies to last dim
+        
+        # 2. 根据每个 site 实际需要的参数量进行裁剪并拼接
+        # 这一步保证了输出形状严格等于 ftn_params_length
+        parts = []
+        for i, size in enumerate(self.param_sizes):
+            # 取出第 i 个 site 的前 size 个参数
+            parts.append(raw_out[:, i, :size])
+            
+        # 3. 拼接成一个大向量: (Batch, Total_TN_Params)
+        return torch.cat(parts, dim=1)
+    
 class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
     """
         For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
@@ -5336,9 +5375,23 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
         Positional encoding is added to the input of the attention block in this model.
         Update from v1: after attention block an position-wise MLP is used to add non-linearity to attention output, and potentially remove layer normalization.
     """
-    def __init__(self, ftn, max_bond=None, embedding_dim=32, attention_heads=4, nn_final_dim=4, nn_eta=1.0, dtype=torch.float32, layer_norm=True, position_wise_mlp=True, positional_encoding=True):
+    def __init__(
+        self,
+        ftn,
+        max_bond=None,
+        embedding_dim=32,
+        attention_heads=4,
+        nn_final_dim=4,
+        nn_eta=1.0,
+        dtype=torch.float32,
+    ):
         super().__init__()
         self.param_dtype = dtype
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.nn_eta = nn_eta
+        self.tree = None
         
         # extract the raw arrays and a skeleton of the TN
         params, self.skeleton = qtn.pack(ftn)
@@ -5353,40 +5406,46 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
         })
 
         # Define the neural network
-        input_dim = ftn.Lx * ftn.Ly
-        phys_dim = ftn.phys_dim()
-        
-        self.nn = SelfAttn_MLP(
-            n_site=input_dim,
-            num_classes=phys_dim,
+        self.attn = SelfAttn_block_pos_batched(
+            n_site=len(ftn.sites),
+            num_classes=ftn.phys_dim(),
             embed_dim=embedding_dim,
             attention_heads=attention_heads,
             dtype=self.param_dtype,
-            layer_norm=layer_norm,
-            position_wise_mlp=position_wise_mlp,
-            positional_encoding=positional_encoding,
         )
-        # for each tensor (labelled by tid), assign a MLP
-        self.mlp = nn.ModuleDict()
+
+        # for each tensor (labelled by tid), compute parameter sizes
+        self.ftn_params_sizes = []
         for tid in self.torch_tn_params.keys():
-            mlp_input_dim = ftn.Lx * ftn.Ly * embedding_dim
             tn_params_dict = {
                 tid: params[int(tid)]
             }
             tn_params_vec = flatten_tn_params(tn_params_dict)
-            self.mlp[tid] = nn.Sequential(
-                nn.Linear(mlp_input_dim, nn_final_dim),
-                nn.LeakyReLU(),
-                nn.Linear(nn_final_dim, tn_params_vec.numel()),
-            )
-            self.mlp[tid].to(self.param_dtype)
+            self.ftn_params_sizes.append(tn_params_vec.numel())
+        self.ftn_params_length = sum(self.ftn_params_sizes)
 
+        # --- REPLACED: 使用 PointwiseBackflow 替代原来的 Flatten+MLP ---
+        # PointwiseBackflow 会自动处理不同大小的 tensor
+        self.nn_backflow_generator = PointwiseBackflow(
+            n_sites=len(ftn.sites),
+            embed_dim=embedding_dim,
+            hidden_dim=nn_final_dim,
+            param_sizes=self.ftn_params_sizes,
+            dtype=self.param_dtype
+        )
+
+        # combine attn and mlp into a single nn_backflow
+        # 注意：移除了 Flatten(start_dim=1)，因为 PointwiseBackflow 需要 (Batch, N, E) 输入
+        self.nn_backflow = nn.Sequential(
+            self.attn,
+            self.nn_backflow_generator
+        )
+        
         # Get symmetry
         self.symmetry = ftn.arrays[0].symmetry
 
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
-
 
         self.model_structure = {
             'fPEPS_backflow_attn_Tensorwise_MLP':
@@ -5402,11 +5461,7 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
                 'max_bond': max_bond,
             },
         }
-        if max_bond is None or max_bond <= 0:
-            max_bond = None
-        self.max_bond = max_bond
-        self.nn_eta = nn_eta
-        self.tree = None
+        
     
     def amplitude(self, x, **kwargs):
         # Reconstruct the original parameter structure (by unpacking from the flattened dict)
@@ -5424,22 +5479,23 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
         batch_amps = []
         for x_i in x:
             # Check x_i type
-            if not type(x_i) == torch.Tensor:
+            if not isinstance(x_i, torch.Tensor):
                 x_i = torch.tensor(x_i, dtype=self.param_dtype)
             else:
                 if x_i.dtype != self.param_dtype:
                     x_i = x_i.to(self.param_dtype)
         
             # Get the NN correction to the parameters, concatenate the results for each tensor
-            nn_features = self.nn(x_i)
-            nn_features_vec = nn_features.view(-1)
-            nn_correction = torch.cat([self.mlp[tid](nn_features_vec) for tid in self.torch_tn_params.keys()])
+            nn_features_vec = self.nn_backflow(x_i.unsqueeze(0)).squeeze(0)
+            nn_correction = nn_features_vec
             # Add the correction to the original parameters
-            tn_nn_params = reconstruct_tn_params(params_vec + self.nn_eta*nn_correction, params)
+            nnftn_params_vec = params_vec + self.nn_eta*nn_correction
+            nnftn_params = reconstruct_tn_params(nnftn_params_vec, params)
             # Reconstruct the TN with the new parameters
-            psi = qtn.unpack(tn_nn_params, self.skeleton)
+            psi = qtn.unpack(nnftn_params, self.skeleton)
             # Get the amplitude
-            amp = psi.get_amp(x_i)
+            # amp = psi.get_amp(x_i)
+            amp = psi.isel({psi.site_ind(site): x_i[i].int() for i, site in enumerate(psi.sites)})
 
             if self.max_bond is None:
                 amp = amp
@@ -5594,7 +5650,7 @@ class fTN_backflow_attn_Tensorwise_Model_v5(wavefunctionModel):
         For each on-site fermionic tensor with specific shape, assign a narrow on-site projector MLP with corresponding output dimension.
         This is to avoid the large number of parameters in the previous model, where Np = N_neurons * N_TNS.
         Positional encoding is added to the input of the attention block in this model.
-        Update: do not flatten the features from the attention block, instead use them directly in each on-site MLP to generate the tensor correction. And modify the amp instead of the state tensor.
+        Update: do not flatten the features from the attention block, instead use them directly in each on-site MLP to generate the tensor correction. And modify the amp tn instead of the state tensor.
     """
     def __init__(
         self,

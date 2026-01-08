@@ -97,21 +97,20 @@ class SelfAttn_block_pos(nn.Module):
         super(SelfAttn_block_pos, self).__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
-        # Linear layer to project one-hot vectors to the embedding dimension
-        self.embedding = nn.Linear(num_classes, embed_dim)
-        # Learnable positional embedding
-        self.positional_embedding = nn.Parameter(
-            torch.randn(n_site, embed_dim) / embed_dim**0.5
-        )
+        # Position-wise linear layer to project one-hot vectors to the embedding dimension
+        self.spatial_emb_lst = nn.ModuleList()
+        for _ in range(n_site):
+            fnn = nn.Sequential(
+                nn.Linear(num_classes, embed_dim, dtype=dtype)
+            )
+            self.spatial_emb_lst.append(fnn)
         # Self-attention block
         self.self_attention = SelfAttention(
             embed_dim=embed_dim, num_heads=attention_heads
         )
 
         self.dtype = dtype
-        self.embedding.to(dtype=dtype)
         self.self_attention.to(dtype=dtype)
-        self.positional_embedding.to(dtype=dtype)
 
     def forward(self, input_seq):
         # Step 1: One-hot encode the input sequence
@@ -119,15 +118,70 @@ class SelfAttn_block_pos(nn.Module):
             self.dtype
         )
 
-        # Step 2: Embed the one-hot encoded sequence
-        embedded = self.embedding(one_hot_encoded)
-        embedded = embedded + self.positional_embedding
+        # Step 2: Embed the one-hot encoded sequence        
+        embedded = torch.stack(
+            [self.spatial_emb_lst[i](one_hot_encoded[i, :]) for i in range(one_hot_encoded.shape[0])], dim=0
+        )
+        embedded = F.layer_norm(embedded,(embedded.size(-1),)) # important to break the symmetry when embedding.norms are small!
 
         # Step 3: Pass through the self-attention block
         attn_output, _ = self.self_attention(embedded)
 
         # Step 4: Residual connection and layer normalization
         attn_output = F.layer_norm(attn_output + embedded, attn_output.size()[1:])
+
+        return attn_output
+
+class SelfAttn_block_pos_batched(nn.Module):
+    """ Self-attention block with positional encoding"""
+    def __init__(
+        self, n_site, num_classes, embed_dim, attention_heads, dtype=torch.float32
+    ):
+        super(SelfAttn_block_pos_batched, self).__init__()
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        # Position-wise linear layer to project one-hot vectors to the embedding dimension
+        self.spatial_emb_lst = nn.ModuleList()
+        for _ in range(n_site):
+            fnn = nn.Sequential(
+                nn.Linear(num_classes, embed_dim, dtype=dtype)
+            )
+            self.spatial_emb_lst.append(fnn)
+        # Self-attention block
+        self.self_attention = SelfAttention(
+            embed_dim=embed_dim, num_heads=attention_heads
+        )
+
+        self.dtype = dtype
+        self.self_attention.to(dtype=dtype)
+
+    def forward(self, input_seq):
+        # input_seq: (Batch, L)
+        
+        # Step 1: One-hot encode (Batch, L, num_classes)
+        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(self.dtype)
+
+        # Step 2: Batched Position-wise Embedding
+        # Instead of the loop, we use a single parameter tensor for the weights
+        # If you want to keep the ModuleList weights, we can stack them once:
+        weights = torch.stack([layer[0].weight for layer in self.spatial_emb_lst]) # (L, D, C)
+        biases = torch.stack([layer[0].bias for layer in self.spatial_emb_lst])   # (L, D)
+
+        # b: batch, l: length (spatial), c: classes, d: embed_dim
+        # x: (b, l, c), weights: (l, d, c) -> we contract over c
+        # Note: nn.Linear weights are (out, in), so it's (l, d, c)
+        embedded = torch.einsum('blc,ldc->bld', one_hot_encoded, weights) + biases
+
+        # Step 3: Layer Norm to prevent entropy collapse
+        embedded = F.layer_norm(embedded, (self.embed_dim,))
+
+        # Step 4: Self-Attention
+        # attn_output shape: (Batch, L, D)
+        attn_output, _ = self.self_attention(embedded)
+
+        # Step 5: Residual + Norm
+        # Using (self.embed_dim,) as normalized_shape is safer for 3D tensors
+        attn_output = F.layer_norm(attn_output + embedded, (self.embed_dim,))
 
         return attn_output
 

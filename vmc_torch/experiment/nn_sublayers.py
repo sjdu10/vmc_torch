@@ -97,21 +97,20 @@ class SelfAttn_block_pos(nn.Module):
         super(SelfAttn_block_pos, self).__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
-        # Linear layer to project one-hot vectors to the embedding dimension
-        self.embedding = nn.Linear(num_classes, embed_dim)
-        # Learnable positional embedding
-        self.positional_embedding = nn.Parameter(
-            torch.randn(n_site, embed_dim) / embed_dim**0.5
-        )
+        # Position-wise linear layer to project one-hot vectors to the embedding dimension
+        self.spatial_emb_lst = nn.ModuleList()
+        for _ in range(n_site):
+            fnn = nn.Sequential(
+                nn.Linear(num_classes, embed_dim, dtype=dtype)
+            )
+            self.spatial_emb_lst.append(fnn)
         # Self-attention block
         self.self_attention = SelfAttention(
             embed_dim=embed_dim, num_heads=attention_heads
         )
 
         self.dtype = dtype
-        self.embedding.to(dtype=dtype)
         self.self_attention.to(dtype=dtype)
-        self.positional_embedding.to(dtype=dtype)
 
     def forward(self, input_seq):
         # Step 1: One-hot encode the input sequence
@@ -119,9 +118,11 @@ class SelfAttn_block_pos(nn.Module):
             self.dtype
         )
 
-        # Step 2: Embed the one-hot encoded sequence
-        embedded = self.embedding(one_hot_encoded)
-        embedded = embedded + self.positional_embedding
+        # Step 2: Embed the one-hot encoded sequence        
+        embedded = torch.stack(
+            [self.spatial_emb_lst[i](one_hot_encoded[i, :]) for i in range(one_hot_encoded.shape[0])], dim=0
+        )
+        embedded = F.layer_norm(embedded,(embedded.size(-1),)) # important to break the symmetry when embedding.norms are small!
 
         # Step 3: Pass through the self-attention block
         attn_output, _ = self.self_attention(embedded)

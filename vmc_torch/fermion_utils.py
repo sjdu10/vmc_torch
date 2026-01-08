@@ -93,6 +93,10 @@ def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None
                     skeleton[site_tag].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1))
                 except Exception:
                     pass
+                try:
+                    skeleton[site_tag].data._dummy_modes = skeleton[site_tag].data._oddpos
+                except Exception:
+                    pass
         else:
             raise NotImplementedError("Only Z2 symmetry is supported for converting old fTN to new symmray format for now.")
     
@@ -105,16 +109,16 @@ def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None
     ftns.apply_to_arrays(lambda x: torch.tensor(scale*x, dtype=dtype))
     ## 3. Set the exponent to 0.0
     ftns.exponent = 0.0
-    # correct the format of oddpos
+    # correct the format of dummy_modes
     for ts in ftns.tensors:
         ts.data.phase_sync(inplace=True)
-        # for Z2 fPEPS converted from U1 fPEPS, need to correct the format of oddpos
-        if ts.data.oddpos:
-            oddpos = ts.data.oddpos
-            if isinstance(oddpos[0].label, tuple):
-                nested_oddpos = oddpos[0].label[0]
-                if isinstance(nested_oddpos, FermionicOperator):
-                    ts.data._oddpos = (nested_oddpos,)
+        # for Z2 fPEPS converted from U1 fPEPS, need to correct the format of dummy_modes
+        if ts.data.dummy_modes:
+            dummy_modes = ts.data.dummy_modes
+            if isinstance(dummy_modes[0].label, tuple):
+                nested_dummy_modes = dummy_modes[0].label[0]
+                if isinstance(nested_dummy_modes, FermionicOperator):
+                    ts.data._dummy_modes = (nested_dummy_modes,)
     return ftns
 
 
@@ -160,10 +164,10 @@ def u1arr_to_z2arr(u1array):
     
     u1indices = u1array.indices
     u1charge = u1array.charge
-    u1oddpos = u1array.oddpos
+    u1dummy_modes = u1array.dummy_modes
     u1duals = u1array.duals
     index_maps = u1ind_to_z2indmap(u1indices)
-    z2array=sr.Z2FermionicArray.from_dense(u1array.to_dense(), index_maps=index_maps, duals=u1duals, charge=u1charge%2, oddpos=u1oddpos)
+    z2array=sr.Z2FermionicArray.from_dense(u1array.to_dense(), index_maps=index_maps, duals=u1duals, charge=u1charge%2, dummy_modes=u1dummy_modes)
     return z2array
 
 def u1peps_to_z2peps(peps):
@@ -233,25 +237,25 @@ class fPEPS(qtn.PEPS):
             n_charge = index_map[int(n)]
             n_array = array_map[int(n)]
 
-            oddpos = None
+            dummy_modes = None
             if not self.spinless:
                 # assert self.symmetry == 'U1', "Only U1 symmetry is supported for spinful fermions for now."
                 if int(n) == 1:
-                    oddpos = (3*tid+1)*(-1)**reverse
+                    dummy_modes = (3*tid+1)*(-1)**reverse
                 elif int(n) == 2:
-                    oddpos = (3*tid+2)*(-1)**reverse
+                    dummy_modes = (3*tid+2)*(-1)**reverse
                 elif int(n) == 3:
-                    # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
-                    oddpos = None
+                    # dummy_modes = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
+                    dummy_modes = None
             else:
-                oddpos = (3*tid+1)*(-1)**reverse
+                dummy_modes = (3*tid+1)*(-1)**reverse
 
             tsr_data = cls.from_blocks(
                 blocks={(n_charge,):n_array}, 
                 duals=(True,),
                 symmetry=self.symmetry, 
                 charge=n_charge, 
-                oddpos=oddpos
+                dummy_modes=dummy_modes
             )
             tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra'))
             product_tn |= tsr
@@ -298,7 +302,7 @@ class fPEPS(qtn.PEPS):
             tid = self.sites.index(site)
             # n_charge = index_map[n.unsqueeze(0).int()].squeeze(0)
             n_charge = 0
-            oddpos = None
+            dummy_modes = None
             if not self.spinless:
                 phase = 1 #...
             else:
@@ -319,7 +323,7 @@ class fPEPS(qtn.PEPS):
         """Slicing to get the amplitude locally, faster than contraction with a tensor product state.
         Note here sites is a list of tuples (x, y) for the sites to be fixed, and config is a 1D array of integers representing the fermion occupation numbers at those sites."""
         peps = self if inplace else self.copy()
-        has_oddpos = hasattr(self.tensors[0].data, 'oddpos')
+        has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
         has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
@@ -402,19 +406,19 @@ class fPEPS(qtn.PEPS):
             new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order+1:]
 
             # XXX: Implementation could be written more elegantly here...
-            if has_oddpos:
+            if has_dummy_modes:
                 if int(n) == 1:
-                    new_oddpos = (3*tid+1)*(-1)
+                    new_dummy_modes = (3*tid+1)*(-1)
                 elif int(n) == 2:
-                    new_oddpos = (3*tid+2)*(-1)
+                    new_dummy_modes = (3*tid+2)*(-1)
                 elif int(n) == 3 or int(n) == 0:
-                    new_oddpos = ()
+                    new_dummy_modes = ()
 
-                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos else ()
-                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if isinstance(new_oddpos1, FermionicOperator) else ftsdata.oddpos
-                oddpos = list(new_oddpos)[::-1]
+                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
+                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
+                dummy_modes = list(new_dummy_modes)[::-1]
                 
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
             elif has_dummy_modes:
                 if int(n) == 1:
@@ -431,7 +435,7 @@ class fPEPS(qtn.PEPS):
                 new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, symmetry=self.symmetry, dummy_modes=dummy_modes)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
             else:
-                raise ValueError("FermionicArray has neither 'oddpos' nor 'dummy_modes' attribute to keep track of odd parity tensor ordering.")
+                raise ValueError("FermionicArray has neither 'dummy_modes' nor 'dummy_modes' attribute to keep track of odd parity tensor ordering.")
 
         amp = qtn.PEPS(peps)
 
@@ -469,7 +473,7 @@ class fPEPS(qtn.PEPS):
     def get_amp_efficient(self, config, inplace=False):
         """Slicing to get the amplitude, faster than contraction with a tensor product state."""
         peps = self if inplace else self.copy()
-        has_oddpos = hasattr(self.tensors[0].data, 'oddpos')
+        has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
         has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
         backend = self.tensors[0].data.backend
         dtype = eval(backend + '.' + self.tensors[0].data.dtype)
@@ -565,18 +569,18 @@ class fPEPS(qtn.PEPS):
                     new_charge_sec_data_dict[new_charge_blk] = new_data # new charge block and its corresponding data in a dictionary
 
             new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order + 1:]
-            # if ftsdata has attibute oddpos:
-            if has_oddpos:
+            # if ftsdata has attibute dummy_modes:
+            if has_dummy_modes:
                 if int(n) == 1:
-                    new_oddpos = (3 * site_id + 1) * (-1)
+                    new_dummy_modes = (3 * site_id + 1) * (-1)
                 elif int(n) == 2:
-                    new_oddpos = (3 * site_id + 2) * (-1)
+                    new_dummy_modes = (3 * site_id + 2) * (-1)
                 elif int(n) == 3 or int(n) == 0:
-                    new_oddpos = ()
+                    new_dummy_modes = ()
                 
-                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos else ()
-                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if isinstance(new_oddpos1, FermionicOperator) else ftsdata.oddpos
-                oddpos = list(new_oddpos)[::-1]
+                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
+                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
+                dummy_modes = list(new_dummy_modes)[::-1]
                 try:
                     if self.symmetry == 'U1':
                         new_charge = charge + ftsdata.charge
@@ -584,7 +588,7 @@ class fPEPS(qtn.PEPS):
                         new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
                     elif self.symmetry == 'U1U1':
                         new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
-                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, oddpos=oddpos, symmetry=self.symmetry)
+                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
                 except Exception as e:
                     print("Error in constructing new f-tensor data:")
                     print(e)
@@ -615,7 +619,7 @@ class fPEPS(qtn.PEPS):
                     # Error when constructing the new f-tensor
                     print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
             else:
-                raise ValueError("FermionicArray has neither 'oddpos' nor 'dummy_modes' attribute to keep track of odd parity tensor ordering.")
+                raise ValueError("FermionicArray has neither 'dummy_modes' nor 'dummy_modes' attribute to keep track of odd parity tensor ordering.")
 
                 
             fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
@@ -701,9 +705,9 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
     )
     peps = fpeps.copy() # set symmetry during initialization
     for ts in peps.tensors:
-        if ts.data.oddpos:
-            x, y = ts.data.oddpos[0].label
-            ts.data._oddpos[0]._label = 3*(x*Ly + y) # 3*tid
+        if ts.data.dummy_modes:
+            x, y = ts.data.dummy_modes[0].label
+            ts.data._dummy_modes[0]._label = 3*(x*Ly + y) # 3*tid
     return peps
 
 
@@ -802,21 +806,21 @@ def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, sp
                     block_indices,
                     charge=1 if parity_config[tid] else 0,
                     seed=rng,
-                    oddpos=3*tid,
+                    dummy_modes=3*tid,
                 )
             elif symmetry == 'U1':
                 data = sr.U1FermionicArray.random(
                     block_indices,
                     charge=int(charge_config[tid]),
                     seed=rng,
-                    oddpos=3*tid,
+                    dummy_modes=3*tid,
                 )
             elif symmetry == 'U1U1':
                 data = sr.U1U1FermionicArray.random(
                     block_indices,
                     charge=charge_config[tid],
                     seed=rng,
-                    oddpos=3*tid,
+                    dummy_modes=3*tid,
                 )
         except Exception:
             # random fermionic array
@@ -914,24 +918,24 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
         n_charge = index_map[int(n)]
         n_array = array_map[int(n)]
 
-        oddpos = None
+        dummy_modes = None
         if not psi.spinless:
             if int(n) == 1:
-                oddpos = (3*tid+1)*(-1)**reverse
+                dummy_modes = (3*tid+1)*(-1)**reverse
             elif int(n) == 2:
-                oddpos = (3*tid+2)*(-1)**reverse
+                dummy_modes = (3*tid+2)*(-1)**reverse
             elif int(n) == 3:
-                # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
-                oddpos = None
+                # dummy_modes = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
+                dummy_modes = None
         else:
-            oddpos = (3*tid+1)*(-1)**reverse
+            dummy_modes = (3*tid+1)*(-1)**reverse
         
         tsr_data = sr.FermionicArray.from_blocks(
             blocks={(n_charge,):n_array}, 
             duals=(dualness,),
             symmetry=psi.symmetry, 
             charge=n_charge, 
-            oddpos=oddpos
+            dummy_modes=dummy_modes
         )
         
         if check:
@@ -948,7 +952,7 @@ def product_bra_state(psi, config, check=False,reverse=True, dualness=True):
                 duals=(dualness,),
                 symmetry=psi.symmetry, 
                 charge=n_charge, 
-                oddpos=oddpos
+                dummy_modes=dummy_modes
             )
         
         tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag, 'bra', f'X{site[0]}', f'Y{site[1]}'))
@@ -1015,8 +1019,8 @@ class fMPS(qtn.MatrixProductState):
             self.spinless = True if self.ind_size(self.site_ind_id.format(self.L-1)) == 2 else False
     
     def product_bra_state(self, config, reverse=1):
-        """For product state ALWAYS make sure the set of oddposes are different from the set of oddposes in the TNS |psi>.
-        When using some overlapping oddposes, the computation of the amplitude will gain some unphysical global phase!!"""
+        """For product state ALWAYS make sure the set of dummy_modeses are different from the set of dummy_modeses in the TNS |psi>.
+        When using some overlapping dummy_modeses, the computation of the amplitude will gain some unphysical global phase!!"""
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
@@ -1057,25 +1061,25 @@ class fMPS(qtn.MatrixProductState):
             n_charge = index_map[int(n)]
             n_array = array_map[int(n)]
 
-            oddpos = None
+            dummy_modes = None
             if not self.spinless:
                 # assert self.symmetry == 'U1', "Only U1 symmetry is supported for spinful fermions for now."
                 if int(n) == 1:
-                    oddpos = (3*tid+1)*(-1)**reverse
+                    dummy_modes = (3*tid+1)*(-1)**reverse
                 elif int(n) == 2:
-                    oddpos = (3*tid+2)*(-1)**reverse
+                    dummy_modes = (3*tid+2)*(-1)**reverse
                 elif int(n) == 3:
-                    # oddpos = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
-                    oddpos = None
+                    # dummy_modes = ((3*tid+1)*(-1)**reverse, (3*tid+2)*(-1)**reverse)
+                    dummy_modes = None
             else:
-                oddpos = (3*tid+1)*(-1)
+                dummy_modes = (3*tid+1)*(-1)
 
             tsr_data = sr.FermionicArray.from_blocks(
                 blocks={(n_charge,):n_array}, 
                 duals=(True,),
                 symmetry=self.symmetry, 
                 charge=n_charge, 
-                oddpos=oddpos
+                dummy_modes=dummy_modes
             )
             tsr = qtn.Tensor(data=tsr_data, inds=(p_ind,),tags=(p_tag))
             product_tn |= tsr
@@ -1156,17 +1160,17 @@ class fMPS(qtn.MatrixProductState):
                 new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order+1:]
 
                 if int(n) == 1:
-                    new_oddpos = (3*tid+1)*(-1)
+                    new_dummy_modes = (3*tid+1)*(-1)
                 elif int(n) == 2:
-                    new_oddpos = (3*tid+2)*(-1)
+                    new_dummy_modes = (3*tid+2)*(-1)
                 elif int(n) == 3 or int(n) == 0:
-                    new_oddpos = ()
+                    new_dummy_modes = ()
 
-                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos else ()
-                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if isinstance(new_oddpos1, FermionicOperator) else ftsdata.oddpos
-                oddpos = list(new_oddpos)[::-1]
+                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
+                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
+                dummy_modes = list(new_dummy_modes)[::-1]
                 
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
             amp = qtn.MatrixProductState(mps)
@@ -1226,17 +1230,17 @@ class fMPS(qtn.MatrixProductState):
                 new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order+1:]
 
                 if int(n) == 1:
-                    new_oddpos = (3*tid+1)*(-1)
+                    new_dummy_modes = (3*tid+1)*(-1)
                 elif int(n) == 2:
-                    new_oddpos = (3*tid+2)*(-1)
+                    new_dummy_modes = (3*tid+2)*(-1)
                 elif int(n) == 3 or int(n) == 0:
-                    new_oddpos = ()
+                    new_dummy_modes = ()
 
-                new_oddpos1 = FermionicOperator(new_oddpos, dual=True) if new_oddpos else ()
-                new_oddpos = ftsdata.oddpos + (new_oddpos1,) if isinstance(new_oddpos1, FermionicOperator) else ftsdata.oddpos
-                oddpos = list(new_oddpos)[::-1]
+                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
+                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
+                dummy_modes = list(new_dummy_modes)[::-1]
                 
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, oddpos=oddpos, symmetry=self.symmetry)
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
             amp = qtn.MatrixProductState(mps)
@@ -1342,14 +1346,14 @@ def generate_random_fmps(L, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless
                 block_indices,
                 charge=1 if parity_config[tid] else 0,
                 seed=rng,
-                oddpos=3*tid,
+                dummy_modes=3*tid,
             )
         elif symmetry == 'U1':
             data = sr.U1FermionicArray.random(
                 block_indices,
                 charge=int(charge_config[tid]),
                 seed=rng,
-                oddpos=3*tid,
+                dummy_modes=3*tid,
             )
         
         mps |= qtn.Tensor(
@@ -1901,7 +1905,7 @@ def calculate_phase_from_adjacent_trans_dict(ampctree, input_config_parity, peps
     """
     phase = 1
 
-    # compute the phase from moving oddpos indices across odd-parity tensors during contraction
+    # compute the phase from moving dummy_modes indices across odd-parity tensors during contraction
     for i, _ in adjacent_transposition_dict.items():
         gen_phase = 1
         tids, left_tids, right_tids = list(ampctree.traverse())[i]

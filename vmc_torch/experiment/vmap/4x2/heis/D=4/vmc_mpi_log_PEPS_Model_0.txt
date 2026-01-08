@@ -1,0 +1,250 @@
+STEP 0:
+Energy per site: -0.5364493151966832
+Energy variance square root: 7.610071944825124e-05
+Sample size: 6144
+
+STEP 1:
+Energy per site: -0.5366544121406397
+Energy variance square root: 6.038139776994477e-05
+Sample size: 6144
+
+STEP 2:
+Energy per site: -0.5365976862917551
+Energy variance square root: 4.686256290756391e-05
+Sample size: 6144
+
+STEP 3:
+Energy per site: -0.5365726471753572
+Energy variance square root: 3.6436777453161705e-05
+Sample size: 6144
+
+STEP 4:
+Energy per site: -0.53660978237402
+Energy variance square root: 2.974158399069814e-05
+Sample size: 6144
+
+STEP 5:
+Energy per site: -0.5366084829216691
+Energy variance square root: 2.4615699076800185e-05
+Sample size: 6144
+
+STEP 6:
+Energy per site: -0.5366022561652363
+Energy variance square root: 1.9853577152287003e-05
+Sample size: 6144
+
+STEP 7:
+Energy per site: -0.5366097075839926
+Energy variance square root: 1.5945823222015283e-05
+Sample size: 6144
+
+STEP 8:
+Energy per site: -0.5366191301891107
+Energy variance square root: 1.331255532408914e-05
+Sample size: 6144
+
+STEP 9:
+Energy per site: -0.5366383581914304
+Energy variance square root: 1.1649731797758228e-05
+Sample size: 6144
+
+STEP 10:
+Energy per site: -0.5366361582715165
+Energy variance square root: 1.0083053953642384e-05
+Sample size: 6144
+
+STEP 11:
+Energy per site: -0.536620231019854
+Energy variance square root: 8.894663591887208e-06
+Sample size: 6144
+
+STEP 12:
+Energy per site: -0.5366116744639507
+Energy variance square root: 7.857222347081998e-06
+Sample size: 6144
+
+STEP 13:
+Energy per site: -0.5366288677223218
+Energy variance square root: 7.289921033220158e-06
+Sample size: 6144
+
+STEP 14:
+Energy per site: -0.5366388481880606
+Energy variance square root: 6.196606523186942e-06
+Sample size: 6144
+
+STEP 15:
+Energy per site: -0.5366346144087367
+Energy variance square root: 5.666708766379068e-06
+Sample size: 6144
+
+STEP 16:
+Energy per site: -0.5366318727253359
+Energy variance square root: 5.468980705982075e-06
+Sample size: 6144
+
+STEP 17:
+Energy per site: -0.5366299196897604
+Energy variance square root: 4.9440230658634736e-06
+Sample size: 6144
+
+STEP 18:
+Energy per site: -0.5366322581285945
+Energy variance square root: 4.611885780509329e-06
+Sample size: 6144
+
+STEP 19:
+Energy per site: -0.5366315235909255
+Energy variance square root: 4.129218468836986e-06
+Sample size: 6144
+
+STEP 20:
+Energy per site: -0.5366358480399199
+Energy variance square root: 4.0217579105610596e-06
+Sample size: 6144
+
+STEP 21:
+Energy per site: -0.5366335441298351
+Energy variance square root: 3.7745222933638984e-06
+Sample size: 6144
+
+STEP 22:
+Energy per site: -0.5366365020350081
+Energy variance square root: 3.654566822413343e-06
+Sample size: 6144
+
+STEP 23:
+Energy per site: -0.5366310627918697
+Energy variance square root: 3.4116550919621982e-06
+Sample size: 6144
+
+STEP 24:
+Energy per site: -0.5366358638345673
+Energy variance square root: 3.210659446883902e-06
+Sample size: 6144
+
+STEP 25:
+Energy per site: -0.5366336124642546
+Energy variance square root: 2.9310524850821127e-06
+Sample size: 6144
+
+STEP 26:
+Energy per site: -0.5366370237310325
+Energy variance square root: 2.737760813957364e-06
+Sample size: 6144
+
+STEP 27:
+Energy per site: -0.5366299893673308
+Energy variance square root: 2.6978603400047347e-06
+Sample size: 6144
+
+STEP 28:
+Energy per site: -0.5366297979792264
+Energy variance square root: 2.485766445664994e-06
+Sample size: 6144
+
+STEP 29:
+Energy per site: -0.5366353455603533
+Energy variance square root: 2.405366146189708e-06
+Sample size: 6144
+
+STEP 30:
+Energy per site: -0.5366365161739745
+Energy variance square root: 2.1536459638122627e-06
+Sample size: 6144
+
+STEP 31:
+Energy per site: -0.5366346383557584
+Energy variance square root: 2.2153143633746184e-06
+Sample size: 6144
+
+STEP 32:
+Energy per site: -0.5366290635608476
+Energy variance square root: 2.0896151671692392e-06
+Sample size: 6144
+
+STEP 33:
+Energy per site: -0.5366298877658423
+Energy variance square root: 2.0384483757970856e-06
+Sample size: 6144
+
+STEP 34:
+Energy per site: -0.5366394445712225
+Energy variance square root: 4.966763206236044e-06
+Sample size: 6144
+
+STEP 35:
+Energy per site: -0.5366317814724767
+Energy variance square root: 1.8922418831064806e-06
+Sample size: 6144
+
+STEP 36:
+Energy per site: -0.5366290700057013
+Energy variance square root: 2.8323645747991047e-06
+Sample size: 6144
+
+STEP 37:
+Energy per site: -0.5366326705064519
+Energy variance square root: 1.7359880008776319e-06
+Sample size: 6144
+
+STEP 38:
+Energy per site: -0.5366360834752012
+Energy variance square root: 3.6263390595043012e-06
+Sample size: 6144
+
+STEP 39:
+Energy per site: -0.5366339827536734
+Energy variance square root: 1.6775593346782488e-06
+Sample size: 6144
+
+STEP 40:
+Energy per site: -0.5366353434984915
+Energy variance square root: 2.877724395103268e-06
+Sample size: 6144
+
+STEP 41:
+Energy per site: -0.5366346342231431
+Energy variance square root: 1.5630616795683766e-06
+Sample size: 6144
+
+STEP 42:
+Energy per site: -0.5366349655872522
+Energy variance square root: 2.4969748965156203e-06
+Sample size: 6144
+
+STEP 43:
+Energy per site: -0.5366350118266027
+Energy variance square root: 2.199665090734751e-06
+Sample size: 6144
+
+STEP 44:
+Energy per site: -0.5366337110404845
+Energy variance square root: 1.7070845275304785e-06
+Sample size: 6144
+
+STEP 45:
+Energy per site: -0.536632073091881
+Energy variance square root: 1.9556950060104393e-06
+Sample size: 6144
+
+STEP 46:
+Energy per site: -0.5366334904758129
+Energy variance square root: 1.7604602976443265e-06
+Sample size: 6144
+
+STEP 47:
+Energy per site: -0.5366326009191001
+Energy variance square root: 1.443366570602208e-06
+Sample size: 6144
+
+STEP 48:
+Energy per site: -0.5366332859347014
+Energy variance square root: 1.2221020847822805e-06
+Sample size: 6144
+
+STEP 49:
+Energy per site: -0.5366348607943126
+Energy variance square root: 1.294677172137653e-06
+Sample size: 6144
+
