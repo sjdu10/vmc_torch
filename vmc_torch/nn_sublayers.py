@@ -159,7 +159,19 @@ class SelfAttn_block_pos_batched(nn.Module):
         # input_seq: (Batch, L)
         
         # Step 1: One-hot encode (Batch, L, num_classes)
-        one_hot_encoded = F.one_hot(input_seq.long(), num_classes=self.num_classes).to(self.dtype)
+        # one_hot_encoded = F.one_hot(input_seq, num_classes=self.num_classes).to(self.dtype)
+
+        # new code (vmap friendly)
+        # output shape: input_shape + (num_classes,)
+        out_shape = input_seq.shape + (self.num_classes,) # (B, L, C)
+        one_hot_encoded = torch.zeros(out_shape, device=input_seq.device, dtype=self.dtype)
+
+        # unsqueeze(-1) to make indices shape (B, L, 1)
+        indices = input_seq.to(torch.int64).unsqueeze(-1)
+
+        # 3. Scatter 1.0 according to indices
+        # dim=-1 means we scatter along the last dimension (num_classes)
+        one_hot_encoded = one_hot_encoded.scatter(-1, indices, 1.0)
 
         # Step 2: Batched Position-wise Embedding
         # Instead of the loop, we use a single parameter tensor for the weights

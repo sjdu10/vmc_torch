@@ -54,7 +54,7 @@ D = 4
 chi = -1
 
 # 路径配置 (保持你的原样)
-pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap'
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
 u1z2 = True
 appendix = '_U1SU' if u1z2 else ''
 

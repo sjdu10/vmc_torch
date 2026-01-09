@@ -12,7 +12,7 @@ N_f = Lx*Ly
 t = 1.0
 U = 8.0
 mu = 0.0
-pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap'
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
 seed = 42
 
 # cpf = 0.0

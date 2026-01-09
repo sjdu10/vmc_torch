@@ -8,11 +8,12 @@ import symmray as sr
 import quimb.tensor as qtn
 import pickle
 from autoray import do
+from functools import partial
 import torch
 import json
 import time
 from tqdm import tqdm
-from vmap_utils import sample_next, evaluate_energy, compute_grads, random_initial_config
+from vmap_utils import sample_next, evaluate_energy, compute_grads, random_initial_config, compute_grads_decoupled
 from vmap_utils import NN_fPEPS_Model, fPEPS_Model, Transformer_fPEPS_Model, Transformer_fPEPS_Model_batchedAttn
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
@@ -25,15 +26,15 @@ SIZE = COMM.Get_size()
 torch.set_default_device("cpu") # CPU
 torch.random.manual_seed(42 + RANK)
 
-Lx = 8
-Ly = 8
-N_f = Lx * Ly - 8 # filling
+Lx = 4
+Ly = 4
+N_f = Lx * Ly - 2 # filling
 D = 4
-chi = D
+chi = -1
 seed = RANK + 42
 # only the flat backend is compatible with jax.jit
 flat = True
-pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap'
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
 u1z2 = True
 appendix = '_U1SU' if u1z2 else ''
 params = pickle.load(open(pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/peps_su_params{appendix}.pkl', 'rb'))
@@ -47,9 +48,8 @@ for site in peps.sites:
     peps[site].data._label = site
     peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1)) # Important for U1->Z2 fPEPS
 
-# fpeps_model = NN_fPEPS_Model(
-#     peps, max_bond=chi, nn_eta=1, nn_hidden_dim=10, dtype=torch.float64
-# )
+# Select fPEPS-based model
+
 fpeps_model = Transformer_fPEPS_Model_batchedAttn(
     tn=peps,
     max_bond=chi,
@@ -59,9 +59,11 @@ fpeps_model = Transformer_fPEPS_Model_batchedAttn(
     nn_eta=1,
     dtype=torch.float64,
 )
+
 model_params_vec = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
 init_std = float(model_params_vec.std())*0.1 # 5e-3
 fpeps_model.apply(lambda x: init_weights_to_zero(x, std=init_std))
+
 # fpeps_model = fPEPS_Model(
 #     peps, max_bond=chi, dtype=torch.float64
 # )
@@ -108,19 +110,28 @@ if Lx*Ly <= 6 and RANK == 0:
     print(f'Double layer energy: {E_double/nsites}')
 
 
-# Prepare initial samples
+
 # Total sample size
-Ns = int(128) 
+Ns = int(2e3) 
 # batchsize per rank
-B = 16
-B_grad = 4
+B = 256
+B_grad = 64
+# Choose gradient computation method
+tn_nn_decouple = False
+if tn_nn_decouple:
+    get_grads = partial(compute_grads_decoupled, verbose=True, batch_size=B_grad)  # use the decoupled gradient computation
+else:
+    get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_grad, verbose=True)  # default to use the vectorized gradient computation
+
+# initial samples for each rank
 fxs = []
 for _ in range(B):
     fxs.append(random_initial_config(N_f, nsites))
 fxs = torch.stack(fxs)
+fxs = fxs.to(torch.long)
 # burn-in for each rank
 t0 = MPI.Wtime()
-for _ in range(0):
+for _ in range(1):
     fxs, current_amps = sample_next(fxs, fpeps_model, graph)
 t1 = MPI.Wtime()
 if RANK == 0:
@@ -162,8 +173,7 @@ for _ in range(vmc_steps):
         pbar = tqdm(total=Ns, desc="Sampling starts...")
         fxs, current_amps = sample_next(fxs, fpeps_model, graph)
         energy, local_energies = evaluate_energy(fxs, fpeps_model, H, current_amps)
-        grads_vec, amps = compute_grads(fxs, fpeps_model, vectorize=True)
-
+        grads_vec, amps = get_grads(fxs, fpeps_model)
         
         E_loc_vec.append(local_energies.detach().numpy())
         amps_vec.append(amps.detach().numpy())
@@ -210,7 +220,7 @@ for _ in range(vmc_steps):
             t11 = MPI.Wtime()
             energy, local_energies = evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False)
             t22 = MPI.Wtime()
-            grads_vec, amps = compute_grads(fxs, fpeps_model, vectorize=True, batch_size=B_grad, verbose=False)
+            grads_vec, amps = get_grads(fxs, fpeps_model)
             t33 = MPI.Wtime()
             sample_time += t11 - t00
             local_energy_time += t22 - t11

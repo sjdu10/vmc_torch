@@ -360,7 +360,6 @@ class Transformer_fPEPS_Model_batchedAttn(nn.Module):
 
         self.nn_eta = nn_eta
 
-
         # We use named_parameters() because self.params only contains parameters, not buffers.
         self.nn_param_names = [name for name, _ in self.nn_backflow.named_parameters()]
         
@@ -405,7 +404,7 @@ class Transformer_fPEPS_Model_batchedAttn(nn.Module):
         # 2. Compute Backflow for the WHOLE BATCH at once
         # This uses the optimized native Attention kernels (No vmap fallback!)
         # Shape: (Batch, ftn_params_length)
-        batch_nn_outputs = torch.func.functional_call(self.nn_backflow, nn_params_dict, x.to(self.dtype))
+        batch_nn_outputs = torch.func.functional_call(self.nn_backflow, nn_params_dict, x)
 
         # 3. Use vmap ONLY for the TN contraction part
         # We map over 'x' (dim 0) and 'batch_nn_outputs' (dim 0)
@@ -625,55 +624,139 @@ def flatten_params(parameters):
         vec.append(param.reshape(-1))
     return torch.cat(vec)
 
-def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=False):
+def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=False, vmap_grad=False):
     if vectorize:
         # Vectorized gradient calculation
         # need per sample gradient of amplitude -- jacobian
-        params_pytree = (
-            list(fpeps_model.params)
-            if type(fpeps_model.params) is torch.nn.ParameterList
-            else dict(fpeps_model.params)
-            if type(fpeps_model.params) is torch.nn.ParameterDict
-            else fpeps_model.params
-        )
-        # params is a pytree, fxs has shape (B, nsites)
-        def g(x, p):
-            results = fpeps_model.vamp(x, p)
-            return results, results
-        if batch_size is None:
-            t0 = time.time()
-            jac_pytree, amps = torch.func.jacrev(g, argnums=1, has_aux=True)(fxs, params_pytree)
-            t1 = time.time()
-            if verbose:
-                if RANK == 1:
-                    print(f"Vectorized jacobian time: {t1 - t0}")
-        else:
+        if vmap_grad:
             B = fxs.shape[0]
-            B_grad = batch_size
-            jac_pytree_list = []
-            amps_list = []
+            # 确定 chunk size
+            B_grad = batch_size if batch_size is not None else B
+            
+            # 1. 准备参数 PyTree
+            # 兼容 ParameterList, ParameterDict 或直接的 Tensor List
+            params_pytree = (
+                list(fpeps_model.params)
+                if isinstance(fpeps_model.params, torch.nn.ParameterList)
+                else dict(fpeps_model.params)
+                if isinstance(fpeps_model.params, torch.nn.ParameterDict)
+                else fpeps_model.params
+            )
+
+            # 2. 定义单样本函数 (Single Sample Function)
+            # vmap 要求我们定义处理 "单个样本" 的逻辑
+            def single_sample_amp_func(x_i, p):
+                # x_i: (L,) 来自 vmap 的切片
+                # p: 参数 PyTree (Shared)
+                
+                # 为了复用现有的 vamp (它可能期待 batch 维度), 我们伪造一个 batch=1
+                # 并在输出时 squeeze 回 scalar
+                
+                # 注意：如果你的 fpeps_model.vamp 内部有 vmap，这里会变成嵌套 vmap
+                # 但这是被允许的，只是要注意效率。
+                # 如果是 Pure TN，建议确保 vamp 能处理 batch=1 的情况
+                
+                amp = fpeps_model.vamp(x_i.unsqueeze(0), p).squeeze(0)
+                return amp, amp # (Loss target, Aux data)
+
+            # 3. 定义 vmap(grad)
+            # argnums=1: 对 params_pytree 求导
+            # in_dims=(0, None): 对 x_i 进行 batch 映射，对 p 进行广播
+            grad_vmap_fn = torch.vmap(
+                torch.func.grad(single_sample_amp_func, argnums=1, has_aux=True),
+                in_dims=(0, None)
+            )
+
+            # 4. Chunking Loop
+            grads_pytree_chunks = []
+            amps_chunks = []
+            
             t0 = time.time()
             for b_start in range(0, B, B_grad):
                 b_end = min(b_start + B_grad, B)
-                jac_pytree_b, amps_b = torch.func.jacrev(g, argnums=1, has_aux=True)(fxs[b_start:b_end], params_pytree)
-                jac_pytree_list.append(jac_pytree_b)
-                amps_list.append(amps_b)
-            # concatenate jac_pytree_list along batch dimension
-            jac_pytree = tree_map(lambda *leaves: torch.cat(leaves, dim=0), *jac_pytree_list)
-            amps = torch.cat(amps_list, dim=0)
-            t1 = time.time()
-            if verbose:
-                if RANK == 1:
-                    print(f"Batched Vectorized jacobian time: {t1 - t0}")
-                    
-        # jac_pytree has shape same as params_pytree, each leaf has shape (B, )
+                fxs_chunk = fxs[b_start:b_end]
+                grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
+                amps_c = amps_c.detach()
+                grads_pytree_chunks.append(grads_chunk)
+                amps_chunks.append(amps_c)
+                
+                del grads_chunk, amps_c
 
-        # Get per-sample batched grads in list of pytree format
-        leaves, _ = tree_flatten(jac_pytree) # list of leaves in jac_pytree, each leaf shape (B, param_shape)
-        leaves_flattend = [leaf.flatten(start_dim=1) for leaf in leaves]  # each leaf shape (B, param_size)
-        batched_grads_vec = torch.cat(leaves_flattend, dim=1) # shape (B, Np), Np is number of parameters
-        amps.unsqueeze_(1)  # shape (B, 1)
-        return batched_grads_vec, amps
+            # 5. 结果拼接
+            amps = torch.cat(amps_chunks, dim=0)
+            if amps.dim() == 1: amps = amps.unsqueeze(-1)
+            def concat_leaves(*leaves):
+                return torch.cat(leaves, dim=0)
+            full_grads_pytree = tree_map(concat_leaves, *grads_pytree_chunks)
+
+            # 6. Flatten to Vector (B, Np)
+            leaves, _ = tree_flatten(full_grads_pytree)
+            # 每个 leaf 现在是 (B, Param_Shape)
+            # Flatten start_dim=1 -> (B, Param_Size)
+            flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
+            batched_grads_vec = torch.cat(flat_leaves, dim=1)
+            
+            batched_grads_vec = batched_grads_vec.detach()
+            fpeps_model.zero_grad()
+            
+            t1 = time.time()
+            if verbose and RANK == 1:
+                print(f"Single Batched vmap(grad) time: {t1 - t0}")
+
+            return batched_grads_vec, amps
+        else:
+            params_pytree = (
+                list(fpeps_model.params)
+                if type(fpeps_model.params) is torch.nn.ParameterList
+                else dict(fpeps_model.params)
+                if type(fpeps_model.params) is torch.nn.ParameterDict
+                else fpeps_model.params
+            )
+            # params is a pytree, fxs has shape (B, nsites)
+            def g(x, p):
+                results = fpeps_model.vamp(x, p)
+                return results, results
+            if batch_size is None:
+                t0 = time.time()
+                jac_pytree, amps = torch.func.jacrev(g, argnums=1, has_aux=True)(fxs, params_pytree)
+                t1 = time.time()
+                if verbose:
+                    if RANK == 1:
+                        print(f"Single Batched Jacobian time: {t1 - t0}")
+            else:
+                B = fxs.shape[0]
+                B_grad = batch_size
+                jac_pytree_list = []
+                amps_list = []
+                t0 = time.time()
+                for b_start in range(0, B, B_grad):
+                    b_end = min(b_start + B_grad, B)
+                    jac_pytree_b, amps_b = torch.func.jacrev(g, argnums=1, has_aux=True)(fxs[b_start:b_end], params_pytree)
+                    amps_b.detach_()
+                    jac_pytree_b = tree_map(lambda x: x.detach(), jac_pytree_b)
+                    jac_pytree_list.append(jac_pytree_b)
+                    amps_list.append(amps_b)
+                # concatenate jac_pytree_list along batch dimension
+                jac_pytree = tree_map(lambda *leaves: torch.cat(leaves, dim=0), *jac_pytree_list)
+                amps = torch.cat(amps_list, dim=0)
+                t1 = time.time()
+                if verbose:
+                    if RANK == 1:
+                        print(f"Single Batched Jacobian time: {t1 - t0}")
+            # jac_pytree has shape same as params_pytree, each leaf has shape (B, )
+
+            # Get per-sample batched grads in list of pytree format
+            leaves, _ = tree_flatten(jac_pytree) # list of leaves in jac_pytree, each leaf shape (B, param_shape)
+            leaves_flattend = [leaf.flatten(start_dim=1) for leaf in leaves]  # each leaf shape (B, param_size)
+            batched_grads_vec = torch.cat(leaves_flattend, dim=1) # shape (B, Np), Np is number of parameters
+            amps.unsqueeze_(1)  # shape (B, 1)
+            
+            # clear grads and cached computational graph to save memory on CPU
+            batched_grads_vec = batched_grads_vec.detach()
+            amps = amps.detach()
+            del jac_pytree
+            fpeps_model.zero_grad()
+            return batched_grads_vec, amps
     
     else:
         # Sequential non-vectorized gradient calculation
@@ -690,11 +773,107 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             qu.tree_map(lambda x: x.grad.zero_(), list(fpeps_model.params))
         t1 = time.time()
         if verbose and RANK == 1:
-            print(f"Sequential jacobian time: {t1 - t0}")
+            print(f"Single Batched Sequential Jacobian time: {t1 - t0}")
         amps = torch.stack(amps, dim=0)
         batched_grads_vec = torch.stack(batched_grads_vec, dim=0)
         return batched_grads_vec, amps
 
+def compute_grads_decoupled(fxs, fpeps_model, batch_size=None, **kwargs):
+    """
+    TN-NN decoupled gradient computation:
+    Step 1: forward pass to get nn_backflow output (no grad), delta_p
+    Step 2: calculate TN gradients (chunked vmap) to get sensitivity vector (dAmp/d(ftn_params) and dAmp/d(delta_p))
+    Step 3: propagate sensitivity vector back to NN (VJP, sequential loop)
+    """
+    B = fxs.shape[0]
+    
+    B_grad = batch_size if batch_size is not None else B
+    
+    ftn_params = list(fpeps_model.ftn_params)
+    nn_params = list(fpeps_model.nn_backflow.parameters())
+    nn_params_dict = dict(zip(fpeps_model.nn_param_names, nn_params))
+
+    with torch.no_grad():
+        batch_delta_p = torch.func.functional_call(
+            fpeps_model.nn_backflow, nn_params_dict, fxs.long()
+        )
+    # batch_delta_p shape: (B, ftn_params_length)
+    
+    def tn_only_func(x_i, ftn_p_list, delta_p_i):
+        amp = fpeps_model.tn_contraction(x_i, ftn_p_list, delta_p_i)
+        return amp, amp # (Target, Aux)
+
+    tn_grad_vmap_func = torch.vmap(
+        torch.func.grad(tn_only_func, argnums=(1, 2), has_aux=True), 
+        in_dims=(0, None, 0)
+    )
+
+    g_ftn_chunks = []
+    g_sensitivity_chunks = []
+    amps_chunks = []
+
+    t0 = time.time()
+    for b_start in range(0, B, B_grad):
+        b_end = min(b_start + B_grad, B)
+        
+        fxs_chunk = fxs[b_start:b_end]
+        delta_p_chunk = batch_delta_p[b_start:b_end]
+        
+        (g_ftn_c, g_sens_c), amps_c = tn_grad_vmap_func(fxs_chunk, ftn_params, delta_p_chunk)
+        
+        if amps_c.requires_grad:
+            amps_c = amps_c.detach()
+            
+        g_ftn_chunks.append(g_ftn_c)       
+        g_sensitivity_chunks.append(g_sens_c)
+        amps_chunks.append(amps_c)
+        
+        del g_ftn_c, g_sens_c, amps_c
+    t1 = time.time()
+
+    g_sensitivity = torch.cat(g_sensitivity_chunks, dim=0)
+    
+    amps = torch.cat(amps_chunks, dim=0)
+    if amps.dim() == 1:
+        amps = amps.unsqueeze(-1)
+
+    g_ftn = tree_map(lambda *leaves: torch.cat(leaves, dim=0), *g_ftn_chunks)
+
+    # =================================================================
+    g_nn_params_list = []
+    t2 = time.time()
+    for i in range(B):
+        x_i = fxs[i].unsqueeze(0) 
+        g_sens_i = g_sensitivity[i].unsqueeze(0) 
+        
+        fpeps_model.nn_backflow.zero_grad()
+        
+        with torch.enable_grad():
+            out_i = torch.func.functional_call(
+                fpeps_model.nn_backflow, 
+                nn_params_dict, 
+                x_i.long()
+            )
+            target = torch.sum(out_i * g_sens_i.detach())
+            grads_i = torch.autograd.grad(target, nn_params, retain_graph=False)
+            
+        flat_g = flatten_params(grads_i)
+        g_nn_params_list.append(flat_g)
+    t3 = time.time()
+    if kwargs.get('verbose', True) and RANK == 1:
+        print(f"Single Batched grad calc: TN gradient time: {t1 - t0}, Sequential NN VJP time: {t3 - t2}")
+    # Stack g_nn_params_list into a tensor of shape (B, Np_nn)
+    g_nn_params_vec = torch.stack(g_nn_params_list)
+
+
+    # Flatten g_ftn
+    leaves, _ = tree_flatten(g_ftn)
+    flat_g_ftn_list = [leaf.flatten(start_dim=1) for leaf in leaves]
+    g_ftn_params_vec = torch.cat(flat_g_ftn_list, dim=1)
+
+    g_params_vec = torch.cat([g_ftn_params_vec, g_nn_params_vec], dim=1) # (B, Np_total)
+    
+    return g_params_vec, amps
 
 def random_initial_config(N_f, N_sites, seed=None):
     if seed is not None:

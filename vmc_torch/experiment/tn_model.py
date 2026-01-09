@@ -286,7 +286,7 @@ class circuit_TNF(wavefunctionModel):
         batch_amps = []
         for x_i in x:
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             
             amp = psi.get_amp(x_i)
 
@@ -361,7 +361,7 @@ class PEPS_model(wavefunctionModel):
         batch_amps = []
         for x_i in x:
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             amp_val = func(x_i)
             batch_amps.append(amp_val)
         
@@ -923,7 +923,7 @@ class PEPS_model_reuse(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             # Get the amplitude
             amp_tn = self.get_amp_tn(x_i)
 
@@ -1299,10 +1299,10 @@ class TN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # Get the NN correction to the parameters, concatenate the results for each tensor
             nn_features = self.nn(x_i)
@@ -1731,10 +1731,10 @@ class fMPSModel(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Get the amplitude
             amp = psi.get_amp(x_i, conj=True)
             amp_val = amp.contract()
@@ -1800,10 +1800,10 @@ class fMPS_TNFModel(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Get the amplitude
             amp = psi.get_amp(x_i, conj=True)
             if self.max_bond is None or self.max_bond <= 0:
@@ -1877,10 +1877,10 @@ class fMPS_backflow_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Get the NN correction to the parameters
             nn_correction = self.nn(x_i)
             # Add the correction to the original parameters
@@ -1958,10 +1958,10 @@ class fMPS_backflow_attn_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Get the NN correction to the parameters
             nn_correction = self.nn(x_i)
             # Add the correction to the original parameters
@@ -2057,10 +2057,10 @@ class fMPS_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # Get the shared attention features
             nn_features = self.attention_block(x_i)
@@ -2173,10 +2173,10 @@ class fMPS_BFA_cluster_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             
             # For each site get the corresponding input config from x_i and receptive field
             local_configs = {tid: x_i[neighbors] for tid, neighbors in self.receptive_field.items()}
@@ -2646,10 +2646,10 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
 
             if self.cache_env_mode:
                 self.clear_wavefunction_env_cache()
@@ -2710,10 +2710,10 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             
             if initial_cache:
                 self.clear_wavefunction_env_cache()
@@ -4074,10 +4074,10 @@ class fTNModel_test(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Get the amplitude
             amp = psi.get_amp(x_i, conj=False, reverse=0)
             if self.max_bond is None:
@@ -4155,10 +4155,10 @@ class fTN_backflow_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Get the NN correction to the parameters
             nn_correction = self.nn(x_i)
             # Add the correction to the original parameters
@@ -4370,10 +4370,10 @@ class fTN_backflow_Model_Blockwise(wavefunctionModel):
         batch_amps = []
         for x_i in x:
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             
             # Neural network corrections for each block
             for block_id, nn in self.nn_blocks.items():
@@ -4500,7 +4500,7 @@ class PureNN_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             
             netket_xi = torch.tensor(from_quimb_config_to_netket_config(x_i), dtype=self.param_dtype)
             # embedded_xi = self.embed(netket_xi).view(-1)  # Flatten the embedding dimensions
@@ -4580,10 +4580,10 @@ class fTN_backflow_attn_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Get the NN correction to the parameters
             nn_correction = self.nn(x_i)
             # Add the correction to the original parameters
@@ -4681,10 +4681,10 @@ class fTN_backflow_attn_Jastrow_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Get the NN correction to the parameters
             nn_correction = self.nn(x_i)
             # Add the correction to the original parameters
@@ -4898,10 +4898,10 @@ class fTN_backflow_attn_Model_boundary(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             
             # Get the bulk parameters
             bulk_tn_params = {
@@ -5036,10 +5036,10 @@ class fTN_backflow_attn_Tensorwise_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # Get the NN correction to the parameters, concatenate the results for each tensor
             nn_correction = torch.cat([self.nn[tid](x_i) for tid in self.torch_tn_params.keys()])
@@ -5162,10 +5162,10 @@ class fTN_backflow_attn_Tensorwise_Model_v1(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # Get the NN correction to the parameters, concatenate the results for each tensor
             nn_features = self.nn(x_i)
@@ -5298,10 +5298,10 @@ class fTN_backflow_attn_Tensorwise_Model_v2(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # Get the NN correction to the parameters, concatenate the results for each tensor
             nn_features = self.nn(x_i)
@@ -5480,10 +5480,10 @@ class fTN_backflow_attn_Tensorwise_Model_v3(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # Get the NN correction to the parameters, concatenate the results for each tensor
             nn_features_vec = self.nn_backflow(x_i.unsqueeze(0)).squeeze(0)
@@ -5611,10 +5611,10 @@ class fTN_backflow_attn_Tensorwise_Model_v4(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # Get the NN correction to the parameters, concatenate the results for each tensor
             nn_features = self.nn(x_i)
@@ -5757,10 +5757,10 @@ class fTN_backflow_attn_Tensorwise_Model_v5(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # Reconstruct the TN with the new parameters
             psi = qtn.unpack(params, self.skeleton)
@@ -5916,10 +5916,10 @@ class fTN_BFA_cluster_Model(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
         
             # For each site get the corresponding input config from x_i and receptive field
             local_configs = {tid: x_i[neighbors] for tid, neighbors in self.receptive_field.items()}
@@ -6532,10 +6532,10 @@ class fTN_BFA_cluster_Model_reuse(wavefunctionModel):
         for x_i in x:
             # Check x_i type
             if not isinstance(x_i, torch.Tensor):
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
 
             # Get the amplitude
             amp = self.get_amp_tn(x_i)
@@ -6811,7 +6811,7 @@ class fTN_NN_proj_Model(torch.nn.Module):
 
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             # Add NN output
             proj_params_vec += self.nn_eta*self.mlp(x_i)
             # Reconstruct the proj parameters
@@ -6950,10 +6950,10 @@ class fTN_NN_proj_variable_Model(torch.nn.Module):
 
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Add NN output
             try:
                 proj_params_vec += self.nn_eta*self.mlp(x_i)[:len(proj_params_vec)]
@@ -7090,10 +7090,10 @@ class fTN_NN_2row_Model(torch.nn.Module):
             
             # Check x_i type
             if not type(x_i) == torch.Tensor:
-                x_i = torch.tensor(x_i, dtype=self.param_dtype)
+                x_i = torch.tensor(x_i, dtype=torch.long)
             else:
-                if x_i.dtype != self.param_dtype:
-                    x_i = x_i.to(self.param_dtype)
+                if x_i.dtype != torch.long:
+                    x_i = x_i.to(torch.long)
             # Add NN output
             amp_2row_params_vec = amp_2row_params_vec + self.nn_eta*self.mlp(x_i)
             # Reconstruct the proj parameters
@@ -7608,10 +7608,10 @@ class fTN_Transformer_Proj_Model(torch.nn.Module):
 
         # Check x_i type
         if not type(x_i) == torch.Tensor:
-            x_i = torch.tensor(x_i, dtype=self.param_dtype)
+            x_i = torch.tensor(x_i, dtype=torch.long)
         else:
             if x_i.dtype != self.param_dtype:
-                x_i = x_i.to(self.param_dtype)
+                x_i = x_i.to(torch.long)
         # Input of the transformer
         src = x_i.unsqueeze(0) # Shape: [batch_size==1, seq_len]
         # Target of the transformer
