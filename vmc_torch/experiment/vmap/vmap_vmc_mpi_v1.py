@@ -1,6 +1,6 @@
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
-os.environ['MKL_NUM_THREADS'] = '2'
+os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
 from mpi4py import MPI
 import numpy as np
@@ -14,7 +14,7 @@ import json
 import time
 from tqdm import tqdm
 from vmap_utils import sample_next, evaluate_energy, compute_grads, random_initial_config, compute_grads_decoupled
-from vmap_utils import NN_fPEPS_Model, fPEPS_Model, Transformer_fPEPS_Model, Transformer_fPEPS_Model_batchedAttn
+from vmap_models import NN_fPEPS_Model, fPEPS_Model, Transformer_fPEPS_Model, Transformer_fPEPS_Model_batchedAttn
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 
@@ -117,10 +117,10 @@ if Lx*Ly <= 6 and RANK == 0:
 
 
 # Total sample size
-Ns = int(2e4) 
+Ns = int(1e4) 
 # batchsize per rank
 B = 1024
-B_grad = 256
+B_grad = 128
 # Choose gradient computation method
 tn_nn_decouple = False
 if tn_nn_decouple:
@@ -134,6 +134,17 @@ minSR=False
 diag_shift = 1e-5
 learning_rate = 0.1
 save_state_every = 10
+
+init_step = 0
+final_step = vmc_steps+init_step
+# read state if init_step > 0
+if init_step > 0:
+    checkpoint_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/checkpoint_step_{fpeps_model._get_name()+str(chi)}_{init_step}.pt'
+    state_dict = torch.load(checkpoint_file, map_location=torch.device('cpu'))
+    fpeps_model.load_state_dict(state_dict)
+    if RANK == 0:
+        print(f'Loaded checkpoint from step {init_step}')
+
 
 # initial samples for each rank
 fxs = []
@@ -159,83 +170,109 @@ stats = {
 }
 
 # 定义通信 Tag
-TAG_UPDATE = 100
-TAG_CMD = 101
-CMD_CONTINUE = 0
-CMD_STOP = 1
+TAG_REQ = 100     # Worker 请求任务/汇报进度
+TAG_CMD = 101     # Master 下达指令
+CMD_CONTINUE = 0  # 指令：继续计算
+CMD_STOP = 1      # 指令：停止
 
-for svmc in range(vmc_steps):
-    # 计时器
+for svmc in range(init_step, final_step):
+    # 计时器与容器初始化 (保持不变)
     sample_time = 0.0
     local_energy_time = 0.0
     grad_time = 0.0
     t0 = MPI.Wtime()
     
-    # 数据容器 (List of Numpy Arrays)
     E_loc_vec = []
     amps_vec = []
     grads_vec_list = []
     
-    # 本地计数
     n_local = 0
     
     # ==========================================================================
     # Phase 1: Sampling & Gradient Computation
     # ==========================================================================
     
-    # --- 分支 A: Master (Rank 0) - 专职调度，不计算 ---
+    # --- 分支 A: Master (Rank 0) - 基于“已派发量”调度 ---
     if RANK == 0:
         pbar = tqdm(total=Ns, desc=f"Step {svmc} Sampling", unit="samples")
-        n_global = 0
-        active_workers = SIZE - 1  # 除去 Rank 0 自身
         
-        # 只要还有 Worker 在干活，Master 就必须在线接电话
+        n_collected = 0   # 已真正入库的样本数 (用于显示进度)
+        n_dispatched = 0  # 已派发出去的任务数 (用于控制刹车)
+        
+        active_workers = SIZE - 1
+        
         while active_workers > 0:
-            # 1. 阻塞接收任意 Worker 的进度报告
+            # 1. 接收请求 (包含上一步完成的样本数，初始为 0)
             status = MPI.Status()
             buf = np.empty(1, dtype=np.int32)
-            COMM.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_UPDATE, status=status)
+            COMM.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
             
             source_rank = status.Get_source()
-            worker_batch_size = buf[0]
+            finished_batch_size = buf[0] # Worker 刚做完的量
             
-            # 2. 更新全局计数
-            n_global += worker_batch_size
-            pbar.update(worker_batch_size)
+            # 2. 更新“已收集”计数 (仅用于 UI 显示和最终统计)
+            if finished_batch_size > 0:
+                n_collected += finished_batch_size
+                pbar.update(finished_batch_size)
             
-            # 3. 决策：是否这就够了？
-            if n_global >= Ns:
-                # 够了，发送停止指令
+            # 3. 核心调度逻辑：检查“已派发”总量
+            # 我们假设 Worker 如果继续，将会产生 B 个样本 (即 fxs.shape[0])
+            # 注意：这里需要知道 Worker 的 batch size。
+            # 简单起见，我们假设所有 Worker 的 Batch Size 都是 B (全局变量)
+            # 或者是从 Worker 上一次汇报的 finished_batch_size 推断 (如果不为0)
+            
+            # 预测本次派发量 (如果批准继续的话)
+            next_batch_size = B 
+            
+            if n_dispatched < Ns:
+                # 还可以派发
+                cmd = np.array([CMD_CONTINUE], dtype=np.int32)
+                COMM.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                
+                # 记账：这笔任务派出去了
+                n_dispatched += next_batch_size
+            else:
+                # 够了，停止派发
                 cmd = np.array([CMD_STOP], dtype=np.int32)
                 COMM.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
                 active_workers -= 1
-            else:
-                # 不够，让该 Worker 继续
-                cmd = np.array([CMD_CONTINUE], dtype=np.int32)
-                COMM.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
         
         pbar.close()
 
-    # --- 分支 B: Worker (Rank > 0) - 专职计算 ---
+    # --- 分支 B: Worker (Rank > 0) - 先申请，再干活 ---
     else:
+        # 初始汇报量为 0，用于触发第一次请求
+        last_finished_batch_size = 0
+        
         while True:
-            # 1. 计算 (Computation)
+            # 1. 发送请求 / 汇报上一步战果
+            buf = np.array([last_finished_batch_size], dtype=np.int32)
+            COMM.Send([buf, MPI.INT], dest=0, tag=TAG_REQ)
+            
+            # 2. 等待指令
+            cmd = np.empty(1, dtype=np.int32)
+            COMM.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
+            
+            # 3. 执行指令
+            if cmd[0] == CMD_STOP:
+                break
+            
+            # --- 开始计算 (CMD_CONTINUE) ---
             t00 = MPI.Wtime()
             fxs, current_amps = sample_next(fxs, fpeps_model, graph, verbose=False)
             t11 = MPI.Wtime()
-            # 注意：evaluate_energy 和 get_grads 内部最好也都加上 torch.no_grad() 除非必须
+            
             energy_batch, local_energies_batch = evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False)
             t22 = MPI.Wtime()
+            
             grads_vec_batch, amps_batch = get_grads(fxs, fpeps_model)
             t33 = MPI.Wtime()
 
-            # 计时累计
             sample_time += t11 - t00
             local_energy_time += t22 - t11
             grad_time += t33 - t22
 
-            # 2. 关键：数据落地 (Offload to CPU & Numpy)
-            # 立即 detach 并转为 numpy，切断与计算图的联系，防止显存泄漏
+            # 数据落地
             E_loc_batch_np = local_energies_batch.detach().cpu().numpy()
             amps_batch_np = amps_batch.detach().cpu().numpy()
             grads_batch_np = grads_vec_batch.detach().cpu().numpy()
@@ -244,27 +281,14 @@ for svmc in range(vmc_steps):
             amps_vec.append(amps_batch_np)
             grads_vec_list.append(grads_batch_np)
             
-            current_batch_size = fxs.shape[0]
-            n_local += current_batch_size
+            # 更新本次产出量，准备在下一次循环开头汇报
+            last_finished_batch_size = fxs.shape[0] # 通常等于 B
+            n_local += last_finished_batch_size
 
-            # 3. 显式清理 (Explicit Cleanup)
-            # 删除 Tensor 引用，辅助 GC
+            # 显式清理
             del local_energies_batch, grads_vec_batch, amps_batch
 
-            # 4. 通信握手 (Handshake)
-            # a. 汇报进度
-            buf = np.array([current_batch_size], dtype=np.int32)
-            COMM.Send([buf, MPI.INT], dest=0, tag=TAG_UPDATE)
-            
-            # b. 等待指令 (Stop/Continue)
-            # 这里的等待时间极短，因为 Rank 0 没在做计算
-            cmd = np.empty(1, dtype=np.int32)
-            COMM.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
-            
-            if cmd[0] == CMD_STOP:
-                break
-    
-    # 确保所有进程都退出了循环
+    # 确保退出同步
     COMM.Barrier()
 
     # ==========================================================================
