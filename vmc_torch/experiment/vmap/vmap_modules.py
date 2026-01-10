@@ -129,6 +129,8 @@ def run_sampling_phase(
     amps_vec = []
     grads_vec_list = []
     n_local = 0
+
+    t0 = MPI.Wtime()
     
     # --- Branch A: Master (Rank 0) ---
     if rank == 0:
@@ -219,5 +221,6 @@ def run_sampling_phase(
         't_energy': local_energy_time,
         't_grad': grad_time
     }
-    
-    return (res_energies, res_grads, res_amps), fxs, stats
+    t1 = MPI.Wtime()
+    total_sample_time = t1 - t0
+    return (res_energies, res_grads, res_amps), fxs, stats, total_sample_time

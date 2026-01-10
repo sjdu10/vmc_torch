@@ -1,6 +1,6 @@
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '2'
 os.environ["OMP_NUM_THREADS"] = '1'
 from mpi4py import MPI
 import numpy as np
@@ -9,10 +9,10 @@ import pickle
 from functools import partial
 import torch
 import json
-# 导入你的辅助函数
-from vmap_utils import compute_grads, random_initial_config
-from vmap_models import Transformer_fPEPS_Model_batchedAttn
-from vmap_modules import run_sampling_phase, distributed_minres_solver
+# ==============================================================================
+from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
+from vmc_torch.experiment.vmap.vmap_models import Transformer_fPEPS_Model_batchedAttn
+from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 # ==============================================================================
 import warnings
@@ -29,7 +29,7 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 2
+Lx, Ly = 4, 4
 N_f = Lx * Ly - 2
 D, chi = 4, -1
 t, U = 1.0, 8.0
@@ -60,7 +60,8 @@ fpeps_model = Transformer_fPEPS_Model_batchedAttn(
     dtype=torch.float64,
 )
 n_params = sum(p.numel() for p in fpeps_model.parameters())
-if RANK == 0: print(f'Model Params: {n_params}')
+if RANK == 0: 
+    print(f'Model Params: {n_params}')
 
 # Hamiltonian
 H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -69,7 +70,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 
 # VMC Hyperparams
 Ns = int(1e4) 
-B = 1024
+B = 512
 B_grad = 128
 vmc_steps = 500
 init_step = 0
@@ -100,7 +101,7 @@ for svmc in range(init_step, vmc_steps + init_step):
     
     # --- Step 1: Sampling Phase (Modularized) ---
     # fxs is updated and returned for the next step (Markov Chain)
-    (local_energies, local_grads, local_amps), fxs, timing = run_sampling_phase(
+    (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = run_sampling_phase(
         svmc, Ns, B, fxs, fpeps_model, H, H.graph, get_grads, COMM, RANK, SIZE
     )
     
@@ -115,8 +116,8 @@ for svmc in range(init_step, vmc_steps + init_step):
     energy_var = np.var(all_energies_global)
     total_samples = all_energies_global.shape[0]
     
-    if RANK != 0:
-        print(f' Rank {RANK} | N={timing["n_local"]} | T_samp={timing["t_sample"]:.2f} T_E={timing["t_energy"]:.2f} T_G={timing["t_grad"]:.2f}')
+    if RANK == 1:
+        print(f' Rank {RANK} | N={sample_stats["n_local"]} | T_samp={sample_stats["t_sample"]:.2f} T_E={sample_stats["t_energy"]:.2f} T_G={sample_stats["t_grad"]:.2f}, MKL={os.environ["MKL_NUM_THREADS"]}')
 
     # --- Step 3: Optimization Phase (SR) ---
     # Now this is just a single function call!
@@ -128,8 +129,13 @@ for svmc in range(init_step, vmc_steps + init_step):
     )
     
     if RANK == 0:
-        print(f" SR Time: {t_sr:.4f}s")
         print(f" Step {svmc} Energy: {energy_mean/peps.nsites:.6f} +/- {np.sqrt(energy_var/total_samples)/peps.nsites:.6f}")
+        print(f" Total Samples: {total_samples}, per Rank: {total_samples//SIZE}")
+        print(f" Batch Size: {B}, Grad Batch Size: {B_grad}, MKL: {os.environ['MKL_NUM_THREADS']}")
+        print(f" Total Time: {MPI.Wtime() - t_start:.4f}s")
+        print(f" Sample Time: {total_sample_time:.4f}s")
+        print(f" SR Time: {t_sr:.4f}s")
+        
 
     # --- Step 4: Parameter Update ---
     # dp is already available on all ranks due to distributed solver
@@ -149,7 +155,12 @@ for svmc in range(init_step, vmc_steps + init_step):
         log_file = file_path + f'vmc_mpi_log_{init_step}.txt'
         if svmc == 0 and os.path.exists(log_file): os.remove(log_file)
         with open(log_file, 'a') as f:
-            f.write(f'STEP {svmc}:\nEnergy: {energy_mean/peps.nsites}\nErr: {np.sqrt(energy_var/total_samples)/peps.nsites}\nN: {total_samples}\nTime: {t_end - t_start}\n\n')
+            f.write(f'STEP {svmc}:\nEnergy: {energy_mean/peps.nsites}\
+                    \nErr: {np.sqrt(energy_var/total_samples)/peps.nsites}\
+                    \nN: {total_samples}\
+                    \nTotal Time: {t_end - t_start}\
+                    \nTotal Sample Time: {total_sample_time}\n\
+                    \nSR Time: {t_sr}\n\n')
         
         # JSON Stats
         stats['mean'].append(energy_mean/peps.nsites)
