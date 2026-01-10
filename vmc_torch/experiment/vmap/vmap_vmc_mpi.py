@@ -27,10 +27,10 @@ torch.set_default_device("cpu") # CPU
 torch.random.manual_seed(42 + RANK)
 
 Lx = 4
-Ly = 4
+Ly = 2
 N_f = Lx * Ly - 2 # filling
 D = 4
-chi = -1
+chi = -2
 seed = RANK + 42
 # only the flat backend is compatible with jax.jit
 flat = True
@@ -50,19 +50,25 @@ for site in peps.sites:
 
 # Select fPEPS-based model
 
+# fpeps_model = NN_fPEPS_Model(
+#     tn=peps,
+#     max_bond=chi,
+#     nn_hidden_dim=4,
+#     nn_eta=1,
+#     dtype=torch.float64,
+# )
+
 fpeps_model = Transformer_fPEPS_Model_batchedAttn(
     tn=peps,
     max_bond=chi,
     embed_dim=16,
     attn_heads=4,
+    attn_depth=1,
     nn_hidden_dim=4*peps.nsites,
     nn_eta=1,
+    init_perturbation_scale=1e-3,
     dtype=torch.float64,
 )
-
-model_params_vec = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
-init_std = float(model_params_vec.std())*0.1 # 5e-3
-fpeps_model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 
 # fpeps_model = fPEPS_Model(
 #     peps, max_bond=chi, dtype=torch.float64
@@ -110,11 +116,10 @@ if Lx*Ly <= 6 and RANK == 0:
     print(f'Double layer energy: {E_double/nsites}')
 
 
-
 # Total sample size
-Ns = int(2e3) 
+Ns = int(1e4) 
 # batchsize per rank
-B = 256
+B = 1024
 B_grad = 64
 # Choose gradient computation method
 tn_nn_decouple = False
@@ -122,6 +127,13 @@ if tn_nn_decouple:
     get_grads = partial(compute_grads_decoupled, verbose=True, batch_size=B_grad)  # use the decoupled gradient computation
 else:
     get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_grad, verbose=True)  # default to use the vectorized gradient computation
+vmc_steps = 200
+TAG_OFFSET = 424242
+vmc_pbar = tqdm(total=vmc_steps, desc="VMC steps")
+minSR=False
+diag_shift = 1e-5
+learning_rate = 0.1
+save_state_every = 10
 
 # initial samples for each rank
 fxs = []
@@ -137,12 +149,6 @@ t1 = MPI.Wtime()
 if RANK == 0:
     print(f'Burn-in sampling time: {t1-t0:.4f} s')
 
-vmc_steps = 50
-TAG_OFFSET = 424242
-vmc_pbar = tqdm(total=vmc_steps, desc="VMC steps")
-minSR=False
-learning_rate = 0.1
-
 stats_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/vmc_mpi_stats_{fpeps_model._get_name()+str(chi)}.json'
 stats = {
     'Np': n_params,
@@ -151,14 +157,13 @@ stats = {
     'error': [],
     'variance': [],
 }
-save_state_every = 10
 
-for _ in range(vmc_steps):
+for svmc in range(vmc_steps):
     sample_time = 0
     local_energy_time = 0
     grad_time = 0
     t0 = MPI.Wtime()
-    message_tag = _
+    message_tag = svmc
     # rank 0 is the master process, receives data and send out signal for stopping
     
     E_loc_vec = []
@@ -167,7 +172,6 @@ for _ in range(vmc_steps):
 
     n = 0
     n_total = 0
-    # terminate = False
     terminate = np.array([0], dtype=np.int32)
     if RANK == 0:
         pbar = tqdm(total=Ns, desc="Sampling starts...")
@@ -252,13 +256,9 @@ for _ in range(vmc_steps):
     energy = np.mean(all_energies)
     energy_var = np.var(all_energies) / all_energies.shape[0]
 
-    if RANK == 0:
-        print(f'\n\nSTEP {_} VMC energy: {energy/nsites}')
-        N_total = all_energies.shape[0]
-        print(f'Total sample size: {N_total}')
-
     # SR to compute parameter update
     if minSR:
+        N_total = all_energies.shape[0]
         all_grads = COMM.gather(grads_vec, root=0) # shape (N_total, Np)
         all_amps = COMM.gather(amps, root=0)
         if RANK == 0:
@@ -279,7 +279,7 @@ for _ in range(vmc_steps):
 
                 O_sk = (all_logamp_grads_vec - log_grads_vec_mean[None, :]) / (N_total**0.5)  # shape (N_total, Np)
                 T = (O_sk @ O_sk.T.conj())  # shape (N_total, N_total)
-                diag_shift = 1e-4
+                
                 T += diag_shift * torch.eye(N_total, device=T.device, dtype=T.dtype)
                 E_s = (all_energies - all_energies_mean) / (N_total**0.5)  # shape (N_total,)
 
@@ -288,6 +288,7 @@ for _ in range(vmc_steps):
                 dp = O_sk.conj().T @ (T_inv @ E_s)  # shape (Np,)
         
     else:
+        t0 = MPI.Wtime()
         # SR with iterative minres solver
         local_logamp_grads_vec = grads_vec / amps  # shape (n, Np)
         local_logamp_grads_vec_sum = np.sum(local_logamp_grads_vec, axis=0)  # shape (Np,)
@@ -318,15 +319,22 @@ for _ in range(vmc_steps):
         
         import scipy.sparse.linalg as spla
         def matvec(x):
-            return R_dot_x(x, 1e-4)
+            return R_dot_x(x, diag_shift)
         A = spla.LinearOperator((n_params, n_params), matvec=matvec)
         b = energy_grad
         dp, info = spla.minres(A, b, rtol=1e-4, maxiter=100)
-
+        del local_logamp_grads_vec, local_logamp_grads_vec_sum, local_E_logamp_grads_vec_sum, A
+        t1 = MPI.Wtime()
+    if RANK == 0:
+        print(f'\n\nSTEP {svmc} VMC mean energy per site: {energy/nsites}')
+        print(f'Mean energy per site var: {energy_var/nsites**2}')
+        print(f'Mean energy per site std: {np.sqrt(energy_var)/nsites}')
+        N_total = all_energies.shape[0]
+        print(f'Total sample size: {N_total}')
+        print(f'SR time: {t1 - t0:.4f} s')
     if RANK == 0:
         # update params
         params_vec = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
-
         new_params_vec = params_vec - learning_rate * torch.tensor(dp, dtype=torch.float64)
     
     COMM.Barrier()
@@ -342,13 +350,12 @@ for _ in range(vmc_steps):
     t1 = MPI.Wtime()
     if RANK == 0:
         # save step, energy, energy variance to a file (if exists, delete and create a new one)
-        
         log_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/vmc_mpi_log_{fpeps_model._get_name()+str(chi)}.txt'
-        if os.path.exists(log_file) and _ == 0:
+        if os.path.exists(log_file) and svmc == 0:
             os.remove(log_file)
         with open(log_file, 'a') as f:
-            f.write(f'STEP {_}:\nEnergy per site: {energy/nsites}\nEnergy variance square root: {np.sqrt(energy_var)/nsites}\nSample size: {N_total}\nTime elapsed: {t1 - t0} seconds\n\n')
-        # print(f'STEP {_}:\nEnergy per site: {energy/nsites}\nEnergy variance square root: {np.sqrt(energy_var)/nsites}\nSample size: {N_total}\nTime elapsed: {t1 - t0} seconds\n\n')
+            f.write(f'STEP {svmc}:\nEnergy per site: {energy/nsites}\nEnergy variance square root: {np.sqrt(energy_var)/nsites}\nSample size: {N_total}\nTime elapsed: {t1 - t0} seconds\n\n')
+        # print(f'STEP {svmc}:\nEnergy per site: {energy/nsites}\nEnergy variance square root: {np.sqrt(energy_var)/nsites}\nSample size: {N_total}\nTime elapsed: {t1 - t0} seconds\n\n')
         # save Np, sample size, mean, error, variance to a json file
         stats['mean'].append(energy/nsites)
         stats['error'].append(np.sqrt(energy_var)/nsites)
@@ -359,8 +366,8 @@ for _ in range(vmc_steps):
             json.dump(stats, f)
         
         # save model checkpoint every few steps
-        if (_ + 1) % save_state_every == 0:
-            checkpoint_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/checkpoint_step_{fpeps_model._get_name()+str(chi)}_{_+1}.pt'
+        if (svmc + 1) % save_state_every == 0:
+            checkpoint_file = pwd+f'/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}/checkpoint_step_{fpeps_model._get_name()+str(chi)}_{svmc+1}.pt'
             torch.save(fpeps_model.state_dict(), checkpoint_file)
     
 

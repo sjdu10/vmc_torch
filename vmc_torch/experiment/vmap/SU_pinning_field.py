@@ -6,9 +6,9 @@ from SU_func import (
     run_z2SU_from_u1SU,
 )
 
-Lx, Ly = 4, 8
+Lx, Ly = 4, 2
 D0 = 4
-N_f = Lx*Ly
+N_f = Lx*Ly - 2
 t = 1.0
 U = 8.0
 mu = 0.0
@@ -60,8 +60,8 @@ su_kwargs = {
     'gate_opts':{'cutoff':0.0}
 }
 su_evolve_schedule = [
-    (100, 0.05),
-    (100, 0.01),
+    (200, 0.05),
+    (200, 0.01),
 ]
 u1peps = run_u1SU(
     Lx=Lx,
