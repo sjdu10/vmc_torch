@@ -1,6 +1,6 @@
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
-os.environ['MKL_NUM_THREADS'] = '2'
+os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
 from mpi4py import MPI
 import numpy as np
@@ -29,9 +29,9 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 4
-N_f = Lx * Ly - 2
-D, chi = 4, -1
+Lx, Ly = 8, 8
+N_f = Lx * Ly - 8
+D, chi = 4, 4
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -54,7 +54,7 @@ fpeps_model = Transformer_fPEPS_Model_batchedAttn(
     embed_dim=16,
     attn_heads=4,
     attn_depth=1,
-    nn_hidden_dim=4 * peps.nsites,
+    nn_hidden_dim=peps.nsites,
     nn_eta=1,
     init_perturbation_scale=1e-3,
     dtype=torch.float64,
@@ -69,12 +69,12 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(1e4) 
-B = 512
-B_grad = 128
-vmc_steps = 500
+Ns = int(100) 
+B = 40
+B_grad = 40
+vmc_steps = 1
 init_step = 0
-burn_in_steps = 10
+burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-5
 save_state_every = 10
@@ -120,6 +120,8 @@ for svmc in range(init_step, vmc_steps + init_step):
     if RANK == 1:
         print(f' Rank {RANK} | N={sample_stats["n_local"]} | T_samp={sample_stats["t_sample"]:.2f} T_E={sample_stats["t_energy"]:.2f} T_G={sample_stats["t_grad"]:.2f}, MKL={os.environ["MKL_NUM_THREADS"]}')
 
+    COMM.Barrier()
+    
     # --- Step 3: Optimization Phase (SR) ---
     # Now this is just a single function call!
     # Master (Rank 0) participates in Allreduce but contributes 0 data

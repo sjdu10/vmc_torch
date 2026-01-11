@@ -188,9 +188,7 @@ def run_sampling_phase(
             fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
             t11 = MPI.Wtime()
             
-            # Use no_grad for energy eval to save memory
-            with torch.no_grad():
-                energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
+            energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
             t22 = MPI.Wtime()
             
             grads_vec_batch, amps_batch = get_grads_func(fxs, model)
