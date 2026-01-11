@@ -74,6 +74,7 @@ B = 512
 B_grad = 128
 vmc_steps = 500
 init_step = 0
+burn_in_steps = 10
 learning_rate = 0.1
 diag_shift = 1e-5
 save_state_every = 10
@@ -102,7 +103,7 @@ for svmc in range(init_step, vmc_steps + init_step):
     # --- Step 1: Sampling Phase (Modularized) ---
     # fxs is updated and returned for the next step (Markov Chain)
     (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = run_sampling_phase(
-        svmc, Ns, B, fxs, fpeps_model, H, H.graph, get_grads, COMM, RANK, SIZE
+        svmc, Ns, B, fxs, fpeps_model, H, H.graph, get_grads, COMM, RANK, SIZE, should_burn_in=svmc==init_step, burn_in_steps=burn_in_steps
     )
     
     # --- Step 2: Aggregation Phase ---

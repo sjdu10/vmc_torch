@@ -105,7 +105,9 @@ def run_sampling_phase(
     get_grads_func, 
     comm,
     rank,
-    size
+    size,
+    should_burn_in=False,
+    burn_in_steps=10,
 ):
     """
     运行 Dedicated Master 模式的采样循环
@@ -163,6 +165,11 @@ def run_sampling_phase(
 
     # --- Branch B: Worker ---
     else:
+        
+        if should_burn_in:
+            for _ in range(burn_in_steps):
+                fxs, _ = sample_next(fxs, model, graph, verbose=False)
+
         last_finished_batch = 0
         while True:
             # 1. Request / Report
