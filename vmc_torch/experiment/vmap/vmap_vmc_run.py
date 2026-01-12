@@ -11,7 +11,7 @@ import torch
 import json
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
-from vmc_torch.experiment.vmap.vmap_models import Transformer_fPEPS_Model_batchedAttn
+from vmc_torch.experiment.vmap.vmap_models import Transformer_fPEPS_Model_batchedAttn, Transformer_fPEPS_Model_GlobalMLP
 from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 # ==============================================================================
@@ -29,9 +29,9 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 8, 8
-N_f = Lx * Ly - 8
-D, chi = 4, 4
+Lx, Ly = 4, 4
+N_f = Lx * Ly - 2
+D, chi = 4, -1
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -48,13 +48,24 @@ for site in peps.sites:
     peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1)) # Important for U1->Z2 fPEPS
 
 # Model
-fpeps_model = Transformer_fPEPS_Model_batchedAttn(
+# fpeps_model = Transformer_fPEPS_Model_batchedAttn(
+#     tn=peps,
+#     max_bond=chi,
+#     embed_dim=16,
+#     attn_heads=4,
+#     attn_depth=1,
+#     nn_hidden_dim=peps.nsites,
+#     nn_eta=1,
+#     init_perturbation_scale=1e-3,
+#     dtype=torch.float64,
+# )
+fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
     tn=peps,
     max_bond=chi,
     embed_dim=16,
     attn_heads=4,
     attn_depth=1,
-    nn_hidden_dim=peps.nsites,
+    nn_hidden_dim=2*peps.nsites,
     nn_eta=1,
     init_perturbation_scale=1e-3,
     dtype=torch.float64,
@@ -69,14 +80,14 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(100) 
-B = 40
-B_grad = 40
-vmc_steps = 1
+Ns = int(9e3) 
+B = 512
+B_grad = 64
+vmc_steps = 500
 init_step = 0
-burn_in_steps = 0
+burn_in_steps = 10
 learning_rate = 0.1
-diag_shift = 1e-5
+diag_shift = 1e-4
 save_state_every = 10
 
 # Load Checkpoint

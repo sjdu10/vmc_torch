@@ -2,8 +2,8 @@ import os
 import pickle
 import quimb.tensor as qtn
 
-Lx = 4
-Ly = 2
+Lx = 6
+Ly = 6
 D = 4
 seed = 42
 
@@ -34,16 +34,16 @@ su = qtn.SimpleUpdateGen(
 
 # run the evolution, these are reasonable defaults
 su.evolve(100, tau=0.3)
-su.evolve(100, tau=0.1)
-su.evolve(100, tau=0.05)
-su.evolve(100, tau=0.01)
+# su.evolve(100, tau=0.1)
+# su.evolve(100, tau=0.05)
+# su.evolve(100, tau=0.01)
 
 su_peps = su.get_state()
 # save the state
 params, _ = qtn.pack(su_peps)
 
 
-pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap'
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
 os.makedirs(pwd+f'/{Lx}x{Ly}/heis/D={D}', exist_ok=True)
 with open(pwd+f'/{Lx}x{Ly}/heis/D={D}/peps_skeleton.pkl', 'wb') as f:
     pickle.dump(skeleton, f)

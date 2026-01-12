@@ -4,6 +4,52 @@ from tqdm import tqdm
 from vmc_torch.experiment.vmap.vmap_utils import sample_next, evaluate_energy
 import scipy.sparse.linalg as spla
 from mpi4py import MPI
+import contextlib
+
+# === Global control ===
+_ENABLE_JITTER = False
+
+@contextlib.contextmanager
+def use_jitter_svd():
+    global _ENABLE_JITTER
+    _ENABLE_JITTER = True
+    try:
+        yield
+    finally:
+        _ENABLE_JITTER = False
+
+# === SVD Patch ===
+if not hasattr(torch.linalg, 'svd_orig'):
+    torch.linalg.svd_orig = torch.linalg.svd
+
+def vmap_friendly_svd(A, full_matrices=True, *, driver=None, **kwargs):
+    if _ENABLE_JITTER:
+        # Inside vmap, A is a BatchedTensor.
+        # We add a very small diagonal perturbation.
+        # For double (float64), 1e-12 is safe.
+        
+        # 1. Construct perturbation matrix (Identity)
+        # Note: Here we need to handle the case where A is not square, only add on the diagonal
+        M, N = A.shape[-2], A.shape[-1]
+        
+        # Create diagonal noise (using PyTorch broadcasting to be compatible with vmap batch dimensions)
+        # jitter_scale = A.norm(dim=(-2,-1), keepdim=True) * 1e-12 # Relative jitter is safer
+        # Or simply absolute jitter
+        jitter_val = 1e-12 
+        
+        # Construct a diagonal matrix with the same device and type as A
+        # torch.eye is compatible with vmap's automatic broadcasting
+        eye = torch.eye(M, N, device=A.device, dtype=A.dtype) * jitter_val
+        
+        # 2. Perform addition (vmap compatible)
+        A_new = A + eye
+        print("Global SVD Jitter Applied.")
+        return torch.linalg.svd_orig(A_new, full_matrices=full_matrices, driver=driver, **kwargs)
+    else:
+        return torch.linalg.svd_orig(A, full_matrices=full_matrices, driver=driver, **kwargs)
+
+# 应用 Patch
+torch.linalg.svd = vmap_friendly_svd
 
 def distributed_minres_solver(
     local_grads, 
@@ -13,7 +59,8 @@ def distributed_minres_solver(
     total_samples, 
     n_params, 
     diag_shift, 
-    comm
+    comm,
+    rtol=1e-4,
 ):
     """
     使用 MinRes 求解 SR 方程 S * dp = g (分布式 Matrix-Free 版本)
@@ -27,6 +74,7 @@ def distributed_minres_solver(
         n_params: 参数总数 (Np)
         diag_shift: 对角偏移量 (SR regularization)
         comm: MPI communicator
+        rtol: MinRes 相对收敛容限
     
     Returns:
         dp: (Np,) 参数更新量
@@ -88,7 +136,7 @@ def distributed_minres_solver(
 
     # 4. 运行 MinRes
     A = spla.LinearOperator((n_params, n_params), matvec=matvec, dtype=np.float64)
-    dp, info = spla.minres(A, energy_grad, rtol=1e-4, maxiter=100)
+    dp, info = spla.minres(A, energy_grad, rtol=rtol, maxiter=100)
     
     t1 = MPI.Wtime()
     return dp, t1 - t0
@@ -165,10 +213,50 @@ def run_sampling_phase(
 
     # --- Branch B: Worker ---
     else:
-        
         if should_burn_in:
-            for _ in range(burn_in_steps):
-                fxs, _ = sample_next(fxs, model, graph, verbose=False)
+            current_step = 0
+            max_resets = 3  # to prevent infinite loops
+            reset_count = 0
+
+            while current_step < burn_in_steps:
+                try:
+                    fxs, _ = sample_next(fxs, model, graph, verbose=False)
+                    current_step += 1
+
+                except RuntimeError as e:
+                    error_str = str(e).lower()
+                    if 'svd' not in error_str and 'converge' not in error_str:
+                        raise e # raise non-svd errors immediately
+
+                    # === Jitter SVD ===
+                    # no need to reset current_step here
+                    success_jitter = False
+                    try:
+                        with use_jitter_svd():
+                            fxs, _ = sample_next(fxs, model, graph, verbose=False)
+                        current_step += 1 # Successfully passed this step
+                        # if pbar_burn: pbar_burn.update(1)
+                        success_jitter = True
+                    except RuntimeError:
+                        pass # Jitter also couldn't recover
+                    if not success_jitter:
+                        # === Permutation (Physical Reset) ===
+                        # Only resort to this if all else fails.
+                        # Cost: must reset current_step = 0
+                        if reset_count < max_resets:
+                            # print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
+                            
+                            with torch.no_grad():
+                                for i in range(fxs.shape[0]):
+                                    perm = torch.randperm(fxs.shape[1])
+                                    fxs[i] = fxs[i][perm]
+                            
+                            # CRITICAL: reset progress!
+                            current_step = 0
+                            reset_count += 1
+                            # if pbar_burn: pbar_burn.reset()
+                        else:
+                            raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
 
         last_finished_batch = 0
         while True:
@@ -182,7 +270,6 @@ def run_sampling_phase(
             
             if cmd[0] == CMD_STOP:
                 break
-            
             # 3. Compute
             t00 = MPI.Wtime()
             fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
