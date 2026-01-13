@@ -32,11 +32,10 @@ SIZE = COMM.Get_size()
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
 torch.set_default_device("cpu")
 torch.random.manual_seed(42 + RANK)
-
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 4
+Lx, Ly = 4, 2
 N_f = Lx * Ly - 2
 D, chi = 4, -1
 t, U = 1.0, 8.0
@@ -54,6 +53,25 @@ for site in peps.sites:
     peps[site].data._label = site
     peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1)) # Important for U1->Z2 fPEPS
 
+# ==============================================================================
+# Model Configuration (Define this FIRST)
+# ==============================================================================
+# 将所有用于初始化的超参数放在这里
+# 注意：ftn (peps) 通常太大或是对象，不适合存json，只要记录生成peps的参数(Lx, Ly等)即可
+model_config = {
+    'max_bond': chi,
+    'embed_dim': 16,
+    'attn_depth': 1,
+    'attn_heads': 4,
+    'nn_hidden_dim': peps.nsites,
+    'init_perturbation_scale': 1e-3,
+    'nn_eta': 1,
+    'dtype_str': 'float64' 
+}
+dtype_map = {'float64': torch.float64, 'float32': torch.float32}
+model_dtype = dtype_map[model_config['dtype_str']]
+init_kwargs = model_config.copy()
+init_kwargs.pop('dtype_str')
 # Model
 # fpeps_model = Transformer_fPEPS_Model_Conv2d(
 #     tn=peps,
@@ -88,27 +106,18 @@ for site in peps.sites:
 #     init_perturbation_scale=1e-3,
 #     dtype=torch.float64,
 # )
-# fpeps_model = Transformer_fPEPS_Model_UNet(
-#     tn=peps,
-#     max_bond=chi,
-#     embed_dim=16,
-#     attn_heads=4,
-#     attn_depth=1,
-#     nn_hidden_dim=peps.nsites,
-#     nn_eta=1,
-#     init_perturbation_scale=1e-3,
-#     dtype=torch.float64,
-# )
-fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
-    ftn=peps,
-    max_bond=chi,
-    embedding_dim=16,
-    attention_heads=4,
-    nn_final_dim=D,
-    nn_eta=1,
-    dtype=torch.float64,
+fpeps_model = Transformer_fPEPS_Model_UNet(
+    tn=peps,
+    dtype=model_dtype,
+    **init_kwargs
 )
-fpeps_model.apply(partial(init_weights_to_zero, std=1e-3))
+
+# fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
+#     ftn=peps,
+#     dtype=model_dtype,
+#     **init_kwargs
+# )
+# fpeps_model.apply(partial(init_weights_to_zero, std=1e-3))
 
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 
@@ -120,9 +129,9 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(9e3) 
-B = 256
-B_grad = 128
+Ns = int(6e3) 
+B = 316
+B_grad = 316
 vmc_steps = 500
 init_step = 0
 burn_in_steps = 0
@@ -143,7 +152,14 @@ get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_
 
 # Init State
 fxs = torch.stack([random_initial_config(N_f, peps.nsites) for _ in range(B)]).to(torch.long)
-stats = {'Np': n_params, 'sample size': Ns, 'mean': [], 'error': [], 'variance': []}
+stats = {
+    "Np": n_params,
+    "sample size": Ns,
+    "model_config": model_config,
+    "mean": [],
+    "error": [],
+    "variance": [],
+}
 
 # ==============================================================================
 # 2. Main VMC Loop
@@ -222,7 +238,7 @@ for svmc in range(init_step, vmc_steps + init_step):
         stats['variance'].append(energy_var/peps.nsites**2)
         stats['sample size'] = total_samples
         with open(file_path + f'vmc_mpi_stats_{init_step}.json', 'w') as f:
-            json.dump(stats, f)
+            json.dump(stats, f, indent=4)
             
         # Checkpoint
         if (svmc + 1) % save_state_every == 0:

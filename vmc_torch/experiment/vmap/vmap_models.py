@@ -577,6 +577,7 @@ class Transformer_fPEPS_Model_DConv2d(nn.Module):
         attn_depth=1,
         init_perturbation_scale=1e-5,
         dtype=torch.float64,
+        **kwargs
     ):
         super().__init__()
         
@@ -720,6 +721,7 @@ class Transformer_fPEPS_Model_Conv2d(nn.Module):
         conv_kernel_size=3,
         init_perturbation_scale=1e-5,
         dtype=torch.float64,
+        **kwargs,
     ):
         import quimb as qu
         import quimb.tensor as qtn
@@ -864,6 +866,7 @@ class Transformer_fPEPS_Model_UNet(nn.Module):
         attn_depth=1,
         init_perturbation_scale=1e-5,
         dtype=torch.float64,
+        **kwargs,
     ):
         super().__init__()
         
@@ -954,6 +957,7 @@ class Transformer_fPEPS_Model_GlobalMLP(nn.Module):
         attn_depth=1,
         init_perturbation_scale=1e-5,
         dtype=torch.float64,
+        **kwargs,
     ):
         super().__init__()
         
@@ -1054,6 +1058,7 @@ class Transformer_fPEPS_Model_Fourier(nn.Module):
         attn_depth=1,
         init_perturbation_scale=1e-5,
         dtype=torch.float64,
+        **kwargs,
     ):
         super().__init__()
         
@@ -1138,7 +1143,7 @@ class Transformer_fPEPS_Model_Fourier(nn.Module):
 # ==============================================================================
 import torch.nn.functional as F
 class Transformer_fPEPS_Model(nn.Module):
-    def __init__(self, tn, max_bond, nn_eta, nn_hidden_dim, embed_dim, attn_heads, dtype=torch.float64):
+    def __init__(self, tn, max_bond, nn_eta, nn_hidden_dim, embed_dim, attn_heads, dtype=torch.float64, **kwargs):
         import quimb as qu
         import quimb.tensor as qtn
         super().__init__()
@@ -1411,11 +1416,12 @@ class fTN_backflow_attn_Tensorwise_Model_vmap(nn.Module):
         self, 
         ftn, 
         max_bond=None, 
-        embedding_dim=32, 
-        attention_heads=4, 
-        nn_final_dim=4, 
+        embed_dim=32, 
+        attn_heads=4, 
+        nn_hidden_dim=4, 
         nn_eta=1.0, 
-        dtype=torch.float32
+        dtype=torch.float32,
+        **kwargs
     ):
         super().__init__()
         self.dtype = dtype
@@ -1446,24 +1452,24 @@ class fTN_backflow_attn_Tensorwise_Model_vmap(nn.Module):
         # --- 2. Neural Network Setup ---
         input_dim = ftn.Lx * ftn.Ly
         phys_dim = ftn.phys_dim()
-        self.embedding_dim = embedding_dim
+        self.embedding_dim = embed_dim
         
         # A. Attention Block
         self.attn_block = SelfAttn_block(
             n_site=input_dim,
             num_classes=phys_dim,
-            embedding_dim=embedding_dim,
-            attention_heads=attention_heads,
+            embedding_dim=embed_dim,
+            attention_heads=attn_heads,
             dtype=self.dtype
         )
         
         # B. Tensorwise MLPs
         # Input to MLP is Flattened Attn Output: Lx * Ly * Embed_Dim
-        mlp_input_dim = input_dim * embedding_dim
+        mlp_input_dim = input_dim * embed_dim
         
         self.nn_backflow_generator = TensorwiseMLPBackflow(
             input_dim=mlp_input_dim,
-            hidden_dim=nn_final_dim, # Matches user's nn_final_dim
+            hidden_dim=nn_hidden_dim, # Matches user's nn_hidden_dim
             param_sizes=self.ftn_params_sizes,
             dtype=self.dtype
         )
@@ -1482,76 +1488,7 @@ class fTN_backflow_attn_Tensorwise_Model_vmap(nn.Module):
         # Combine all parameters for optimizers
         self.params = nn.ParameterList(list(self.ftn_params) + list(self.nn_backflow.parameters()))
 
-    def _get_name(self):
-        return 'fPEPS_backflow_attn_Tensorwise_vmap'
-
-    def tn_contraction(self, x, ftn_params, nn_output):
-        """ 
-        Single sample contraction (Traced by vmap)
-        x: (N_sites,)
-        ftn_params: list of tensors (unbatched)
-        nn_output: (Total_Params,) vector (unbatched)
-        """
-        # 1. Flatten TN params to vector
-        ftn_params_vector = nn.utils.parameters_to_vector(ftn_params)
-        
-        # 2. Add Backflow Correction
-        # New Params = Old + eta * NN_output
-        nnftn_params_vector = ftn_params_vector + self.nn_eta * nn_output
-        
-        # 3. Unpack vector back to list of tensors
-        nnftn_params = []
-        pointer = 0
-        for shape in self.ftn_params_shape:
-            length = torch.prod(torch.tensor(shape)).item()
-            nnftn_params.append(nnftn_params_vector[pointer:pointer+length].view(shape))
-            pointer += length
-        
-        # 4. Reconstruct TN object using Quimb
-        # Note: tree_unflatten and unpack logic happens inside trace, 
-        # but since they just rearrange tensors, it's usually fine.
-        nnftn_params_dict = qu.utils.tree_unflatten(nnftn_params, self.ftn_params_pytree)
-        tn = qtn.unpack(nnftn_params_dict, self.skeleton)
-        
-        # 5. Contract
-        # Select sites based on config x
-        # Note: x needs to be iterated. In vmap x is a Tensor.
-        # We need to act carefully here. qtn.isel expects dictionary.
-        # enumerate(tn.sites) is static, so it's fine.
-        amp = tn.isel({tn.site_ind(site): x[i] for i, site in enumerate(tn.sites)})
-        
-        if self.chi is not None and self.chi > 0:
-            # Boundary contraction
-            amp.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[0, amp.Ly//2-1])
-            amp.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[amp.Ly//2, amp.Ly-1])
-            return amp.contract()
-        else:
-            # Exact contraction
-            return amp.contract(optimize='auto-hq')
-
-    def vamp(self, x, params):
-        """
-        Batched Forward Pass using vmap for contraction
-        """
-        # 1. Split parameters
-        ftn_params = params[:len(self.ftn_params)]
-        nn_params = params[len(self.ftn_params):]
-        nn_params_dict = dict(zip(self.nn_param_names, nn_params))
-
-        # 2. Compute NN Backflow (Batched)
-        # This runs the standard PyTorch batched forward pass
-        # Output: (Batch, Total_Params)
-        batch_nn_outputs = torch.func.functional_call(self.nn_backflow, nn_params_dict, x)
-
-        # 3. TN Contraction (Vmapped)
-        # We map over 'x' (dim 0) and 'batch_nn_outputs' (dim 0)
-        # We do NOT map over 'ftn_params' (None, shared across batch)
-        amps = torch.vmap(
-            self.tn_contraction,
-            in_dims=(0, None, 0),
-        )(x, ftn_params, batch_nn_outputs)
-        
-        return amps
-
-    def forward(self, x):
-        return self.vamp(x, self.params)
+    # ... (Reuse Logic) ...
+    tn_contraction = Transformer_fPEPS_Model_DConv2d.tn_contraction
+    vamp = Transformer_fPEPS_Model_DConv2d.vamp
+    forward = Transformer_fPEPS_Model_DConv2d.forward
