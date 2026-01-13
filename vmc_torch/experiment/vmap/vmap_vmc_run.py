@@ -11,9 +11,16 @@ import torch
 import json
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
-from vmc_torch.experiment.vmap.vmap_models import Transformer_fPEPS_Model_batchedAttn, Transformer_fPEPS_Model_GlobalMLP
+from vmc_torch.experiment.vmap.vmap_models import (
+    Transformer_fPEPS_Model_Conv2d,
+    Transformer_fPEPS_Model_GlobalMLP,
+    Transformer_fPEPS_Model_UNet,
+    Transformer_fPEPS_Model_DConv2d,
+    fTN_backflow_attn_Tensorwise_Model_vmap
+)
 from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
+from vmc_torch.experiment.tn_model import init_weights_to_zero
 # ==============================================================================
 import warnings
 warnings.filterwarnings("ignore")
@@ -48,7 +55,7 @@ for site in peps.sites:
     peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1)) # Important for U1->Z2 fPEPS
 
 # Model
-# fpeps_model = Transformer_fPEPS_Model_batchedAttn(
+# fpeps_model = Transformer_fPEPS_Model_Conv2d(
 #     tn=peps,
 #     max_bond=chi,
 #     embed_dim=16,
@@ -59,17 +66,50 @@ for site in peps.sites:
 #     init_perturbation_scale=1e-3,
 #     dtype=torch.float64,
 # )
-fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
-    tn=peps,
+# fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
+#     tn=peps,
+#     max_bond=chi,
+#     embed_dim=16,
+#     attn_heads=4,
+#     attn_depth=1,
+#     nn_hidden_dim=peps.nsites,
+#     nn_eta=1,
+#     init_perturbation_scale=1e-3,
+#     dtype=torch.float64,
+# )
+# fpeps_model = Transformer_fPEPS_Model_DConv2d(
+#     tn=peps,
+#     max_bond=chi,
+#     embed_dim=16,
+#     attn_heads=4,
+#     attn_depth=1,
+#     nn_hidden_dim=peps.nsites,
+#     nn_eta=1,
+#     init_perturbation_scale=1e-3,
+#     dtype=torch.float64,
+# )
+# fpeps_model = Transformer_fPEPS_Model_UNet(
+#     tn=peps,
+#     max_bond=chi,
+#     embed_dim=16,
+#     attn_heads=4,
+#     attn_depth=1,
+#     nn_hidden_dim=peps.nsites,
+#     nn_eta=1,
+#     init_perturbation_scale=1e-3,
+#     dtype=torch.float64,
+# )
+fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
+    ftn=peps,
     max_bond=chi,
-    embed_dim=16,
-    attn_heads=4,
-    attn_depth=1,
-    nn_hidden_dim=2*peps.nsites,
+    embedding_dim=16,
+    attention_heads=4,
+    nn_final_dim=D,
     nn_eta=1,
-    init_perturbation_scale=1e-3,
     dtype=torch.float64,
 )
+fpeps_model.apply(partial(init_weights_to_zero, std=1e-3))
+
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 
     print(f'Model Params: {n_params}')
@@ -81,11 +121,11 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 
 # VMC Hyperparams
 Ns = int(9e3) 
-B = 512
-B_grad = 64
+B = 256
+B_grad = 128
 vmc_steps = 500
 init_step = 0
-burn_in_steps = 10
+burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10
@@ -173,7 +213,7 @@ for svmc in range(init_step, vmc_steps + init_step):
                     \nErr: {np.sqrt(energy_var/total_samples)/peps.nsites}\
                     \nN: {total_samples}\
                     \nTotal Time: {t_end - t_start}\
-                    \nTotal Sample Time: {total_sample_time}\n\
+                    \nTotal Sample Time: {total_sample_time}\
                     \nSR Time: {t_sr}\n\n')
         
         # JSON Stats
