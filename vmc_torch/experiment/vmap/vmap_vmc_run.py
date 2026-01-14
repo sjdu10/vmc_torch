@@ -35,9 +35,9 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 2
-N_f = Lx * Ly - 2
-D, chi = 4, -1
+Lx, Ly = 8, 8
+N_f = Lx * Ly - 8
+D, chi = 8, 16
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -73,17 +73,11 @@ model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-# fpeps_model = Transformer_fPEPS_Model_Conv2d(
-#     tn=peps,
-#     max_bond=chi,
-#     embed_dim=16,
-#     attn_heads=4,
-#     attn_depth=1,
-#     nn_hidden_dim=peps.nsites,
-#     nn_eta=1,
-#     init_perturbation_scale=1e-3,
-#     dtype=torch.float64,
-# )
+fpeps_model = Transformer_fPEPS_Model_Conv2d(
+    tn=peps,
+    dtype=model_dtype,
+    **init_kwargs
+)
 # fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
 #     tn=peps,
 #     max_bond=chi,
@@ -106,11 +100,11 @@ init_kwargs.pop('dtype_str')
 #     init_perturbation_scale=1e-3,
 #     dtype=torch.float64,
 # )
-fpeps_model = Transformer_fPEPS_Model_UNet(
-    tn=peps,
-    dtype=model_dtype,
-    **init_kwargs
-)
+# fpeps_model = Transformer_fPEPS_Model_UNet(
+#     tn=peps,
+#     dtype=model_dtype,
+#     **init_kwargs
+# )
 
 # fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
 #     ftn=peps,
@@ -129,9 +123,9 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(6e3) 
-B = 316
-B_grad = 316
+Ns = int(40) 
+B = 40
+B_grad = 4
 vmc_steps = 500
 init_step = 0
 burn_in_steps = 0

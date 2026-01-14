@@ -802,10 +802,6 @@ class Transformer_fPEPS_Model_Conv2d(nn.Module):
                 if m.bias is not None:
                     torch.nn.init.zeros_(m.bias)
     
-    def _get_name(self):
-        # Override to provide a custom name for the model
-        return 'Transformer_fPEPS_Model_batchedAttn'
-    
     def tn_contraction(self, x, ftn_params, nn_output):
         """ This is the part that TRULY needs vmap. """
         # 1. Reconstruct the vector
