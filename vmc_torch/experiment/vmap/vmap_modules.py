@@ -43,7 +43,7 @@ def vmap_friendly_svd(A, full_matrices=True, *, driver=None, **kwargs):
         
         # 2. Perform addition (vmap compatible)
         A_new = A + eye
-        print(f"Global SVD Jitter Applied to Rank {MPI.COMM_WORLD.Get_rank()}")
+        
         return torch.linalg.svd_orig(A_new, full_matrices=full_matrices, driver=driver, **kwargs)
     else:
         return torch.linalg.svd_orig(A, full_matrices=full_matrices, driver=driver, **kwargs)
@@ -233,6 +233,7 @@ def run_sampling_phase(
                     success_jitter = False
                     try:
                         with use_jitter_svd():
+                            print(f"Global SVD Jitter Applied to Rank {MPI.COMM_WORLD.Get_rank()}")
                             fxs, _ = sample_next(fxs, model, graph, verbose=False)
                         current_step += 1 # Successfully passed this step
                         # if pbar_burn: pbar_burn.update(1)
@@ -245,7 +246,7 @@ def run_sampling_phase(
                         # Cost: must reset current_step = 0
                         if reset_count < max_resets:
                             # print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
-                            
+                            print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
                             with torch.no_grad():
                                 for i in range(fxs.shape[0]):
                                     perm = torch.randperm(fxs.shape[1])
