@@ -18,6 +18,7 @@ from vmc_torch.experiment.vmap.vmap_models import (
     Transformer_fPEPS_Model_DConv2d,
     fTN_backflow_attn_Tensorwise_Model_vmap
 )
+from vmc_torch.experiment.vmap.vmap_utils import sample_next, evaluate_energy
 from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
@@ -123,8 +124,8 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(20) 
-B = 20
+Ns = int(30) 
+B = 30
 B_grad = 4
 vmc_steps = 500
 init_step = 0
@@ -158,82 +159,11 @@ stats = {
 # ==============================================================================
 # 2. Main VMC Loop
 # ==============================================================================
-for svmc in range(init_step, vmc_steps + init_step):
-    t_start = MPI.Wtime()
-    
-    # --- Step 1: Sampling Phase (Modularized) ---
-    # fxs is updated and returned for the next step (Markov Chain)
-    (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = run_sampling_phase(
-        svmc, Ns, B, fxs, fpeps_model, H, H.graph, get_grads, COMM, RANK, SIZE, should_burn_in=svmc==init_step, burn_in_steps=burn_in_steps
-    )
-    
-    # --- Step 2: Aggregation Phase ---
-    # Gather statistics for logging
-    all_energies_list = COMM.allgather(local_energies)
-    # Filter out empty arrays (from Master)
-    valid_energies = [e for e in all_energies_list if e.size > 0]
-    all_energies_global = np.concatenate(valid_energies)
-    
-    energy_mean = np.mean(all_energies_global)
-    energy_var = np.var(all_energies_global)
-    total_samples = all_energies_global.shape[0]
-    
-    if RANK == 1:
-        print(f' Rank {RANK} | N={sample_stats["n_local"]} | T_samp={sample_stats["t_sample"]:.2f} T_E={sample_stats["t_energy"]:.2f} T_G={sample_stats["t_grad"]:.2f}, MKL={os.environ["MKL_NUM_THREADS"]}')
-
-    COMM.Barrier()
-    
-    # --- Step 3: Optimization Phase (SR) ---
-    # Now this is just a single function call!
-    # Master (Rank 0) participates in Allreduce but contributes 0 data
-    
-    dp, t_sr = distributed_minres_solver(
-        local_grads, local_amps, local_energies,
-        energy_mean, total_samples, n_params, diag_shift, COMM
-    )
-    
-    if RANK == 0:
-        print(f" Step {svmc} Energy: {energy_mean/peps.nsites:.6f} +/- {np.sqrt(energy_var/total_samples)/peps.nsites:.6f}")
-        print(f" Total Samples: {total_samples}, per Rank: {total_samples//SIZE}")
-        print(f" Batch Size: {B}, Grad Batch Size: {B_grad}, MKL: {os.environ['MKL_NUM_THREADS']}")
-        print(f" Total Time: {MPI.Wtime() - t_start:.4f}s")
-        print(f" Sample Time: {total_sample_time:.4f}s")
-        print(f" SR Time: {t_sr:.4f}s")
-        
-
-    # --- Step 4: Parameter Update ---
-    # dp is already available on all ranks due to distributed solver
-    with torch.no_grad():
-        dp_tensor = torch.tensor(dp, device='cpu', dtype=torch.float64)
-        curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
-        new_params = curr_params - learning_rate * dp_tensor
-        torch.nn.utils.vector_to_parameters(new_params, fpeps_model.parameters())
-
-    # --- Step 5: Logging (Master Only) ---
-    t_end = MPI.Wtime()
-    if RANK == 0:
-        if not os.path.exists(file_path): 
-            os.makedirs(file_path)
-        
-        # Text Log
-        log_file = file_path + f'vmc_mpi_log_{init_step}.txt'
-        if svmc == 0 and os.path.exists(log_file): os.remove(log_file)
-        with open(log_file, 'a') as f:
-            f.write(f'STEP {svmc}:\nEnergy: {energy_mean/peps.nsites}\
-                    \nErr: {np.sqrt(energy_var/total_samples)/peps.nsites}\
-                    \nN: {total_samples}\
-                    \nTotal Time: {t_end - t_start}\
-                    \nTotal Sample Time: {total_sample_time}\
-                    \nSR Time: {t_sr}\n\n')
-        
-        # JSON Stats
-        stats['mean'].append(energy_mean/peps.nsites)
-        stats['error'].append(np.sqrt(energy_var/total_samples)/peps.nsites)
-        stats['variance'].append(energy_var/peps.nsites**2)
-        stats['sample size'] = total_samples
-        with open(file_path + f'vmc_mpi_stats_{init_step}.json', 'w') as f:
-            json.dump(stats, f, indent=4)
-            
-        # Checkpoint
-        if (svmc + 1) % save_state_every == 0:
-            torch.save(fpeps_model.state_dict(), file_path + f'checkpoint_step_{svmc+1}.pt')
+for _ in range(10):
+    t0 = MPI.Wtime()
+    fxs, current_amps = sample_next(fxs, fpeps_model, H.graph, verbose=False)
+    energy_batch, local_energies_batch = evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False)
+    t1 = MPI.Wtime()
+    print(f"Rank {RANK} Sampling + Energy Evaluation Time: {t1 - t0} seconds")
+    print(energy_batch)
+# ==============================================================================
