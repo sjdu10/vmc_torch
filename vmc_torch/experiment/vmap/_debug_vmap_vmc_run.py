@@ -160,10 +160,14 @@ stats = {
 # 2. Main VMC Loop
 # ==============================================================================
 for _ in range(10):
-    t0 = MPI.Wtime()
-    fxs, current_amps = sample_next(fxs, fpeps_model, H.graph, verbose=False)
-    energy_batch, local_energies_batch = evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False)
-    t1 = MPI.Wtime()
-    print(f"Rank {RANK} Sampling + Energy Evaluation Time: {t1 - t0} seconds")
-    print(energy_batch)
+    try:
+        t0 = MPI.Wtime()
+        fxs, current_amps = sample_next(fxs, fpeps_model, H.graph, verbose=False)
+        energy_batch, local_energies_batch = evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False)
+        t1 = MPI.Wtime()
+        print(f"Rank {RANK} Sampling + Energy Evaluation Time: {t1 - t0} seconds")
+        print(energy_batch)
+    except RuntimeError as e:
+        print(f"Rank {RANK} encountered error during sampling/energy evaluation: {e}")
+        print(fxs)
 # ==============================================================================

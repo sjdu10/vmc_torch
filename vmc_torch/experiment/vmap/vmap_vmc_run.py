@@ -48,7 +48,7 @@ params = pickle.load(open(params_path + f'peps_su_params{appendix}.pkl', 'rb'))
 skeleton = pickle.load(open(params_path + f'peps_skeleton{appendix}.pkl', 'rb'))
 peps = qtn.unpack(params, skeleton)
 for ts in peps.tensors: 
-    ts.modify(data=ts.data.to_flat()*10)
+    ts.modify(data=ts.data.to_flat()*4)
 for site in peps.sites: 
     peps[site].data._label = site
     peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1)) # Important for U1->Z2 fPEPS
@@ -127,11 +127,11 @@ Ns = int(20)
 B = 20
 B_grad = 4
 vmc_steps = 500
-init_step = 0
+init_step = 9
 burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-4
-save_state_every = 10
+save_state_every = 1
 
 # Load Checkpoint
 file_path = f'{params_path}/{fpeps_model._get_name()}/chi={chi}/'

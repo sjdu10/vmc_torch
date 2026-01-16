@@ -199,6 +199,9 @@ def run_sampling_phase(
             if finished_batch > 0:
                 n_collected += finished_batch
                 pbar.update(finished_batch)
+            elif finished_batch < 0: # worker failed
+                n_dispatched -= finished_batch # revert dispatch count
+                print(f"Master detected failure from Rank {source_rank}, reverting dispatched count by {-finished_batch}.")
             
             next_batch = B
             if n_dispatched < Ns:
@@ -224,6 +227,8 @@ def run_sampling_phase(
                     current_step += 1
 
                 except RuntimeError as e:
+                    # save fxs for debugging to current directory
+                    torch.save(fxs, f'fxs_burnin_error_rank_{rank}_step_{svmc}_currstep_{current_step}.pt')
                     error_str = str(e).lower()
                     if 'svd' not in error_str and 'converge' not in error_str:
                         raise e # raise non-svd errors immediately
@@ -259,6 +264,7 @@ def run_sampling_phase(
                         else:
                             raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
 
+
         last_finished_batch = 0
         while True:
             # 1. Request / Report
@@ -271,30 +277,68 @@ def run_sampling_phase(
             
             if cmd[0] == CMD_STOP:
                 break
-            # 3. Compute
-            t00 = MPI.Wtime()
-            fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
-            t11 = MPI.Wtime()
-            
-            energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
-            t22 = MPI.Wtime()
-            
-            grads_vec_batch, amps_batch = get_grads_func(fxs, model)
-            t33 = MPI.Wtime()
 
-            sample_time += t11 - t00
-            local_energy_time += t22 - t11
-            grad_time += t33 - t22
+            try:
+                # 3. Compute
+                t00 = MPI.Wtime()
+                fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
+                t11 = MPI.Wtime()
+                
+                energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
+                t22 = MPI.Wtime()
+                
+                grads_vec_batch, amps_batch = get_grads_func(fxs, model)
+                t33 = MPI.Wtime()
 
-            # Offload
-            E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
-            amps_vec.append(amps_batch.detach().cpu().numpy())
-            grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
-            
-            last_finished_batch = fxs.shape[0]
-            n_local += last_finished_batch
-            
-            del local_energies_batch, grads_vec_batch, amps_batch
+                sample_time += t11 - t00
+                local_energy_time += t22 - t11
+                grad_time += t33 - t22
+
+                # Offload
+                E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
+                amps_vec.append(amps_batch.detach().cpu().numpy())
+                grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
+                
+                last_finished_batch = fxs.shape[0]
+                n_local += last_finished_batch
+                
+                del local_energies_batch, grads_vec_batch, amps_batch
+            except RuntimeError as e:
+                print(f"Rank {rank} encountered error during sampling/energy/grad computation: {e}")
+                # save fxs for debugging to current directory
+                torch.save(fxs, f'fxs_error_rank_{rank}_step_{svmc}.pt')
+                
+                # === Jitter SVD Attempt ===
+                try:
+                    with use_jitter_svd():
+                        print(f"Local SVD Jitter Applied to Rank {rank} during sampling phase.")
+                        # 3. Compute
+                        t00 = MPI.Wtime()
+                        fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
+                        t11 = MPI.Wtime()
+                        
+                        energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
+                        t22 = MPI.Wtime()
+                        
+                        grads_vec_batch, amps_batch = get_grads_func(fxs, model)
+                        t33 = MPI.Wtime()
+
+                        sample_time += t11 - t00
+                        local_energy_time += t22 - t11
+                        grad_time += t33 - t22
+
+                        # Offload
+                        E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
+                        amps_vec.append(amps_batch.detach().cpu().numpy())
+                        grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
+                        
+                        last_finished_batch = fxs.shape[0]
+                        n_local += last_finished_batch
+                        
+                        del local_energies_batch, grads_vec_batch, amps_batch
+                except RuntimeError as e_jitter:
+                    last_finished_batch = -B
+                    print(f"Rank {rank} failed even with jitter during sampling phase: {e_jitter}")
     
     comm.Barrier()
     
