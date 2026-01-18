@@ -288,6 +288,7 @@ def run_sampling_phase(
                 print(f"Rank {rank} encountered error during energy computation: {e_energy}")
                 # save fxs for debugging to current directory
                 if debug_file_path is not None:
+                    torch.save(model.state_dict(), debug_file_path + f'model_state_error_rank_{rank}_step_{svmc}.pt')
                     torch.save(fxs, debug_file_path + f'fxs_energy_error_rank_{rank}_step_{svmc}.pt')
                 comm.Abort(1)
             t22 = MPI.Wtime()

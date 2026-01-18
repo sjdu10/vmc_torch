@@ -163,8 +163,23 @@ for svmc in range(init_step, vmc_steps + init_step):
     
     # --- Step 1: Sampling Phase (Modularized) ---
     # fxs is updated and returned for the next step (Markov Chain)
-    (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = run_sampling_phase(
-        svmc, Ns, B, fxs, fpeps_model, H, H.graph, get_grads, COMM, RANK, SIZE, should_burn_in=svmc==init_step, burn_in_steps=burn_in_steps, debug_file_path=file_path
+    (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = (
+        run_sampling_phase(
+            svmc,
+            Ns,
+            B,
+            fxs,
+            fpeps_model,
+            H,
+            H.graph,
+            get_grads,
+            COMM,
+            RANK,
+            SIZE,
+            should_burn_in=svmc == init_step,
+            burn_in_steps=burn_in_steps,
+            debug_file_path=file_path,
+        )
     )
     
     # --- Step 2: Aggregation Phase ---
