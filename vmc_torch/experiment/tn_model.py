@@ -7732,16 +7732,16 @@ class SlaterDeterminant(wavefunctionModel):
         
         # Initialize the parameter M (N x Nf matrix)
         self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
             if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
         )
 
         # Store the shapes of the parameters
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'SlaterDeterminant':{'N_orbitals': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions}
+            'SlaterDeterminant':{'N_orbitals': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions}
         }
 
     def amplitude(self, x, **kwargs):
@@ -7892,16 +7892,16 @@ class NeuralBackflow_spinful(wavefunctionModel):
         
         # Initialize the parameter M (N x Nf matrix)
         self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)) 
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)) 
             if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)
         )
 
         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
-            nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
+            nn.Linear(self.hilbert.n_orbitals, hidden_dim, dtype=self.param_dtype),
             nn.Tanh(),
-            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)
+            nn.Linear(hidden_dim, self.hilbert.n_orbitals*self.hilbert.n_fermions_per_spin[0], dtype=self.param_dtype)
         )
 
         # Convert NNs to the appropriate data type
@@ -7911,7 +7911,7 @@ class NeuralBackflow_spinful(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
+            'Neuralbackflow':{'N_site': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
         }
 
     def amplitude(self, x, **kwargs):
@@ -7956,16 +7956,16 @@ class NNBF(wavefunctionModel):
         
         # Initialize the parameter M (N x Nf matrix)
         self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
             if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
         )
 
         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
-            nn.Linear(self.hilbert.size, hidden_dim),
+            nn.Linear(self.hilbert.n_orbitals, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
+            nn.Linear(hidden_dim, self.hilbert.n_orbitals*self.hilbert.n_fermions),
         )
 
         # Convert NNs to the appropriate data type
@@ -7977,7 +7977,7 @@ class NNBF(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin, 'nn_eta': self.nn_eta}
+            'Neuralbackflow':{'N_site': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin, 'nn_eta': self.nn_eta}
         }
 
     def amplitude(self, x, **kwargs):
@@ -8039,27 +8039,27 @@ class NNBF_attention(wavefunctionModel):
         self.M = nn.Parameter(
             kernel_init(
                 torch.empty(
-                    self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype
+                    self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype
                 )
             )
             if kernel_init is not None
             else torch.randn(
-                self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype
+                self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype
             )
         )
         if self.spinflip_symmetry:
             self.M_flip = nn.Parameter(
                 kernel_init(
                     torch.empty(
-                        self.hilbert.size,
-                        self.hilbert.size - self.hilbert.n_fermions,
+                        self.hilbert.n_orbitals,
+                        self.hilbert.n_orbitals - self.hilbert.n_fermions,
                         dtype=self.param_dtype,
                     )
                 )
                 if kernel_init is not None
                 else torch.randn(
-                    self.hilbert.size,
-                    self.hilbert.size - self.hilbert.n_fermions,
+                    self.hilbert.n_orbitals,
+                    self.hilbert.n_orbitals - self.hilbert.n_fermions,
                     dtype=self.param_dtype,
                 )
             )
@@ -8081,13 +8081,13 @@ class NNBF_attention(wavefunctionModel):
         self.nn = nn.Sequential(
             nn.Linear(embed_dim * nsite, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions),
+            nn.Linear(hidden_dim, self.hilbert.n_orbitals * self.hilbert.n_fermions),
         )
         if self.spinflip_symmetry:
             self.nn_flip = nn.Sequential(
                 nn.Linear(embed_dim * nsite, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions),
+                nn.Linear(hidden_dim, self.hilbert.n_orbitals * self.hilbert.n_fermions),
             )
 
         # Convert NNs to the appropriate data type
@@ -8203,9 +8203,9 @@ class NNBF_attention_Nsd(wavefunctionModel):
         # Initialize the parameter M (N x Nf matrix) for each Slater determinant
         self.Ms = nn.ParameterList([
             nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype))
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype))
             if kernel_init is not None
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
             )
             for _ in range(self.Nsd)
         ])
@@ -8235,7 +8235,7 @@ class NNBF_attention_Nsd(wavefunctionModel):
             fnn = nn.Sequential(
                 nn.Linear(self.embed_dim * nsite, hidden_dim, dtype=self.param_dtype),
                 nn.GELU(),
-                nn.Linear(hidden_dim, self.hilbert.size * self.hilbert.n_fermions, dtype=self.param_dtype),
+                nn.Linear(hidden_dim, self.hilbert.n_orbitals * self.hilbert.n_fermions, dtype=self.param_dtype),
             )
             if eps is not None:
                 # Initialize the last layer with small std
@@ -8354,9 +8354,9 @@ class NNBF_attention_Nsd_v1(wavefunctionModel):
         # Initialize the parameter M (N x Nf matrix) for each Slater determinant
         self.Ms = nn.ParameterList([
             nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype))
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype))
             if kernel_init is not None
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
             )
             for _ in range(self.Nsd)
         ])
@@ -8491,16 +8491,16 @@ class HFDS(wavefunctionModel):
         
         # Initialize the parameter M ( Nx(Nf+Nh) matrix )
         self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.Nf+self.Nh, dtype=self.param_dtype)) 
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.Nf+self.Nh, dtype=self.param_dtype)) 
             if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.Nf+self.Nh, dtype=self.param_dtype)
+            else torch.randn(self.hilbert.n_orbitals, self.Nf+self.Nh, dtype=self.param_dtype)
         )
 
         # Initialize Nh neural networks, input is n and output is a row vector of length Nf+Nh
         # Assume the first Nh/2 fermions are spin up and the rest are spin down
         for i in range(self.Nh):
             setattr(self, f'nn{i}', nn.Sequential(
-                nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
+                nn.Linear(self.hilbert.n_orbitals, hidden_dim, dtype=self.param_dtype),
                 nn.GELU(),
                 nn.Linear(hidden_dim, self.Nf+self.Nh, dtype=self.param_dtype)
             ))
@@ -8511,7 +8511,7 @@ class HFDS(wavefunctionModel):
         
         if self.jastrow:
             self.nn_jastrow = nn.Sequential(
-                nn.Linear(self.hilbert.size, hidden_dim, dtype=self.param_dtype),
+                nn.Linear(self.hilbert.n_orbitals, hidden_dim, dtype=self.param_dtype),
                 nn.GELU(),
                 nn.Linear(hidden_dim, 1, dtype=self.param_dtype)
             )
@@ -8523,7 +8523,7 @@ class HFDS(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'HFDS':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin,
+            'HFDS':{'N_site': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin,
                     'N_hidden_fermions': self.Nh, 'Jastrow': self.jastrow}
         }
 

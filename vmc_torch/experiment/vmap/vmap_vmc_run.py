@@ -37,7 +37,7 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 Lx, Ly = 8, 8
 N_f = Lx * Ly - 8
-D, chi = 8, 8
+D, chi = 8, 16
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -124,10 +124,10 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 
 # VMC Hyperparams
 Ns = int(20) 
-B = 20
+B = 4
 B_grad = 4
 vmc_steps = 500
-init_step = 9
+init_step = 0
 burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-4
@@ -164,7 +164,7 @@ for svmc in range(init_step, vmc_steps + init_step):
     # --- Step 1: Sampling Phase (Modularized) ---
     # fxs is updated and returned for the next step (Markov Chain)
     (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = run_sampling_phase(
-        svmc, Ns, B, fxs, fpeps_model, H, H.graph, get_grads, COMM, RANK, SIZE, should_burn_in=svmc==init_step, burn_in_steps=burn_in_steps
+        svmc, Ns, B, fxs, fpeps_model, H, H.graph, get_grads, COMM, RANK, SIZE, should_burn_in=svmc==init_step, burn_in_steps=burn_in_steps, debug_file_path=file_path
     )
     
     # --- Step 2: Aggregation Phase ---
