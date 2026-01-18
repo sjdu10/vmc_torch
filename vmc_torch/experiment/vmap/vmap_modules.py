@@ -223,47 +223,45 @@ def run_sampling_phase(
             reset_count = 0
 
             while current_step < burn_in_steps:
-                # try:
-                fxs, _ = sample_next(fxs, model, graph, verbose=False)
-                current_step += 1
+                try:
+                    fxs, _ = sample_next(fxs, model, graph, verbose=False)
+                    current_step += 1
 
-                # except RuntimeError as e:
-                #     # save fxs for debugging to current directory
-                #     torch.save(fxs, f'fxs_burnin_error_rank_{rank}_step_{svmc}_currstep_{current_step}.pt')
-                #     error_str = str(e).lower()
-                #     if 'svd' not in error_str and 'converge' not in error_str:
-                #         raise e # raise non-svd errors immediately
+                except RuntimeError as e:
+                    error_str = str(e).lower()
+                    if 'svd' not in error_str and 'converge' not in error_str:
+                        raise e # raise non-svd errors immediately
 
-                #     # === Jitter SVD ===
-                #     # no need to reset current_step here
-                #     success_jitter = False
-                #     try:
-                #         with use_jitter_svd():
-                #             print(f"Global SVD Jitter Applied to Rank {MPI.COMM_WORLD.Get_rank()}")
-                #             fxs, _ = sample_next(fxs, model, graph, verbose=False)
-                #         current_step += 1 # Successfully passed this step
-                #         # if pbar_burn: pbar_burn.update(1)
-                #         success_jitter = True
-                #     except RuntimeError:
-                #         pass # Jitter also couldn't recover
-                #     if not success_jitter:
-                #         # === Permutation (Physical Reset) ===
-                #         # Only resort to this if all else fails.
-                #         # Cost: must reset current_step = 0
-                #         if reset_count < max_resets:
-                #             # print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
-                #             print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
-                #             with torch.no_grad():
-                #                 for i in range(fxs.shape[0]):
-                #                     perm = torch.randperm(fxs.shape[1])
-                #                     fxs[i] = fxs[i][perm]
+                    # === Jitter SVD ===
+                    # no need to reset current_step here
+                    success_jitter = False
+                    try:
+                        with use_jitter_svd():
+                            print(f"Global SVD Jitter Applied to Rank {comm.Get_rank()}")
+                            fxs, _ = sample_next(fxs, model, graph, verbose=False)
+                        current_step += 1 # Successfully passed this step
+                        # if pbar_burn: pbar_burn.update(1)
+                        success_jitter = True
+                    except RuntimeError:
+                        pass # Jitter also couldn't recover
+                    if not success_jitter:
+                        # === Permutation (Physical Reset) ===
+                        # Only resort to this if all else fails.
+                        # Cost: must reset current_step = 0
+                        if reset_count < max_resets:
+                            # print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
+                            print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
+                            with torch.no_grad():
+                                for i in range(fxs.shape[0]):
+                                    perm = torch.randperm(fxs.shape[1])
+                                    fxs[i] = fxs[i][perm]
                             
-                #             # CRITICAL: reset progress!
-                #             current_step = 0
-                #             reset_count += 1
-                #             # if pbar_burn: pbar_burn.reset()
-                #         else:
-                #             raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
+                            # CRITICAL: reset progress!
+                            current_step = 0
+                            reset_count += 1
+                            # if pbar_burn: pbar_burn.reset()
+                        else:
+                            raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
 
 
         last_finished_batch = 0
@@ -291,7 +289,7 @@ def run_sampling_phase(
                 # save fxs for debugging to current directory
                 if debug_file_path is not None:
                     torch.save(fxs, debug_file_path + f'fxs_energy_error_rank_{rank}_step_{svmc}.pt')
-                MPI.COMM_WORLD.Abort(1)
+                comm.Abort(1)
             t22 = MPI.Wtime()
             
             grads_vec_batch, amps_batch = get_grads_func(fxs, model)
