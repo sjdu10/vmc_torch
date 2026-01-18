@@ -56,6 +56,109 @@ def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25, seed=No
             raise ValueError("Invalid configuration")
     return proposed_config, 1
 
+def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25, **kwargs):
+    """
+    完全向量化的 Propose 函数 (GPU Friendly)。
+    一次性处理一批构型，无 CPU-GPU 同步。
+    
+    Args:
+        i, j: (int) 发生交换/hopping 的 site 索引
+        current_configs: (Batch, N_sites) Tensor, dtype=long/int
+        hopping_rate: (float) 跳跃概率
+        
+    Returns:
+        proposed_configs: (Batch, N_sites) 新的构型
+        change_mask: (Batch,) bool Tensor, 指示哪些样本发生了有效改变
+    """
+    B = current_configs.shape[0]
+    device = current_configs.device
+    
+    # 粒子数映射表: 0->0, 1->1, 2->1, 3->2
+    # 放到 device 上以便索引
+    # 建议在外部定义为全局常量以避免重复创建，但在函数内创建开销也很小
+    n_map = torch.tensor([0, 1, 1, 2], device=device, dtype=torch.long)
+    
+    # 提取第 i 列和第 j 列 (Batch,)
+    col_i = current_configs[:, i]
+    col_j = current_configs[:, j]
+    
+    # 1. 基础检查：如果两个位置状态相同，则无法交换或hopping
+    # 对应原代码: if current_config[i] == current_config[j]: return ..., 0
+    diff_mask = (col_i != col_j)
+    
+    # 2. 随机决定是 Exchange 还是 Hopping
+    # 生成 (Batch,) 的随机数
+    rand_vals = torch.rand(B, device=device)
+    
+    # 只有状态不同 (diff_mask) 的才需要处理
+    is_exchange = (rand_vals < (1 - hopping_rate)) & diff_mask
+    is_hopping = (~is_exchange) & diff_mask
+    
+    # 初始化新的一列，默认等于旧的
+    new_col_i = col_i.clone()
+    new_col_j = col_j.clone()
+    
+    # --- A. 处理 Exchange (以及 delta_n=1 的 Hopping) ---
+    # 计算粒子数
+    n_i = n_map[col_i]
+    n_j = n_map[col_j]
+    delta_n = (n_i - n_j).abs()
+    
+    # 原逻辑：delta_n == 1 时也是简单的 swap
+    mask_swap = is_exchange | (is_hopping & (delta_n == 1))
+    
+    if mask_swap.any():
+        new_col_i[mask_swap] = col_j[mask_swap]
+        new_col_j[mask_swap] = col_i[mask_swap]
+        
+    # --- B. 处理 Hopping (delta_n = 0 或 2) ---
+    # 仅当 is_hopping 为 True 时才检查这些条件
+    
+    # Case: delta_n == 0 (e.g. u,d -> 0,ud)
+    # 目标: 随机变为 (0, 3) 或 (3, 0)
+    mask_d0 = is_hopping & (delta_n == 0)
+    if mask_d0.any():
+        # 生成随机位: 0 或 1
+        rand_bits = torch.randint(0, 2, (B,), device=device, dtype=torch.bool)
+        
+        # 准备目标值常量
+        val_0 = torch.tensor(0, device=device, dtype=col_i.dtype)
+        val_3 = torch.tensor(3, device=device, dtype=col_i.dtype)
+        
+        # 根据 rand_bits 选择 i 是 0 还是 3
+        # rand=0 -> i=0, j=3; rand=1 -> i=3, j=0
+        target_i = torch.where(rand_bits, val_3, val_0)
+        target_j = torch.where(rand_bits, val_0, val_3)
+        
+        new_col_i[mask_d0] = target_i[mask_d0]
+        new_col_j[mask_d0] = target_j[mask_d0]
+
+    # Case: delta_n == 2 (e.g. 0,ud -> u,d)
+    # 目标: 随机变为 (1, 2) 或 (2, 1)
+    mask_d2 = is_hopping & (delta_n == 2)
+    if mask_d2.any():
+        rand_bits_2 = torch.randint(0, 2, (B,), device=device, dtype=torch.bool)
+        
+        val_1 = torch.tensor(1, device=device, dtype=col_i.dtype)
+        val_2 = torch.tensor(2, device=device, dtype=col_i.dtype)
+        
+        # rand=0 -> i=1, j=2; rand=1 -> i=2, j=1
+        target_i_2 = torch.where(rand_bits_2, val_2, val_1)
+        target_j_2 = torch.where(rand_bits_2, val_1, val_2)
+        
+        new_col_i[mask_d2] = target_i_2[mask_d2]
+        new_col_j[mask_d2] = target_j_2[mask_d2]
+        
+    # 3. 组装结果
+    # 克隆整个 configs (GPU上内存拷贝很快)
+    proposed_configs = current_configs.clone()
+    proposed_configs[:, i] = new_col_i
+    proposed_configs[:, j] = new_col_j
+    
+    # diff_mask 基本上覆盖了所有有效变化，
+    # 因为 hopping 规则 (u,d)->(0,3) 肯定会改变状态。
+    return proposed_configs, diff_mask
+
 
 # Batched Metropolis-Hastings updates
 @torch.inference_mode()
@@ -144,6 +247,73 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False, seed=N
             print(f"Completed one full sweep of MH updates over {n} edges in time: {t1 - t0}")
     return fxs, current_amps
 
+# Batched Metropolis-Hastings updates
+@torch.inference_mode()
+def sample_next_vec(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, seed=None):
+    if seed is not None:
+        torch.manual_seed(seed)
+    current_amps = fpeps_model(fxs)
+    B = fxs.shape[0]
+    device = fxs.device
+    
+    n_updates = 0
+    t0 = time.time()
+    
+    # 合并 row_edges 和 col_edges 循环，减少重复代码
+    all_edges = []
+    for edges in graph.row_edges.values(): 
+        all_edges.extend(edges)
+    for edges in graph.col_edges.values(): 
+        all_edges.extend(edges)
+    
+    # 如果 edge 很多，考虑 shuffle，防止遍历顺序造成的 bias (虽然 sweeps 多了无所谓)
+    # random.shuffle(all_edges) 
+
+    for edge in all_edges:
+        n_updates += 1
+        i, j = edge
+        
+        # 1. 直接调用向量化函数，不需要 list comprehension
+        proposed_fxs, new_flags = propose_exchange_or_hopping_vec(i, j, fxs, hopping_rate)
+        
+        # 快速检查: 如果所有 sample 都没有产生有效 update (比如都是同色自旋交换)，直接跳过
+        if not new_flags.any():
+            continue
+        
+        # 2. Compute Amplitudes (只计算改变了的)
+        # 注意: 即使不需要 update 的，proposed_amps 也要初始化为 current_amps
+        proposed_amps = current_amps.clone()
+        
+        # 仅对 new_flags 为 True 的部分计算模型
+        new_proposed_fxs = proposed_fxs[new_flags]
+        new_proposed_amps = fpeps_model(new_proposed_fxs)
+        proposed_amps[new_flags] = new_proposed_amps
+        
+        # 3. Accept/Reject (完全向量化，无 .item() 调用)
+        # ratio calculation
+        # 为了数值稳定性，建议在 log domain 做 (如果 model 输出 log_psi)，如果是 psi，直接平方
+        # 避免除以 0: 虽然物理上 psi 不应为 0，但可以加个 epsilon
+        ratio = (proposed_amps.abs()**2) / (current_amps.abs()**2 + 1e-18)
+        
+        # 向量化生成随机数
+        probs = torch.rand(B, device=device)
+        
+        # 生成掩码: 只有 new_flags 为 True 且 随机数 < ratio 的才接受
+        # torch.minimum(ratio, 1) 其实不需要显式写，因为 probs 也是 [0, 1)
+        accept_mask = new_flags & (probs < ratio)
+        
+        # 4. Update (In-place update using masking)
+        # 使用 torch.where 或者索引赋值，避免 Python loop
+        if accept_mask.any():
+            fxs[accept_mask] = proposed_fxs[accept_mask]
+            current_amps[accept_mask] = proposed_amps[accept_mask]
+
+    t1 = time.time()
+    if verbose and RANK == 1:
+        print(f"Completed one full sweep of MH updates over {n_updates} edges in time: {t1 - t0:.4f}s")
+        
+    return fxs, current_amps
+
 @torch.inference_mode()
 def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False):
     # TODO: divide the connected configs into chunks of size fxs.shape[0] to avoid OOM
@@ -188,6 +358,61 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False):
     if verbose:
         if RANK == 1:
             print(f'Energy: {energy.item()}')
+
+    return energy, local_energies
+
+@torch.inference_mode()
+def evaluate_energy_vec(fxs, fpeps_model, H, current_amps, verbose=False):
+    B = fxs.shape[0]
+    device = fxs.device
+    
+    # 1. 准备连接配置 (Hamiltonian Logic - 依然在 CPU)
+    # 这一步如果 H.get_conn 是瓶颈，需要重写 H 类使其支持 vectorization
+    conn_eta_num = []
+    conn_etas = []
+    conn_eta_coeffs = []
+    
+    for fx in fxs:
+        eta, coeffs = H.get_conn(fx)
+        conn_eta_num.append(len(eta))
+        conn_etas.append(torch.as_tensor(eta, device=device))     # 直接转到 device
+        conn_eta_coeffs.append(torch.as_tensor(coeffs, device=device))
+        
+    conn_etas = torch.cat(conn_etas, dim=0)
+    conn_eta_coeffs = torch.cat(conn_eta_coeffs, dim=0)
+    
+    # 记录每个 sample 有多少个连接配置，用于后续还原
+    conn_eta_num = torch.tensor(conn_eta_num, device=device) # (B,)
+
+    # 2. Batch 计算 connected amplitudes
+    # 这是一个大矩阵运算，效率很高
+    chunk_size = B # 或者更大，取决于显存
+    conn_amps_list = []
+    for i in range(0, conn_etas.shape[0], chunk_size):
+        conn_amps_list.append(fpeps_model(conn_etas[i:i+chunk_size]))
+    conn_amps = torch.cat(conn_amps_list)
+
+    # 3. 向量化计算 Local Energies (消除 CPU Loop)
+    
+    # 我们需要构造一个 batch_index 来告诉 GPU 哪些 conn_amps 属于第 b 个样本
+    # 例如 conn_eta_num = [2, 3], 那么 batch_ids = [0, 0, 1, 1, 1]
+    batch_ids = torch.repeat_interleave(torch.arange(B, device=device), conn_eta_num)
+    
+    # 扩展 current_amps 以匹配 conn_amps 的长度
+    # current_amps_expanded = [amp[0], amp[0], amp[1], amp[1], amp[1]]
+    current_amps_expanded = current_amps[batch_ids]
+    
+    # 计算每一项的 H_s's * (psi_s' / psi_s)
+    terms = conn_eta_coeffs * (conn_amps / current_amps_expanded)
+    
+    # 聚合结果: 将 terms 按照 batch_ids 加回到 local_energies
+    local_energies = torch.zeros(B, device=device, dtype=terms.dtype)
+    local_energies.index_add_(0, batch_ids, terms)
+
+    energy = torch.mean(local_energies)
+    
+    if verbose and RANK == 1:
+        print(f'Energy: {energy.item()}')
 
     return energy, local_energies
 

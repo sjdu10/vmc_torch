@@ -18,7 +18,7 @@ from vmc_torch.experiment.vmap.vmap_models import (
     Transformer_fPEPS_Model_DConv2d,
     fTN_backflow_attn_Tensorwise_Model_vmap
 )
-from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver
+from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_vec
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 # ==============================================================================
@@ -124,7 +124,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 
 # VMC Hyperparams
 Ns = int(20) 
-B = 4
+B = 20
 B_grad = 4
 vmc_steps = 500
 init_step = 0
@@ -135,6 +135,7 @@ save_state_every = 1
 
 # Load Checkpoint
 file_path = f'{params_path}/{fpeps_model._get_name()}/chi={chi}/'
+fpeps_model.debug_file = file_path
 if init_step > 0:
     ckpt_path = file_path + f'checkpoint_step_{init_step}.pt'
     fpeps_model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
@@ -178,7 +179,6 @@ for svmc in range(init_step, vmc_steps + init_step):
             SIZE,
             should_burn_in=svmc == init_step,
             burn_in_steps=burn_in_steps,
-            debug_file_path=file_path,
         )
     )
     

@@ -5,6 +5,7 @@ import torch.nn as nn
 import math
 from typing import Optional
 from vmc_torch.nn_sublayers import SelfAttn_block_pos
+from mpi4py import MPI
 
 class PEPS_Model(nn.Module):
     def __init__(self, tn, max_bond, dtype=torch.float64):
@@ -721,6 +722,7 @@ class Transformer_fPEPS_Model_Conv2d(nn.Module):
         conv_kernel_size=3,
         init_perturbation_scale=1e-5,
         dtype=torch.float64,
+        debug_file=None,
         **kwargs,
     ):
         import quimb as qu
@@ -729,6 +731,7 @@ class Transformer_fPEPS_Model_Conv2d(nn.Module):
         
         params, skeleton = qtn.pack(tn)
         self.dtype = dtype
+        self.debug_file = debug_file
         self.skeleton = skeleton
         self.chi = max_bond
         # for torch, further flatten pytree into a single list
@@ -848,7 +851,17 @@ class Transformer_fPEPS_Model_Conv2d(nn.Module):
         return amps
 
     def forward(self, x):
-        return self.vamp(x, self.params)
+        try:
+            return self.vamp(x, self.params)
+        except RuntimeError as e:
+            print(f"RuntimeError in forward pass: {e}")
+            if self.debug_file is None:
+                raise e
+            print(f"Saving debug info to {self.debug_file} and aborting...")
+            # save x to debug file if provided
+            torch.save(x, self.debug_file+'error_input.pt')
+            torch.save(self.state_dict(), self.debug_file+'model_state.pt')
+            MPI.COMM_WORLD.Abort(1)
 
 class Transformer_fPEPS_Model_UNet(nn.Module):
     def __init__(
