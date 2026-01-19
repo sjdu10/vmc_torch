@@ -1,14 +1,8 @@
 import quimb as qu
-import quimb.tensor as qtn
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import time
 import random
-import math
 from mpi4py import MPI
-from typing import Optional
-from vmc_torch.nn_sublayers import SelfAttn_block_pos
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
 comm = MPI.COMM_WORLD

@@ -34,8 +34,8 @@ def vmap_friendly_svd(A, full_matrices=True, *, driver=None, **kwargs):
         
         # Create diagonal noise (using PyTorch broadcasting to be compatible with vmap batch dimensions)
         # jitter_scale = A.norm(dim=(-2,-1), keepdim=True) * 1e-12 # Relative jitter is safer
-        # Or simply absolute jitter
-        jitter_val = 1e-12 
+        jitter_val = 1e-12 * A.norm(dim=(-2,-1), keepdim=True)
+        # jitter_val = 1e-5
         
         # Construct a diagonal matrix with the same device and type as A
         # torch.eye is compatible with vmap's automatic broadcasting
@@ -43,12 +43,11 @@ def vmap_friendly_svd(A, full_matrices=True, *, driver=None, **kwargs):
         
         # 2. Perform addition (vmap compatible)
         A_new = A + eye
-        
         return torch.linalg.svd_orig(A_new, full_matrices=full_matrices, driver=driver, **kwargs)
     else:
         return torch.linalg.svd_orig(A, full_matrices=full_matrices, driver=driver, **kwargs)
 
-# 应用 Patch
+# Apply Patch （Must be done before any SVD operation in vmap）
 torch.linalg.svd = vmap_friendly_svd
 
 def distributed_minres_solver(
@@ -201,7 +200,7 @@ def run_sampling_phase(
                 n_collected += finished_batch
                 pbar.update(finished_batch)
             elif finished_batch < 0: # worker failed
-                n_dispatched -= finished_batch # revert dispatch count
+                n_dispatched += finished_batch # revert dispatch count
                 print(f"Master detected failure from Rank {source_rank}, reverting dispatched count by {-finished_batch}.")
             
             next_batch = B
@@ -228,40 +227,22 @@ def run_sampling_phase(
                     current_step += 1
 
                 except RuntimeError as e:
-                    error_str = str(e).lower()
-                    if 'svd' not in error_str and 'converge' not in error_str:
-                        raise e # raise non-svd errors immediately
-
-                    # === Jitter SVD ===
-                    # no need to reset current_step here
-                    success_jitter = False
-                    try:
-                        with use_jitter_svd():
-                            print(f"Global SVD Jitter Applied to Rank {comm.Get_rank()}")
-                            fxs, _ = sample_next(fxs, model, graph, verbose=False)
-                        current_step += 1 # Successfully passed this step
-                        # if pbar_burn: pbar_burn.update(1)
-                        success_jitter = True
-                    except RuntimeError:
-                        pass # Jitter also couldn't recover
-                    if not success_jitter:
-                        # === Permutation (Physical Reset) ===
-                        # Only resort to this if all else fails.
-                        # Cost: must reset current_step = 0
-                        if reset_count < max_resets:
-                            # print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
-                            print(f"Rank {rank}: SVD failed hard. Permuting configs and RESTARTING burn-in.")
-                            with torch.no_grad():
-                                for i in range(fxs.shape[0]):
-                                    perm = torch.randperm(fxs.shape[1])
-                                    fxs[i] = fxs[i][perm]
-                            
-                            # CRITICAL: reset progress!
-                            current_step = 0
-                            reset_count += 1
-                            # if pbar_burn: pbar_burn.reset()
-                        else:
-                            raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
+                    print(f"Rank {rank} encountered error during burn-in sampling: {e}")
+                    # === Permutation (Physical Reset) ===
+                    # Only resort to this if all else fails.
+                    # Cost: must reset current_step = 0
+                    if reset_count < max_resets:
+                        print(f"Rank {rank}: Burn-in failed. Permuting configs and RESTARTING burn-in.")
+                        with torch.no_grad():
+                            for i in range(fxs.shape[0]):
+                                perm = torch.randperm(fxs.shape[1])
+                                fxs[i] = fxs[i][perm]
+                        
+                        # CRITICAL: reset progress!
+                        current_step = 0
+                        reset_count += 1
+                    else:
+                        raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
 
 
         last_finished_batch = 0
@@ -276,66 +257,33 @@ def run_sampling_phase(
             
             if cmd[0] == CMD_STOP:
                 break
-
-            # try:
+            
             # 3. Compute
-            t00 = MPI.Wtime()
-            fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
-            t11 = MPI.Wtime()
-            energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
-            t22 = MPI.Wtime()
-            grads_vec_batch, amps_batch = get_grads_func(fxs, model)
-            t33 = MPI.Wtime()
+            try:
+                t00 = MPI.Wtime()
+                fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
+                t11 = MPI.Wtime()
+                energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
+                t22 = MPI.Wtime()
+                grads_vec_batch, amps_batch = get_grads_func(fxs, model)
+                t33 = MPI.Wtime()
 
-            sample_time += t11 - t00
-            local_energy_time += t22 - t11
-            grad_time += t33 - t22
+                sample_time += t11 - t00
+                local_energy_time += t22 - t11
+                grad_time += t33 - t22
 
-            # Offload
-            E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
-            amps_vec.append(amps_batch.detach().cpu().numpy())
-            grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
-            
-            last_finished_batch = fxs.shape[0]
-            n_local += last_finished_batch
-            
-            del local_energies_batch, grads_vec_batch, amps_batch
-            # except RuntimeError as e:
-            #     print(f"Rank {rank} encountered error during sampling/energy/grad computation: {e}")
-            #     # save fxs for debugging to current directory
-            #     torch.save(fxs, f'fxs_error_rank_{rank}_step_{svmc}.pt')
+                # Offload
+                E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
+                amps_vec.append(amps_batch.detach().cpu().numpy())
+                grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
                 
-            #     # === Jitter SVD Attempt ===
-            #     try:
-            #         with use_jitter_svd():
-            #             print(f"Local SVD Jitter Applied to Rank {rank} during sampling phase.")
-            #             # 3. Compute
-            #             t00 = MPI.Wtime()
-            #             fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
-            #             t11 = MPI.Wtime()
-                        
-            #             energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
-            #             t22 = MPI.Wtime()
-                        
-            #             grads_vec_batch, amps_batch = get_grads_func(fxs, model)
-            #             t33 = MPI.Wtime()
-
-            #             sample_time += t11 - t00
-            #             local_energy_time += t22 - t11
-            #             grad_time += t33 - t22
-
-            #             # Offload
-            #             E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
-            #             amps_vec.append(amps_batch.detach().cpu().numpy())
-            #             grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
-                        
-            #             last_finished_batch = fxs.shape[0]
-            #             n_local += last_finished_batch
-                        
-            #             del local_energies_batch, grads_vec_batch, amps_batch
-            #     except RuntimeError as e_jitter:
-            #         last_finished_batch = -B
-            #         print(f"Rank {rank} failed even with jitter during sampling phase: {e_jitter}")
+                last_finished_batch = fxs.shape[0]
+                n_local += last_finished_batch
+                
+                del local_energies_batch, grads_vec_batch, amps_batch
+            except RuntimeError as e:
+                print(f"Rank {rank} Error: {e}")
+                last_finished_batch = -B # Report Failure
     
     comm.Barrier()
     
@@ -376,7 +324,7 @@ def run_sampling_phase_vec(
     burn_in_steps=10,
 ):
     """
-    Unchecked yet
+    WARNING: Unchecked yet
     """
     # 定义 Tag
     TAG_REQ = 100

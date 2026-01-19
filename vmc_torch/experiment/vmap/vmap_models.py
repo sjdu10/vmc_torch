@@ -6,6 +6,9 @@ import math
 from typing import Optional
 from vmc_torch.nn_sublayers import SelfAttn_block_pos
 from mpi4py import MPI
+from vmap_modules import use_jitter_svd, vmap_friendly_svd
+# ==============================================================================
+torch.linalg.svd = vmap_friendly_svd
 
 class PEPS_Model(nn.Module):
     def __init__(self, tn, max_bond, dtype=torch.float64):
@@ -853,15 +856,21 @@ class Transformer_fPEPS_Model_Conv2d(nn.Module):
     def forward(self, x):
         try:
             return self.vamp(x, self.params)
+        
         except RuntimeError as e:
-            print(f"RuntimeError in forward pass: {e}")
-            if self.debug_file is None:
+            if "svd" in str(e).lower() or "converge" in str(e).lower() or "info" in str(e).lower():
+                try:
+                    # (Robust path)
+                    with use_jitter_svd():
+                        return self.vamp(x, self.params)
+                
+                except RuntimeError as e2:
+                    # let outer MPI handle the failure
+                    # print(f" -> [Warning] Rank {COMM.Get_rank()} failed even with jitter.")
+                    raise e2
+            else:
                 raise e
-            print(f"Saving debug info to {self.debug_file} and aborting...")
-            # save x to debug file if provided
-            torch.save(x, self.debug_file+'error_input.pt')
-            torch.save(self.state_dict(), self.debug_file+'model_state.pt')
-            MPI.COMM_WORLD.Abort(1)
+                
 
 class Transformer_fPEPS_Model_UNet(nn.Module):
     def __init__(
