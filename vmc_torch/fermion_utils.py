@@ -95,6 +95,8 @@ def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None
                     pass
                 try:
                     skeleton[site_tag].data._dummy_modes = skeleton[site_tag].data._oddpos
+                    for m in skeleton[site_tag].data._dummy_modes:
+                        m._parity = 1 # feels unnecessary as dummy_modes must have odd parity
                 except Exception:
                     pass
         else:
