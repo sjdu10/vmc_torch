@@ -46,8 +46,8 @@ model.apply(init_weights_to_zero)
 
 
 """Potentially load a pre-trained model"""
-init_step = 50
-total_steps = 200
+init_step = 0
+total_steps = 1
 if init_step != 0:
     saved_model_params = torch.load(f'./example_data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{model_name}/model_params_step{init_step}.pth', weights_only=False)
     saved_model_params_vec = torch.tensor(saved_model_params['model_params_vec'])
@@ -55,12 +55,12 @@ if init_step != 0:
 
 
 """Set MC sample size"""
-N_samples = int(5e3)
+N_samples = int(1e3)
 N_samples = N_samples - N_samples % SIZE + SIZE - 1
 
 
 """Choose the sampler""" 
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=True, random_edge=False, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
 
 
 """Create the variational state object"""

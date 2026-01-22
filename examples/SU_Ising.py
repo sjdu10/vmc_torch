@@ -31,8 +31,8 @@ su = qtn.tensor_arbgeom_tebd.SimpleUpdateGen(
     compute_energy_every=10,
     compute_energy_per_site=True,
 )
-for tau in [1.0, 0.3, 0.1, 0.01]:#, 0.1, 0.03, 0.01]:
-    su.evolve(100, tau=tau)
+for tau in [1.0, 0.3]:#, 0.1, 0.03, 0.01]:
+    su.evolve(5, tau=tau) # Just to get a rough initial state, for practical use one should increase SU steps
 psi_su = su.state
 peps = su.get_state()
 peps.equalize_norms_(value=1)

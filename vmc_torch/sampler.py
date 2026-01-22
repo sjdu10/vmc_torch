@@ -1,6 +1,7 @@
 import random
 
 import numpy as np
+from autoray import do
 
 # torch
 import torch
@@ -17,6 +18,47 @@ RANK = COMM.Get_rank()
 
 
 # --- Utils ---
+def strip_base10(x):
+    # Ensure x is a tensor for torch operations
+    if not torch.is_tensor(x):
+        x = torch.tensor(x)
+    
+    # Handle the zero case to avoid log(0) errors
+    if x == 0:
+        return torch.tensor(0.0), torch.tensor(0)
+
+    # Use log10 to find the magnitude
+    # floor of log10 gives the exponent
+    exponent = torch.floor(torch.log10(torch.abs(x)))
+    
+    # Calculate mantissa by shifting the decimal point
+    mantissa = x / (10**exponent)
+    
+    return mantissa, exponent
+
+def get_safe_ratio(psi_eta, psi_sigma):
+    """
+    Compute psi_eta / psi_sigma in a numerically stable way
+    psi_eta: array-like (vector)
+    psi_sigma: scalar
+    """
+    # Extract sign
+    # sign_ratio = np.sign(psi_eta) * np.sign(psi_sigma)
+    sign_ratio = do("sign", psi_eta) * do("sign", psi_sigma)
+    
+    # Compute exponent difference in log space (Base 10)
+    # log_psi_eta = np.log10(np.abs(psi_eta))
+    log_psi_eta = do('log10', do('abs', psi_eta))
+    log_psi_sigma = do('log10', do('abs', psi_sigma))
+    # log_psi_sigma = np.log10(np.abs(psi_sigma))
+    
+    log_diff = log_psi_eta - log_psi_sigma
+    
+    # return to ratio
+    # This method is more stable than direct division because np.power(10, log_diff) 
+    # handles very small exponent differences much better than floating-point division
+    return sign_ratio * do('power', 10.0, log_diff)
+
 def from_netket_config_to_quimb_config(netket_configs):
     def func(netket_config):
         """Translate netket spin-1/2 config to tensor network product state config"""
@@ -361,11 +403,18 @@ class Sampler(AbstractSampler):
             psi_eta = psi_eta.cpu().detach().numpy()
 
             # compute the local operator
+            ratio = get_safe_ratio(psi_eta, psi_sigma)
             op_loc = (
-                np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+                np.sum(O_etasigma * ratio, axis=-1)
                 if not vec_op
-                else O_etasigma * (psi_eta / psi_sigma)
+                else O_etasigma * ratio
             )
+            # op_loc1 = (
+            #     np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+            #     if not vec_op
+            #     else O_etasigma * (psi_eta / psi_sigma)
+            # )
+            # assert np.allclose(op_loc, op_loc1), "Inconsistent local operator calculation!"
             if not vec_op:
                 op_loc_vec[chain_step] = op_loc
 
@@ -597,7 +646,9 @@ class Sampler(AbstractSampler):
             logpsi_sigma_grad = logpsi_sigma_grad.cpu().detach().numpy()
 
             # compute the local operator
-            op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+            ratio = get_safe_ratio(psi_eta, psi_sigma)
+            op_loc = np.sum(O_etasigma * ratio, axis=-1)
+            # op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
             # if abs(op_loc) > 1e4:
             #     chain_step -= 1
             #     continue
@@ -814,6 +865,9 @@ class Sampler(AbstractSampler):
         # # if DEBUG:
         if logpsi_sigma_grad.abs().max() > 1e5:
             logpsi_sigma_grad = torch.clamp(logpsi_sigma_grad, min=-1e5, max=1e5)
+            print(
+                f"    RANK{RANK} Warning: Clipped large gradient values to [-1e5, 1e5]."
+            )
             # # do clipping to the large values in the gradient: set those values to 0
             # logpsi_sigma_grad = torch.where(logpsi_sigma_grad.abs() > 1e5, torch.zeros_like(logpsi_sigma_grad), logpsi_sigma_grad)
 
@@ -831,7 +885,9 @@ class Sampler(AbstractSampler):
         logpsi_sigma_grad = logpsi_sigma_grad.cpu().detach().numpy()
 
         # compute the local operator
-        op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+        ratio = get_safe_ratio(psi_eta, psi_sigma)
+        op_loc = np.sum(O_etasigma * ratio, axis=-1)
+        # op_loc = np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
 
         if DEBUG:
             if abs(op_loc) > 1e4:
@@ -873,11 +929,18 @@ class Sampler(AbstractSampler):
         psi_eta = psi_eta.cpu().detach().numpy()
 
         # compute the local operator
+        ratio = get_safe_ratio(psi_eta, psi_sigma)
         op_loc = (
-            np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+            np.sum(O_etasigma * ratio, axis=-1)
             if not vec_op
-            else O_etasigma * (psi_eta / psi_sigma)
+            else O_etasigma * ratio
         )
+        # op_loc1 = (
+        #     np.sum(O_etasigma * (psi_eta / psi_sigma), axis=-1)
+        #     if not vec_op
+        #     else O_etasigma * (psi_eta / psi_sigma)
+        # )
+        # assert np.allclose(op_loc, op_loc1), "Inconsistent local operator calculation!"
 
         self.sample_time += time1 - time0  # for profiling purposes
         self.local_energy_time += time3 - time2
@@ -1205,7 +1268,6 @@ class MetropolisExchangeSamplerSpinless(Sampler):
     def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
         current_amp = vstate.amplitude(self.current_config)
-        current_prob = abs(current_amp) ** 2
         proposed_config = self.current_config.clone()
         if self.random_edge:
             # Randomly select an edge to exchange, until the subchain_length is reached.
@@ -1225,35 +1287,23 @@ class MetropolisExchangeSamplerSpinless(Sampler):
             proposed_prob = abs(proposed_amp) ** 2
 
             try:
-                acceptance_ratio = proposed_prob / current_prob
+                p_m, p_e = strip_base10(proposed_amp)
+                p_m_sq, p_e_sq = p_m**2, p_e * 2
+                c_m, c_e = strip_base10(current_amp)
+                c_m_sq, c_e_sq = c_m**2, c_e * 2
+                # acceptance_ratio = proposed_prob / current_prob
+                acceptance_ratio = (p_m_sq / c_m_sq) * (10 ** (p_e_sq - c_e_sq))
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
 
             if random.random() < acceptance_ratio:
                 self.current_config = proposed_config
                 current_amp = proposed_amp
-                current_prob = proposed_prob
 
         return self.current_config, current_amp
 
 
-def strip_base10(x):
-    # Ensure x is a tensor for torch operations
-    if not torch.is_tensor(x):
-        x = torch.tensor(x)
-    
-    # Handle the zero case to avoid log(0) errors
-    if x == 0:
-        return torch.tensor(0.0), torch.tensor(0)
 
-    # Use log10 to find the magnitude
-    # floor of log10 gives the exponent
-    exponent = torch.floor(torch.log10(torch.abs(x)))
-    
-    # Calculate mantissa by shifting the decimal point
-    mantissa = x / (10**exponent)
-    
-    return mantissa, exponent
 
 class MetropolisSamplerSpinless(Sampler):
     """
@@ -1298,8 +1348,6 @@ class MetropolisSamplerSpinless(Sampler):
         current_amp = vstate.amplitude(self.current_config)
         current_prob = abs(current_amp) ** 2
         proposed_config = self.current_config.clone()
-        c_m, c_e = strip_base10(current_amp)
-        c_m_sq, c_e_sq = c_m**2, c_e * 2
 
         if self.random_site:
             # Randomly select a site to update, until the subchain_length is reached.
@@ -1315,9 +1363,12 @@ class MetropolisSamplerSpinless(Sampler):
             proposed_config[i] = new_state
             proposed_amp = vstate.amplitude(proposed_config).cpu()
             proposed_prob = abs(proposed_amp) ** 2
-            p_m, p_e = strip_base10(proposed_amp)
-            p_m_sq, p_e_sq = p_m**2, p_e * 2
+            
             try:
+                p_m, p_e = strip_base10(proposed_amp)
+                p_m_sq, p_e_sq = p_m**2, p_e * 2
+                c_m, c_e = strip_base10(current_amp)
+                c_m_sq, c_e_sq = c_m**2, c_e * 2
                 # acceptance_ratio = proposed_prob / current_prob
                 if self.strip_exponent:
                     acceptance_ratio = (p_m_sq / c_m_sq) * (
@@ -1340,8 +1391,6 @@ class MetropolisSamplerSpinless(Sampler):
                 self.current_config = proposed_config
                 current_amp = proposed_amp
                 current_prob = proposed_prob
-                c_m, c_e = p_m, p_e
-                c_m_sq, c_e_sq = p_m_sq, p_e_sq
 
         return self.current_config, current_amp
 
@@ -1411,8 +1460,16 @@ class MetropolisExchangeSamplerSpinless_2D_reusable(Sampler):
             proposed_config[j] = config_i
             proposed_amp = vstate.amplitude(proposed_config).cpu()
             proposed_prob = abs(proposed_amp) ** 2
+            
             try:
-                acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                p_m, p_e = strip_base10(proposed_amp)
+                p_m_sq, p_e_sq = p_m**2, p_e * 2
+                c_m, c_e = strip_base10(self.current_amp)
+                c_m_sq, c_e_sq = c_m**2, c_e * 2
+                # acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                acceptance_ratio = min(
+                    1, (p_m_sq / c_m_sq) * (10 ** (p_e_sq - c_e_sq))
+                )
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
             if random.random() < acceptance_ratio or (self.current_prob == 0):
@@ -1570,7 +1627,12 @@ class MetropolisExchangeSamplerSpinful(Sampler):
             else:
                 raise ValueError("Invalid configuration")
             try:
-                acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                p_m , p_e = strip_base10(proposed_amp)
+                p_m_sq , p_e_sq = p_m**2 , p_e*2
+                c_m , c_e = strip_base10(self.current_amp)
+                c_m_sq , c_e_sq = c_m**2 , c_e*2
+                # acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                acceptance_ratio = min(1, (p_m_sq / c_m_sq) * (10 ** (p_e_sq - c_e_sq)))
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
             if random.random() < acceptance_ratio or (self.current_prob == 0):
@@ -1698,7 +1760,12 @@ class MetropolisExchangeSamplerSpinful_hopping(Sampler):
                 else:
                     raise ValueError("Invalid configuration")
             try:
-                acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                p_m , p_e = strip_base10(proposed_amp)
+                p_m_sq , p_e_sq = p_m**2 , p_e*2
+                c_m , c_e = strip_base10(self.current_amp)
+                c_m_sq , c_e_sq = c_m**2 , c_e*2
+                # acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                acceptance_ratio = min(1, (p_m_sq / c_m_sq) * (10 ** (p_e_sq - c_e_sq)))
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
             if random.random() < acceptance_ratio or (self.current_prob == 0):
@@ -1819,7 +1886,12 @@ class MetropolisExchangeSamplerSpinful_1D_reusable(Sampler):
             else:
                 raise ValueError("Invalid configuration")
             try:
-                acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                p_m , p_e = strip_base10(proposed_amp)
+                p_m_sq , p_e_sq = p_m**2 , p_e*2
+                c_m , c_e = strip_base10(self.current_amp)
+                c_m_sq , c_e_sq = c_m**2 , c_e*2
+                # acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                acceptance_ratio = min(1, (p_m_sq / c_m_sq) * (10 ** (p_e_sq - c_e_sq)))
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
             if random.random() < acceptance_ratio or (self.current_prob == 0):
@@ -1968,7 +2040,12 @@ class MetropolisExchangeSamplerSpinful_2D_reusable(Sampler):
                 else:
                     raise ValueError("Invalid configuration")
             try:
-                acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                p_m , p_e = strip_base10(proposed_amp)
+                p_m_sq , p_e_sq = p_m**2 , p_e*2
+                c_m , c_e = strip_base10(self.current_amp)
+                c_m_sq , c_e_sq = c_m**2 , c_e*2
+                # acceptance_ratio = min(1, (proposed_prob / self.current_prob))
+                acceptance_ratio = min(1, (p_m_sq / c_m_sq) * (10 ** (p_e_sq - c_e_sq)))
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
             if random.random() < acceptance_ratio or (self.current_prob == 0):

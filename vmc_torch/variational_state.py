@@ -11,6 +11,7 @@ from vmc_torch.experiment.tn_model import fTNModel_reuse
 
 from .global_var import DEBUG, set_debug, AMP_CACHE_SIZE, GRAD_CACHE_SIZE
 from .utils import tensor_aware_lru_cache
+from .sampler import get_safe_ratio
 
 
 COMM = MPI.COMM_WORLD
@@ -122,10 +123,12 @@ class Variational_State:
             try:
                 if self.vstate_func.debug:
                     amp.backward(retain_graph=retain_graph)
-                    vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+                    # vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+                    vec_log_grad = get_safe_ratio(self.vstate_func.params_grad_to_vec().detach(), amp.detach())
                 else:
                     self.vstate_func.get_grad()
-                    vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+                    # vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+                    vec_log_grad = get_safe_ratio(self.vstate_func.params_grad_to_vec().detach(), amp.detach())
             except Exception as e:
                 print(f"Rank {RANK} model grad debug fail: {e}")
                 raise ValueError("model grad debug fail")
@@ -143,7 +146,9 @@ class Variational_State:
         else:
             # Backpropagate the amplitude to compute the gradient
             amp.backward(retain_graph=retain_graph)
-            vec_log_grad = self.vstate_func.params_grad_to_vec()/amp
+            vec_log_grad = get_safe_ratio(self.vstate_func.params_grad_to_vec().detach(), amp.detach())
+            # vec_log_grad1 = self.vstate_func.params_grad_to_vec()/amp
+            # assert torch.allclose(vec_log_grad, vec_log_grad1, rtol=1e-5, atol=1e-8), f"Rank {RANK} amplitude grad mismatch!"
 
         # Clear the gradient
         self.reset()
