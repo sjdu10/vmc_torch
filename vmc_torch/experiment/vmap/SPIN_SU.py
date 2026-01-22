@@ -2,7 +2,7 @@ import os
 import pickle
 import quimb.tensor as qtn
 
-Lx = 6
+Lx = 4
 Ly = 6
 D = 4
 seed = 42
@@ -33,7 +33,7 @@ su = qtn.SimpleUpdateGen(
 )
 
 # run the evolution, these are reasonable defaults
-su.evolve(100, tau=0.3)
+su.evolve(5, tau=0.3)
 # su.evolve(100, tau=0.1)
 # su.evolve(100, tau=0.05)
 # su.evolve(100, tau=0.01)

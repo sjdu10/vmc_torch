@@ -318,8 +318,8 @@ class circuit_TNF(wavefunctionModel):
 
 
 class PEPS_model(wavefunctionModel):
-    def __init__(self, peps, max_bond=None):
-        super().__init__()
+    def __init__(self, peps, max_bond=None, dtype=torch.float64):
+        super().__init__(dtype=dtype)
         self.peps = peps
         if max_bond is None or max_bond <= 0:
             max_bond = None
@@ -372,11 +372,11 @@ class PEPS_model_reuse(wavefunctionModel):
         self,
         peps,
         max_bond=None,
-        dtype=torch.float32,
+        dtype=torch.float64,
         debug=False,
         contraction_kwargs={'mode':'mps'},
     ):
-        super().__init__()
+        super().__init__(dtype=dtype)
         self.peps = peps
         if max_bond is None or max_bond <= 0:
             max_bond = None

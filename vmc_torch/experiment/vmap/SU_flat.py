@@ -5,7 +5,7 @@ import quimb.tensor as qtn
 
 symmetry = "Z2"
 
-Lx = 4
+Lx = 2
 Ly = 2
 D = 4
 seed = 42
@@ -61,10 +61,10 @@ su = qtn.SimpleUpdateGen(
 )
 
 # run the evolution, these are reasonable defaults
-su.evolve(100, tau=0.3)
-su.evolve(100, tau=0.1)
-su.evolve(100, tau=0.05)
-su.evolve(100, tau=0.01)
+su.evolve(5, tau=0.3)
+# su.evolve(100, tau=0.1)
+# su.evolve(100, tau=0.05)
+# su.evolve(100, tau=0.01)
 
 su_peps = su.get_state()
 for ts in su_peps.tensors:
@@ -77,7 +77,7 @@ for site in su_peps.sites:
 params, _ = qtn.pack(su_peps)
 
 
-pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap'
+pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
 os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}', exist_ok=True)
 with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/peps_skeleton.pkl', 'wb') as f:
     pickle.dump(skeleton, f)

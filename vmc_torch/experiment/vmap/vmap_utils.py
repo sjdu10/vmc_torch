@@ -241,6 +241,125 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False, seed=N
             print(f"Completed one full sweep of MH updates over {n} edges in time: {t1 - t0}")
     return fxs, current_amps
 
+# Batched Metropolis-Hastings updates with reuse of cached bMPS params
+@torch.inference_mode()
+def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, seed=None, benchmark_model=None):
+    B = fxs.shape[0]
+    # cache bMPS params along x direction first for reuse
+    B_bMPS_params_x_dict, current_amps = v_model.cache_bMPS_params_any_direction_vmap(fxs, direction='x')
+    for row, edges in graph.row_edges.items():
+        for edge in edges:
+            i, j = edge
+            proposed_fxs, new_flags = [], []
+            fx_id = 0
+            for fx in fxs:
+                proposed_fx, new = propose_exchange_or_hopping(
+                    i,
+                    j,
+                    fx,
+                    hopping_rate=hopping_rate,
+                    seed=seed + fx_id if seed is not None else None,
+                )
+                proposed_fxs.append(proposed_fx)
+                new_flags.append(new)
+                fx_id += 1
+            proposed_fxs = torch.stack(proposed_fxs, dim=0)
+            if not any(new_flags):
+                if verbose:
+                    print(f"No changes proposed in this edge. (x, {row}, edge: {edge})")
+                continue
+            # compute amplitudes for all proposed configs (because must align batchsize with reused bMPS batchsize)
+            new_proposed_fxs = proposed_fxs
+            # reuse of bMPS from xmin & xmax w.r.t. row to compute amplitudes
+            new_proposed_amps = v_model(
+                new_proposed_fxs,
+                bMPS_params_x_batched=B_bMPS_params_x_dict,
+                bMPS_params_y_batched=None,
+                selected_rows=(row,),
+                selected_cols=None,
+            )
+            proposed_amps = new_proposed_amps
+            if benchmark_model is not None and verbose:
+                benchmark_amps = benchmark_model(new_proposed_fxs)
+                print(f"Benchmark vs Reuse amplitudes check (x, {row}):")
+                print(torch.allclose(benchmark_amps, new_proposed_amps, atol=1e-5))
+            # Metropolis-Hastings acceptance
+            ratio = proposed_amps**2 / current_amps**2
+            accept_probs = torch.minimum(ratio, torch.ones_like(ratio))
+            for k in range(B):
+                if random.random() < accept_probs[k].item():
+                    fxs[k] = proposed_fxs[k]
+                    current_amps[k] = proposed_amps[k]
+        
+        # update bMPS params to next row for reuse
+        if row == v_model.Lx - 1:
+            # reach the bottom row, no further bMPS to be updated
+            break
+        B_bMPS_params_x_dict = v_model.update_bMPS_params_to_row_vmap(
+            fxs,
+            row_id = row,
+            bMPS_params_x_batched=B_bMPS_params_x_dict,
+            from_which='xmin',
+        )
+
+    B_bMPS_params_y_dict, current_amps = v_model.cache_bMPS_params_any_direction_vmap(fxs, direction='y')
+    for col, edges in graph.col_edges.items():
+        for edge in edges:
+            i, j = edge
+            proposed_fxs, new_flags = [], []
+            fx_id = 0
+            for fx in fxs:
+                proposed_fx, new = propose_exchange_or_hopping(
+                    i,
+                    j,
+                    fx,
+                    hopping_rate=hopping_rate,
+                    seed=seed + fx_id if seed is not None else None,
+                )
+                proposed_fxs.append(proposed_fx)
+                new_flags.append(new)
+                fx_id += 1
+            proposed_fxs = torch.stack(proposed_fxs, dim=0)
+            if not any(new_flags):
+                if verbose:
+                    print(f"No changes proposed in this edge. (y, {col}, edge: {edge})")
+                continue
+            # compute amplitudes for all proposed configs (because must align batchsize with reused bMPS batchsize)
+            new_proposed_fxs = proposed_fxs
+            # reuse of bMPS from ymin & ymax w.r.t. col to compute amplitudes
+            new_proposed_amps = v_model(
+                new_proposed_fxs,
+                bMPS_params_x_batched=None,
+                bMPS_params_y_batched=B_bMPS_params_y_dict,
+                selected_rows=None,
+                selected_cols=(col,),
+            )
+            if benchmark_model is not None and verbose:
+                benchmark_amps = benchmark_model(new_proposed_fxs)
+                print(f"Benchmark vs Reuse amplitudes check (y, {col}):")
+                print(torch.allclose(benchmark_amps, new_proposed_amps, atol=1e-5))
+            proposed_amps = new_proposed_amps
+            # Metropolis-Hastings acceptance
+            ratio = proposed_amps**2 / current_amps**2
+            accept_probs = torch.minimum(ratio, torch.ones_like(ratio))
+            for k in range(B):
+                if random.random() < accept_probs[k].item():
+                    fxs[k] = proposed_fxs[k]
+                    current_amps[k] = proposed_amps[k]
+        
+        # update bMPS params to next col for reuse
+        if col == v_model.Ly - 1:
+            # reach the rightmost col, no further bMPS to be updated
+            break
+        B_bMPS_params_y_dict = v_model.update_bMPS_params_to_col_vmap(
+            fxs,
+            col_id = col,
+            bMPS_params_y_batched=B_bMPS_params_y_dict,
+            from_which='ymin',
+        )
+
+    return fxs, current_amps
+
 # Batched Metropolis-Hastings updates
 @torch.inference_mode()
 def sample_next_vec(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, seed=None):
@@ -354,6 +473,230 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False):
             print(f'Energy: {energy.item()}')
 
     return energy, local_energies
+
+@torch.inference_mode()
+def evaluate_energy_reuse(fxs, v_model, H, current_amps, verbose=False, benchmark_model=None):
+    t0 = time.time()
+    # Label each connected config with which sample it comes from to enable reuse
+    B = fxs.shape[0]
+    # cache bMPS params for reuse
+    B_bMPS_params_x_dict, B_bMPS_params_y_dict = v_model.cache_bMPS_params_vmap(fxs)
+
+    def detect_changed_row_col_pair(fx1, fx2):
+        # currently only support nearest neighbor on square lattice
+        Ly = v_model.skeleton._Ly
+        changed_pos = torch.nonzero(fx1 - fx2)
+        changed_pos_2d = []
+        assert changed_pos.shape[0] <= 2, "Expect at most 2 on-site config changes"
+        for pos in changed_pos:
+            x, y = pos.item() // Ly, pos.item() % Ly
+            changed_pos_2d.append( (x, y) )
+        if len(changed_pos_2d) == 2:
+            delta_row = abs(changed_pos_2d[0][0] - changed_pos_2d[1][0])
+            delta_col = abs(changed_pos_2d[0][1] - changed_pos_2d[1][1])
+            if delta_row <= delta_col:
+                x1 = min(changed_pos_2d, key=lambda t: t[0])[0]
+                row = True
+                col = False
+                return row, col, list(x for x in range(x1, x1+delta_row+1))
+            else:
+                y1 = min(changed_pos_2d, key=lambda t: t[1])[1]
+                row = False
+                col = True
+                return row, col, list(y for y in range(y1, y1+delta_col+1))
+        else:
+            row = col = False
+            return row, col, None
+             
+    # --------------------------------------------------------------------------
+    # 2. Batched Calculation with Reuse
+    # --------------------------------------------------------------------------
+    # get connected configurations, coefficients and indices
+    conn_eta_num = []
+    conn_etas = []
+    conn_eta_coeffs = []
+    conn_eta_indices = []
+
+    fx_ind = 0
+    for fx in fxs:
+        eta, coeffs = H.get_conn(fx)
+        for i_eta in range(len(eta)):
+            r, c, pos = detect_changed_row_col_pair(fx, eta[i_eta])
+            conn_eta_indices.append( (fx_ind, i_eta, r, c, pos) )
+
+        conn_eta_num.append(len(eta))
+        conn_etas.append(torch.tensor(eta))
+        conn_eta_coeffs.append(torch.tensor(coeffs))
+        fx_ind += 1
+
+    conn_etas = torch.cat(conn_etas, dim=0)
+    conn_eta_coeffs = torch.cat(conn_eta_coeffs, dim=0)
+
+    # group connected configs by changed row/col first
+    # within row/col group, further group by position
+
+    # select the indices where r==True and c==False
+    # TODO: modify this part, form the pytree with batched leaves to input to reusbale PEPS amplitude calculation [x]
+    tasks_map = {} # Key: (mode, indices_tuple), Value: lists of (global_idx, parent_idx)
+    
+    # Record which are "diagonal terms" (x' == x), these do not need recomputation and can directly reuse current amplitudes
+    diagonal_mask = torch.zeros(conn_etas.shape[0], dtype=torch.bool, device=fxs.device)
+    diagonal_parent_indices = []
+    
+    # Iterate over all connected configurations and classify them
+    # conn_eta_indices[k] = (parent_fx_ind, i_eta, r_bool, c_bool, pos_list)
+    for k, (parent_idx, _, is_row, is_col, indices) in enumerate(conn_eta_indices):
+        if indices is None:
+            # Config doesn't change (Diagonal term, e.g. density-density interaction)
+            diagonal_mask[k] = True
+            diagonal_parent_indices.append(parent_idx)
+            continue
+            
+        mode = 'row' if is_row else 'col'
+        indices_tuple = tuple(sorted(indices)) 
+        group_key = (mode, indices_tuple)
+        
+        if group_key not in tasks_map:
+            tasks_map[group_key] = {'global_idxs': [], 'parent_idxs': []}
+        
+        tasks_map[group_key]['global_idxs'].append(k)
+        tasks_map[group_key]['parent_idxs'].append(parent_idx)
+
+    # --------------------------------------------------------------------------
+    # 2. Batched Calculation with Reuse
+    # --------------------------------------------------------------------------
+    # Preallocate result container
+    total_conns = conn_etas.shape[0]
+    conn_amps = torch.zeros(total_conns, dtype=current_amps.dtype, device=fxs.device)
+    
+    # A. Handle diagonal terms (Direct Copy)
+    if len(diagonal_parent_indices) > 0:
+        # find locations of diagonal terms in conn_etas
+        diag_locs = torch.nonzero(diagonal_mask).squeeze()
+        # find parent indices
+        parents = torch.tensor(diagonal_parent_indices, device=fxs.device)
+        # Direct copy: <x|psi>
+        conn_amps[diag_locs] = current_amps[parents]
+
+    # B. Handle non-diagonal terms (Grouped Vmap Contraction)
+    # Fetch the corresponding Batched Environment Dictionary in the pytree
+    def slice_env_dict(env_dict, idxs):
+        """
+        env_dict: {key: PyTree_of_Tensors}
+        idxs: indices to slice the pytree
+        
+        We need to operate on each value (PyTree) in env_dict,
+        using qu.utils.tree_map to go inside the PyTree and slice each leaf Tensor.
+        """
+        return {
+            k: qu.utils.tree_map(lambda x: x[idxs], v) 
+            for k, v in env_dict.items()
+        }
+
+    for (mode, indices), data in tasks_map.items():
+        # get indices within conn_etas
+        global_idxs = data['global_idxs']  # positions within conn_etas
+        parent_idxs = data['parent_idxs']  # originating from which fxs[i]
+        
+        # 1. target configs x'
+        # Note: conn_etas is a large tensor, slicing directly
+        target_configs = conn_etas[global_idxs] # (Batch_Group, N_sites)
+        
+        # 2. corresponding parent indices (for environment slicing)
+        subset_parents = torch.tensor(parent_idxs, device=fxs.device)
+        
+        # 3. slice environment parameters
+        subset_env_x = slice_env_dict(B_bMPS_params_x_dict, subset_parents)
+        subset_env_y = slice_env_dict(B_bMPS_params_y_dict, subset_parents)
+        
+        # 4. reuse forward
+        if mode == 'row':
+            amps_group = v_model(
+                target_configs,
+                bMPS_params_x_batched=subset_env_x,
+                bMPS_params_y_batched=subset_env_y,
+                selected_rows=indices,
+                selected_cols=None
+            )
+        else: # col
+            amps_group = v_model(
+                target_configs,
+                bMPS_params_x_batched=subset_env_x,
+                bMPS_params_y_batched=subset_env_y,
+                selected_rows=None,
+                selected_cols=indices
+            )
+            
+        # 5. fill back results into Tensor
+        locs = torch.tensor(global_idxs, device=fxs.device)
+        conn_amps[locs] = amps_group
+
+    # --------------------------------------------------------------------------
+    # 3. Compute Local Energy
+    # --------------------------------------------------------------------------
+    # E_loc(x) = \sum_{x'} H_{x,x'} * (psi(x') / psi(x))
+    
+    # conn_amps is shape: (total_conns,)
+    # conn_eta_num[b] tells how many connected configs for config b
+    
+    local_energies = []
+    offset = 0
+    
+    # simple for loop
+    for b in range(B):
+        n_conn = conn_eta_num[b]
+        
+        # get connected amplitudes and coefficients for config b
+        # shape: (n_conn,)
+        amps_slice = conn_amps[offset : offset + n_conn]
+        coeffs_slice = conn_eta_coeffs[offset : offset + n_conn]
+        
+        # Ratio: psi(x') / psi(x)
+        # current_amps[b] is a scalar
+        ratio = amps_slice / current_amps[b]
+        
+        # H_loc = \sum H_{xx'} * Ratio
+        e_loc = torch.sum(coeffs_slice * ratio)
+        
+        local_energies.append(e_loc)
+        offset += n_conn
+        
+    local_energies = torch.stack(local_energies)
+    
+    # Global Mean Energy
+    energy_mean = torch.mean(local_energies)
+
+    # if verbose and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+    #     print(f"Reuse Stats: Processed {len(tasks_map)} groups + diagonal terms.")
+
+    if benchmark_model is not None and verbose:
+        t1 = time.time()
+        print(f'Energy (Reuse)    : {energy_mean.item()}, time: {t1 - t0:.4f} s')
+        # below is logics without reuse implemented yet
+        ################################################################################
+        current_amps_benchmark = benchmark_model(fxs)
+        t0 = time.time()
+        # calculate amplitudes for connected configs, in the future consider TN reuse to speed up calculation, TN reuse is controlled by a param that is not batched over (control flow?)
+        conn_amps_benchmark = torch.cat([benchmark_model(conn_etas[i:i+B]) for i in range(0, conn_etas.shape[0], B)])
+
+        # Local energy \sum_{s'} H_{s,s'} <s'|psi>/<s|psi>
+
+        local_energies = []
+        offset = 0
+        for b in range(B):
+            n_conn = conn_eta_num[b]
+            amps_ratio = conn_amps_benchmark[offset:offset+n_conn] / current_amps_benchmark[b]
+            energy_b = torch.sum(conn_eta_coeffs[offset:offset+n_conn] * amps_ratio)
+            local_energies.append(energy_b)
+            offset += n_conn
+        local_energies = torch.stack(local_energies, dim=0)
+        # Energy: (1/N) * \sum_s <s|H|psi>/<s|psi> = (1/N) * \sum_s \sum_{s'} H_{s,s'} <s'|psi>/<s|psi>
+        energy = torch.mean(local_energies)
+        t1 = time.time()
+        print(f'Energy (Benchmark): {energy.item()}, time: {t1 - t0:.4f} s')
+        ################################################################################
+
+    return energy_mean, local_energies
 
 @torch.inference_mode()
 def evaluate_energy_vec(fxs, fpeps_model, H, current_amps, verbose=False):
@@ -496,6 +839,10 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             if verbose and RANK == 1:
                 print(f"Single Batched vmap(grad) time: {t1 - t0}")
 
+            # detect if batched_grads_vec contains NaN or Inf
+            if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
+                print(batched_grads_vec[0])
+                raise ValueError(f"NaN or Inf detected in batched_grads_vec in RANK {RANK}")
             return batched_grads_vec, amps
         else:
             params_pytree = (

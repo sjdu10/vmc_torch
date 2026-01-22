@@ -1,7 +1,14 @@
 import numpy as np
 import torch
 from tqdm import tqdm
-from vmc_torch.experiment.vmap.vmap_utils import sample_next, evaluate_energy, sample_next_vec, evaluate_energy_vec
+from vmc_torch.experiment.vmap.vmap_utils import (
+    sample_next,
+    evaluate_energy,
+    sample_next_vec,
+    evaluate_energy_vec,
+    sample_next_reuse,
+    evaluate_energy_reuse,
+)
 import scipy.sparse.linalg as spla
 from mpi4py import MPI
 import contextlib
@@ -142,20 +149,20 @@ def distributed_minres_solver(
 
 
 def run_sampling_phase(
-    svmc, 
-    Ns, 
-    B, 
-    fxs, 
-    model, 
+    svmc: int, 
+    Ns: int, 
+    B: int, 
+    fxs: torch.Tensor, 
+    model: torch.nn.Module, 
     hamiltonian, 
     graph, 
-    get_grads_func, 
+    get_grads_func: callable, 
     comm,
-    rank,
-    size,
+    rank: int,
+    size: int,
     should_burn_in=False,
     burn_in_steps=10,
-    debug_file_path=None,
+    sampling_hopping_rate=0.25
 ):
     """
     运行 Dedicated Master 模式的采样循环
@@ -223,7 +230,7 @@ def run_sampling_phase(
 
             while current_step < burn_in_steps:
                 try:
-                    fxs, _ = sample_next(fxs, model, graph, verbose=False)
+                    fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
                     current_step += 1
 
                 except RuntimeError as e:
@@ -246,6 +253,7 @@ def run_sampling_phase(
 
 
         last_finished_batch = 0
+        err_trial = 0
         while True:
             # 1. Request / Report
             buf = np.array([last_finished_batch], dtype=np.int32)
@@ -261,7 +269,7 @@ def run_sampling_phase(
             # 3. Compute
             try:
                 t00 = MPI.Wtime()
-                fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
+                fxs, current_amps = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
                 t11 = MPI.Wtime()
                 energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
                 t22 = MPI.Wtime()
@@ -284,6 +292,179 @@ def run_sampling_phase(
             except RuntimeError as e:
                 print(f"Rank {rank} Error: {e}")
                 last_finished_batch = -B # Report Failure
+                err_trial += 1
+            if err_trial >= 5:
+                raise RuntimeError(f"Rank {rank} failed too many times during sampling phase.")
+    
+    comm.Barrier()
+    
+    # Pack Results
+    if n_local > 0:
+        res_energies = np.concatenate(E_loc_vec)
+        res_grads = np.concatenate(grads_vec_list)
+        res_amps = np.concatenate(amps_vec)
+    else:
+        res_energies = np.array([], dtype=np.float64)
+        res_grads = np.array([], dtype=np.float64)
+        res_amps = np.array([], dtype=np.float64)
+        
+    stats = {
+        'n_local': n_local,
+        't_sample': sample_time,
+        't_energy': local_energy_time,
+        't_grad': grad_time
+    }
+    t1 = MPI.Wtime()
+    total_sample_time = t1 - t0
+    return (res_energies, res_grads, res_amps), fxs, stats, total_sample_time
+
+def run_sampling_phase_reuse(
+    svmc: int, 
+    Ns: int, 
+    B: int, 
+    fxs: torch.Tensor, 
+    model: torch.nn.Module, 
+    hamiltonian, 
+    graph, 
+    get_grads_func: callable, 
+    comm,
+    rank: int,
+    size: int,
+    should_burn_in=False,
+    burn_in_steps=10,
+    sampling_hopping_rate=0.25
+):
+    """
+    运行 Dedicated Master 模式的采样循环
+    
+    Returns:
+        local_data: (energies, grads, amps) 的 numpy 数组
+        fxs: 更新后的构型 (用于下一次热启动)
+        stats: dict, 包含时间统计和样本数
+    """
+    # 定义 Tag
+    TAG_REQ = 100
+    TAG_CMD = 101
+    CMD_CONTINUE = 0
+    CMD_STOP = 1
+
+    sample_time = 0.0
+    local_energy_time = 0.0
+    grad_time = 0.0
+    
+    E_loc_vec = []
+    amps_vec = []
+    grads_vec_list = []
+    n_local = 0
+
+    t0 = MPI.Wtime()
+    
+    # --- Branch A: Master (Rank 0) ---
+    if rank == 0:
+        pbar = tqdm(total=Ns, desc=f"Step {svmc} Sampling", unit="samples")
+        n_collected = 0
+        n_dispatched = 0
+        active_workers = size - 1
+        
+        while active_workers > 0:
+            status = MPI.Status()
+            buf = np.empty(1, dtype=np.int32)
+            comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
+            source_rank = status.Get_source()
+            finished_batch = buf[0]
+            
+            if finished_batch > 0:
+                n_collected += finished_batch
+                pbar.update(finished_batch)
+            elif finished_batch < 0: # worker failed
+                n_dispatched += finished_batch # revert dispatch count
+                print(f"Master detected failure from Rank {source_rank}, reverting dispatched count by {-finished_batch}.")
+            
+            next_batch = B
+            if n_dispatched < Ns:
+                cmd = np.array([CMD_CONTINUE], dtype=np.int32)
+                comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                n_dispatched += next_batch
+            else:
+                cmd = np.array([CMD_STOP], dtype=np.int32)
+                comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                active_workers -= 1
+        pbar.close()
+
+    # --- Branch B: Worker ---
+    else:
+        if should_burn_in:
+            current_step = 0
+            max_resets = 3  # to prevent infinite loops
+            reset_count = 0
+
+            while current_step < burn_in_steps:
+                try:
+                    fxs, _ = sample_next_reuse(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+                    current_step += 1
+
+                except RuntimeError as e:
+                    print(f"Rank {rank} encountered error during burn-in sampling: {e}")
+                    # === Permutation (Physical Reset) ===
+                    # Only resort to this if all else fails.
+                    # Cost: must reset current_step = 0
+                    if reset_count < max_resets:
+                        print(f"Rank {rank}: Burn-in failed. Permuting configs and RESTARTING burn-in.")
+                        with torch.no_grad():
+                            for i in range(fxs.shape[0]):
+                                perm = torch.randperm(fxs.shape[1])
+                                fxs[i] = fxs[i][perm]
+                        
+                        # CRITICAL: reset progress!
+                        current_step = 0
+                        reset_count += 1
+                    else:
+                        raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
+
+
+        last_finished_batch = 0
+        err_trial = 0
+        while True:
+            # 1. Request / Report
+            buf = np.array([last_finished_batch], dtype=np.int32)
+            comm.Send([buf, MPI.INT], dest=0, tag=TAG_REQ)
+            
+            # 2. Wait Command
+            cmd = np.empty(1, dtype=np.int32)
+            comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
+            
+            if cmd[0] == CMD_STOP:
+                break
+            
+            # 3. Compute
+            try:
+                t00 = MPI.Wtime()
+                fxs, current_amps = sample_next_reuse(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+                t11 = MPI.Wtime()
+                energy_batch, local_energies_batch = evaluate_energy_reuse(fxs, model, hamiltonian, current_amps, verbose=False)
+                t22 = MPI.Wtime()
+                grads_vec_batch, amps_batch = get_grads_func(fxs, model)
+                t33 = MPI.Wtime()
+
+                sample_time += t11 - t00
+                local_energy_time += t22 - t11
+                grad_time += t33 - t22
+
+                # Offload
+                E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
+                amps_vec.append(amps_batch.detach().cpu().numpy())
+                grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
+                
+                last_finished_batch = fxs.shape[0]
+                n_local += last_finished_batch
+                
+                del local_energies_batch, grads_vec_batch, amps_batch
+            except RuntimeError as e:
+                print(f"Rank {rank} Error: {e}")
+                last_finished_batch = -B # Report Failure
+                err_trial += 1
+            if err_trial >= 5:
+                raise RuntimeError(f"Rank {rank} failed too many times during sampling phase.")
     
     comm.Barrier()
     

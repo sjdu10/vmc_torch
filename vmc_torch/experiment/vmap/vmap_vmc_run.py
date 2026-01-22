@@ -35,9 +35,9 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 8, 8
-N_f = Lx * Ly - 8
-D, chi = 8, 16
+Lx, Ly = 4, 2
+N_f = Lx * Ly - 2
+D, chi = 4, 16
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -66,7 +66,8 @@ model_config = {
     'nn_hidden_dim': peps.nsites,
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
-    'dtype_str': 'float64' 
+    'dtype_str': 'float64',
+    'jitter_svd': 1,
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
 model_dtype = dtype_map[model_config['dtype_str']]
@@ -123,15 +124,15 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(20) 
-B = 10
-B_grad = 5
+Ns = int(1e4) 
+B = 250
+B_grad = 125
 vmc_steps = 500
-init_step = 0
-burn_in_steps = 0
-learning_rate = 0.1
+init_step = 310
+burn_in_steps = 20
+learning_rate = 0.05
 diag_shift = 1e-4
-save_state_every = 1
+save_state_every = 10
 
 # Load Checkpoint
 file_path = f'{params_path}/{fpeps_model._get_name()}/chi={chi}/'

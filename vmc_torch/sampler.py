@@ -1237,6 +1237,24 @@ class MetropolisExchangeSamplerSpinless(Sampler):
         return self.current_config, current_amp
 
 
+def strip_base10(x):
+    # Ensure x is a tensor for torch operations
+    if not torch.is_tensor(x):
+        x = torch.tensor(x)
+    
+    # Handle the zero case to avoid log(0) errors
+    if x == 0:
+        return torch.tensor(0.0), torch.tensor(0)
+
+    # Use log10 to find the magnitude
+    # floor of log10 gives the exponent
+    exponent = torch.floor(torch.log10(torch.abs(x)))
+    
+    # Calculate mantissa by shifting the decimal point
+    mantissa = x / (10**exponent)
+    
+    return mantissa, exponent
+
 class MetropolisSamplerSpinless(Sampler):
     """
     Metropolis sampler with single-site updates for spinless fermions or bosons.
@@ -1255,6 +1273,9 @@ class MetropolisSamplerSpinless(Sampler):
         subchain_length=None,
         equal_partition=True,
         dtype=torch.float32,
+        strip_exponent=True,
+        debug_log=False,
+        **kwargs,
     ):
         super().__init__(
             hi,
@@ -1268,12 +1289,18 @@ class MetropolisSamplerSpinless(Sampler):
             dtype,
         )
         self.random_site = random_site
+        self.strip_exponent = strip_exponent
+        self.debug_log = debug_log
 
+    @torch.no_grad()
     def _sample_next(self, vstate, **kwargs):
         """Sample the next configuration. Change the current configuration in place."""
         current_amp = vstate.amplitude(self.current_config)
         current_prob = abs(current_amp) ** 2
         proposed_config = self.current_config.clone()
+        c_m, c_e = strip_base10(current_amp)
+        c_m_sq, c_e_sq = c_m**2, c_e * 2
+
         if self.random_site:
             # Randomly select a site to update, until the subchain_length is reached.
             site_list = random.choices(range(self.graph.N), k=self.subchain_length)
@@ -1288,9 +1315,24 @@ class MetropolisSamplerSpinless(Sampler):
             proposed_config[i] = new_state
             proposed_amp = vstate.amplitude(proposed_config).cpu()
             proposed_prob = abs(proposed_amp) ** 2
-
+            p_m, p_e = strip_base10(proposed_amp)
+            p_m_sq, p_e_sq = p_m**2, p_e * 2
             try:
-                acceptance_ratio = proposed_prob / current_prob
+                # acceptance_ratio = proposed_prob / current_prob
+                if self.strip_exponent:
+                    acceptance_ratio = (p_m_sq / c_m_sq) * (
+                        10 ** (p_e_sq - c_e_sq)
+                    )
+                else:
+                    acceptance_ratio = proposed_prob / current_prob
+
+                if self.debug_log:
+                    _ratio1 = (p_m_sq / c_m_sq) * (
+                        10 ** (p_e_sq - c_e_sq)
+                    )
+                    _ratio = proposed_prob / current_prob
+                    if abs(_ratio1 - _ratio) > 1e-6:
+                        print(f'Log ratio: {_ratio1}, Direct ratio: {_ratio}')
             except ZeroDivisionError:
                 acceptance_ratio = 1 if proposed_prob > 0 else 0
 
@@ -1298,6 +1340,8 @@ class MetropolisSamplerSpinless(Sampler):
                 self.current_config = proposed_config
                 current_amp = proposed_amp
                 current_prob = proposed_prob
+                c_m, c_e = p_m, p_e
+                c_m_sq, c_e_sq = p_m_sq, p_e_sq
 
         return self.current_config, current_amp
 
