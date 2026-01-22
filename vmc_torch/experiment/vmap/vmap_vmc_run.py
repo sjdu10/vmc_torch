@@ -14,7 +14,7 @@ from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_c
 from vmc_torch.experiment.vmap.vmap_models import (
     Transformer_fPEPS_Model_Conv2d,
     Transformer_fPEPS_Model_GlobalMLP,
-    Transformer_fPEPS_Model_UNet,
+    Transformer_fPEPS_Model_Cluster,
     Transformer_fPEPS_Model_DConv2d,
     fTN_backflow_attn_Tensorwise_Model_vmap
 )
@@ -37,7 +37,7 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 Lx, Ly = 4, 2
 N_f = Lx * Ly - 2
-D, chi = 4, 16
+D, chi = 4, -2
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -63,34 +63,29 @@ model_config = {
     'embed_dim': 16,
     'attn_depth': 1,
     'attn_heads': 4,
-    'nn_hidden_dim': peps.nsites,
+    'nn_hidden_dim': 4, #peps.nsites,
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
     'jitter_svd': 1,
+    'uniform_kernel': 0,
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
 model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-fpeps_model = Transformer_fPEPS_Model_Conv2d(
+# fpeps_model = Transformer_fPEPS_Model_Conv2d(
+#     tn=peps,
+#     dtype=model_dtype,
+#     **init_kwargs
+# )
+fpeps_model = Transformer_fPEPS_Model_Cluster(
     tn=peps,
     dtype=model_dtype,
     **init_kwargs
 )
 # fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
-#     tn=peps,
-#     max_bond=chi,
-#     embed_dim=16,
-#     attn_heads=4,
-#     attn_depth=1,
-#     nn_hidden_dim=peps.nsites,
-#     nn_eta=1,
-#     init_perturbation_scale=1e-3,
-#     dtype=torch.float64,
-# )
-# fpeps_model = Transformer_fPEPS_Model_DConv2d(
 #     tn=peps,
 #     max_bond=chi,
 #     embed_dim=16,
@@ -112,7 +107,6 @@ fpeps_model = Transformer_fPEPS_Model_Conv2d(
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
-# fpeps_model.apply(partial(init_weights_to_zero, std=1e-3))
 
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 
@@ -125,12 +119,12 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 
 # VMC Hyperparams
 Ns = int(1e4) 
-B = 250
-B_grad = 125
+B = 1000
+B_grad = 250
 vmc_steps = 500
-init_step = 310
-burn_in_steps = 20
-learning_rate = 0.05
+init_step = 0
+burn_in_steps = 10
+learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10
 

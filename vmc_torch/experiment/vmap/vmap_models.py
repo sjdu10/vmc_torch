@@ -523,7 +523,7 @@ class SelfAttn_block_pos_batched(nn.Module):
         self.depth = depth
 
         # --- Embedding 部分 (vmap 优化版) ---
-        # 直接使用 3D Parameter，避免 forward 里的 stack 操作
+        # 直接使用 3D Parameter, 避免 forward 里的 stack 操作
         # Shape: (Sites, Embed_Dim, Classes)
         self.pos_weights = nn.Parameter(torch.empty(n_site, embed_dim, num_classes, dtype=dtype))
         self.pos_biases = nn.Parameter(torch.empty(n_site, embed_dim, dtype=dtype))
@@ -544,7 +544,7 @@ class SelfAttn_block_pos_batched(nn.Module):
             for _ in range(depth)
         ])
         
-        # 可选：最后的 Norm (常见于 Pre-Norm 架构的末尾)
+        # 可选: 最后的 Norm (常见于 Pre-Norm 架构的末尾)
         self.final_norm = nn.LayerNorm(embed_dim, dtype=dtype)
 
     def forward(self, input_seq):
@@ -595,8 +595,8 @@ class PointwiseBackflow(nn.Module):
         self.param_sizes = param_sizes  # list, e.g., [32, 32, 128, 128, ...]
         self.max_size = max(param_sizes) # e.g., 128
         
-        # 这是一个 "Local" MLP，作用于 (Batch, N, embed_dim)
-        # 参数量只与 hidden_dim 和 max_size 有关，与 n_sites 无关！
+        # 这是一个 "Local" MLP, 作用于 (Batch, N, embed_dim)
+        # 参数量只与 hidden_dim 和 max_size 有关, 与 n_sites 无关！
         self.net = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim, dtype=dtype),
             nn.GELU(),
@@ -622,8 +622,8 @@ class PointwiseBackflow(nn.Module):
 class Conv2dBackflow(nn.Module):
     """
     2D 卷积 Backflow 模块。
-    将 (Batch, N_sites, Embed) 还原为 (Batch, Embed, Lx, Ly) 的 2D 图像结构，
-    利用 Conv2d 提取近邻信息 (上下左右)，再投影回参数空间。
+    将 (Batch, N_sites, Embed) 还原为 (Batch, Embed, Lx, Ly) 的 2D 图像结构, 
+    利用 Conv2d 提取近邻信息 (上下左右), 再投影回参数空间。
     """
     def __init__(self, lx, ly, kernel_size, embed_dim, hidden_dim, param_sizes, dtype, pbc=False):
         super().__init__()
@@ -655,7 +655,7 @@ class Conv2dBackflow(nn.Module):
             nn.GELU(),
             
             # Layer 2: 投影到参数维度 (Pointwise Projection)
-            # Kernel=1 等价于 Pointwise Linear，但在 (C, H, W) 格式下运算
+            # Kernel=1 等价于 Pointwise Linear, 但在 (C, H, W) 格式下运算
             nn.Conv2d(
                 in_channels=hidden_dim, 
                 out_channels=self.max_size, 
@@ -663,6 +663,14 @@ class Conv2dBackflow(nn.Module):
                 dtype=dtype
             )
         )
+    
+    def initialize_output_scale(self, scale):
+        # 这个类知道自己的最后一层在 self.net[-1]
+        last_layer = self.net[-1]
+        print(f" -> Init Conv2d output scale: {scale}")
+        torch.nn.init.normal_(last_layer.weight, mean=0.0, std=scale)
+        if last_layer.bias is not None:
+            torch.nn.init.zeros_(last_layer.bias)
 
     def forward(self, x):
         # Input x: (Batch, N_sites, Embed_Dim)
@@ -742,7 +750,7 @@ class UNetBackflow(nn.Module):
         self.pool = nn.MaxPool2d(2) # 尺寸减半
         
         # Bottleneck (全局信息处理)
-        # 此时图像尺寸很小，卷积核可以轻易覆盖全局
+        # 此时图像尺寸很小, 卷积核可以轻易覆盖全局
         self.bottleneck = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim * 2, 3, padding=1, dtype=dtype),
             nn.GELU(),
@@ -836,7 +844,7 @@ class FourierBackflow(nn.Module):
         x_ft = torch.fft.rfft2(x_h.float(), norm='ortho') # (B, H, Lx, Ly/2+1)
         
         # 3. Frequency Mixing
-        # 这里简化：不做复杂的模式截断，直接对全频段做 Pointwise Conv
+        # 这里简化: 不做复杂的模式截断, 直接对全频段做 Pointwise Conv
         # weights: (H, H, Lx, Ly/2+1) (Complex)
         w_complex = torch.view_as_complex(self.weights)
         
@@ -859,14 +867,14 @@ class FourierBackflow(nn.Module):
 
 class GlobalMLPBackflow(nn.Module):
     """
-    Backflow 模块：Transformer -> Flatten -> N 个独立的 MLP
+    Backflow 模块: Transformer -> Flatten -> N 个独立的 MLP
     
-    逻辑：
+    逻辑: 
     1. Transformer 输出 (Batch, N_sites, Embed_Dim)
     2. Flatten 成 (Batch, N_sites * Embed_Dim) 的全局特征向量
-    3. 对于 PEPS 中的每一个 Site i：
-       使用一个独立的 MLP_i，输入全局特征向量，输出该 Site 的参数更新量 (Param_Size_i)
-    4. 拼接所有输出，得到 (Batch, Total_Params)
+    3. 对于 PEPS 中的每一个 Site i:
+       使用一个独立的 MLP_i, 输入全局特征向量, 输出该 Site 的参数更新量 (Param_Size_i)
+    4. 拼接所有输出, 得到 (Batch, Total_Params)
     """
     def __init__(self, attn_block, n_sites, embed_dim, hidden_dim, param_sizes, dtype):
         super().__init__()
@@ -879,7 +887,7 @@ class GlobalMLPBackflow(nn.Module):
         self.global_feat_dim = n_sites * embed_dim
         
         # 为每个 Site 创建一个独立的 MLP
-        # 注意：每个 tensor 的参数量 (p_size) 可能不同
+        # 注意: 每个 tensor 的参数量 (p_size) 可能不同
         self.site_mlps = nn.ModuleList()
         
         for p_size in param_sizes:
@@ -913,11 +921,595 @@ class GlobalMLPBackflow(nn.Module):
         # 4. Concatenate all params: (Batch, Total_TN_Params)
         return torch.cat(outputs, dim=1)
 
+class LocallyConnected2d(nn.Module):
+    """
+    实现不共享权重的 2D 卷积 (Locally Connected Layer)。
+    每个空间位置 (x, y) 都有自己独立的卷积核。
+    """
+    def __init__(self, in_channels, out_channels, output_size, kernel_size, padding_mode='zeros', bias=True, dtype=torch.float32):
+        super().__init__()
+        self.output_size = output_size # (Lx, Ly)
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.padding_mode = padding_mode
+        self.dtype = dtype
+        
+        Lx, Ly = output_size
+        N_sites = Lx * Ly
+        
+        # 权重形状: (N_sites, Out_Channels, In_Channels * K * K)
+        # 每一个 site 都有一个 (Out, In_flat) 的矩阵
+        self.weight_flat_dim = in_channels * kernel_size * kernel_size
+        self.weight = nn.Parameter(
+            torch.empty((N_sites, out_channels, self.weight_flat_dim), dtype=dtype)
+        )
+        
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty((N_sites, out_channels), dtype=dtype)
+            )
+        else:
+            self.register_parameter('bias', None)
+            
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # 使用 Kaiming 初始化
+        # 这里的 fan_in 计算的是单个 kernel 的输入维度
+        fan_in = self.weight_flat_dim
+        std = math.sqrt(2.0 / fan_in)
+        nn.init.normal_(self.weight, mean=0.0, std=std)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        # x: (Batch, In_Channels, Lx, Ly)
+        B, C, Lx, Ly = x.shape
+        
+        # 1. 处理 Padding
+        # Unfold 只支持 zero padding。如果是 circular, 我们需要手动 pad。
+        padding_amt = self.kernel_size // 2
+        
+        if self.padding_mode == 'circular':
+            # 左右上下各 pad
+            x_padded = F.pad(x, (padding_amt, padding_amt, padding_amt, padding_amt), mode='circular')
+            # 既然手动 pad 了, unfold 时 padding=0
+            unfold_padding = 0
+        else:
+            x_padded = x
+            unfold_padding = padding_amt
+
+        # 2. Unfold (提取滑窗)
+        # Input: (B, C, H_pad, W_pad)
+        # Output: (B, C * K * K, L_out) where L_out = Lx * Ly
+        # 这一步把每个像素周围的邻居都拉成了一根长条
+        patches = F.unfold(
+            x_padded, 
+            kernel_size=self.kernel_size, 
+            padding=unfold_padding
+        ) # Shape: (B, Flat_In, N_sites)
+
+        # 3. 本地矩阵乘法 (Site-wise Matrix Multiplication)
+        # patches: (Batch, Flat_In, N_sites)
+        # weight:  (N_sites, Out_Chan, Flat_In)
+        # Target:  (Batch, Out_Chan, N_sites)
+        
+        # Einsum 解释:
+        # b: Batch
+        # i: Flat_In (Input features per patch)
+        # n: N_sites (Spatial location)
+        # o: Out_Channels
+        
+        out = torch.einsum('bin,noi->bon', patches, self.weight)
+        
+        if self.bias is not None:
+            # bias: (N_sites, Out_Channels) -> (1, Out_Channels, N_sites)
+            out = out + self.bias.permute(1, 0).unsqueeze(0)
+        
+        # 4. 恢复 2D 形状
+        out = out.view(B, self.out_channels, Lx, Ly)
+        
+        return out
+
+class CoordinateAwareBackflow(nn.Module):
+    """
+    针对 OBC 优化的 Backflow。
+    1. 输入层: 自动通过 concat 坐标信息 (normalized x, y) 来打破平移对称性。
+    2. 隐藏层: Shared Conv2d, 高效提取特征。
+    3. 输出层: Site-dependent 1x1 Conv (LocallyConnected), 允许每个 site 有独特的参数映射。
+    """
+    def __init__(self, lx, ly, kernel_size, embed_dim, hidden_dim, param_sizes, dtype, pbc=False):
+        super().__init__()
+        self.lx = lx
+        self.ly = ly
+        self.param_sizes = param_sizes
+        self.max_size = max(param_sizes)
+        self.dtype = dtype
+        
+        # --- 1. 坐标 Embedding 预计算 ---
+        # 生成归一化的坐标网格 [-1, 1]
+        # Shape: (1, 2, Lx, Ly) -> Channel 0 is X, Channel 1 is Y
+        x_coords = torch.linspace(-1, 1, steps=lx)
+        y_coords = torch.linspace(-1, 1, steps=ly)
+        grid_x, grid_y = torch.meshgrid(x_coords, y_coords, indexing='ij')
+        
+        # 注册为 buffer (不是参数, 不更新, 但随模型保存/移动设备)
+        self.register_buffer('coord_grid', torch.stack([grid_x, grid_y], dim=0).unsqueeze(0))
+        
+        # --- 2. Shared Feature Extractor ---
+        # Input Channel = embed_dim (物理特征) + 2 (坐标特征)
+        # 即使是 Shared Kernel, 因为输入带了坐标, 它也能学会"在左边界做A操作, 在中心做B操作"
+        padding_mode = 'circular' if pbc else 'zeros' # OBC 用 zeros padding 也能辅助打破对称性
+        
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(
+                in_channels=embed_dim + 2, # +2 for x, y coords
+                out_channels=hidden_dim,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                padding_mode=padding_mode,
+                dtype=dtype
+            ),
+            nn.GELU(),
+            # 可以加深网络...
+            # nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, dtype=dtype),
+            # nn.GELU()
+        )
+        
+        # --- 3. Independent Output Projection ---
+        # 最后一层使用不共享权重的全连接 (实现为 Unshared 1x1 Conv)
+        # 这允许每个 Site 决定如何将 hidden features 映射为自己的 PEPS 参数
+        self.site_dependent_proj = LocallyConnected2d(
+            in_channels=hidden_dim,
+            out_channels=self.max_size,
+            output_size=(lx, ly),
+            kernel_size=1, # 1x1 只看局部
+            padding_mode='zeros',
+            dtype=dtype
+        )
+
+    def initialize_output_scale(self, scale):
+        # 这个类知道自己的最后一层是 self.site_dependent_proj
+        print(f" -> Init LocallyConnected output scale: {scale}")
+        # LocallyConnected2d 也有 .weight 和 .bias 属性, 操作方式一样
+        torch.nn.init.normal_(self.site_dependent_proj.weight, mean=0.0, std=scale)
+        if self.site_dependent_proj.bias is not None:
+            torch.nn.init.zeros_(self.site_dependent_proj.bias)
+
+    def forward(self, x):
+        # x: (Batch, N, D)
+        B, N, D = x.shape
+        
+        # 1. Reshape to Image: (B, D, Lx, Ly)
+        x_img = x.view(B, self.lx, self.ly, D).permute(0, 3, 1, 2)
+        
+        # 2. Append Coordinates
+        # coord_grid: (1, 2, Lx, Ly) -> expand to (B, 2, Lx, Ly)
+        coords = self.coord_grid.expand(B, -1, -1, -1).to(x.dtype) # ensure float64 compat
+        x_input = torch.cat([x_img, coords], dim=1) # (B, D+2, Lx, Ly)
+        
+        # 3. Shared Convolutions (Spatial Mixing)
+        # 此时网络“知道”自己在哪里
+        features = self.feature_extractor(x_input) # (B, Hidden, Lx, Ly)
+        
+        # 4. Independent Projection
+        # 允许边界 tensor 和 内部 tensor 有完全不同的参数分布
+        out_2d = self.site_dependent_proj(features) # (B, Max_Size, Lx, Ly)
+        
+        # 5. Flatten & Output
+        raw_out = out_2d.flatten(2).permute(0, 2, 1) # (B, N, Max_Size)
+        
+        # Clipping parts (Same as before)
+        parts = []
+        for i, size in enumerate(self.param_sizes):
+            parts.append(raw_out[:, i, :size])
+            
+        return torch.cat(parts, dim=1)
+
+
+class LocalSiteNetwork(nn.Module):
+    """
+    针对单个 Site 的独立网络：
+    Input (Neighbor Indices) -> Embedding -> Self Attention -> MLP -> Param Delta
+    """
+    def __init__(self, n_neighbors, num_classes, embed_dim, attention_heads, hidden_dim, output_dim, dtype):
+        super().__init__()
+        self.dtype = dtype
+        
+        # 1. Independent Embedding for this site (or shared, but independent is more expressive)
+        self.embedding = nn.Embedding(num_classes, embed_dim)
+        
+        # 2. Local Self Attention
+        # Input: (Batch, n_neighbors, embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=attention_heads,
+            batch_first=True,
+            dtype=dtype
+        )
+        
+        # 3. Output MLP
+        # Flatten input: n_neighbors * embed_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(n_neighbors * embed_dim, hidden_dim, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim, dtype=dtype)
+        )
+
+    def forward(self, x_local_indices):
+        # x_local_indices: (Batch, n_neighbors) int64
+        
+        # Embed: (Batch, n_neighbors, D)
+        h = self.embedding(x_local_indices).to(self.dtype)
+        
+        # Self Attention
+        # attn_output: (Batch, n_neighbors, D)
+        h_attn, _ = self.attn(h, h, h)
+        
+        # Residual + Norm (Optional, simplified here to just Attn output)
+        h = h + h_attn
+        
+        # Flatten
+        B = h.shape[0]
+        h_flat = h.reshape(B, -1)
+        
+        # Project to Tensor Params
+        return self.mlp(h_flat)
+
+def get_receptive_field_2d(Lx, Ly, r, site_index_map=lambda i, j, Lx, Ly: i * Ly + j):
+    """
+        Get the receptive field (OBC) for each site in a square lattice graph.
+        Default ordering is zig-zag ordering.
+    """
+    receptive_field = {}
+    for i in range(Lx):
+        for j in range(Ly):
+            for ix in range(-r+i, r+1+i):
+                for jx in range(-r+j, r+1+j):
+                    if ix >= 0 and ix < Lx and jx >= 0 and jx < Ly:
+                        site_id = site_index_map(i, j, Lx, Ly)
+                        if site_id not in receptive_field:
+                            receptive_field[site_id] = []
+                        receptive_field[site_id].append(site_index_map(ix, jx, Lx, Ly))
+    return receptive_field
+
+class LocalClusterBackflow(nn.Module):
+    def __init__(self, lx, ly, radius, phys_dim, embed_dim, attn_heads, hidden_dim, param_sizes, dtype):
+        super().__init__()
+        self.lx = lx
+        self.ly = ly
+        
+        # 1. 计算 Receptive Fields
+        # 假设 site index map 是 row-major (i * Ly + j)
+        rf_dict = get_receptive_field_2d(lx, ly, radius)
+        
+        # 预存 Indices 以加速 forward (避免 list 查找)
+        # self.rf_indices[i] 是第 i 个 site 的邻居列表
+        n_sites = lx * ly
+        self.rf_indices = []
+        for i in range(n_sites):
+            self.rf_indices.append(rf_dict[i])
+            
+        # 2. 创建 N 个独立的网络
+        self.site_networks = nn.ModuleList()
+        for i in range(n_sites):
+            n_neighbors = len(self.rf_indices[i])
+            output_dim = param_sizes[i]
+            
+            net = LocalSiteNetwork(
+                n_neighbors=n_neighbors,
+                num_classes=phys_dim,
+                embed_dim=embed_dim,
+                attention_heads=attn_heads,
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                dtype=dtype
+            )
+            self.site_networks.append(net)
+
+    def initialize_output_scale(self, scale):
+        print(f" -> [Init] LocalClusterBackflow: Clamping output weights to scale {scale}")
+        for net in self.site_networks:
+            # The last layer of the MLP is at index 2
+            last_layer = net.mlp[-1]
+            torch.nn.init.normal_(last_layer.weight, mean=0.0, std=scale)
+            if last_layer.bias is not None:
+                torch.nn.init.zeros_(last_layer.bias)
+
+    def forward(self, x):
+        # x: (Batch, N_sites) Int/Long
+        outputs = []
+        
+        # 既然是 Independent Weights，循环是不可避免的
+        # 但每个循环内部是 Batched 的
+        for i, net in enumerate(self.site_networks):
+            neighbors = self.rf_indices[i]
+            
+            # Gather local config: (Batch, n_neighbors)
+            x_local = x[:, neighbors]
+            
+            # Run local net
+            out_i = net(x_local)
+            outputs.append(out_i)
+            
+        # Concatenate all params: (Batch, Total_Params)
+        return torch.cat(outputs, dim=1)
 
 
 # ==============================================================================
 # Main Transformer based NN-fPEPS Model
 # ==============================================================================
+
+class BasefPEPSBackflowModel(nn.Module):
+    """
+    Base Class: Handles fPEPS parameter management, vmap contraction logic, 
+    and general forward pass flow.
+    
+    Subclasses must define `self.nn_backflow` in `__init__` and call 
+    `self.finish_initialization()`.
+    """
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        dtype=torch.float64,
+        jitter_svd=False,
+        debug_file=None,
+    ):
+        super().__init__()
+        self.dtype = dtype
+        self.jitter_svd = jitter_svd
+        self.debug_file = debug_file
+        self.chi = max_bond
+        self.nn_eta = nn_eta
+
+        # --- 1. Tensor Network Setup (Common) ---
+        # Extract raw arrays and skeleton
+        params, skeleton = qtn.pack(tn)
+        self.skeleton = skeleton
+        self.skeleton.exponent = 0 
+        
+        # Flatten TN parameters into a single list and a PyTree structure
+        ftn_params_flat, ftn_params_pytree = qu.utils.tree_flatten(params, get_ref=True)
+        self.ftn_params_pytree = ftn_params_pytree
+
+        # Register TN parameters as a ParameterList so optimizer can see them
+        self.ftn_params = torch.nn.ParameterList([
+            torch.as_tensor(x, dtype=self.dtype) for x in ftn_params_flat
+        ])
+        
+        # Metadata for reconstruction inside vmap
+        self.ftn_params_shape = [p.shape for p in self.ftn_params]
+        self.ftn_params_sizes = [p.numel() for p in self.ftn_params] 
+        self.ftn_params_length = sum(self.ftn_params_sizes)
+
+        # Placeholders for Child class to fill
+        self.nn_backflow = None 
+        self.nn_backflow_generator = None 
+        self.nn_param_names = None
+        self.params = None
+
+    def finish_initialization(self, init_scale=1e-5):
+        """
+        Must be called by the subclass after `self.nn_backflow` is defined.
+        It registers all parameters and initializes weights.
+        """
+        if self.nn_backflow is None:
+            raise ValueError("Child class must define self.nn_backflow before calling finish_initialization")
+
+        # 1. Register NN parameter names for functional_call
+        self.nn_param_names = [name for name, _ in self.nn_backflow.named_parameters()]
+        
+        # 2. Combine all params into one list for the optimizer
+        # Order: [TN Params ... NN Params]
+        self.params = nn.ParameterList(list(self.ftn_params) + list(self.nn_backflow.parameters()))
+        
+        # 3. Initialize perturbation weights to be small
+        self._init_weights_for_perturbation(scale=init_scale)
+
+    def _init_weights_for_perturbation(self, scale=1e-5):
+        """
+        Delegates initialization to the backflow generator (Generic Interface Pattern).
+        """
+        target_module = self.nn_backflow_generator if self.nn_backflow_generator else self.nn_backflow
+        
+        if hasattr(target_module, 'initialize_output_scale'):
+            target_module.initialize_output_scale(scale)
+        else:
+            # Fallback for simple structures
+            print(f"Warning: {type(target_module).__name__} does not implement 'initialize_output_scale'.")
+            # Try to guess standard layers (Sequential/ModuleList)
+            last_layer = None
+            if isinstance(target_module, nn.Sequential):
+                last_layer = target_module[-1]
+            
+            if last_layer and hasattr(last_layer, 'weight'):
+                 print(f" -> Initializing last layer {type(last_layer).__name__} with scale {scale}")
+                 torch.nn.init.normal_(last_layer.weight, mean=0.0, std=scale)
+                 if last_layer.bias is not None: 
+                     torch.nn.init.zeros_(last_layer.bias)
+
+    def tn_contraction(self, x, ftn_params, nn_output):
+        """ 
+        Core logic for vmap:
+        1. Reconstruct TN parameters from vector.
+        2. Add NN backflow correction.
+        3. Pack into Quimb TN.
+        4. Perform contraction.
+        """
+        # 1. Reconstruct the vector
+        ftn_params_vector = nn.utils.parameters_to_vector(ftn_params)
+        
+        # 2. Add backflow (NN correction)
+        # nn_output is a single sample correction vector
+        nnftn_params_vector = ftn_params_vector + self.nn_eta * nn_output
+        
+        # 3. Unpack to PyTree (list of tensors)
+        nnftn_params = []
+        pointer = 0
+        for shape in self.ftn_params_shape:
+            length = torch.prod(torch.tensor(shape)).item()
+            nnftn_params.append(nnftn_params_vector[pointer:pointer+length].view(shape))
+            pointer += length
+        
+        # Restore dictionary structure and unpack to Quimb TN
+        nnftn_params = qu.utils.tree_unflatten(nnftn_params, self.ftn_params_pytree)
+        tn = qtn.unpack(nnftn_params, self.skeleton)
+        
+        # 4. Contraction
+        # Note: x here is a single sample (tensor of indices)
+        # Select tensors based on configuration x
+        amp = tn.isel({tn.site_ind(site): x[i] for i, site in enumerate(tn.sites)})
+        
+        # Contract boundary environments if max_bond is set
+        if self.chi > 0:
+            amp.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[0, amp.Ly//2-1])
+            amp.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[amp.Ly//2, amp.Ly-1])
+        
+        return amp.contract()
+
+    def vamp(self, x, params):
+        """
+        Batched computation:
+        1. functional_call to compute Backflow (Batch Mode).
+        2. vmap to compute TN Contraction.
+        """
+        # 1. Split params into TN part and NN part
+        n_ftn = len(self.ftn_params)
+        ftn_params = params[:n_ftn]
+        nn_params = params[n_ftn:]
+        
+        # Reconstruct NN param dict for functional_call
+        nn_params_dict = dict(zip(self.nn_param_names, nn_params))
+
+        # 2. Compute Backflow (Batch Mode)
+        # nn_backflow handles the logic (Global Attn, Local Conv, or Independent Cluster)
+        batch_nn_outputs = torch.func.functional_call(self.nn_backflow, nn_params_dict, x)
+
+        # 3. vmap TN Contraction
+        # Map over x (dim 0) and nn_outputs (dim 0)
+        # We do NOT map over ftn_params (None)
+        if self.jitter_svd:
+            with use_jitter_svd():
+                amps = torch.vmap(self.tn_contraction, in_dims=(0, None, 0))(x, ftn_params, batch_nn_outputs)
+        else:
+            amps = torch.vmap(self.tn_contraction, in_dims=(0, None, 0))(x, ftn_params, batch_nn_outputs)
+            
+        return amps
+
+    def forward(self, x):
+        # Ensure inputs are long type for embeddings/indexing
+        if x.dtype != torch.long:
+             x = x.to(torch.long)
+        
+        # Forward pass wraps vamp with optional jitter context
+        if self.jitter_svd:
+            with use_jitter_svd():
+                return self.vamp(x, self.params)
+        else:
+            return self.vamp(x, self.params)
+            
+class Transformer_fPEPS_Model_Conv2d(BasefPEPSBackflowModel):
+    """
+    Subclass A: Global Attention + Convolutional Backflow.
+    Suitable for systems with translational symmetry or requiring global context.
+    """
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        nn_hidden_dim,
+        embed_dim,
+        attn_heads,
+        attn_depth=1,
+        conv_kernel_size=3,
+        init_perturbation_scale=1e-5,
+        dtype=torch.float64,
+        uniform_kernel=False,
+        **kwargs,
+    ):
+        # 1. Call Base Init
+        super().__init__(tn, max_bond, nn_eta, dtype, kwargs.get('jitter_svd', False), kwargs.get('debug_file'))
+
+        # 2. Define NN Architecture
+        # Part A: Global Position-aware Attention
+        self.attn = SelfAttn_block_pos_batched(
+            n_site=len(tn.sites),
+            num_classes=tn.phys_dim(),
+            embed_dim=embed_dim,
+            attention_heads=attn_heads,
+            depth=attn_depth,
+            dtype=self.dtype,
+        )
+        
+        # Part B: Convolutional Generator
+        if uniform_kernel:
+            # Assumes Conv2dBackflow is defined
+            self.nn_backflow_generator = Conv2dBackflow(
+                lx=tn.Lx, ly=tn.Ly, kernel_size=conv_kernel_size,
+                embed_dim=embed_dim, hidden_dim=nn_hidden_dim,
+                param_sizes=self.ftn_params_sizes, dtype=self.dtype
+            )
+        else:
+            # Assumes CoordinateAwareBackflow is defined (Hybrid strategy)
+            self.nn_backflow_generator = CoordinateAwareBackflow(
+                lx=tn.Lx, ly=tn.Ly, kernel_size=conv_kernel_size,
+                embed_dim=embed_dim, hidden_dim=nn_hidden_dim,
+                param_sizes=self.ftn_params_sizes, dtype=self.dtype
+            )
+            
+        # Combine into a sequential module
+        self.nn_backflow = nn.Sequential(self.attn, self.nn_backflow_generator)
+
+        # 3. Finalize initialization (Register params and init weights)
+        self.finish_initialization(init_perturbation_scale)
+
+
+class Transformer_fPEPS_Model_Cluster(BasefPEPSBackflowModel):
+    """
+    Subclass B: Local Cluster Backflow.
+    Totally independent neural networks per site. No global attention.
+    Input for each site is determined strictly by its receptive field.
+    """
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        nn_hidden_dim,
+        embed_dim,
+        attn_heads,
+        radius=1,
+        init_perturbation_scale=1e-5,
+        dtype=torch.float64,
+        **kwargs,
+    ):
+        # 1. Call Base Init
+        super().__init__(tn, max_bond, nn_eta, dtype, kwargs.get('jitter_svd', False), kwargs.get('debug_file'))
+        
+        # 2. Define NN Architecture (Local & Independent)
+        # Assumes LocalClusterBackflow is defined
+        self.nn_backflow_generator = LocalClusterBackflow(
+            lx=tn.Lx,
+            ly=tn.Ly,
+            radius=radius,
+            phys_dim=tn.phys_dim(),
+            embed_dim=embed_dim,
+            attn_heads=attn_heads,
+            hidden_dim=nn_hidden_dim,
+            param_sizes=self.ftn_params_sizes,
+            dtype=self.dtype
+        )
+        
+        # Direct assignment (no global attn prepended)
+        self.nn_backflow = self.nn_backflow_generator
+
+        # 3. Finalize initialization
+        self.finish_initialization(init_perturbation_scale)
+        
 
 class Transformer_fPEPS_Model_DConv2d(nn.Module):
     def __init__(
@@ -1061,156 +1653,6 @@ class Transformer_fPEPS_Model_DConv2d(nn.Module):
 
     def forward(self, x):
         return self.vamp(x, self.params)
-
-class Transformer_fPEPS_Model_Conv2d(nn.Module):
-    def __init__(
-        self,
-        tn,
-        max_bond,
-        nn_eta,
-        nn_hidden_dim,
-        embed_dim,
-        attn_heads,
-        attn_depth=1,
-        conv_kernel_size=3,
-        init_perturbation_scale=1e-5,
-        dtype=torch.float64,
-        debug_file=None,
-        jitter_svd=False,
-        **kwargs,
-    ):
-        import quimb as qu
-        import quimb.tensor as qtn
-        super().__init__()
-        
-        params, skeleton = qtn.pack(tn)
-        self.dtype = dtype
-        self.debug_file = debug_file
-        self.jitter_svd = jitter_svd
-        self.skeleton = skeleton
-        self.chi = max_bond
-        # for torch, further flatten pytree into a single list
-        ftn_params_flat, ftn_params_pytree = qu.utils.tree_flatten(
-            params, get_ref=True
-        )
-        self.ftn_params_pytree = ftn_params_pytree
-
-        # register the flat list parameters
-        self.ftn_params = torch.nn.ParameterList([
-            torch.as_tensor(x, dtype=self.dtype) for x in ftn_params_flat
-        ])
-        # --- NEW: 计算每个 tensor 的参数量 ---
-        # e.g., [32, 32, 128, 128, ...]
-        self.ftn_params_shape = [p.shape for p in self.ftn_params]
-        self.ftn_params_sizes = [p.numel() for p in self.ftn_params] 
-        self.ftn_params_length = sum(self.ftn_params_sizes)
-        
-        self.nn_hidden_dim = nn_hidden_dim
-        self.embed_dim = embed_dim
-        self.attn_heads = attn_heads
-        
-        self.attn = SelfAttn_block_pos_batched(
-            n_site=len(tn.sites),
-            num_classes=tn.phys_dim(),
-            embed_dim=self.embed_dim,
-            attention_heads=self.attn_heads,
-            depth=attn_depth,
-            dtype=self.dtype,
-        )
-        # PointwiseBackflow 会自动处理不同大小的 tensor
-        self.nn_backflow_generator = Conv2dBackflow(
-            lx=self.skeleton.Lx,
-            ly=self.skeleton.Ly,
-            kernel_size=conv_kernel_size,
-            embed_dim=self.embed_dim,
-            hidden_dim=self.nn_hidden_dim,
-            param_sizes=self.ftn_params_sizes,
-            dtype=self.dtype
-        )
-        # combine attn and mlp into a single nn_backflow
-        self.nn_backflow = nn.Sequential(
-            self.attn,
-            self.nn_backflow_generator
-        )
-
-        self.nn_eta = nn_eta
-        # We use named_parameters() because self.params only contains parameters, not buffers.
-        self.nn_param_names = [name for name, _ in self.nn_backflow.named_parameters()]
-        # combine ftn_params and nn_backflow params into a single pytree
-        self.params = nn.ParameterList(list(self.ftn_params) + list(self.nn_backflow.parameters()))
-        # Initialize weights for perturbative backflow
-        self._init_weights_for_perturbation(scale=init_perturbation_scale)
-    
-    def _init_weights_for_perturbation(self, scale=1e-5):
-        """
-        Initialize the final output layer of the backflow network to small random values,
-        """
-        backflow_module = self.nn_backflow_generator
-        output_layer = backflow_module.net[-1]
-        # 兼容 Linear 和 Conv2d
-        if isinstance(output_layer, (torch.nn.Linear, torch.nn.Conv2d)):
-            print(f" -> Clamping output layer ({type(output_layer).__name__}) weights to scale {scale}")
-            torch.nn.init.normal_(output_layer.weight, mean=0.0, std=scale)
-            if output_layer.bias is not None:
-                torch.nn.init.zeros_(output_layer.bias)
-        # Optional
-        for m in self.attn.modules():
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
-    
-    def tn_contraction(self, x, ftn_params, nn_output):
-        """ This is the part that TRULY needs vmap. """
-        # 1. Reconstruct the vector
-        ftn_params_vector = nn.utils.parameters_to_vector(ftn_params)
-        # 2. Add backflow (nn_output is now a single sample's correction)
-        nnftn_params_vector = ftn_params_vector + self.nn_eta * nn_output
-        
-        # ... Rest of the unpacking and TN contraction logic ...
-        nnftn_params = []
-        pointer = 0
-        for shape in self.ftn_params_shape:
-            length = torch.prod(torch.tensor(shape)).item()
-            nnftn_params.append(nnftn_params_vector[pointer:pointer+length].view(shape))
-            pointer += length
-        
-        nnftn_params = qu.utils.tree_unflatten(nnftn_params, self.ftn_params_pytree)
-        tn = qtn.unpack(nnftn_params, self.skeleton)
-        
-        # Site indexing and contraction
-        amp = tn.isel({tn.site_ind(site): x[i] for i, site in enumerate(tn.sites)})
-        if self.chi > 0:
-            amp.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[0, amp.Ly//2-1])
-            amp.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[amp.Ly//2, amp.Ly-1])
-        return amp.contract()
-
-    def vamp(self, x, params):
-        # 1. Split params
-        ftn_params = params[:len(self.ftn_params)]
-        nn_params = params[len(self.ftn_params):]
-        nn_params_dict = dict(zip(self.nn_param_names, nn_params))
-
-        # 2. Compute Backflow for the WHOLE BATCH at once
-        # This uses the optimized native Attention kernels (No vmap fallback!)
-        # Shape: (Batch, ftn_params_length)
-        batch_nn_outputs = torch.func.functional_call(self.nn_backflow, nn_params_dict, x)
-
-        # 3. Use vmap ONLY for the TN contraction part
-        # We map over 'x' (dim 0) and 'batch_nn_outputs' (dim 0)
-        # We do NOT map over 'ftn_params' (None)
-        amps = torch.vmap(
-            self.tn_contraction,
-            in_dims=(0, None, 0),
-        )(x, ftn_params, batch_nn_outputs)
-        return amps
-
-    def forward(self, x):
-        if self.jitter_svd:
-            with use_jitter_svd():
-                return self.vamp(x, self.params)
-        else:
-            return self.vamp(x, self.params)
                 
 
 class Transformer_fPEPS_Model_UNet(nn.Module):
@@ -1281,7 +1723,7 @@ class Transformer_fPEPS_Model_UNet(nn.Module):
         self._init_weights_for_perturbation(scale=init_perturbation_scale)
     
     def _init_weights_for_perturbation(self, scale=1e-5):
-        # UNet 的输出层通常命名为 head 或类似名字，这里我们需要定位到 generator 的最后一层
+        # UNet 的输出层通常命名为 head 或类似名字, 这里我们需要定位到 generator 的最后一层
         backflow_module = self.nn_backflow_generator
         # 假设 UNetBackflow 的最后一层叫做 head
         output_layer = backflow_module.head 
@@ -1333,7 +1775,7 @@ class Transformer_fPEPS_Model_GlobalMLP(nn.Module):
             torch.as_tensor(x, dtype=self.dtype) for x in ftn_params_flat
         ])
         
-        # 计算每个 Tensor 的参数量，这对于 Global MLP 至关重要
+        # 计算每个 Tensor 的参数量, 这对于 Global MLP 至关重要
         self.ftn_params_shape = [p.shape for p in self.ftn_params]
         self.ftn_params_sizes = [p.numel() for p in self.ftn_params] 
         self.ftn_params_length = sum(self.ftn_params_sizes)
@@ -1365,13 +1807,10 @@ class Transformer_fPEPS_Model_GlobalMLP(nn.Module):
 
         self.nn_eta = nn_eta
         
-        # 注册参数名字以便 functional_call 使用
         self.nn_param_names = [name for name, _ in self.nn_backflow.named_parameters()]
         
-        # 将所有参数合并到一个 ParameterList
         self.params = nn.ParameterList(list(self.ftn_params) + list(self.nn_backflow.parameters()))
         
-        # 初始化微扰
         self._init_weights_for_perturbation(scale=init_perturbation_scale)
     
     def _init_weights_for_perturbation(self, scale=1e-5):
