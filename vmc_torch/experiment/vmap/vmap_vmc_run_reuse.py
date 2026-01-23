@@ -9,25 +9,18 @@ import pickle
 from functools import partial
 import torch
 import json
-import autoray as ar
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
 from vmc_torch.experiment.vmap.vmap_models import (
-    Transformer_fPEPS_Model_Conv2d,
-    Transformer_fPEPS_Model_GlobalMLP,
-    Transformer_fPEPS_Model_Cluster,
-    Transformer_fPEPS_Model_DConv2d,
-    fTN_backflow_attn_Tensorwise_Model_vmap
+    fPEPS_Model_reuse
 )
-from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_vec
+from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_reuse
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
-from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
 # ==============================================================================
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
-ar.register_function('torch','linalg.svd', RobustSVD.apply)
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
@@ -38,9 +31,9 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 4
+Lx, Ly = 4, 2
 N_f = Lx * Ly - 2
-D, chi = 4, 16
+D, chi = 4, -1
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -70,7 +63,7 @@ model_config = {
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
-    'jitter_svd': 0,
+    'jitter_svd': 1,
     'uniform_kernel': 0,
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
@@ -83,34 +76,11 @@ init_kwargs.pop('dtype_str')
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
-fpeps_model = Transformer_fPEPS_Model_Cluster(
+fpeps_model = fPEPS_Model_reuse(
     tn=peps,
+    max_bond=chi,
     dtype=model_dtype,
-    **init_kwargs
 )
-# fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
-#     tn=peps,
-#     max_bond=chi,
-#     embed_dim=16,
-#     attn_heads=4,
-#     attn_depth=1,
-#     nn_hidden_dim=peps.nsites,
-#     nn_eta=1,
-#     init_perturbation_scale=1e-3,
-#     dtype=torch.float64,
-# )
-# fpeps_model = Transformer_fPEPS_Model_UNet(
-#     tn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
-
-# fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
-#     ftn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
-
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 
     print(f'Model Params: {n_params}')
@@ -126,7 +96,7 @@ B = 100
 B_grad = 100
 vmc_steps = 500
 init_step = 0
-burn_in_steps = 0
+burn_in_steps = 5
 learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10
@@ -145,6 +115,7 @@ get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_
 
 # Init State
 fxs = torch.stack([random_initial_config(N_f, peps.nsites) for _ in range(B)]).to(torch.long)
+fpeps_model.cache_bMPS_skeleton(fxs[0]) if isinstance(fpeps_model, fPEPS_Model_reuse) else None
 stats = {
     "Np": n_params,
     "sample size": Ns,
@@ -163,7 +134,7 @@ for svmc in range(init_step, vmc_steps + init_step):
     # --- Step 1: Sampling Phase (Modularized) ---
     # fxs is updated and returned for the next step (Markov Chain)
     (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = (
-        run_sampling_phase(
+        run_sampling_phase_reuse(
             svmc,
             Ns,
             B,
@@ -177,6 +148,7 @@ for svmc in range(init_step, vmc_steps + init_step):
             SIZE,
             should_burn_in=svmc == init_step,
             burn_in_steps=burn_in_steps,
+            sampling_hopping_rate=0.25
         )
     )
     
