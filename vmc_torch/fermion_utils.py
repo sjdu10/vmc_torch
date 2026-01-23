@@ -187,7 +187,8 @@ class fPEPS(qtn.PEPS):
     def __init__(self, arrays, *, shape="urdlp", tags=None, site_ind_id="k{},{}", site_tag_id="I{},{}", x_tag_id="X{}", y_tag_id="Y{}", **tn_opts):
         super().__init__(arrays, shape=shape, tags=tags, site_ind_id=site_ind_id, site_tag_id=site_tag_id, x_tag_id=x_tag_id, y_tag_id=y_tag_id, **tn_opts)
         self.symmetry = self.arrays[0].symmetry
-        self.spinless = True if self.phys_dim() == 2 else False
+        # self.spinless = True if self.phys_dim() == 2 else False
+        self.spinless = True if self.arrays[0].shape[-1]==2 else False
     
     def product_bra_state(self, config, reverse=1):
         product_tn = qtn.TensorNetwork()

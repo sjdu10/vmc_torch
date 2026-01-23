@@ -27,7 +27,7 @@ from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
-ar.register_function('torch','linalg.svd', RobustSVD.apply)
+# ar.register_function('torch','linalg.svd', RobustSVD.apply)
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
@@ -70,7 +70,7 @@ model_config = {
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
-    'jitter_svd': 0,
+    'jitter_svd': 1,
     'uniform_kernel': 0,
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
@@ -78,16 +78,16 @@ model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-# fpeps_model = Transformer_fPEPS_Model_Conv2d(
-#     tn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
-fpeps_model = Transformer_fPEPS_Model_Cluster(
+fpeps_model = Transformer_fPEPS_Model_Conv2d(
     tn=peps,
     dtype=model_dtype,
     **init_kwargs
 )
+# fpeps_model = Transformer_fPEPS_Model_Cluster(
+#     tn=peps,
+#     dtype=model_dtype,
+#     **init_kwargs
+# )
 # fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
 #     tn=peps,
 #     max_bond=chi,

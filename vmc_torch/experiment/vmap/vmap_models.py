@@ -1783,7 +1783,9 @@ class Transformer_fPEPS_Model_Conv2d(BasefPEPSBackflowModel):
         **kwargs,
     ):
         # 1. Call Base Init
-        super().__init__(tn, max_bond, nn_eta, dtype, kwargs.get('jitter_svd', False), kwargs.get('debug_file'))
+        super().__init__(tn, max_bond, nn_eta, dtype, kwargs.get('jitter_svd', 0), kwargs.get('debug_file'))
+        if self.jitter_svd:
+            print(" -> [Warning] Jitter SVD is enabled in Conv2d Backflow model.")
 
         # 2. Define NN Architecture
         # Part A: Global Position-aware Attention
@@ -1839,7 +1841,9 @@ class Transformer_fPEPS_Model_Cluster(BasefPEPSBackflowModel):
         **kwargs,
     ):
         # 1. Call Base Init
-        super().__init__(tn, max_bond, nn_eta, dtype, kwargs.get('jitter_svd', False), kwargs.get('debug_file'))
+        super().__init__(tn, max_bond, nn_eta, dtype, kwargs.get('jitter_svd', 0), kwargs.get('debug_file'))
+        if self.jitter_svd:
+            print(" -> [Warning] Jitter SVD is enabled in Local Cluster Backflow model.")
         
         # 2. Define NN Architecture (Local & Independent)
         # Assumes LocalClusterBackflow is defined

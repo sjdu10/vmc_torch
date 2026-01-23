@@ -3717,14 +3717,8 @@ class fTNModel_reuse(wavefunctionModel):
 
             if self.max_bond is None:
                 amp = amp_tn
-                if self.tree is None:
-                    opt = ctg.HyperOptimizer(
-                        progbar=True, max_repeats=10, parallel=True
-                    )
-                    self.tree = amp.contraction_tree(optimize=opt)
-                amp_val = amp.contract(
-                    optimize=self.tree
-                )  # quimb will address the cached exponent automatically
+                amp_val = amp.contract()  
+                # quimb will address the cached exponent automatically
 
             else:
                 if self.cache_env_mode:
