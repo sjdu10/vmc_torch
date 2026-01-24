@@ -295,7 +295,7 @@ class VMC:
 
                     # update the MC_energy_stats.json
                     with open(path + f'/energy_stats_start_{start}.json', 'w') as f:
-                        json.dump(MC_energy_stats, f)
+                        json.dump(MC_energy_stats, f, indent=4)
             
         return MC_energy_stats
     

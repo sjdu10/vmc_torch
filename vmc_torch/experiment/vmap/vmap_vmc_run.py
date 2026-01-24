@@ -38,8 +38,8 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 4
-N_f = Lx * Ly - 2
+Lx, Ly = 8, 8
+N_f = Lx * Ly - 8
 D, chi = 4, 16
 t, U = 1.0, 8.0
 
@@ -121,9 +121,9 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(1e3) 
-B = 100
-B_grad = 100
+Ns = int(10) 
+B = 10
+B_grad = 10
 vmc_steps = 500
 init_step = 0
 burn_in_steps = 0

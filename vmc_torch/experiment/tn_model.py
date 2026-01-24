@@ -316,7 +316,56 @@ class circuit_TNF(wavefunctionModel):
             
         return torch.stack(batch_amps)
 
+class arbTN_model(wavefunctionModel):
+    def __init__(self, tns, max_bond=None, dtype=torch.float64):
+        super().__init__(dtype=dtype)
+        self.tns = tns
+        if max_bond is None or max_bond <= 0:
+            max_bond = None
+        self.max_bond = max_bond
+        self.model_structure = {
+            'arbTN':{'D': tns.max_bond()},
+        }
+        # extract the raw arrays and a skeleton of the TN
+        params, self.skeleton = qtn.pack(tns)
 
+        self.torch_tn_params = {
+            str(tid): nn.Parameter(data)  # Convert Tensor to Parameter
+            for tid, data in params.items()
+        }
+        # register the torch tensors as parameters
+        for tid, param in self.torch_tn_params.items():
+            self.register_parameter(tid, param)
+        # Store the shapes of the parameters
+        self.param_shapes = [param.shape for param in self.parameters()]
+
+    def amplitude(self, x, **kwargs):
+        # update self.PEPS
+        params ={
+            int(tid): data
+            for tid, data in self.torch_tn_params.items()
+        }
+        tns = qtn.unpack(params, self.skeleton)
+        def func(xi):
+            if self.max_bond is None:
+                amp_val = tns.isel({tns.site_inds[i]: int(s) for i, s in enumerate(xi)}).contract()
+                return amp_val
+            else:
+                amp = tns.isel({tns.site_inds[i]: int(s) for i, s in enumerate(xi)})
+                amp.contract_boundary_from_ymin_(max_bond=self.max_bond, cutoff=0.0, yrange=[0, tns.Ly//2-1],canonize=True)
+                amp.contract_boundary_from_ymax_(max_bond=self.max_bond, cutoff=0.0, yrange=[tns.Ly//2, tns.Ly-1],canonize=True)
+                amp_val = amp.contract()
+                return amp_val
+            
+        batch_amps = []
+        for x_i in x:
+            if not isinstance(x_i, torch.Tensor):
+                x_i = torch.tensor(x_i, dtype=torch.long)
+            amp_val = func(x_i)
+            batch_amps.append(amp_val)
+        
+        return torch.stack(batch_amps)
+    
 class PEPS_model(wavefunctionModel):
     def __init__(self, peps, max_bond=None, dtype=torch.float64):
         super().__init__(dtype=dtype)

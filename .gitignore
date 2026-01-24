@@ -20,3 +20,4 @@ vmc_torch.egg-info/
 *.sqlite
 *.nsys-rep
 vmc_torch/experiment/vmap/data
+vmc_torch/experiment/vmap/debug
