@@ -145,7 +145,7 @@ def distributed_minres_solver(
     dp, info = spla.minres(A, energy_grad, rtol=rtol, maxiter=100)
     
     t1 = MPI.Wtime()
-    return dp, t1 - t0
+    return dp, t1 - t0, info
 
 
 def run_sampling_phase(

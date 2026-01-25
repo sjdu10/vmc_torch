@@ -198,7 +198,7 @@ for svmc in range(init_step, vmc_steps + init_step):
     # Now this is just a single function call!
     # Master (Rank 0) participates in Allreduce but contributes 0 data
     
-    dp, t_sr = distributed_minres_solver(
+    dp, t_sr, info = distributed_minres_solver(
         local_grads, local_amps, local_energies,
         energy_mean, total_samples, n_params, diag_shift, COMM
     )
@@ -209,7 +209,7 @@ for svmc in range(init_step, vmc_steps + init_step):
         print(f" Batch Size: {B}, Grad Batch Size: {B_grad}, MKL: {os.environ['MKL_NUM_THREADS']}")
         print(f" Total Time: {MPI.Wtime() - t_start:.4f}s")
         print(f" Sample Time: {total_sample_time:.4f}s")
-        print(f" SR Time: {t_sr:.4f}s")
+        print(f" SR Time: {t_sr:.4f}s, Info: {info}")
         
 
     # --- Step 4: Parameter Update ---
