@@ -782,16 +782,6 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             # 2. 定义单样本函数 (Single Sample Function)
             # vmap 要求我们定义处理 "单个样本" 的逻辑
             def single_sample_amp_func(x_i, p):
-                # x_i: (L,) 来自 vmap 的切片
-                # p: 参数 PyTree (Shared)
-                
-                # 为了复用现有的 vamp (它可能期待 batch 维度), 我们伪造一个 batch=1
-                # 并在输出时 squeeze 回 scalar
-                
-                # 注意：如果你的 fpeps_model.vamp 内部有 vmap，这里会变成嵌套 vmap
-                # 但这是被允许的，只是要注意效率。
-                # 如果是 Pure TN，建议确保 vamp 能处理 batch=1 的情况
-                
                 amp = fpeps_model.vamp(x_i.unsqueeze(0), p).squeeze(0)
                 return amp, amp # (Loss target, Aux data)
 

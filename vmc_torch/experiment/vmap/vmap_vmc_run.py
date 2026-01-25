@@ -27,7 +27,7 @@ from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
-# ar.register_function('torch','linalg.svd', RobustSVD.apply)
+ar.register_function('torch','linalg.svd', RobustSVD.apply)
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
@@ -38,9 +38,9 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 8, 8
-N_f = Lx * Ly - 8
-D, chi = 4, 16
+Lx, Ly = 4, 2
+N_f = Lx * Ly - 2
+D, chi = 4, -1
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -59,8 +59,6 @@ for site in peps.sites:
 # ==============================================================================
 # Model Configuration (Define this FIRST)
 # ==============================================================================
-# 将所有用于初始化的超参数放在这里
-# 注意：ftn (peps) 通常太大或是对象，不适合存json，只要记录生成peps的参数(Lx, Ly等)即可
 model_config = {
     'max_bond': chi,
     'embed_dim': 16,
@@ -78,16 +76,16 @@ model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-fpeps_model = Transformer_fPEPS_Model_Conv2d(
-    tn=peps,
-    dtype=model_dtype,
-    **init_kwargs
-)
-# fpeps_model = Transformer_fPEPS_Model_Cluster(
+# fpeps_model = Transformer_fPEPS_Model_Conv2d(
 #     tn=peps,
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
+fpeps_model = Transformer_fPEPS_Model_Cluster(
+    tn=peps,
+    dtype=model_dtype,
+    **init_kwargs
+)
 # fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
 #     tn=peps,
 #     max_bond=chi,
@@ -121,14 +119,14 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(10) 
-B = 10
-B_grad = 10
+Ns = int(1e4) 
+B = 1000
+B_grad = 500
 vmc_steps = 500
 init_step = 0
-burn_in_steps = 0
+burn_in_steps = 10
 learning_rate = 0.1
-diag_shift = 1e-4
+diag_shift = 1e-5
 save_state_every = 10
 
 # Load Checkpoint

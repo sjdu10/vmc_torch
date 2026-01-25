@@ -21,7 +21,7 @@ class RobustSVD(torch.autograd.Function):
         # A: (Batch, M, N) or (M, N)
         scale = torch.amax(torch.abs(A), dim=(-2, -1), keepdim=True)
         
-        # Hybrid Jitter
+        # Jitter
         relative_eps = 1e-12
         
         M, N = A.shape[-2:]

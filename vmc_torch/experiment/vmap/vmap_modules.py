@@ -229,27 +229,27 @@ def run_sampling_phase(
             reset_count = 0
 
             while current_step < burn_in_steps:
-                try:
-                    fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
-                    current_step += 1
+                # try:
+                fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+                current_step += 1
 
-                except RuntimeError as e:
-                    print(f"Rank {rank} encountered error during burn-in sampling: {e}")
-                    # === Permutation (Physical Reset) ===
-                    # Only resort to this if all else fails.
-                    # Cost: must reset current_step = 0
-                    if reset_count < max_resets:
-                        print(f"Rank {rank}: Burn-in failed. Permuting configs and RESTARTING burn-in.")
-                        with torch.no_grad():
-                            for i in range(fxs.shape[0]):
-                                perm = torch.randperm(fxs.shape[1])
-                                fxs[i] = fxs[i][perm]
+                # except RuntimeError as e:
+                #     print(f"Rank {rank} encountered error during burn-in sampling: {e}")
+                #     # === Permutation (Physical Reset) ===
+                #     # Only resort to this if all else fails.
+                #     # Cost: must reset current_step = 0
+                #     if reset_count < max_resets:
+                #         print(f"Rank {rank}: Burn-in failed. Permuting configs and RESTARTING burn-in.")
+                #         with torch.no_grad():
+                #             for i in range(fxs.shape[0]):
+                #                 perm = torch.randperm(fxs.shape[1])
+                #                 fxs[i] = fxs[i][perm]
                         
-                        # CRITICAL: reset progress!
-                        current_step = 0
-                        reset_count += 1
-                    else:
-                        raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
+                #         # CRITICAL: reset progress!
+                #         current_step = 0
+                #         reset_count += 1
+                #     else:
+                #         raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
 
 
         last_finished_batch = 0
@@ -267,34 +267,35 @@ def run_sampling_phase(
                 break
             
             # 3. Compute
-            try:
-                t00 = MPI.Wtime()
-                fxs, current_amps = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
-                t11 = MPI.Wtime()
-                energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
-                t22 = MPI.Wtime()
-                grads_vec_batch, amps_batch = get_grads_func(fxs, model)
-                t33 = MPI.Wtime()
+            # try:
+            t00 = MPI.Wtime()
+            fxs, current_amps = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+            t11 = MPI.Wtime()
+            energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
+            t22 = MPI.Wtime()
+            grads_vec_batch, amps_batch = get_grads_func(fxs, model)
+            t33 = MPI.Wtime()
 
-                sample_time += t11 - t00
-                local_energy_time += t22 - t11
-                grad_time += t33 - t22
+            sample_time += t11 - t00
+            local_energy_time += t22 - t11
+            grad_time += t33 - t22
 
-                # Offload
-                E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
-                amps_vec.append(amps_batch.detach().cpu().numpy())
-                grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
-                
-                last_finished_batch = fxs.shape[0]
-                n_local += last_finished_batch
-                
-                del local_energies_batch, grads_vec_batch, amps_batch
-            except RuntimeError as e:
-                print(f"Rank {rank} Error: {e}")
-                last_finished_batch = -B # Report Failure
-                err_trial += 1
-            if err_trial >= 5:
-                raise RuntimeError(f"Rank {rank} failed too many times during sampling phase.")
+            # Offload
+            E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
+            amps_vec.append(amps_batch.detach().cpu().numpy())
+            grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
+            
+            last_finished_batch = fxs.shape[0]
+            n_local += last_finished_batch
+            
+            del local_energies_batch, grads_vec_batch, amps_batch
+            # except RuntimeError as e:
+            #     print(f"Rank {rank} Error: {e}")
+            #     last_finished_batch = -B # Report Failure
+            #     err_trial += 1
+            # if err_trial >= 5:
+            #     print(f"Rank {rank} failed too many times during sampling phase.")
+            #     comm.Abort(1)
     
     comm.Barrier()
     
