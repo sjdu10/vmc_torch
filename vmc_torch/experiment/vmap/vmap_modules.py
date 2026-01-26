@@ -219,41 +219,21 @@ def run_sampling_phase(
                 cmd = np.array([CMD_STOP], dtype=np.int32)
                 comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
                 active_workers -= 1
+        
+        print('Sampling phase should be done now.')
         pbar.close()
 
     # --- Branch B: Worker ---
     else:
         if should_burn_in:
             current_step = 0
-            max_resets = 3  # to prevent infinite loops
-            reset_count = 0
 
             while current_step < burn_in_steps:
-                # try:
                 fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
                 current_step += 1
 
-                # except RuntimeError as e:
-                #     print(f"Rank {rank} encountered error during burn-in sampling: {e}")
-                #     # === Permutation (Physical Reset) ===
-                #     # Only resort to this if all else fails.
-                #     # Cost: must reset current_step = 0
-                #     if reset_count < max_resets:
-                #         print(f"Rank {rank}: Burn-in failed. Permuting configs and RESTARTING burn-in.")
-                #         with torch.no_grad():
-                #             for i in range(fxs.shape[0]):
-                #                 perm = torch.randperm(fxs.shape[1])
-                #                 fxs[i] = fxs[i][perm]
-                        
-                #         # CRITICAL: reset progress!
-                #         current_step = 0
-                #         reset_count += 1
-                #     else:
-                #         raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
-
 
         last_finished_batch = 0
-        err_trial = 0
         while True:
             # 1. Request / Report
             buf = np.array([last_finished_batch], dtype=np.int32)
@@ -289,13 +269,6 @@ def run_sampling_phase(
             n_local += last_finished_batch
             
             del local_energies_batch, grads_vec_batch, amps_batch
-            # except RuntimeError as e:
-            #     print(f"Rank {rank} Error: {e}")
-            #     last_finished_batch = -B # Report Failure
-            #     err_trial += 1
-            # if err_trial >= 5:
-            #     print(f"Rank {rank} failed too many times during sampling phase.")
-            #     comm.Abort(1)
     
     comm.Barrier()
     
