@@ -226,6 +226,13 @@ def run_sampling_phase(
                         # print(f"Rank {source_rank} finished with {finished_batch} samples. Remaining: {active_rank_ids}")
                         print(f'Remaining num of active workers: {len(active_rank_ids)}, {active_workers}')
                 
+                if n_collected >= Ns:
+                    cmd = np.array([CMD_STOP], dtype=np.int32)
+                    for arank in active_rank_ids:
+                        comm.Send([cmd, MPI.INT], dest=arank, tag=TAG_CMD)
+                    print(f"\n[Master] Sample target reached ({n_collected}). Sent STOP to all remaining workers: {active_rank_ids}")
+
+                
             else:
                 if n_collected >= Ns:
                     print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}")
