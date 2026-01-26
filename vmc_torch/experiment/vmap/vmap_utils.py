@@ -831,8 +831,8 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
 
             # detect if batched_grads_vec contains NaN or Inf
             if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
-                print(batched_grads_vec[0])
-                raise ValueError(f"NaN or Inf detected in batched_grads_vec in RANK {RANK}")
+                print(f"NaN or Inf detected in batched_grads_vec in RANK {RANK}")
+                comm.Abort(1)
             return batched_grads_vec, amps
         else:
             params_pytree = (
