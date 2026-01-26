@@ -36,6 +36,7 @@ SIZE = COMM.Get_size()
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
 torch.set_default_device("cpu")
 torch.random.manual_seed(42 + RANK)
+torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
@@ -110,9 +111,9 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(1e3) 
-B = 125
-B_grad = 125
+Ns = int(1e2) 
+B = 10
+B_grad = 10
 vmc_steps = 200
 init_step = 0
 burn_in_steps = 0
@@ -144,6 +145,8 @@ get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_
 
 # Init State
 fxs = torch.stack([random_initial_config(N_f, peps.nsites) for _ in range(B)]).to(torch.long)
+# rfxs = random_initial_config(N_f, peps.nsites)
+# fxs = rfxs.unsqueeze(0).repeat(B, 1).to(torch.long) # test with identical initial states
 stats = {
     "Np": n_params,
     "sample size": Ns,
@@ -178,6 +181,8 @@ for svmc in range(init_step, vmc_steps + init_step):
             burn_in_steps=burn_in_steps,
         )
     )
+    # if RANK == 1:
+    #     print(fxs)
     
     # --- Step 2: Aggregation Phase ---
     # Gather statistics for logging

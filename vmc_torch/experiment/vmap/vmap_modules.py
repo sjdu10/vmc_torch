@@ -1,5 +1,6 @@
 import sys
 import numpy as np
+import time
 import torch
 from tqdm import tqdm
 from vmc_torch.experiment.vmap.vmap_utils import (
@@ -199,34 +200,44 @@ def run_sampling_phase(
         active_rank_ids = set(range(1, size))
         
         while active_workers > 0:
-            status = MPI.Status()
-            buf = np.empty(1, dtype=np.int32)
-            comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
-            source_rank = status.Get_source()
-            finished_batch = buf[0]
-            
-            if finished_batch > 0:
-                n_collected += finished_batch
-                pbar.update(finished_batch)
-            elif finished_batch < 0: # worker failed
-                n_dispatched += finished_batch # revert dispatch count
-                print(f"Master detected failure from Rank {source_rank}, reverting dispatched count by {-finished_batch}.")
-            
-            next_batch = B
-            if n_dispatched < Ns:
-                cmd = np.array([CMD_CONTINUE], dtype=np.int32)
-                comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                n_dispatched += next_batch
+            has_message = comm.Iprobe(source=MPI.ANY_SOURCE, tag=TAG_REQ)
+            if has_message:
+                status = MPI.Status()
+                buf = np.empty(1, dtype=np.int32)
+                comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
+                source_rank = status.Get_source()
+                finished_batch = buf[0]
+                
+                if finished_batch > 0:
+                    n_collected += finished_batch
+                    pbar.update(finished_batch)
+                
+                next_batch = B
+                if n_dispatched < Ns:
+                    cmd = np.array([CMD_CONTINUE], dtype=np.int32)
+                    comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                    n_dispatched += next_batch
+                else:
+                    cmd = np.array([CMD_STOP], dtype=np.int32)
+                    comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                    active_workers -= 1
+                    if source_rank in active_rank_ids:
+                        active_rank_ids.remove(source_rank)
+                        # print(f"Rank {source_rank} finished with {finished_batch} samples. Remaining: {active_rank_ids}")
+                        print(f'Remaining num of active workers: {len(active_rank_ids)}, {active_workers}')
+                
             else:
-                cmd = np.array([CMD_STOP], dtype=np.int32)
-                comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                active_workers -= 1
-                if source_rank in active_rank_ids:
-                    active_rank_ids.remove(source_rank)
-                    print(f"Rank {source_rank} finished with {finished_batch} samples. Remaining: {active_rank_ids}")
+                if n_collected >= Ns:
+                    print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}")
+                    break
+                time.sleep(0.001)
         
         print('Sampling phase should be done now.')
         pbar.close()
+
+        if len(active_rank_ids) > 0:
+            print(f"ERROR: Finishing with {len(active_rank_ids)} dead ranks.")
+            comm.Abort(1)
 
     # --- Branch B: Worker ---
     else:
