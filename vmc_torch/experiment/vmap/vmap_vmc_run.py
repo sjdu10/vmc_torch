@@ -41,7 +41,7 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 Lx, Ly = 4, 2
 N_f = Lx * Ly - 2
-D, chi = 4, -1
+D, chi = 4, -10
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -114,8 +114,8 @@ Ns = int(2e4)
 B = 1000
 B_grad = 500
 vmc_steps = 200
-init_step = 600
-burn_in_steps = 10
+init_step = 0
+burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-5
 save_state_every = 10

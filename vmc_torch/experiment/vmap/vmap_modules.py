@@ -196,6 +196,7 @@ def run_sampling_phase(
         n_collected = 0
         n_dispatched = 0
         active_workers = size - 1
+        active_rank_ids = set(range(1, size))
         
         while active_workers > 0:
             status = MPI.Status()
@@ -220,6 +221,9 @@ def run_sampling_phase(
                 cmd = np.array([CMD_STOP], dtype=np.int32)
                 comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
                 active_workers -= 1
+                if source_rank in active_rank_ids:
+                    active_rank_ids.remove(source_rank)
+                    print(f"Rank {source_rank} finished. Remaining: {active_rank_ids}")
         
         print('Sampling phase should be done now.')
         pbar.close()
