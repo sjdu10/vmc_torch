@@ -165,14 +165,14 @@ def run_sampling_phase(
     sampling_hopping_rate=0.25
 ):
     """
-    运行 Dedicated Master 模式的采样循环
+    Sampling loop with Dedicated Master
     
     Returns:
-        local_data: (energies, grads, amps) 的 numpy 数组
-        fxs: 更新后的构型 (用于下一次热启动)
-        stats: dict, 包含时间统计和样本数
+        local_data: (energies, grads, amps), numpy arrays
+        fxs: initial configs in a batch
+        stats: dict, containing timing statistics and sample counts
     """
-    # 定义 Tag
+    # Define Tags
     TAG_REQ = 100
     TAG_CMD = 101
     CMD_CONTINUE = 0

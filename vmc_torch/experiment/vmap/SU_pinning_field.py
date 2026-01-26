@@ -6,7 +6,7 @@ from SU_func import (
     run_z2SU_from_u1SU,
 )
 
-Lx, Ly = 4, 4
+Lx, Ly = 4, 2
 D0 = 4
 N_f = Lx*Ly - 2
 t = 1.0

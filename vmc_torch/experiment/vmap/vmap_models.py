@@ -5,7 +5,7 @@ import torch.nn as nn
 import math
 from typing import Optional
 from vmc_torch.nn_sublayers import SelfAttn_block_pos
-from mpi4py import MPI
+from typing import List
 from vmc_torch.experiment.vmap.vmap_modules import use_jitter_svd, vmap_friendly_svd
 # ==============================================================================
 torch.linalg.svd = vmap_friendly_svd
@@ -1365,12 +1365,49 @@ class LocallyConnected2d(nn.Module):
 
 class CoordinateAwareBackflow(nn.Module):
     """
-    针对 OBC 优化的 Backflow。
-    1. 输入层: 自动通过 concat 坐标信息 (normalized x, y) 来打破平移对称性。
-    2. 隐藏层: Shared Conv2d, 高效提取特征。
-    3. 输出层: Site-dependent 1x1 Conv (LocallyConnected), 允许每个 site 有独特的参数映射。
+    [Shared Output + Deep MLP Version]
+    Optimized Backflow for Open Boundary Conditions (OBC).
+    
+    Instead of a single projection layer, this uses a multi-layer MLP (Pointwise) 
+    as the output head. This significantly enhances the model's ability to fit 
+    non-linear boundary behaviors using coordinate information.
+
+    Attributes:
+        lx (int): Width of the lattice.
+        ly (int): Height of the lattice.
+        max_size (int): The maximum number of parameters required by any single tensor site.
+        param_sizes (List[int]): A list containing the specific parameter count for each site.
     """
-    def __init__(self, lx, ly, kernel_size, embed_dim, hidden_dim, param_sizes, dtype, pbc=False):
+
+    def __init__(
+        self, 
+        lx: int, 
+        ly: int, 
+        kernel_size: int, 
+        embed_dim: int, 
+        hidden_dim: int, 
+        param_sizes: List[int], 
+        dtype: torch.dtype, 
+        pbc: bool = False, 
+        mlp_depth: int = 2
+    ):
+        """
+        Initializes the CoordinateAwareBackflow_DeepMLP module.
+
+        Args:
+            lx (int): The width of the lattice (dimension in x-direction).
+            ly (int): The height of the lattice (dimension in y-direction).
+            kernel_size (int): The size of the convolutional kernel (e.g., 3 for 3x3).
+            embed_dim (int): The dimension of the input embeddings (physical features).
+            hidden_dim (int): The number of channels in the hidden layers.
+            param_sizes (List[int]): A list where the i-th element represents the number 
+                of variational parameters required for the i-th tensor site.
+            dtype (torch.dtype): The data type for the parameters (e.g., torch.float64).
+            pbc (bool, optional): Whether to use Periodic Boundary Conditions. 
+                Defaults to False (OBC).
+            mlp_depth (int, optional): The depth of the output pointwise MLP. 
+                Defaults to 2 (1 hidden layer + 1 output layer).
+        """
         super().__init__()
         self.lx = lx
         self.ly = ly
@@ -1378,24 +1415,23 @@ class CoordinateAwareBackflow(nn.Module):
         self.max_size = max(param_sizes)
         self.dtype = dtype
         
-        # --- 1. 坐标 Embedding 预计算 ---
-        # 生成归一化的坐标网格 [-1, 1]
+        # --- 1. Coordinate Embedding (Pre-calculated) ---
+        # Generate normalized coordinate grid [-1, 1]
         # Shape: (1, 2, Lx, Ly) -> Channel 0 is X, Channel 1 is Y
         x_coords = torch.linspace(-1, 1, steps=lx)
         y_coords = torch.linspace(-1, 1, steps=ly)
         grid_x, grid_y = torch.meshgrid(x_coords, y_coords, indexing='ij')
         
-        # 注册为 buffer (不是参数, 不更新, 但随模型保存/移动设备)
+        # Register as buffer (not a learnable parameter, but part of state_dict)
         self.register_buffer('coord_grid', torch.stack([grid_x, grid_y], dim=0).unsqueeze(0))
         
         # --- 2. Shared Feature Extractor ---
-        # Input Channel = embed_dim (物理特征) + 2 (坐标特征)
-        # 即使是 Shared Kernel, 因为输入带了坐标, 它也能学会"在左边界做A操作, 在中心做B操作"
-        padding_mode = 'circular' if pbc else 'zeros' # OBC 用 zeros padding 也能辅助打破对称性
+        # Input Channel = embed_dim (physical features) + 2 (coordinate features)
+        padding_mode = 'circular' if pbc else 'zeros'
         
         self.feature_extractor = nn.Sequential(
             nn.Conv2d(
-                in_channels=embed_dim + 2, # +2 for x, y coords
+                in_channels=embed_dim + 2,
                 out_channels=hidden_dim,
                 kernel_size=kernel_size,
                 padding=kernel_size // 2,
@@ -1403,55 +1439,90 @@ class CoordinateAwareBackflow(nn.Module):
                 dtype=dtype
             ),
             nn.GELU(),
-            # 可以加深网络...
-            # nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, dtype=dtype),
-            # nn.GELU()
+            # Optional: Add more layers here to deepen feature extraction
         )
         
-        # --- 3. Independent Output Projection ---
-        # 最后一层使用不共享权重的全连接 (实现为 Unshared 1x1 Conv)
-        # 这允许每个 Site 决定如何将 hidden features 映射为自己的 PEPS 参数
-        self.site_dependent_proj = LocallyConnected2d(
-            in_channels=hidden_dim,
-            out_channels=self.max_size,
-            output_size=(lx, ly),
-            kernel_size=1, # 1x1 只看局部
-            padding_mode='zeros',
-            dtype=dtype
-        )
+        # --- 3. Shared Deep MLP Output Projection (Core Modification) ---
+        # We construct a Pointwise MLP (Sequence of 1x1 Convs).
+        # Structure: Hidden -> [MLP Hidden -> GELU] * (Depth - 1) -> Output
+        # Note: 1x1 Conv2d is mathematically equivalent to applying a shared Linear layer to every pixel.
+        
+        layers = []
+        # Hidden Layers
+        for _ in range(mlp_depth - 1):
+            layers.append(nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, dtype=dtype))
+            layers.append(nn.GELU()) # Non-linearity is key for fitting complex boundary effects
+            
+        # Final Output Layer
+        # Project to parameter space, no activation function here
+        layers.append(nn.Conv2d(hidden_dim, self.max_size, kernel_size=1, dtype=dtype))
+        
+        self.output_mlp = nn.Sequential(*layers)
 
-    def initialize_output_scale(self, scale):
-        # 这个类知道自己的最后一层是 self.site_dependent_proj
-        print(f" -> Init LocallyConnected output scale: {scale}")
-        # LocallyConnected2d 也有 .weight 和 .bias 属性, 操作方式一样
-        torch.nn.init.normal_(self.site_dependent_proj.weight, mean=0.0, std=scale)
-        if self.site_dependent_proj.bias is not None:
-            torch.nn.init.zeros_(self.site_dependent_proj.bias)
+    def initialize_output_scale(self, scale: float):
+        """
+        Initialize the output layer weights to be small values for perturbative updates.
 
-    def forward(self, x):
-        # x: (Batch, N, D)
+        IMPORTANT: We only initialize the *last layer* of the MLP to be near-zero.
+        Hidden layers should use standard initialization (e.g., Kaiming) to maintain variance.
+
+        Args:
+            scale (float): The standard deviation for the normal distribution used 
+                to initialize the last layer's weights.
+        """
+        # Get the last layer from Sequential
+        last_layer = self.output_mlp[-1]
+        
+        print(f" -> [Init] CoordinateAwareBackflow_DeepMLP: Clamping last layer '{type(last_layer).__name__}' weights to scale {scale}")
+        
+        torch.nn.init.normal_(last_layer.weight, mean=0.0, std=scale)
+        if last_layer.bias is not None:
+            torch.nn.init.zeros_(last_layer.bias)
+            
+        # Optional: Explicitly initialize hidden layers with Kaiming/He initialization
+        # (PyTorch default for Conv2d is usually adequate, but explicit is safer)
+        for i in range(len(self.output_mlp) - 1):
+            layer = self.output_mlp[i]
+            if isinstance(layer, nn.Conv2d):
+                # He initialization for layers followed by GELU/ReLU
+                torch.nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+                if layer.bias is not None:
+                    torch.nn.init.zeros_(layer.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the forward pass of the backflow network.
+
+        Args:
+            x (torch.Tensor): Input embeddings or indices. 
+                Shape: (Batch, N_sites, Embed_Dim)
+
+        Returns:
+            torch.Tensor: The flattened parameter updates concatenated for all sites.
+                Shape: (Batch, Total_TN_Params)
+        """
+        # Input x: (Batch, N_sites, Embed_Dim)
         B, N, D = x.shape
         
-        # 1. Reshape to Image: (B, D, Lx, Ly)
+        # 1. Reshape sequence to image & Permute to (B, C, H, W)
         x_img = x.view(B, self.lx, self.ly, D).permute(0, 3, 1, 2)
         
-        # 2. Append Coordinates
-        # coord_grid: (1, 2, Lx, Ly) -> expand to (B, 2, Lx, Ly)
-        coords = self.coord_grid.expand(B, -1, -1, -1).to(x.dtype) # ensure float64 compat
-        x_input = torch.cat([x_img, coords], dim=1) # (B, D+2, Lx, Ly)
+        # 2. Concatenate Coordinates
+        # Expand coords to match batch size
+        coords = self.coord_grid.expand(B, -1, -1, -1).to(x.dtype)
+        x_input = torch.cat([x_img, coords], dim=1)
         
-        # 3. Shared Convolutions (Spatial Mixing)
-        # 此时网络“知道”自己在哪里
-        features = self.feature_extractor(x_input) # (B, Hidden, Lx, Ly)
+        # 3. Extract Features (Position Aware due to input coordinates)
+        features = self.feature_extractor(x_input)
         
-        # 4. Independent Projection
-        # 允许边界 tensor 和 内部 tensor 有完全不同的参数分布
-        out_2d = self.site_dependent_proj(features) # (B, Max_Size, Lx, Ly)
+        # 4. Deep MLP Projection (Pointwise)
+        # Input: (B, Hidden, Lx, Ly) -> Output: (B, Max_Size, Lx, Ly)
+        out_2d = self.output_mlp(features)
         
-        # 5. Flatten & Output
-        raw_out = out_2d.flatten(2).permute(0, 2, 1) # (B, N, Max_Size)
+        # 5. Flatten back to sequence: (B, Max_Size, Lx, Ly) -> (B, N, Max_Size)
+        raw_out = out_2d.flatten(2).permute(0, 2, 1)
         
-        # Clipping parts (Same as before)
+        # 6. Clip and Concatenate according to param_sizes
         parts = []
         for i, size in enumerate(self.param_sizes):
             parts.append(raw_out[:, i, :size])
@@ -2543,6 +2614,15 @@ class TensorwiseMLPBackflow(nn.Module):
             # Ensure dtype
             mlp.to(dtype=dtype)
             self.mlps.append(mlp)
+    
+    def initialize_output_scale(self, scale):
+        print(f" -> [Init] TensorwiseMLPBackflow: Clamping output weights to scale {scale}")
+        for net in self.mlps:
+            # The last layer of the MLP is at index 2
+            last_layer = net[-1]
+            torch.nn.init.normal_(last_layer.weight, mean=0.0, std=scale)
+            if last_layer.bias is not None:
+                torch.nn.init.zeros_(last_layer.bias)
 
     def forward(self, attn_features):
         # attn_features: (Batch, N_sites, Embed_Dim)
@@ -2564,7 +2644,7 @@ class TensorwiseMLPBackflow(nn.Module):
 # ==============================================================================
 # 3. Main Vmap-Compatible Model
 # ==============================================================================
-class fTN_backflow_attn_Tensorwise_Model_vmap(nn.Module):
+class fTN_backflow_attn_Tensorwise_Model_vmap(BasefPEPSBackflowModel):
     def __init__(
         self, 
         ftn, 
@@ -2574,9 +2654,10 @@ class fTN_backflow_attn_Tensorwise_Model_vmap(nn.Module):
         nn_hidden_dim=4, 
         nn_eta=1.0, 
         dtype=torch.float32,
+        init_perturbation_scale=1e-5,
         **kwargs
     ):
-        super().__init__()
+        super().__init__(ftn, max_bond, nn_eta, dtype, kwargs.get('jitter_svd', 0), kwargs.get('debug_file'))
         self.dtype = dtype
         
         # --- 1. TN Parameter Setup ---
@@ -2641,7 +2722,5 @@ class fTN_backflow_attn_Tensorwise_Model_vmap(nn.Module):
         # Combine all parameters for optimizers
         self.params = nn.ParameterList(list(self.ftn_params) + list(self.nn_backflow.parameters()))
 
-    # ... (Reuse Logic) ...
-    tn_contraction = Transformer_fPEPS_Model_DConv2d.tn_contraction
-    vamp = Transformer_fPEPS_Model_DConv2d.vamp
-    forward = Transformer_fPEPS_Model_DConv2d.forward
+        # Initialize the MLP output layers to small random values
+        self.nn_backflow_generator.initialize_output_scale(scale=init_perturbation_scale)

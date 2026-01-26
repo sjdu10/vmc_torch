@@ -23,6 +23,7 @@ from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distribut
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
+from vmc_torch.optimizer import DecayScheduler
 # ==============================================================================
 import warnings
 warnings.filterwarnings("ignore")
@@ -64,11 +65,11 @@ model_config = {
     'embed_dim': 16,
     'attn_depth': 1,
     'attn_heads': 4,
-    'nn_hidden_dim': 4, #peps.nsites,
+    'nn_hidden_dim': D, #peps.nsites, D
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
-    'jitter_svd': 1,
+    'jitter_svd': 0,
     'uniform_kernel': 0,
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
@@ -81,33 +82,23 @@ init_kwargs.pop('dtype_str')
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
-fpeps_model = Transformer_fPEPS_Model_Cluster(
-    tn=peps,
-    dtype=model_dtype,
-    **init_kwargs
-)
-# fpeps_model = Transformer_fPEPS_Model_GlobalMLP(
+# fpeps_model = Transformer_fPEPS_Model_Cluster(
 #     tn=peps,
-#     max_bond=chi,
-#     embed_dim=16,
-#     attn_heads=4,
-#     attn_depth=1,
-#     nn_hidden_dim=peps.nsites,
-#     nn_eta=1,
-#     init_perturbation_scale=1e-3,
-#     dtype=torch.float64,
+#     dtype=model_dtype,
+#     **init_kwargs
 # )
+
 # fpeps_model = Transformer_fPEPS_Model_UNet(
 #     tn=peps,
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
 
-# fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
-#     ftn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
+fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
+    ftn=peps,
+    dtype=model_dtype,
+    **init_kwargs
+)
 
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 
@@ -119,15 +110,16 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(1e4) 
+Ns = int(2e4) 
 B = 1000
 B_grad = 500
-vmc_steps = 500
-init_step = 0
+vmc_steps = 200
+init_step = 600
 burn_in_steps = 10
 learning_rate = 0.1
 diag_shift = 1e-5
 save_state_every = 10
+scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-2)
 
 # Load Checkpoint
 file_path = f'{params_path}/{fpeps_model._get_name()}/chi={chi}/'
@@ -137,6 +129,15 @@ if init_step > 0:
     fpeps_model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
     if RANK == 0: 
         print(f'Loaded step {init_step}')
+
+# Broadcast RANK 0 parameters to all ranks (Important to ensure the training makes sense -- train the same model!!)
+curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
+COMM.Bcast(curr_params.detach().numpy(), root=0)
+curr_params = curr_params.to(model_dtype)
+# require gradient
+torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), curr_params)
+torch.nn.utils.vector_to_parameters(curr_params, fpeps_model.parameters())
+COMM.Barrier()
 
 # Grad Function
 get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_grad, verbose=False)
@@ -162,18 +163,18 @@ for svmc in range(init_step, vmc_steps + init_step):
     # fxs is updated and returned for the next step (Markov Chain)
     (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = (
         run_sampling_phase(
-            svmc,
-            Ns,
-            B,
-            fxs,
-            fpeps_model,
-            H,
-            H.graph,
-            get_grads,
-            COMM,
-            RANK,
-            SIZE,
-            should_burn_in=svmc == init_step,
+            svmc=svmc,
+            Ns=Ns,
+            B=B,
+            fxs=fxs,
+            model=fpeps_model,
+            hamiltonian=H,
+            graph=H.graph,
+            get_grads_func=get_grads,
+            comm=COMM,
+            rank=RANK,
+            size=SIZE,
+            should_burn_in=svmc==init_step,
             burn_in_steps=burn_in_steps,
         )
     )
@@ -199,8 +200,15 @@ for svmc in range(init_step, vmc_steps + init_step):
     # Master (Rank 0) participates in Allreduce but contributes 0 data
     
     dp, t_sr, info = distributed_minres_solver(
-        local_grads, local_amps, local_energies,
-        energy_mean, total_samples, n_params, diag_shift, COMM
+        local_grads=local_grads,
+        local_amps=local_amps,
+        local_energies=local_energies,
+        energy_mean=energy_mean,
+        total_samples=total_samples,
+        n_params=n_params,
+        diag_shift=diag_shift,
+        comm=COMM,
+        rtol=5e-5
     )
     
     if RANK == 0:
@@ -209,15 +217,19 @@ for svmc in range(init_step, vmc_steps + init_step):
         print(f" Batch Size: {B}, Grad Batch Size: {B_grad}, MKL: {os.environ['MKL_NUM_THREADS']}")
         print(f" Total Time: {MPI.Wtime() - t_start:.4f}s")
         print(f" Sample Time: {total_sample_time:.4f}s")
-        print(f" SR Time: {t_sr:.4f}s, Info: {info}")
+        print(f" SR Time: {t_sr:.4f}s, Info: {info}\n")
         
 
     # --- Step 4: Parameter Update ---
     # dp is already available on all ranks due to distributed solver
     with torch.no_grad():
-        dp_tensor = torch.tensor(dp, device='cpu', dtype=torch.float64)
+        dp_tensor = torch.tensor(dp, device='cpu', dtype=model_dtype)
         curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
-        new_params = curr_params - learning_rate * dp_tensor
+        lr = scheduler(svmc)
+        new_params = curr_params - lr * dp_tensor
+        COMM.Bcast(new_params.detach().numpy(), root=0)
+        new_params = new_params.to(model_dtype)
+        torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), new_params)
         torch.nn.utils.vector_to_parameters(new_params, fpeps_model.parameters())
 
     # --- Step 5: Logging (Master Only) ---
