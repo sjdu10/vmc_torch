@@ -110,9 +110,9 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(2e4) 
-B = 1000
-B_grad = 500
+Ns = int(1e3) 
+B = 125
+B_grad = 125
 vmc_steps = 200
 init_step = 0
 burn_in_steps = 0

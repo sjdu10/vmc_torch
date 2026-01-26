@@ -223,7 +223,7 @@ def run_sampling_phase(
                 active_workers -= 1
                 if source_rank in active_rank_ids:
                     active_rank_ids.remove(source_rank)
-                    print(f"Rank {source_rank} finished. Remaining: {active_rank_ids}")
+                    print(f"Rank {source_rank} finished with {finished_batch} samples. Remaining: {active_rank_ids}")
         
         print('Sampling phase should be done now.')
         pbar.close()
