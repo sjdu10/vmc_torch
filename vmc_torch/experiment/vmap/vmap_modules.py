@@ -1,3 +1,4 @@
+import sys
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -225,50 +226,57 @@ def run_sampling_phase(
 
     # --- Branch B: Worker ---
     else:
-        if should_burn_in:
-            current_step = 0
+        try:
+            if should_burn_in:
+                current_step = 0
 
-            while current_step < burn_in_steps:
-                fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
-                current_step += 1
+                while current_step < burn_in_steps:
+                    fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+                    current_step += 1
 
 
-        last_finished_batch = 0
-        while True:
-            # 1. Request / Report
-            buf = np.array([last_finished_batch], dtype=np.int32)
-            comm.Send([buf, MPI.INT], dest=0, tag=TAG_REQ)
-            
-            # 2. Wait Command
-            cmd = np.empty(1, dtype=np.int32)
-            comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
-            
-            if cmd[0] == CMD_STOP:
-                break
-            
-            # 3. Compute
-            # try:
-            t00 = MPI.Wtime()
-            fxs, current_amps = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
-            t11 = MPI.Wtime()
-            energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
-            t22 = MPI.Wtime()
-            grads_vec_batch, amps_batch = get_grads_func(fxs, model)
-            t33 = MPI.Wtime()
+            last_finished_batch = 0
+            while True:
+                # 1. Request / Report
+                buf = np.array([last_finished_batch], dtype=np.int32)
+                comm.Send([buf, MPI.INT], dest=0, tag=TAG_REQ)
+                
+                # 2. Wait Command
+                cmd = np.empty(1, dtype=np.int32)
+                comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
+                
+                if cmd[0] == CMD_STOP:
+                    break
+                
+                # 3. Compute
+                # try:
+                t00 = MPI.Wtime()
+                fxs, current_amps = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+                t11 = MPI.Wtime()
+                energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
+                t22 = MPI.Wtime()
+                grads_vec_batch, amps_batch = get_grads_func(fxs, model)
+                t33 = MPI.Wtime()
 
-            sample_time += t11 - t00
-            local_energy_time += t22 - t11
-            grad_time += t33 - t22
+                sample_time += t11 - t00
+                local_energy_time += t22 - t11
+                grad_time += t33 - t22
 
-            # Offload
-            E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
-            amps_vec.append(amps_batch.detach().cpu().numpy())
-            grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
-            
-            last_finished_batch = fxs.shape[0]
-            n_local += last_finished_batch
-            
-            del local_energies_batch, grads_vec_batch, amps_batch
+                # Offload
+                E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
+                amps_vec.append(amps_batch.detach().cpu().numpy())
+                grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
+                
+                last_finished_batch = fxs.shape[0]
+                n_local += last_finished_batch
+                
+                del local_energies_batch, grads_vec_batch, amps_batch
+        except Exception as e:
+            import traceback
+            error_msg = traceback.format_exc()
+            print(f"!!! Rank {rank} CRASHED with FATAL ERROR !!!\n{error_msg}")
+            sys.stdout.flush()
+            comm.Abort(1)
     
     comm.Barrier()
     
