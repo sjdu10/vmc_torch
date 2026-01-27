@@ -78,11 +78,11 @@ model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-# fpeps_model = Transformer_fPEPS_Model_Conv2d(
-#     tn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
+fpeps_model = Transformer_fPEPS_Model_Conv2d(
+    tn=peps,
+    dtype=model_dtype,
+    **init_kwargs
+)
 # fpeps_model = Transformer_fPEPS_Model_Cluster(
 #     tn=peps,
 #     dtype=model_dtype,
@@ -95,11 +95,11 @@ init_kwargs.pop('dtype_str')
 #     **init_kwargs
 # )
 
-fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
-    ftn=peps,
-    dtype=model_dtype,
-    **init_kwargs
-)
+# fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
+#     ftn=peps,
+#     dtype=model_dtype,
+#     **init_kwargs
+# )
 
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 
@@ -114,7 +114,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 Ns = int(1e2) 
 B = 10
 B_grad = 10
-vmc_steps = 200
+vmc_steps = 50
 init_step = 0
 burn_in_steps = 0
 learning_rate = 0.1
@@ -179,6 +179,7 @@ for svmc in range(init_step, vmc_steps + init_step):
             size=SIZE,
             should_burn_in=svmc==init_step,
             burn_in_steps=burn_in_steps,
+            verbose=True
         )
     )
     # if RANK == 1:

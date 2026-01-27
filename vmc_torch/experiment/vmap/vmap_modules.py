@@ -164,7 +164,8 @@ def run_sampling_phase(
     size: int,
     should_burn_in=False,
     burn_in_steps=10,
-    sampling_hopping_rate=0.25
+    sampling_hopping_rate=0.25,
+    verbose=False
 ):
     """
     Sampling loop with Dedicated Master
@@ -188,7 +189,7 @@ def run_sampling_phase(
     amps_vec = []
     grads_vec_list = []
     n_local = 0
-    max_n_local = abs(-(Ns / (size-1)) // B) * B # take ceiling 
+    # max_n_local = abs(-(Ns / (size-1)) // B) * B # take ceiling 
 
     t0 = MPI.Wtime()
     
@@ -213,6 +214,7 @@ def run_sampling_phase(
                 if finished_batch > 0:
                     n_collected += finished_batch
                     pbar.update(finished_batch)
+                    # pbar.refresh()
                 
                 next_batch = B
                 if n_dispatched < Ns:
@@ -220,7 +222,8 @@ def run_sampling_phase(
                     comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
                     has_sent_cmd = 1
                     n_dispatched += next_batch
-                    print(f"[Master] Dispatched {next_batch} samples to Rank {source_rank}. Total dispatched: {n_dispatched}.", flush=True)
+                    if verbose:
+                        print(f"[Master] Dispatched {next_batch} samples to Rank {source_rank}. Total dispatched: {n_dispatched}.", flush=True)
                 else:
                     cmd = np.array([CMD_STOP], dtype=np.int32)
                     comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
@@ -228,7 +231,8 @@ def run_sampling_phase(
                     active_workers -= 1
                     if source_rank in active_rank_ids:
                         active_rank_ids.remove(source_rank)
-                        print(f'[Master] Kill rank {source_rank} with {finished_batch} samples. Remaining num of active workers: {len(active_rank_ids)}, {active_workers}', flush=True)
+                        if verbose:
+                            print(f'[Master] Kill rank {source_rank} with {finished_batch} samples. Remaining num of active workers: {len(active_rank_ids)}, {active_workers}', flush=True)
                 
                 if n_collected >= Ns:
                     cmd = np.array([CMD_STOP], dtype=np.int32)
@@ -236,16 +240,20 @@ def run_sampling_phase(
                         comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
                         if source_rank in active_rank_ids:
                             active_rank_ids.remove(source_rank)
-                    print(f"\n[Master] Sample target reached ({n_collected}).", flush=True)
+                    if verbose:
+                        print(f"\n[Master] Sample target reached ({n_collected}).", flush=True)
                     break
                 
             else:
                 if n_collected >= Ns:
-                    print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}", flush=True)
+                    if verbose:
+                        print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}", flush=True)
                     break
                 time.sleep(0.001)
         
-        print('Sampling phase should be done now.', flush=True)
+        if verbose:
+            print('Sampling phase should be done now.', flush=True)
+            
         pbar.close()
 
         if len(active_rank_ids) > 0:
@@ -271,9 +279,6 @@ def run_sampling_phase(
                 # 2. Wait Command
                 cmd = np.empty(1, dtype=np.int32)
                 comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
-
-                if n_local >= max_n_local:
-                    assert cmd[0] == CMD_STOP, f"Rank {rank} exceeded max_n_local but received CMD_CONTINUE."
 
                 if cmd[0] == CMD_STOP:
                     break
