@@ -231,6 +231,7 @@ def run_sampling_phase(
                     for arank in active_rank_ids:
                         comm.Send([cmd, MPI.INT], dest=arank, tag=TAG_CMD)
                     print(f"\n[Master] Sample target reached ({n_collected}). Sent STOP to all remaining workers: {active_rank_ids}")
+                    break
 
                 
             else:
