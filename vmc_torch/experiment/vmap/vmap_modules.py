@@ -188,6 +188,7 @@ def run_sampling_phase(
     amps_vec = []
     grads_vec_list = []
     n_local = 0
+    max_n_local = abs(-(Ns / (size-1)) // B) * B # take ceiling 
 
     t0 = MPI.Wtime()
     
@@ -205,6 +206,7 @@ def run_sampling_phase(
                 status = MPI.Status()
                 buf = np.empty(1, dtype=np.int32)
                 comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
+                has_sent_cmd = 0
                 source_rank = status.Get_source()
                 finished_batch = buf[0]
                 
@@ -216,35 +218,38 @@ def run_sampling_phase(
                 if n_dispatched < Ns:
                     cmd = np.array([CMD_CONTINUE], dtype=np.int32)
                     comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                    has_sent_cmd = 1
                     n_dispatched += next_batch
+                    print(f"[Master] Dispatched {next_batch} samples to Rank {source_rank}. Total dispatched: {n_dispatched}.", flush=True)
                 else:
                     cmd = np.array([CMD_STOP], dtype=np.int32)
                     comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                    has_sent_cmd = 1
                     active_workers -= 1
                     if source_rank in active_rank_ids:
                         active_rank_ids.remove(source_rank)
-                        # print(f"Rank {source_rank} finished with {finished_batch} samples. Remaining: {active_rank_ids}")
-                        print(f'Remaining num of active workers: {len(active_rank_ids)}, {active_workers}')
+                        print(f'[Master] Kill rank {source_rank} with {finished_batch} samples. Remaining num of active workers: {len(active_rank_ids)}, {active_workers}', flush=True)
                 
                 if n_collected >= Ns:
                     cmd = np.array([CMD_STOP], dtype=np.int32)
-                    for arank in active_rank_ids:
-                        comm.Send([cmd, MPI.INT], dest=arank, tag=TAG_CMD)
-                    print(f"\n[Master] Sample target reached ({n_collected}). Sent STOP to all remaining workers: {active_rank_ids}")
+                    if has_sent_cmd == 0:
+                        comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                        if source_rank in active_rank_ids:
+                            active_rank_ids.remove(source_rank)
+                    print(f"\n[Master] Sample target reached ({n_collected}).", flush=True)
                     break
-
                 
             else:
                 if n_collected >= Ns:
-                    print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}")
+                    print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}", flush=True)
                     break
                 time.sleep(0.001)
         
-        print('Sampling phase should be done now.')
+        print('Sampling phase should be done now.', flush=True)
         pbar.close()
 
         if len(active_rank_ids) > 0:
-            print(f"ERROR: Finishing with {len(active_rank_ids)} dead ranks.")
+            print(f"ERROR: Finishing with {len(active_rank_ids)} dead ranks.", flush=True)
             comm.Abort(1)
 
     # --- Branch B: Worker ---
@@ -252,7 +257,6 @@ def run_sampling_phase(
         try:
             if should_burn_in:
                 current_step = 0
-
                 while current_step < burn_in_steps:
                     fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
                     current_step += 1
@@ -267,7 +271,10 @@ def run_sampling_phase(
                 # 2. Wait Command
                 cmd = np.empty(1, dtype=np.int32)
                 comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
-                
+
+                if n_local >= max_n_local:
+                    assert cmd[0] == CMD_STOP, f"Rank {rank} exceeded max_n_local but received CMD_CONTINUE."
+
                 if cmd[0] == CMD_STOP:
                     break
                 
@@ -297,10 +304,9 @@ def run_sampling_phase(
         except Exception as e:
             import traceback
             error_msg = traceback.format_exc()
-            print(f"!!! Rank {rank} CRASHED with FATAL ERROR !!!\n{error_msg}")
+            print(f"!!! Rank {rank} CRASHED with FATAL ERROR !!!\n{error_msg}", flush=True)
             sys.stdout.flush()
             comm.Abort(1)
-    
     comm.Barrier()
     
     # Pack Results
