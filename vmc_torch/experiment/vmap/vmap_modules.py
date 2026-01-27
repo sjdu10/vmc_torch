@@ -27,6 +27,18 @@ def use_jitter_svd():
     finally:
         _ENABLE_JITTER = False
 
+def gentle_barrier(comm, sleep_interval=0.01):
+    """
+    A non-blocking barrier that periodically yields CPU to avoid busy-waiting.
+    """
+    # non-blocking barrier
+    request = comm.Ibarrier()
+    
+    # check completion in a loop
+    while not request.Test():
+        # key: yield CPU while waiting
+        time.sleep(sleep_interval)
+
 # === SVD Patch ===
 if not hasattr(torch.linalg, 'svd_orig'):
     torch.linalg.svd_orig = torch.linalg.svd
@@ -312,7 +324,9 @@ def run_sampling_phase(
             print(f"!!! Rank {rank} CRASHED with FATAL ERROR !!!\n{error_msg}", flush=True)
             sys.stdout.flush()
             comm.Abort(1)
-    comm.Barrier()
+    
+    # Rest the CPU until all ranks finish
+    gentle_barrier(comm, sleep_interval=0.01)
     
     # Pack Results
     if n_local > 0:

@@ -9,6 +9,7 @@ import pickle
 from functools import partial
 import torch
 import json
+import autoray as ar
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
 from vmc_torch.experiment.vmap.vmap_models import (
@@ -17,10 +18,13 @@ from vmc_torch.experiment.vmap.vmap_models import (
 from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_reuse
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
+from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
+from vmc_torch.optimizer import DecayScheduler
 # ==============================================================================
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
+ar.register_function('torch','linalg.svd', RobustSVD.apply)
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
@@ -63,7 +67,7 @@ model_config = {
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
-    'jitter_svd': 1,
+    'jitter_svd': 0,
     'uniform_kernel': 0,
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
@@ -100,6 +104,7 @@ burn_in_steps = 5
 learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10
+scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-2)
 
 # Load Checkpoint
 file_path = f'{params_path}/{fpeps_model._get_name()}/chi={chi}/'
@@ -109,6 +114,14 @@ if init_step > 0:
     fpeps_model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
     if RANK == 0: 
         print(f'Loaded step {init_step}')
+# Broadcast RANK 0 parameters to all ranks (Important to ensure the training makes sense -- train the same model!!)
+curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
+COMM.Bcast(curr_params.detach().numpy(), root=0)
+curr_params = curr_params.to(model_dtype)
+# require gradient
+torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), curr_params)
+torch.nn.utils.vector_to_parameters(curr_params, fpeps_model.parameters())
+COMM.Barrier()
 
 # Grad Function
 get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_grad, verbose=False)
@@ -189,9 +202,13 @@ for svmc in range(init_step, vmc_steps + init_step):
     # --- Step 4: Parameter Update ---
     # dp is already available on all ranks due to distributed solver
     with torch.no_grad():
-        dp_tensor = torch.tensor(dp, device='cpu', dtype=torch.float64)
+        dp_tensor = torch.tensor(dp, device='cpu', dtype=model_dtype)
         curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
-        new_params = curr_params - learning_rate * dp_tensor
+        lr = scheduler(svmc)
+        new_params = curr_params - lr * dp_tensor
+        COMM.Bcast(new_params.detach().numpy(), root=0)
+        new_params = new_params.to(model_dtype)
+        torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), new_params)
         torch.nn.utils.vector_to_parameters(new_params, fpeps_model.parameters())
 
     # --- Step 5: Logging (Master Only) ---

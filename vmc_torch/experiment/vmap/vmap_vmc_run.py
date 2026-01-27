@@ -40,9 +40,9 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 2
-N_f = Lx * Ly - 2
-D, chi = 4, -10
+Lx, Ly = 8, 8
+N_f = Lx * Ly - 8
+D, chi = 4, 8
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -204,7 +204,6 @@ for svmc in range(init_step, vmc_steps + init_step):
     # --- Step 3: Optimization Phase (SR) ---
     # Now this is just a single function call!
     # Master (Rank 0) participates in Allreduce but contributes 0 data
-    
     dp, t_sr, info = distributed_minres_solver(
         local_grads=local_grads,
         local_amps=local_amps,
