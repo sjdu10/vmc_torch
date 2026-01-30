@@ -29,7 +29,7 @@ from vmc_torch.optimizer import DecayScheduler
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
-ar.register_function('torch','linalg.svd', RobustSVD.apply)
+ar.register_function('torch','linalg.svd', partial(RobustSVD.apply, jitter=1e-10))
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()

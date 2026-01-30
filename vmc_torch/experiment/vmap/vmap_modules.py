@@ -68,8 +68,8 @@ def vmap_friendly_svd(A, full_matrices=True, *, driver=None, **kwargs):
     else:
         return torch.linalg.svd_orig(A, full_matrices=full_matrices, driver=driver, **kwargs)
 
-# Apply Patch （Must be done before any SVD operation in vmap）
-torch.linalg.svd = vmap_friendly_svd
+# # Apply Patch （Must be done before any SVD operation in vmap）
+# torch.linalg.svd = vmap_friendly_svd
 
 def distributed_minres_solver(
     local_grads, 

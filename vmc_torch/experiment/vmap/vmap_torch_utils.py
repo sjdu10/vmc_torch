@@ -13,7 +13,7 @@ class RobustSVD(torch.autograd.Function):
     generate_vmap_rule = True
 
     @staticmethod
-    def forward(A):
+    def forward(A, jitter_strength=1e-12):
         """
         forward must be a pure function of pytorch operations.
         """
@@ -22,7 +22,7 @@ class RobustSVD(torch.autograd.Function):
         scale = torch.amax(torch.abs(A), dim=(-2, -1), keepdim=True)
         
         # Jitter
-        relative_eps = 1e-12
+        relative_eps = jitter_strength
         
         M, N = A.shape[-2:]
         eye = torch.eye(M, N, device=A.device, dtype=A.dtype)
@@ -107,7 +107,7 @@ class RobustSVD(torch.autograd.Function):
             # delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
             dA = dA + delta
 
-        return dA
+        return dA, None
 
-def svd_robust(A):
-    return RobustSVD.apply(A)
+def svd_robust(A, jitter=1e-12):
+    return RobustSVD.apply(A, jitter)
