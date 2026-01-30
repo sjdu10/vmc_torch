@@ -15,7 +15,7 @@ from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_c
 from vmc_torch.experiment.vmap.vmap_models import (
     fPEPS_Model_reuse
 )
-from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_reuse
+from vmc_torch.experiment.vmap.vmap_modules import distributed_minres_solver, run_sampling_phase_reuse
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
@@ -35,9 +35,9 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 2
-N_f = Lx * Ly - 2
-D, chi = 4, -1
+Lx, Ly = 8, 8
+N_f = Lx * Ly - 8
+D, chi = 4, 16
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -95,12 +95,12 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(1e3) 
-B = 100
-B_grad = 100
-vmc_steps = 500
+Ns = int(1e2) 
+B = 10
+B_grad = 10
+vmc_steps = 50
 init_step = 0
-burn_in_steps = 5
+burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10
@@ -161,7 +161,8 @@ for svmc in range(init_step, vmc_steps + init_step):
             SIZE,
             should_burn_in=svmc == init_step,
             burn_in_steps=burn_in_steps,
-            sampling_hopping_rate=0.25
+            sampling_hopping_rate=0.25,
+            verbose=True
         )
     )
     
@@ -185,7 +186,7 @@ for svmc in range(init_step, vmc_steps + init_step):
     # Now this is just a single function call!
     # Master (Rank 0) participates in Allreduce but contributes 0 data
     
-    dp, t_sr = distributed_minres_solver(
+    dp, t_sr, info = distributed_minres_solver(
         local_grads, local_amps, local_energies,
         energy_mean, total_samples, n_params, diag_shift, COMM
     )
@@ -196,7 +197,7 @@ for svmc in range(init_step, vmc_steps + init_step):
         print(f" Batch Size: {B}, Grad Batch Size: {B_grad}, MKL: {os.environ['MKL_NUM_THREADS']}")
         print(f" Total Time: {MPI.Wtime() - t_start:.4f}s")
         print(f" Sample Time: {total_sample_time:.4f}s")
-        print(f" SR Time: {t_sr:.4f}s")
+        print(f" SR Time: {t_sr:.4f}s, Info: {info}\n")
         
 
     # --- Step 4: Parameter Update ---

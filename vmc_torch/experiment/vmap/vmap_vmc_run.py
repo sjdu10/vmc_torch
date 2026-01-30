@@ -17,7 +17,8 @@ from vmc_torch.experiment.vmap.vmap_models import (
     Transformer_fPEPS_Model_GlobalMLP,
     Transformer_fPEPS_Model_Cluster,
     Transformer_fPEPS_Model_DConv2d,
-    fTN_backflow_attn_Tensorwise_Model_vmap
+    fTN_backflow_attn_Tensorwise_Model_vmap,
+    fPEPS_Model
 )
 from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_vec
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
@@ -42,7 +43,7 @@ torch.set_num_threads(1)
 # ==============================================================================
 Lx, Ly = 8, 8
 N_f = Lx * Ly - 8
-D, chi = 4, 8
+D, chi = 4, 16
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -78,11 +79,16 @@ model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-fpeps_model = Transformer_fPEPS_Model_Conv2d(
+fpeps_model = fPEPS_Model(
     tn=peps,
     dtype=model_dtype,
     **init_kwargs
 )
+# fpeps_model = Transformer_fPEPS_Model_Conv2d(
+#     tn=peps,
+#     dtype=model_dtype,
+#     **init_kwargs
+# )
 # fpeps_model = Transformer_fPEPS_Model_Cluster(
 #     tn=peps,
 #     dtype=model_dtype,
@@ -100,6 +106,7 @@ fpeps_model = Transformer_fPEPS_Model_Conv2d(
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
+
 
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 

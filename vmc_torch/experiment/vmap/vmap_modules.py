@@ -362,17 +362,18 @@ def run_sampling_phase_reuse(
     size: int,
     should_burn_in=False,
     burn_in_steps=10,
-    sampling_hopping_rate=0.25
+    sampling_hopping_rate=0.25,
+    verbose=False
 ):
     """
-    运行 Dedicated Master 模式的采样循环
+    Sampling loop with Dedicated Master
     
     Returns:
-        local_data: (energies, grads, amps) 的 numpy 数组
-        fxs: 更新后的构型 (用于下一次热启动)
-        stats: dict, 包含时间统计和样本数
+        local_data: (energies, grads, amps), numpy arrays
+        fxs: initial configs in a batch
+        stats: dict, containing timing statistics and sample counts
     """
-    # 定义 Tag
+    # Define Tags
     TAG_REQ = 100
     TAG_CMD = 101
     CMD_CONTINUE = 0
@@ -386,6 +387,7 @@ def run_sampling_phase_reuse(
     amps_vec = []
     grads_vec_list = []
     n_local = 0
+    # max_n_local = abs(-(Ns / (size-1)) // B) * B # take ceiling 
 
     t0 = MPI.Wtime()
     
@@ -395,79 +397,92 @@ def run_sampling_phase_reuse(
         n_collected = 0
         n_dispatched = 0
         active_workers = size - 1
+        active_rank_ids = set(range(1, size))
         
         while active_workers > 0:
-            status = MPI.Status()
-            buf = np.empty(1, dtype=np.int32)
-            comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
-            source_rank = status.Get_source()
-            finished_batch = buf[0]
-            
-            if finished_batch > 0:
-                n_collected += finished_batch
-                pbar.update(finished_batch)
-            elif finished_batch < 0: # worker failed
-                n_dispatched += finished_batch # revert dispatch count
-                print(f"Master detected failure from Rank {source_rank}, reverting dispatched count by {-finished_batch}.")
-            
-            next_batch = B
-            if n_dispatched < Ns:
-                cmd = np.array([CMD_CONTINUE], dtype=np.int32)
-                comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                n_dispatched += next_batch
+            has_message = comm.Iprobe(source=MPI.ANY_SOURCE, tag=TAG_REQ)
+            if has_message:
+                status = MPI.Status()
+                buf = np.empty(1, dtype=np.int32)
+                comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
+                has_sent_cmd = 0
+                source_rank = status.Get_source()
+                finished_batch = buf[0]
+                
+                if finished_batch > 0:
+                    n_collected += finished_batch
+                    pbar.update(finished_batch)
+                    # pbar.refresh()
+                
+                next_batch = B
+                if n_dispatched < Ns:
+                    cmd = np.array([CMD_CONTINUE], dtype=np.int32)
+                    comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                    has_sent_cmd = 1
+                    n_dispatched += next_batch
+                    if verbose:
+                        print(f"[Master] Dispatched {next_batch} samples to Rank {source_rank}. Total dispatched: {n_dispatched}.", flush=True)
+                else:
+                    cmd = np.array([CMD_STOP], dtype=np.int32)
+                    comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                    has_sent_cmd = 1
+                    active_workers -= 1
+                    if source_rank in active_rank_ids:
+                        active_rank_ids.remove(source_rank)
+                        if verbose:
+                            print(f'[Master] Kill rank {source_rank} with {finished_batch} samples. Remaining num of active workers: {len(active_rank_ids)}, {active_workers}', flush=True)
+                
+                if n_collected >= Ns:
+                    cmd = np.array([CMD_STOP], dtype=np.int32)
+                    if has_sent_cmd == 0:
+                        comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
+                        if source_rank in active_rank_ids:
+                            active_rank_ids.remove(source_rank)
+                    if verbose:
+                        print(f"\n[Master] Sample target reached ({n_collected}).", flush=True)
+                    break
+                
             else:
-                cmd = np.array([CMD_STOP], dtype=np.int32)
-                comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                active_workers -= 1
+                if n_collected >= Ns:
+                    if verbose:
+                        print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}", flush=True)
+                    break
+                time.sleep(0.001)
+        
+        if verbose:
+            print('Sampling phase should be done now.', flush=True)
+            
         pbar.close()
+
+        if len(active_rank_ids) > 0:
+            print(f"ERROR: Finishing with {len(active_rank_ids)} dead ranks.", flush=True)
+            comm.Abort(1)
 
     # --- Branch B: Worker ---
     else:
-        if should_burn_in:
-            current_step = 0
-            max_resets = 3  # to prevent infinite loops
-            reset_count = 0
-
-            while current_step < burn_in_steps:
-                try:
+        try:
+            if should_burn_in:
+                current_step = 0
+                while current_step < burn_in_steps:
                     fxs, _ = sample_next_reuse(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
                     current_step += 1
 
-                except RuntimeError as e:
-                    print(f"Rank {rank} encountered error during burn-in sampling: {e}")
-                    # === Permutation (Physical Reset) ===
-                    # Only resort to this if all else fails.
-                    # Cost: must reset current_step = 0
-                    if reset_count < max_resets:
-                        print(f"Rank {rank}: Burn-in failed. Permuting configs and RESTARTING burn-in.")
-                        with torch.no_grad():
-                            for i in range(fxs.shape[0]):
-                                perm = torch.randperm(fxs.shape[1])
-                                fxs[i] = fxs[i][perm]
-                        
-                        # CRITICAL: reset progress!
-                        current_step = 0
-                        reset_count += 1
-                    else:
-                        raise RuntimeError(f"Rank {rank} failed burn-in too many times.")
 
+            last_finished_batch = 0
+            while True:
+                # 1. Request / Report
+                buf = np.array([last_finished_batch], dtype=np.int32)
+                comm.Send([buf, MPI.INT], dest=0, tag=TAG_REQ)
+                
+                # 2. Wait Command
+                cmd = np.empty(1, dtype=np.int32)
+                comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
 
-        last_finished_batch = 0
-        err_trial = 0
-        while True:
-            # 1. Request / Report
-            buf = np.array([last_finished_batch], dtype=np.int32)
-            comm.Send([buf, MPI.INT], dest=0, tag=TAG_REQ)
-            
-            # 2. Wait Command
-            cmd = np.empty(1, dtype=np.int32)
-            comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
-            
-            if cmd[0] == CMD_STOP:
-                break
-            
-            # 3. Compute
-            try:
+                if cmd[0] == CMD_STOP:
+                    break
+                
+                # 3. Compute
+                # try:
                 t00 = MPI.Wtime()
                 fxs, current_amps = sample_next_reuse(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
                 t11 = MPI.Wtime()
@@ -489,14 +504,15 @@ def run_sampling_phase_reuse(
                 n_local += last_finished_batch
                 
                 del local_energies_batch, grads_vec_batch, amps_batch
-            except RuntimeError as e:
-                print(f"Rank {rank} Error: {e}")
-                last_finished_batch = -B # Report Failure
-                err_trial += 1
-            if err_trial >= 5:
-                raise RuntimeError(f"Rank {rank} failed too many times during sampling phase.")
+        except Exception as e:
+            import traceback
+            error_msg = traceback.format_exc()
+            print(f"!!! Rank {rank} CRASHED with FATAL ERROR !!!\n{error_msg}", flush=True)
+            sys.stdout.flush()
+            comm.Abort(1)
     
-    comm.Barrier()
+    # Rest the CPU until all ranks finish
+    gentle_barrier(comm, sleep_interval=0.01)
     
     # Pack Results
     if n_local > 0:
