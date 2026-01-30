@@ -6,7 +6,7 @@ import math
 from typing import Optional
 from vmc_torch.nn_sublayers import SelfAttn_block_pos
 from typing import List
-from vmc_torch.experiment.vmap.vmap_modules import use_jitter_svd, vmap_friendly_svd
+from vmc_torch.experiment.vmap.vmap_torch_utils import use_jitter_svd, vmap_friendly_svd
 # ==============================================================================
 torch.linalg.svd = vmap_friendly_svd
 

@@ -1,11 +1,57 @@
 import torch
+import contextlib
+
+# === Global control ===
+_ENABLE_JITTER = False
+
+@contextlib.contextmanager
+def use_jitter_svd():
+    global _ENABLE_JITTER
+    _ENABLE_JITTER = True
+    try:
+        yield
+    finally:
+        _ENABLE_JITTER = False
+
+# === SVD Patch ===
+if not hasattr(torch.linalg, 'svd_orig'):
+    torch.linalg.svd_orig = torch.linalg.svd
+
+def vmap_friendly_svd(A, full_matrices=True, *, driver=None, **kwargs):
+    if _ENABLE_JITTER:
+        # Inside vmap, A is a BatchedTensor.
+        # We add a very small diagonal perturbation.
+        # For double (float64), 1e-12 is safe.
+        
+        # 1. Construct perturbation matrix (Identity)
+        # Note: Here we need to handle the case where A is not square, only add on the diagonal
+        M, N = A.shape[-2], A.shape[-1]
+        
+        # Create diagonal noise (using PyTorch broadcasting to be compatible with vmap batch dimensions)
+        # jitter_scale = A.norm(dim=(-2,-1), keepdim=True) * 1e-12 # Relative jitter is safer
+        jitter_val = 1e-12 * A.norm(dim=(-2,-1), keepdim=True)
+        
+        # Construct a diagonal matrix with the same device and type as A
+        # torch.eye is compatible with vmap's automatic broadcasting
+        eye = torch.eye(M, N, device=A.device, dtype=A.dtype) * jitter_val
+        
+        # 2. Perform addition (vmap compatible)
+        A_new = A + eye
+        return torch.linalg.svd_orig(A_new, full_matrices=full_matrices, driver=driver, **kwargs)
+    else:
+        return torch.linalg.svd_orig(A, full_matrices=full_matrices, driver=driver, **kwargs)
+
+# Apply Patch （Must be done before any SVD operation in vmap）
+torch.linalg.svd = vmap_friendly_svd
+
+
 def safe_inverse(x, epsilon=1e-12):
     """ Lorentzian broadening of the inverse to avoid division by zero. """
     return x / (x.pow(2) + epsilon)
 
 class RobustSVD(torch.autograd.Function):
     """
-    Robust SVD with Relative Jitter and NaN Guard.
+    Robust SVD with Relative Jitter.
     Updated for PyTorch 2.0+ (torch.func / vmap compatibility).
     """
     

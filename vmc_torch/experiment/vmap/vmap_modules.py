@@ -11,21 +11,9 @@ from vmc_torch.experiment.vmap.vmap_utils import (
     sample_next_reuse,
     evaluate_energy_reuse,
 )
+from vmc_torch.experiment.vmap.vmap_torch_utils import use_jitter_svd
 import scipy.sparse.linalg as spla
 from mpi4py import MPI
-import contextlib
-
-# === Global control ===
-_ENABLE_JITTER = False
-
-@contextlib.contextmanager
-def use_jitter_svd():
-    global _ENABLE_JITTER
-    _ENABLE_JITTER = True
-    try:
-        yield
-    finally:
-        _ENABLE_JITTER = False
 
 def gentle_barrier(comm, sleep_interval=0.01):
     """
@@ -38,38 +26,6 @@ def gentle_barrier(comm, sleep_interval=0.01):
     while not request.Test():
         # key: yield CPU while waiting
         time.sleep(sleep_interval)
-
-# === SVD Patch ===
-if not hasattr(torch.linalg, 'svd_orig'):
-    torch.linalg.svd_orig = torch.linalg.svd
-
-def vmap_friendly_svd(A, full_matrices=True, *, driver=None, **kwargs):
-    if _ENABLE_JITTER:
-        # Inside vmap, A is a BatchedTensor.
-        # We add a very small diagonal perturbation.
-        # For double (float64), 1e-12 is safe.
-        
-        # 1. Construct perturbation matrix (Identity)
-        # Note: Here we need to handle the case where A is not square, only add on the diagonal
-        M, N = A.shape[-2], A.shape[-1]
-        
-        # Create diagonal noise (using PyTorch broadcasting to be compatible with vmap batch dimensions)
-        # jitter_scale = A.norm(dim=(-2,-1), keepdim=True) * 1e-12 # Relative jitter is safer
-        jitter_val = 1e-12 * A.norm(dim=(-2,-1), keepdim=True)
-        # jitter_val = 1e-5
-        
-        # Construct a diagonal matrix with the same device and type as A
-        # torch.eye is compatible with vmap's automatic broadcasting
-        eye = torch.eye(M, N, device=A.device, dtype=A.dtype) * jitter_val
-        
-        # 2. Perform addition (vmap compatible)
-        A_new = A + eye
-        return torch.linalg.svd_orig(A_new, full_matrices=full_matrices, driver=driver, **kwargs)
-    else:
-        return torch.linalg.svd_orig(A, full_matrices=full_matrices, driver=driver, **kwargs)
-
-# # Apply Patch （Must be done before any SVD operation in vmap）
-# torch.linalg.svd = vmap_friendly_svd
 
 def distributed_minres_solver(
     local_grads, 
@@ -687,43 +643,7 @@ def run_sampling_phase_vec(
             n_local += last_finished_batch
             
             del local_energies_batch, grads_vec_batch, amps_batch
-            # except RuntimeError as e:
-            #     print(f"Rank {rank} encountered error during sampling/energy/grad computation: {e}")
-            #     # save fxs for debugging to current directory
-            #     torch.save(fxs, f'fxs_error_rank_{rank}_step_{svmc}.pt')
-                
-            #     # === Jitter SVD Attempt ===
-            #     try:
-            #         with use_jitter_svd():
-            #             print(f"Local SVD Jitter Applied to Rank {rank} during sampling phase.")
-            #             # 3. Compute
-            #             t00 = MPI.Wtime()
-            #             fxs, current_amps = sample_next(fxs, model, graph, verbose=False)
-            #             t11 = MPI.Wtime()
-                        
-            #             energy_batch, local_energies_batch = evaluate_energy(fxs, model, hamiltonian, current_amps, verbose=False)
-            #             t22 = MPI.Wtime()
-                        
-            #             grads_vec_batch, amps_batch = get_grads_func(fxs, model)
-            #             t33 = MPI.Wtime()
-
-            #             sample_time += t11 - t00
-            #             local_energy_time += t22 - t11
-            #             grad_time += t33 - t22
-
-            #             # Offload
-            #             E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
-            #             amps_vec.append(amps_batch.detach().cpu().numpy())
-            #             grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
-                        
-            #             last_finished_batch = fxs.shape[0]
-            #             n_local += last_finished_batch
-                        
-            #             del local_energies_batch, grads_vec_batch, amps_batch
-            #     except RuntimeError as e_jitter:
-            #         last_finished_batch = -B
-            #         print(f"Rank {rank} failed even with jitter during sampling phase: {e_jitter}")
-    
+            
     comm.Barrier()
     
     # Pack Results

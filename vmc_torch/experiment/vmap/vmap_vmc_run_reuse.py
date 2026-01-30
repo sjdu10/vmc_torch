@@ -25,7 +25,7 @@ import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
 SVD_JITTER = 1e-10
-ar.register_function('torch', 'linalg.svd', lambda x, **kwargs: RobustSVD.apply(x, SVD_JITTER))
+ar.register_function('torch', 'linalg.svd', lambda x: RobustSVD.apply(x, SVD_JITTER))
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()

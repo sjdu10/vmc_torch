@@ -9,6 +9,37 @@ comm = MPI.COMM_WORLD
 RANK = comm.Get_rank()
 SIZE = comm.Get_size()
 
+# =============== Debug ================
+def are_pytrees_equal(tree1, tree2):
+    from torch.utils import _pytree as pytree
+    import torch
+    # Flatten both trees
+    leaves1, spec1 = pytree.tree_flatten(tree1)
+    leaves2, spec2 = pytree.tree_flatten(tree2)
+    
+    # 1. Compare structure (TreeSpec)
+    if spec1 != spec2:
+        print("Tree structures differ.")
+        return False
+    
+    # 2. Compare leaves (Tensors/Values)
+    if len(leaves1) != len(leaves2):
+        print("Number of leaves differ.")
+        return False
+        
+    for l1, l2 in zip(leaves1, leaves2):
+        if torch.is_tensor(l1) and torch.is_tensor(l2):
+            if not torch.equal(l1, l2):
+                print("Tensor leaves differ.")
+                return False
+        else:
+            if (l1 != l2).any():
+                print("Non-tensor leaves differ.")
+                print("l1:", l1)
+                print("l2:", l2)
+                return False
+                
+    return True
 
 #=== Utility functions for Metropolis-Hastings sampling ===#
 
@@ -52,74 +83,75 @@ def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25, seed=No
 
 def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25, **kwargs):
     """
-    完全向量化的 Propose 函数 (GPU Friendly)。
-    一次性处理一批构型，无 CPU-GPU 同步。
+    Fully vectorized Propose function (GPU Friendly).
+    Processes a batch of configurations in one pass without CPU-GPU synchronization.
     
     Args:
-        i, j: (int) 发生交换/hopping 的 site 索引
+        i, j: (int) Site indices where exchange/hopping occurs
         current_configs: (Batch, N_sites) Tensor, dtype=long/int
-        hopping_rate: (float) 跳跃概率
+        hopping_rate: (float) Hopping probability
         
     Returns:
-        proposed_configs: (Batch, N_sites) 新的构型
-        change_mask: (Batch,) bool Tensor, 指示哪些样本发生了有效改变
+        proposed_configs: (Batch, N_sites) New configurations
+        change_mask: (Batch,) bool Tensor indicating which samples underwent valid changes
     """
     B = current_configs.shape[0]
     device = current_configs.device
     
-    # 粒子数映射表: 0->0, 1->1, 2->1, 3->2
-    # 放到 device 上以便索引
-    # 建议在外部定义为全局常量以避免重复创建，但在函数内创建开销也很小
+    # Particle number mapping: 0->0, 1->1, 2->1, 3->2
+    # Place on device for indexing
+    # Recommended to define as global constant externally to avoid repeated creation,
+    # but creating inside function has minimal overhead
     n_map = torch.tensor([0, 1, 1, 2], device=device, dtype=torch.long)
     
-    # 提取第 i 列和第 j 列 (Batch,)
+    # Extract column i and column j (Batch,)
     col_i = current_configs[:, i]
     col_j = current_configs[:, j]
     
-    # 1. 基础检查：如果两个位置状态相同，则无法交换或hopping
-    # 对应原代码: if current_config[i] == current_config[j]: return ..., 0
+    # 1. Basic check: if states at two positions are identical, no exchange or hopping possible
+    # Corresponds to original code: if current_config[i] == current_config[j]: return ..., 0
     diff_mask = (col_i != col_j)
     
-    # 2. 随机决定是 Exchange 还是 Hopping
-    # 生成 (Batch,) 的随机数
+    # 2. Randomly decide between Exchange or Hopping
+    # Generate (Batch,) random numbers
     rand_vals = torch.rand(B, device=device)
     
-    # 只有状态不同 (diff_mask) 的才需要处理
+    # Only process samples where states differ (diff_mask)
     is_exchange = (rand_vals < (1 - hopping_rate)) & diff_mask
     is_hopping = (~is_exchange) & diff_mask
     
-    # 初始化新的一列，默认等于旧的
+    # Initialize new columns, default equal to old
     new_col_i = col_i.clone()
     new_col_j = col_j.clone()
     
-    # --- A. 处理 Exchange (以及 delta_n=1 的 Hopping) ---
-    # 计算粒子数
+    # --- A. Handle Exchange (and Hopping with delta_n=1) ---
+    # Calculate particle numbers
     n_i = n_map[col_i]
     n_j = n_map[col_j]
     delta_n = (n_i - n_j).abs()
     
-    # 原逻辑：delta_n == 1 时也是简单的 swap
+    # Original logic: delta_n == 1 also requires simple swap
     mask_swap = is_exchange | (is_hopping & (delta_n == 1))
     
     if mask_swap.any():
         new_col_i[mask_swap] = col_j[mask_swap]
         new_col_j[mask_swap] = col_i[mask_swap]
         
-    # --- B. 处理 Hopping (delta_n = 0 或 2) ---
-    # 仅当 is_hopping 为 True 时才检查这些条件
+    # --- B. Handle Hopping (delta_n = 0 or 2) ---
+    # Only check these conditions when is_hopping is True
     
     # Case: delta_n == 0 (e.g. u,d -> 0,ud)
-    # 目标: 随机变为 (0, 3) 或 (3, 0)
+    # Target: randomly become (0, 3) or (3, 0)
     mask_d0 = is_hopping & (delta_n == 0)
     if mask_d0.any():
-        # 生成随机位: 0 或 1
+        # Generate random bits: 0 or 1
         rand_bits = torch.randint(0, 2, (B,), device=device, dtype=torch.bool)
         
-        # 准备目标值常量
+        # Prepare target value constants
         val_0 = torch.tensor(0, device=device, dtype=col_i.dtype)
         val_3 = torch.tensor(3, device=device, dtype=col_i.dtype)
         
-        # 根据 rand_bits 选择 i 是 0 还是 3
+        # Based on rand_bits, choose whether i is 0 or 3
         # rand=0 -> i=0, j=3; rand=1 -> i=3, j=0
         target_i = torch.where(rand_bits, val_3, val_0)
         target_j = torch.where(rand_bits, val_0, val_3)
@@ -128,7 +160,7 @@ def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25, **
         new_col_j[mask_d0] = target_j[mask_d0]
 
     # Case: delta_n == 2 (e.g. 0,ud -> u,d)
-    # 目标: 随机变为 (1, 2) 或 (2, 1)
+    # Target: randomly become (1, 2) or (2, 1)
     mask_d2 = is_hopping & (delta_n == 2)
     if mask_d2.any():
         rand_bits_2 = torch.randint(0, 2, (B,), device=device, dtype=torch.bool)
@@ -143,14 +175,14 @@ def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25, **
         new_col_i[mask_d2] = target_i_2[mask_d2]
         new_col_j[mask_d2] = target_j_2[mask_d2]
         
-    # 3. 组装结果
-    # 克隆整个 configs (GPU上内存拷贝很快)
+    # 3. Assemble results
+    # Clone entire configs (GPU memory copy is very fast)
     proposed_configs = current_configs.clone()
     proposed_configs[:, i] = new_col_i
     proposed_configs[:, j] = new_col_j
     
-    # diff_mask 基本上覆盖了所有有效变化，
-    # 因为 hopping 规则 (u,d)->(0,3) 肯定会改变状态。
+    # diff_mask essentially covers all valid changes,
+    # because hopping rules (u,d)->(0,3) must change state
     return proposed_configs, diff_mask
 
 
@@ -372,51 +404,48 @@ def sample_next_vec(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, s
     n_updates = 0
     t0 = time.time()
     
-    # 合并 row_edges 和 col_edges 循环，减少重复代码
+    # Merge row_edges and col_edges loops to reduce code duplication
     all_edges = []
     for edges in graph.row_edges.values(): 
         all_edges.extend(edges)
     for edges in graph.col_edges.values(): 
         all_edges.extend(edges)
-    
-    # 如果 edge 很多，考虑 shuffle，防止遍历顺序造成的 bias (虽然 sweeps 多了无所谓)
-    # random.shuffle(all_edges) 
 
     for edge in all_edges:
         n_updates += 1
         i, j = edge
         
-        # 1. 直接调用向量化函数，不需要 list comprehension
+        # 1. Call vectorized function directly without list comprehension
         proposed_fxs, new_flags = propose_exchange_or_hopping_vec(i, j, fxs, hopping_rate)
         
-        # 快速检查: 如果所有 sample 都没有产生有效 update (比如都是同色自旋交换)，直接跳过
+        # Quick check: if all samples have no valid update (e.g., same-spin exchange), skip
         if not new_flags.any():
             continue
         
-        # 2. Compute Amplitudes (只计算改变了的)
-        # 注意: 即使不需要 update 的，proposed_amps 也要初始化为 current_amps
+        # 2. Compute Amplitudes (only for changed samples)
+        # Note: Initialize proposed_amps to current_amps even for unchanged samples
         proposed_amps = current_amps.clone()
         
-        # 仅对 new_flags 为 True 的部分计算模型
+        # Compute model only for parts where new_flags is True
         new_proposed_fxs = proposed_fxs[new_flags]
         new_proposed_amps = fpeps_model(new_proposed_fxs)
         proposed_amps[new_flags] = new_proposed_amps
         
-        # 3. Accept/Reject (完全向量化，无 .item() 调用)
-        # ratio calculation
-        # 为了数值稳定性，建议在 log domain 做 (如果 model 输出 log_psi)，如果是 psi，直接平方
-        # 避免除以 0: 虽然物理上 psi 不应为 0，但可以加个 epsilon
+        # 3. Accept/Reject (fully vectorized, no .item() calls)
+        # Ratio calculation
+        # For numerical stability, consider working in log domain if model outputs log_psi
+        # If raw psi, square directly. Avoid division by zero with small epsilon
         ratio = (proposed_amps.abs()**2) / (current_amps.abs()**2 + 1e-18)
         
-        # 向量化生成随机数
+        # Vectorized random number generation
         probs = torch.rand(B, device=device)
         
-        # 生成掩码: 只有 new_flags 为 True 且 随机数 < ratio 的才接受
-        # torch.minimum(ratio, 1) 其实不需要显式写，因为 probs 也是 [0, 1)
+        # Create mask: accept only where new_flags is True and random < ratio
+        # torch.minimum(ratio, 1) not needed since probs is in [0, 1)
         accept_mask = new_flags & (probs < ratio)
         
         # 4. Update (In-place update using masking)
-        # 使用 torch.where 或者索引赋值，避免 Python loop
+        # Use torch.where or indexing to avoid Python loop
         if accept_mask.any():
             fxs[accept_mask] = proposed_fxs[accept_mask]
             current_amps[accept_mask] = proposed_amps[accept_mask]
@@ -429,7 +458,26 @@ def sample_next_vec(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, s
 
 @torch.inference_mode()
 def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False):
-    # TODO: divide the connected configs into chunks of size fxs.shape[0] to avoid OOM
+    r"""Calculate local energy and energy expectation value for a batch of configurations.
+
+    Math:
+        Local energy for configuration $|s\rangle$:
+        $$E_{\text{loc}}(s) = \sum_{s'} H_{s,s'} \frac{\langle s'|\psi\rangle}{\langle s|\psi\rangle}$$
+
+        Energy expectation value:
+        $$E = \frac{1}{N} \sum_s E_{\text{loc}}(s)$$
+
+    Args:
+        fxs: (B, N) Tensor of configurations.
+        fpeps_model: Function that takes in (B, N) Tensor and returns (B,) Tensor of amplitudes.
+        H: Hamiltonian object with method get_conn(config) that returns connected configurations and coefficients.
+        current_amps: (B,) Tensor of amplitudes for fxs.
+        verbose: Whether to print verbose output.
+
+    Returns:
+        energy: Scalar Tensor of energy expectation value.
+        local_energies: (B,) Tensor of local energies for each configuration.
+    """
     B = fxs.shape[0]
     # get connected configurations and coefficients
     conn_eta_num = []
@@ -703,8 +751,8 @@ def evaluate_energy_vec(fxs, fpeps_model, H, current_amps, verbose=False):
     B = fxs.shape[0]
     device = fxs.device
     
-    # 1. 准备连接配置 (Hamiltonian Logic - 依然在 CPU)
-    # 这一步如果 H.get_conn 是瓶颈，需要重写 H 类使其支持 vectorization
+    # 1. Prepare connected configurations (Hamiltonian Logic - still on CPU)
+    # If H.get_conn is a bottleneck, need to rewrite H class to support vectorization
     conn_eta_num = []
     conn_etas = []
     conn_eta_coeffs = []
@@ -712,37 +760,37 @@ def evaluate_energy_vec(fxs, fpeps_model, H, current_amps, verbose=False):
     for fx in fxs:
         eta, coeffs = H.get_conn(fx)
         conn_eta_num.append(len(eta))
-        conn_etas.append(torch.as_tensor(eta, device=device))     # 直接转到 device
+        conn_etas.append(torch.as_tensor(eta, device=device))     # Direct transfer to device
         conn_eta_coeffs.append(torch.as_tensor(coeffs, device=device))
         
     conn_etas = torch.cat(conn_etas, dim=0)
     conn_eta_coeffs = torch.cat(conn_eta_coeffs, dim=0)
     
-    # 记录每个 sample 有多少个连接配置，用于后续还原
+    # Record how many connected configurations each sample has, for later reconstruction
     conn_eta_num = torch.tensor(conn_eta_num, device=device) # (B,)
 
-    # 2. Batch 计算 connected amplitudes
-    # 这是一个大矩阵运算，效率很高
-    chunk_size = B # 或者更大，取决于显存
+    # 2. Batch compute connected amplitudes
+    # This is a large matrix operation with high efficiency
+    chunk_size = B # Or larger, depending on available memory
     conn_amps_list = []
     for i in range(0, conn_etas.shape[0], chunk_size):
         conn_amps_list.append(fpeps_model(conn_etas[i:i+chunk_size]))
     conn_amps = torch.cat(conn_amps_list)
 
-    # 3. 向量化计算 Local Energies (消除 CPU Loop)
+    # 3. Vectorized computation of Local Energies (eliminate CPU loop)
     
-    # 我们需要构造一个 batch_index 来告诉 GPU 哪些 conn_amps 属于第 b 个样本
-    # 例如 conn_eta_num = [2, 3], 那么 batch_ids = [0, 0, 1, 1, 1]
+    # Construct a batch_index to tell GPU which conn_amps belong to the b-th sample
+    # For example, if conn_eta_num = [2, 3], then batch_ids = [0, 0, 1, 1, 1]
     batch_ids = torch.repeat_interleave(torch.arange(B, device=device), conn_eta_num)
     
-    # 扩展 current_amps 以匹配 conn_amps 的长度
+    # Expand current_amps to match the length of conn_amps
     # current_amps_expanded = [amp[0], amp[0], amp[1], amp[1], amp[1]]
     current_amps_expanded = current_amps[batch_ids]
     
-    # 计算每一项的 H_s's * (psi_s' / psi_s)
+    # Calculate each term: H_s's * (psi_s' / psi_s)
     terms = conn_eta_coeffs * (conn_amps / current_amps_expanded)
     
-    # 聚合结果: 将 terms 按照 batch_ids 加回到 local_energies
+    # Aggregate results: accumulate terms back to local_energies according to batch_ids
     local_energies = torch.zeros(B, device=device, dtype=terms.dtype)
     local_energies.index_add_(0, batch_ids, terms)
 
@@ -753,7 +801,9 @@ def evaluate_energy_vec(fxs, fpeps_model, H, current_amps, verbose=False):
 
     return energy, local_energies
 
+
 def flatten_params(parameters):
+    """Utility function to flatten model parameters into a single vector."""
     vec = []
     for param in parameters:
         # Ensure the parameters are located in the same device
@@ -766,11 +816,11 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
         # need per sample gradient of amplitude -- jacobian
         if vmap_grad:
             B = fxs.shape[0]
-            # 确定 chunk size
+            # Determine chunk size
             B_grad = batch_size if batch_size is not None else B
             
-            # 1. 准备参数 PyTree
-            # 兼容 ParameterList, ParameterDict 或直接的 Tensor List
+            # 1. Prepare parameters PyTree
+            # Compatible with ParameterList, ParameterDict or direct Tensor List
             params_pytree = (
                 list(fpeps_model.params)
                 if isinstance(fpeps_model.params, torch.nn.ParameterList)
@@ -779,21 +829,21 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
                 else fpeps_model.params
             )
 
-            # 2. 定义单样本函数 (Single Sample Function)
-            # vmap 要求我们定义处理 "单个样本" 的逻辑
+            # 2. Define single sample function
+            # vmap requires us to define the logic for processing a "single sample"
             def single_sample_amp_func(x_i, p):
                 amp = fpeps_model.vamp(x_i.unsqueeze(0), p).squeeze(0)
                 return amp, amp # (Loss target, Aux data)
 
-            # 3. 定义 vmap(grad)
-            # argnums=1: 对 params_pytree 求导
-            # in_dims=(0, None): 对 x_i 进行 batch 映射，对 p 进行广播
+            # 3. Define vmap(grad)
+            # argnums=1: compute gradient with respect to params_pytree
+            # in_dims=(0, None): batch map over x_i, broadcast over p
             grad_vmap_fn = torch.vmap(
                 torch.func.grad(single_sample_amp_func, argnums=1, has_aux=True),
                 in_dims=(0, None)
             )
 
-            # 4. Chunking Loop
+            # 4. Chunking loop
             grads_pytree_chunks = []
             amps_chunks = []
             
@@ -808,16 +858,16 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
                 
                 del grads_chunk, amps_c
 
-            # 5. 结果拼接
+            # 5. Concatenate results
             amps = torch.cat(amps_chunks, dim=0)
             if amps.dim() == 1: amps = amps.unsqueeze(-1)
             def concat_leaves(*leaves):
                 return torch.cat(leaves, dim=0)
             full_grads_pytree = tree_map(concat_leaves, *grads_pytree_chunks)
 
-            # 6. Flatten to Vector (B, Np)
+            # 6. Flatten to vector (B, Np)
             leaves, _ = tree_flatten(full_grads_pytree)
-            # 每个 leaf 现在是 (B, Param_Shape)
+            # Each leaf is now (B, Param_Shape)
             # Flatten start_dim=1 -> (B, Param_Size)
             flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
             batched_grads_vec = torch.cat(flat_leaves, dim=1)
@@ -829,7 +879,7 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             if verbose and RANK == 1:
                 print(f"Single Batched vmap(grad) time: {t1 - t0}")
 
-            # detect if batched_grads_vec contains NaN or Inf
+            # Detect if batched_grads_vec contains NaN or Inf
             if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
                 print(f"NaN or Inf detected in batched_grads_vec in RANK {RANK}")
                 comm.Abort(1)
@@ -866,7 +916,7 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
                     jac_pytree_b = tree_map(lambda x: x.detach(), jac_pytree_b)
                     jac_pytree_list.append(jac_pytree_b)
                     amps_list.append(amps_b)
-                # concatenate jac_pytree_list along batch dimension
+                # Concatenate jac_pytree_list along batch dimension
                 jac_pytree = tree_map(lambda *leaves: torch.cat(leaves, dim=0), *jac_pytree_list)
                 amps = torch.cat(amps_list, dim=0)
                 t1 = time.time()
@@ -881,7 +931,7 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             batched_grads_vec = torch.cat(leaves_flattend, dim=1) # shape (B, Np), Np is number of parameters
             amps.unsqueeze_(1)  # shape (B, 1)
             
-            # clear grads and cached computational graph to save memory on CPU
+            # Clear grads and cached computational graph to save memory on CPU
             batched_grads_vec = batched_grads_vec.detach()
             amps = amps.detach()
             del jac_pytree
@@ -1023,36 +1073,3 @@ def random_initial_config(N_f, N_sites, seed=None):
     assert num_1 == N_f//2 and num_2 == N_f//2, f"Number of spin up and spin down fermions should be {N_f//2}, but got {num_1} and {num_2}"
 
     return doped_config
-
-
-# =============== Debug ================
-def are_pytrees_equal(tree1, tree2):
-    from torch.utils import _pytree as pytree
-    import torch
-    # Flatten both trees
-    leaves1, spec1 = pytree.tree_flatten(tree1)
-    leaves2, spec2 = pytree.tree_flatten(tree2)
-    
-    # 1. Compare structure (TreeSpec)
-    if spec1 != spec2:
-        print("Tree structures differ.")
-        return False
-    
-    # 2. Compare leaves (Tensors/Values)
-    if len(leaves1) != len(leaves2):
-        print("Number of leaves differ.")
-        return False
-        
-    for l1, l2 in zip(leaves1, leaves2):
-        if torch.is_tensor(l1) and torch.is_tensor(l2):
-            if not torch.equal(l1, l2):
-                print("Tensor leaves differ.")
-                return False
-        else:
-            if (l1 != l2).any():
-                print("Non-tensor leaves differ.")
-                print("l1:", l1)
-                print("l2:", l2)
-                return False
-                
-    return True
