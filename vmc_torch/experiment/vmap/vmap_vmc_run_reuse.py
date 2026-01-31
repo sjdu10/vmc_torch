@@ -57,8 +57,8 @@ for site in peps.sites:
 # ==============================================================================
 # Model Configuration (Define this FIRST)
 # ==============================================================================
-# 将所有用于初始化的超参数放在这里
-# 注意：ftn (peps) 通常太大或是对象，不适合存json，只要记录生成peps的参数(Lx, Ly等)即可
+# Put all hyperparameters for initialization here
+# Note: ftn (peps) is usually too large or an object, not suitable for json storage, only record the parameters used to generate peps (Lx, Ly, etc.)
 model_config = {
     'max_bond': chi,
     'embed_dim': 16,

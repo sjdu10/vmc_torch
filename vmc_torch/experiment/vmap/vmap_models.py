@@ -6,9 +6,8 @@ import math
 from typing import Optional
 from vmc_torch.nn_sublayers import SelfAttn_block_pos
 from typing import List
-from vmc_torch.experiment.vmap.vmap_torch_utils import use_jitter_svd, vmap_friendly_svd
+from vmc_torch.experiment.vmap.vmap_torch_utils import use_jitter_svd
 # ==============================================================================
-torch.linalg.svd = vmap_friendly_svd
 
 class PEPS_Model(nn.Module):
     def __init__(self, tn, max_bond, dtype=torch.float64):
@@ -430,8 +429,8 @@ class fPEPS_Model(nn.Module):
         # might need to specify the right site ordering here
         amp = tn.isel({tn.site_ind(site): x[i] for i, site in enumerate(tn.sites)})
         if self.chi > 0:
-            amp.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[0, amp.Ly//2-1])
-            amp.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[amp.Ly//2, amp.Ly-1])
+            amp.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[0, amp.Lx//2-1])
+            amp.contract_boundary_from_xmax_(max_bond=self.chi, cutoff=0.0, xrange=[amp.Lx//2, amp.Lx-1])
         return amp.contract()
     
     def vamp(self, x, params):

@@ -8,9 +8,9 @@ import time
 from tqdm import tqdm
 
 # 假设这些是你现有的工具库
-from vmc_torch.experiment.vmap.GPU_vmap_utils import sample_next, evaluate_energy, compute_grads, random_initial_config
-from vmc_torch.experiment.vmap.GPU_vmap_utils import Transformer_fPEPS_Model_batchedAttn, fPEPS_Model
-from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
+from vmc_torch.experiment.vmap.GPU.GPU_vmap_utils import sample_next, evaluate_energy, compute_grads, random_initial_config
+from vmc_torch.experiment.vmap.vmap_models import PEPS_Model, fPEPS_Model
+from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch, spin_Heisenberg_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 import quimb.tensor as qtn
 
@@ -41,13 +41,14 @@ RANK, WORLD_SIZE, device = setup_distributed()
 
 # 设置默认精度
 torch.set_default_dtype(torch.float64)
+torch.set_default_device(device)
 # 不同 Rank 设置不同随机种子，保证采样独立
 torch.manual_seed(42 + RANK)
 
 # ==========================================
 # 2. 参数设置与模型加载
 # ==========================================
-Lx, Ly = 4, 2
+Lx, Ly = 2, 2
 nsites = Lx * Ly
 N_f = nsites
 D = 4
@@ -67,7 +68,7 @@ peps = qtn.unpack(params_pkl, skeleton)
 
 # 预处理 (CPU)
 for ts in peps.tensors:
-    ts.modify(data=ts.data.to_flat() * 10)
+    ts.modify(data=ts.data.to_flat() * 4)
 for site in peps.sites:
     peps[site].data._label = site
     peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1))
@@ -80,11 +81,13 @@ fpeps_model = fPEPS_Model(
     tn=peps, max_bond=chi, dtype=torch.float64,
 )
 fpeps_model.to(device) # <--- 关键：模型全在 GPU
+# # 尝试编译模型
+# fpeps_model = torch.compile(fpeps_model, mode="default", fullgraph=False)
 
 # 初始化权重
 model_params_vec = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
-init_std = float(model_params_vec.std().item()) * 0.1
-fpeps_model.apply(lambda x: init_weights_to_zero(x, std=init_std))
+# init_std = float(model_params_vec.std().item()) * 0.1
+# fpeps_model.apply(lambda x: init_weights_to_zero(x, std=init_std))
 
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0:
@@ -109,7 +112,7 @@ graph = H.graph
 # ==========================================
 # 3. 采样配置
 # ==========================================
-Total_Ns = int(2e2)  # 总样本数
+Total_Ns = int(1e3)  # 总样本数
 # 确保每个 Rank 分到的样本数是整数
 assert Total_Ns % WORLD_SIZE == 0, f"Total samples {Total_Ns} must be divisible by World Size {WORLD_SIZE}"
 samples_per_rank = Total_Ns // WORLD_SIZE
@@ -119,7 +122,7 @@ samples_per_rank = Total_Ns // WORLD_SIZE
 # 如果显存不够，可以设小一点，循环多次累积
 batch_size_per_rank = 64
 # 确保初始化 walkers 在 GPU 上
-fxs_list = [random_initial_config(N_f, nsites, seed=42) for _ in range(batch_size_per_rank)]
+fxs_list = [random_initial_config(N_f, nsites, seed=42+_) for _ in range(batch_size_per_rank)]
 fxs = torch.stack(fxs_list).to(device)
 
 # Burn-in (Warmup)
