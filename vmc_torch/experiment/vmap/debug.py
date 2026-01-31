@@ -40,9 +40,9 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 4
-N_f = Lx * Ly - 2
-D, chi = 4, 4
+Lx, Ly = 8, 8
+N_f = Lx * Ly - 8
+D, chi = 8, 8
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -53,7 +53,7 @@ params = pickle.load(open(params_path + f'peps_su_params{appendix}.pkl', 'rb'))
 skeleton = pickle.load(open(params_path + f'peps_skeleton{appendix}.pkl', 'rb'))
 peps = qtn.unpack(params, skeleton)
 for ts in peps.tensors: 
-    ts.modify(data=ts.data.to_flat()*4)
+    ts.modify(data=ts.data.to_flat()*5)
 for site in peps.sites: 
     peps[site].data._label = site
     peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1)) # Important for U1->Z2 fPEPS

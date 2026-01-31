@@ -65,7 +65,8 @@ class RobustSVD(torch.autograd.Function):
         """
         # --- 1. Jitter Logic (Same as before) ---
         # A: (Batch, M, N) or (M, N)
-        scale = torch.amax(torch.abs(A), dim=(-2, -1), keepdim=True)
+        # scale = torch.amax(torch.abs(A), dim=(-2, -1), keepdim=True)
+        scale = A.norm(dim=(-2,-1), keepdim=True)
         
         # Jitter
         relative_eps = jitter_strength

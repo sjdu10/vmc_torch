@@ -12,7 +12,13 @@ from vmc_torch.experiment.vmap.GPU.GPU_vmap_utils import sample_next, evaluate_e
 from vmc_torch.experiment.vmap.vmap_models import PEPS_Model, fPEPS_Model
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch, spin_Heisenberg_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
+from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
+import autoray as ar
 import quimb.tensor as qtn
+
+JITTER = 0
+driver='gesvd'
+ar.register_function('torch', 'linalg.svd', lambda x, **kwargs: RobustSVD.apply(x, jitter_strength=JITTER, driver=driver))
 
 # ==========================================
 # 1. 初始化 Distributed 环境 (GPU Native)
@@ -48,9 +54,9 @@ torch.manual_seed(42 + RANK)
 # ==========================================
 # 2. 参数设置与模型加载
 # ==========================================
-Lx, Ly = 2, 2
+Lx, Ly = 4, 4
 nsites = Lx * Ly
-N_f = nsites
+N_f = nsites - 2
 D = 4
 chi = -1
 
@@ -81,8 +87,8 @@ fpeps_model = fPEPS_Model(
     tn=peps, max_bond=chi, dtype=torch.float64,
 )
 fpeps_model.to(device) # <--- 关键：模型全在 GPU
-# # 尝试编译模型
-# fpeps_model = torch.compile(fpeps_model, mode="default", fullgraph=False)
+# 尝试编译模型
+fpeps_model = torch.compile(fpeps_model, mode="default", fullgraph=False)
 
 # 初始化权重
 model_params_vec = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
@@ -112,7 +118,7 @@ graph = H.graph
 # ==========================================
 # 3. 采样配置
 # ==========================================
-Total_Ns = int(1e3)  # 总样本数
+Total_Ns = int(64)  # 总样本数
 # 确保每个 Rank 分到的样本数是整数
 assert Total_Ns % WORLD_SIZE == 0, f"Total samples {Total_Ns} must be divisible by World Size {WORLD_SIZE}"
 samples_per_rank = Total_Ns // WORLD_SIZE
