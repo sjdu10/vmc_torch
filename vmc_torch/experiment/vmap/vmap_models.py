@@ -403,7 +403,7 @@ class PEPS_Model_reuse(nn.Module):
         )
 
 class fPEPS_Model(nn.Module):
-    def __init__(self, tn, max_bond, dtype=torch.float64, **kwargs):
+    def __init__(self, tn, max_bond, dtype=torch.float64, compile=False, contract_boundary_opts={}, **kwargs):
         import quimb as qu
         import quimb.tensor as qtn
         super().__init__()
@@ -411,6 +411,7 @@ class fPEPS_Model(nn.Module):
         params, skeleton = qtn.pack(tn)
         self.dtype = dtype
         self.skeleton = skeleton
+        self.contract_boundary_opts = contract_boundary_opts
         self.chi = max_bond
         # for torch, further flatten pytree into a single list
         params_flat, params_pytree = qu.utils.tree_flatten(
@@ -423,22 +424,30 @@ class fPEPS_Model(nn.Module):
             torch.as_tensor(x, dtype=self.dtype) for x in params_flat
         ])
 
+        self._vmapped_amplitude = torch.vmap(
+            self.amplitude,
+            in_dims=(0, None)
+        ) # pre-vmap the amplitude function for efficiency
+
+        if compile:
+            self._vmapped_amplitude = torch.compile(
+                self._vmapped_amplitude, 
+                fullgraph=False,
+                mode="default",
+            )
     
     def amplitude(self, x, params):
         tn = qtn.unpack(params, self.skeleton)
         # might need to specify the right site ordering here
         amp = tn.isel({tn.site_ind(site): x[i] for i, site in enumerate(tn.sites)})
         if self.chi > 0:
-            amp.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[0, amp.Lx//2-1])
-            amp.contract_boundary_from_xmax_(max_bond=self.chi, cutoff=0.0, xrange=[amp.Lx//2, amp.Lx-1])
+            amp.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[0, amp.Lx//2-1], **self.contract_boundary_opts)
+            amp.contract_boundary_from_xmax_(max_bond=self.chi, cutoff=0.0, xrange=[amp.Lx//2, amp.Lx-1], **self.contract_boundary_opts)
         return amp.contract()
     
     def vamp(self, x, params):
         params = qu.utils.tree_unflatten(params, self.params_pytree)
-        return torch.vmap(
-            self.amplitude,
-            in_dims=(0, None),
-        )(x, params)
+        return self._vmapped_amplitude(x, params)
 
     def forward(self, x):
         return self.vamp(x, self.params)
@@ -1833,8 +1842,10 @@ class BasefPEPSBackflowModel(nn.Module):
         dtype=torch.float64,
         jitter_svd=False,
         debug_file=None,
+        contract_boundary_opts={}
     ):
         super().__init__()
+        self.contract_boundary_opts = contract_boundary_opts
         self.dtype = dtype
         self.jitter_svd = jitter_svd
         self.debug_file = debug_file
@@ -1941,8 +1952,8 @@ class BasefPEPSBackflowModel(nn.Module):
         
         # Contract boundary environments if max_bond is set
         if self.chi > 0:
-            amp.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[0, amp.Ly//2-1])
-            amp.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[amp.Ly//2, amp.Ly-1])
+            amp.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[0, amp.Ly//2-1], **self.contract_boundary_opts)
+            amp.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[amp.Ly//2, amp.Ly-1], **self.contract_boundary_opts)
         
         return amp.contract()
 

@@ -267,9 +267,6 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             t0 = time.time()
             jac_pytree, amps = torch.func.jacrev(g, argnums=1, has_aux=True)(fxs, params_pytree)
             t1 = time.time()
-            # if verbose:
-            #     if RANK == 0:
-            #         print(f"Vectorized jacobian time: {t1 - t0}")
         else:
             B = fxs.shape[0]
             B_grad = batch_size
@@ -285,9 +282,6 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             jac_pytree = tree_map(lambda *leaves: torch.cat(leaves, dim=0), *jac_pytree_list)
             amps = torch.cat(amps_list, dim=0)
             t1 = time.time()
-            # if verbose:
-            #     if RANK == 0:
-            #         print(f"Batched Vectorized jacobian time: {t1 - t0}")
                     
         # jac_pytree has same shape as params_pytree, each leaf has shape (B, )
 

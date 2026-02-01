@@ -16,8 +16,8 @@ from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
 import autoray as ar
 import quimb.tensor as qtn
 
-JITTER = 0
-driver='gesvd'
+JITTER = 1e-10
+driver = None
 ar.register_function('torch', 'linalg.svd', lambda x, **kwargs: RobustSVD.apply(x, jitter_strength=JITTER, driver=driver))
 
 # ==========================================
@@ -85,10 +85,14 @@ for site in peps.sites:
 # )
 fpeps_model = fPEPS_Model(
     tn=peps, max_bond=chi, dtype=torch.float64,
+    compile=False,
+    contract_boundary_opts={
+        'mode': 'mps',
+        'equalize_norms': 1.0,
+        'canonize': True,
+    }
 )
 fpeps_model.to(device) # <--- 关键：模型全在 GPU
-# 尝试编译模型
-fpeps_model = torch.compile(fpeps_model, mode="default", fullgraph=False)
 
 # 初始化权重
 model_params_vec = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
@@ -118,7 +122,7 @@ graph = H.graph
 # ==========================================
 # 3. 采样配置
 # ==========================================
-Total_Ns = int(64)  # 总样本数
+Total_Ns = int(4096)  # 总样本数
 # 确保每个 Rank 分到的样本数是整数
 assert Total_Ns % WORLD_SIZE == 0, f"Total samples {Total_Ns} must be divisible by World Size {WORLD_SIZE}"
 samples_per_rank = Total_Ns // WORLD_SIZE
@@ -126,7 +130,8 @@ samples_per_rank = Total_Ns // WORLD_SIZE
 # 并行运行的 Chain 数量 (Batch Size)
 # 如果显存够，可以直接设为 samples_per_rank，这样一步到位
 # 如果显存不够，可以设小一点，循环多次累积
-batch_size_per_rank = 64
+batch_size_per_rank = 4096
+grad_batch_size = 512
 # 确保初始化 walkers 在 GPU 上
 fxs_list = [random_initial_config(N_f, nsites, seed=42+_) for _ in range(batch_size_per_rank)]
 fxs = torch.stack(fxs_list).to(device)
@@ -172,7 +177,7 @@ for step in range(vmc_steps):
         
         # 3. 计算梯度
         # batch_size=batch_size_per_rank 表示一次处理完，避免 OOM
-        local_grads, local_amps = compute_grads(fxs, fpeps_model, vectorize=True)
+        local_grads, local_amps = compute_grads(fxs, fpeps_model, vectorize=True, batch_size=grad_batch_size)
         
         # 4. 收集 (还是 GPU tensor)
         # 裁剪掉多余的样本 (如果 batch_size 不整除 samples_per_rank)
@@ -234,30 +239,33 @@ for step in range(vmc_steps):
         # 如果 Np < Total_Ns (参数少，样本多)，应该算 (Np, Np) 的协方差矩阵
         # 如果 Np > Total_Ns (参数多，样本少)，minSR 算 (Ns, Ns) 的 Gram Matrix
         
-        if minSR:
-            # T is (Ns, Ns) - usually small
-            T = O_sk @ O_sk.conj().T
-            # Add small diagonal shift for numerical stability
-            diag_shift = 1e-4
-            T += diag_shift * torch.eye(T.shape[0], device=T.device, dtype=T.dtype)
-            # Pseudo-inverse
-            T_inv = torch.linalg.pinv(T, rtol=1e-12, hermitian=True)
+        # if minSR:
+        #     # T is (Ns, Ns) - usually small
+        #     T = O_sk @ O_sk.conj().T
+        #     # Add small diagonal shift for numerical stability
+        #     diag_shift = 1e-4
+        #     T += diag_shift * torch.eye(T.shape[0], device=T.device, dtype=T.dtype)
+        #     # Pseudo-inverse
+        #     T_inv = torch.linalg.pinv(T, rtol=1e-12, hermitian=True)
 
-            # dp = O^dagger * T_inv * E_s
-            # (Np, Ns) @ (Ns, Ns) @ (Ns, ) -> (Np, )
-            dp = O_sk.conj().T @ (T_inv @ E_s)
-        else:
-            # 也可以在这里实现 Iterative Solver (CG/MinRes) using torch.linalg
-            # T is (Ns, Ns) - usually small
-            T = O_sk @ O_sk.conj().T
-            # Add small diagonal shift for numerical stability
-            diag_shift = 1e-4
-            T += diag_shift * torch.eye(T.shape[0], device=T.device, dtype=T.dtype)
-            x = torch.linalg.solve(T, E_s)
+        #     # dp = O^dagger * T_inv * E_s
+        #     # (Np, Ns) @ (Ns, Ns) @ (Ns, ) -> (Np, )
+        #     dp = O_sk.conj().T @ (T_inv @ E_s)
+        # else:
+        #     # 也可以在这里实现 Iterative Solver (CG/MinRes) using torch.linalg
+        #     # T is (Ns, Ns) - usually small
+        #     T = O_sk @ O_sk.conj().T
+        #     # Add small diagonal shift for numerical stability
+        #     diag_shift = 1e-4
+        #     T += diag_shift * torch.eye(T.shape[0], device=T.device, dtype=T.dtype)
+        #     x = torch.linalg.solve(T, E_s)
 
-            # dp = O^dagger * x
-            # (Np, Ns) @ (Ns, ) -> (Np, )
-            dp = O_sk.conj().T @ x
+        #     # dp = O^dagger * x
+        #     # (Np, Ns) @ (Ns, ) -> (Np, )
+        #     dp = O_sk.conj().T @ x
+
+        # use energy grad as dp
+        dp = O_sk.conj().T @ E_s
 
         # 打印信息
         print(f"Step {step}: E = {E_mean.item()/nsites:.6f}, Var = {E_var.item()/nsites**2:.2e}, Std of E_mean = {(E_var.item()/(Total_Ns*nsites**2))**0.5:.2e}")

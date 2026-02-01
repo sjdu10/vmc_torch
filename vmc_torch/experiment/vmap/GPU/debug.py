@@ -25,7 +25,7 @@ Lx, Ly = 4, 4
 nsites = Lx * Ly
 N_f = nsites - 2
 D = 4
-chi = 4
+chi = -1
 
 # 路径配置 (保持你的原样)
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
@@ -70,4 +70,5 @@ batch_size_per_rank = 64
 fxs_list = [random_initial_config(N_f, nsites, seed=42+_) for _ in range(batch_size_per_rank)]
 fxs = torch.stack(fxs_list).to(device)
 
-print(fpeps_model(fxs))
+# print(fpeps_model(fxs))
+print(c_fpeps_model(fxs))

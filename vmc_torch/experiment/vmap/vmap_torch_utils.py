@@ -59,7 +59,7 @@ class RobustSVD(torch.autograd.Function):
     generate_vmap_rule = True
 
     @staticmethod
-    def forward(A, jitter_strength=1e-12, driver=None):
+    def forward(A, jitter_strength, driver):
         """
         forward must be a pure function of pytorch operations.
         """
