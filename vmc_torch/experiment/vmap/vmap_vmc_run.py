@@ -23,15 +23,19 @@ from vmc_torch.experiment.vmap.vmap_models import (
 from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_vec
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
-from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
+from vmc_torch.experiment.vmap.vmap_torch_utils import robust_svd_wrapper, qr_svd_wrapper, robust_svd_wrapper_random, qr_svd_wrapper_random
 from vmc_torch.optimizer import DecayScheduler
 # ==============================================================================
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
-JITTER = 1e-10
-ar.register_function('torch','linalg.svd', lambda x: RobustSVD.apply(x, JITTER))
 
+
+SVD_JITTER = 1e-10
+driver = None
+# ar.register_function('torch','linalg.svd', lambda x: robust_svd_wrapper(x, jitter=SVD_JITTER, driver=driver))
+ar.register_function('torch','linalg.svd', lambda x: qr_svd_wrapper(x, jitter=SVD_JITTER, driver=driver))
+# ==============================================================================
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
 SIZE = COMM.Get_size()
@@ -42,9 +46,9 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 4
+Lx, Ly = 4, 2
 N_f = Lx * Ly - 2
-D, chi = 4, -1
+D, chi = 4, 8
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -119,9 +123,9 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(64) 
-B = 64
-B_grad = 64
+Ns = int(1000) 
+B = 100
+B_grad = B // 2
 vmc_steps = 50
 init_step = 0
 burn_in_steps = 0
