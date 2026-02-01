@@ -33,8 +33,9 @@ warnings.filterwarnings("ignore")
 
 SVD_JITTER = 1e-10
 driver = None
+jitter_seed = 42
 # ar.register_function('torch','linalg.svd', lambda x: robust_svd_wrapper(x, jitter=SVD_JITTER, driver=driver))
-ar.register_function('torch','linalg.svd', lambda x: qr_svd_wrapper(x, jitter=SVD_JITTER, driver=driver))
+ar.register_function('torch','linalg.svd', lambda x: robust_svd_wrapper_random(x, jitter=SVD_JITTER, driver=driver, seed=jitter_seed))
 # ==============================================================================
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
@@ -76,7 +77,6 @@ model_config = {
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
-    'jitter_svd': 0,
     'uniform_kernel': 0,
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
@@ -84,21 +84,31 @@ model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-fpeps_model = fPEPS_Model(
-    tn=peps,
-    dtype=model_dtype,
-    **init_kwargs
-)
+# fpeps_model = fPEPS_Model(
+#     tn=peps,
+#     dtype=model_dtype,
+#     contract_boundary_opts={
+#         'mode': 'mps',
+#         'equalize_norms': 1.0,
+#         'canonize': True,
+#     },
+#     **init_kwargs
+# )
 # fpeps_model = Transformer_fPEPS_Model_Conv2d(
 #     tn=peps,
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
-# fpeps_model = Transformer_fPEPS_Model_Cluster(
-#     tn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
+fpeps_model = Transformer_fPEPS_Model_Cluster(
+    tn=peps,
+    dtype=model_dtype,
+    contract_boundary_opts={
+        'mode': 'mps',
+        'equalize_norms': 1.0,
+        'canonize': True,
+    },
+    **init_kwargs
+)
 
 # fpeps_model = Transformer_fPEPS_Model_UNet(
 #     tn=peps,

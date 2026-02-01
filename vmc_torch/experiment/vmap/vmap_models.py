@@ -426,7 +426,8 @@ class fPEPS_Model(nn.Module):
 
         self._vmapped_amplitude = torch.vmap(
             self.amplitude,
-            in_dims=(0, None)
+            in_dims=(0, None),
+            randomness='different',
         ) # pre-vmap the amplitude function for efficiency
 
         if compile:
@@ -1840,14 +1841,12 @@ class BasefPEPSBackflowModel(nn.Module):
         max_bond,
         nn_eta,
         dtype=torch.float64,
-        jitter_svd=False,
         debug_file=None,
         contract_boundary_opts={}
     ):
         super().__init__()
         self.contract_boundary_opts = contract_boundary_opts
         self.dtype = dtype
-        self.jitter_svd = jitter_svd
         self.debug_file = debug_file
         self.chi = max_bond
         self.nn_eta = nn_eta
@@ -1877,6 +1876,9 @@ class BasefPEPSBackflowModel(nn.Module):
         self.nn_backflow_generator = None 
         self.nn_param_names = None
         self.params = None
+
+        # vamp func
+        self._vamp = torch.vmap(self.tn_contraction, in_dims=(0, None, 0), randomness='different')
 
     def finish_initialization(self, init_scale=1e-5):
         """
@@ -1978,11 +1980,7 @@ class BasefPEPSBackflowModel(nn.Module):
         # 3. vmap TN Contraction
         # Map over x (dim 0) and nn_outputs (dim 0)
         # We do NOT map over ftn_params (None)
-        if self.jitter_svd:
-            with use_jitter_svd():
-                amps = torch.vmap(self.tn_contraction, in_dims=(0, None, 0))(x, ftn_params, batch_nn_outputs)
-        else:
-            amps = torch.vmap(self.tn_contraction, in_dims=(0, None, 0))(x, ftn_params, batch_nn_outputs)
+        amps = self._vamp(x, ftn_params, batch_nn_outputs)
             
         return amps
 
@@ -1992,11 +1990,7 @@ class BasefPEPSBackflowModel(nn.Module):
              x = x.to(torch.long)
         
         # Forward pass wraps vamp with optional jitter context
-        if self.jitter_svd:
-            with use_jitter_svd():
-                return self.vamp(x, self.params)
-        else:
-            return self.vamp(x, self.params)
+        return self.vamp(x, self.params)
             
 class Transformer_fPEPS_Model_Conv2d(BasefPEPSBackflowModel):
     """
@@ -2077,9 +2071,7 @@ class Transformer_fPEPS_Model_Cluster(BasefPEPSBackflowModel):
         **kwargs,
     ):
         # 1. Call Base Init
-        super().__init__(tn, max_bond, nn_eta, dtype, kwargs.get('jitter_svd', 0), kwargs.get('debug_file'))
-        if self.jitter_svd:
-            print(" -> [Warning] Jitter SVD is enabled in Local Cluster Backflow model.")
+        super().__init__(tn, max_bond, nn_eta, dtype, kwargs.get('debug_file'))
         
         # 2. Define NN Architecture (Local & Independent)
         # Assumes LocalClusterBackflow is defined
