@@ -29,13 +29,10 @@ from vmc_torch.optimizer import DecayScheduler
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
-
-
 SVD_JITTER = 1e-10
 driver = None
-jitter_seed = 42
 # ar.register_function('torch','linalg.svd', lambda x: robust_svd_wrapper(x, jitter=SVD_JITTER, driver=driver))
-ar.register_function('torch','linalg.svd', lambda x: robust_svd_wrapper_random(x, jitter=SVD_JITTER, driver=driver, seed=jitter_seed))
+ar.register_function('torch','linalg.svd', lambda x: robust_svd_wrapper_random(x, jitter=SVD_JITTER, driver=driver))
 # ==============================================================================
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
@@ -47,9 +44,9 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 2
-N_f = Lx * Ly - 2
-D, chi = 4, 8
+Lx, Ly = 8, 8
+N_f = Lx * Ly - 8
+D, chi = 8, 8
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -133,8 +130,8 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(1000) 
-B = 100
+Ns = int(100) 
+B = 10
 B_grad = B // 2
 vmc_steps = 50
 init_step = 0

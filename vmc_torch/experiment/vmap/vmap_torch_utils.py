@@ -35,7 +35,6 @@ class RobustSVD(torch.autograd.Function):
         """
         # --- 1. Jitter Logic (Same as before) ---
         # A: (Batch, M, N) or (M, N)
-        # scale = torch.amax(torch.abs(A), dim=(-2, -1), keepdim=True)
         scale = A.norm(dim=(-2,-1), keepdim=True)
         
         # Jitter
@@ -55,7 +54,14 @@ class RobustSVD(torch.autograd.Function):
         # A_new = A + scale * relative_eps * R
         
         # --- 2. SVD Calculation ---
-        U, S, Vh = torch.linalg.svd(A_new, full_matrices=False, driver=driver)
+        scale_new = torch.amax(torch.abs(A_new), dim=(-2, -1), keepdim=True)
+        scale_new = torch.where(scale_new < 1e-16, torch.ones_like(scale_new), scale_new)
+        A_new_normalized = A_new / scale_new
+        if driver is not None:
+            U, S_norm, Vh = torch.linalg.svd(A_new_normalized, full_matrices=False, driver=driver)
+        else:
+            U, S_norm, Vh = torch.linalg.svd(A_new_normalized, full_matrices=False)
+        S = S_norm * scale_new.squeeze(-1)
         
         # --- 3. Sign Fixing (Vectorized) ---
         max_abs_cols = torch.argmax(torch.abs(U), dim=-2, keepdim=True)
@@ -150,26 +156,18 @@ class RobustSVD_random(torch.autograd.Function):
     generate_vmap_rule = True
 
     @staticmethod
-    def forward(A, jitter_strength, driver, seed):
+    def forward(A, jitter_strength, driver):
         """
         Args:
             A: Input matrix (..., M, N)
             jitter_strength: Magnitude of the jitter
             driver: LAPACK/cuSOLVER driver
-            seed: (int or None) Random seed for reproducible jitter
         """
         # Calculate scale based on norm
         scale = torch.linalg.norm(A, dim=(-2, -1), keepdim=True)
         
         # --- Random Jitter Logic ---
-        if seed is not None:
-            # Create a local generator for reproducibility
-            gen = torch.Generator(device=A.device)
-            gen.manual_seed(seed)
-            noise = torch.randn(A.shape, generator=gen, device=A.device, dtype=A.dtype)
-        else:
-            # Fallback to global state
-            noise = torch.randn_like(A)
+        noise = torch.randn_like(A)
         
         # Normalize noise to unit norm
         noise_norm = torch.linalg.norm(noise, dim=(-2, -1), keepdim=True)
@@ -179,10 +177,14 @@ class RobustSVD_random(torch.autograd.Function):
         A_new = A + noise * (scale * jitter_strength)
         
         # --- SVD Calculation ---
+        scale_new = torch.amax(torch.abs(A_new), dim=(-2, -1), keepdim=True)
+        scale_new = torch.where(scale_new < 1e-16, torch.ones_like(scale_new), scale_new)
+        A_new_normalized = A_new / scale_new
         if driver is not None:
-            U, S, Vh = torch.linalg.svd(A_new, full_matrices=False, driver=driver)
+            U, S_norm, Vh = torch.linalg.svd(A_new_normalized, full_matrices=False, driver=driver)
         else:
-            U, S, Vh = torch.linalg.svd(A_new, full_matrices=False)
+            U, S_norm, Vh = torch.linalg.svd(A_new_normalized, full_matrices=False)
+        S = S_norm * scale_new.squeeze(-1)
             
         # --- Sign Fixing ---
         max_abs_cols = torch.argmax(torch.abs(U), dim=-2, keepdim=True)
@@ -246,7 +248,7 @@ class RobustSVD_random(torch.autograd.Function):
             delta = term1 - term2
             dA = dA + delta
 
-        return dA, None, None, None
+        return dA, None, None
 
 
 def robust_svd_wrapper(A, jitter=1e-12, driver=None):
@@ -264,13 +266,9 @@ def qr_svd_wrapper(A, jitter=1e-12, driver=None):
     3. U = Q U'
     """
     # 1. QR Decomposition
-    # mode='reduced' 也就是默认模式，返回 Q(..., M, K), R(..., K, N)
-    # 这一步将长条形矩阵 A 压缩成了方形（或矮胖）的上三角矩阵 R
     Q, R = torch.linalg.qr(A, mode='reduced')
     
     # 2. 对 R 做 Robust SVD
-    # R 包含了 A 的所有奇异值信息，且通常结构更好
-    # 注意：这里调用的是你写好的 RobustSVD.apply
     U_prime, S, Vh = RobustSVD.apply(R, jitter, driver)
     
     # 3. 还原 U
@@ -280,13 +278,13 @@ def qr_svd_wrapper(A, jitter=1e-12, driver=None):
     return U, S, Vh
 
 
-def robust_svd_wrapper_random(A, jitter=1e-12, driver=None, seed=None):
+def robust_svd_wrapper_random(A, jitter=1e-12, driver=None):
     """
     Renamed wrapper for Robust SVD with Random Jitter.
     """
-    return RobustSVD_random.apply(A, jitter, driver, seed)
+    return RobustSVD_random.apply(A, jitter, driver)
 
-def qr_svd_wrapper_random(A, jitter=1e-12, driver=None, seed=None):
+def qr_svd_wrapper_random(A, jitter=1e-12, driver=None):
     """
     Renamed wrapper for QR-SVD using RobustSVD_random.
     """
@@ -294,7 +292,7 @@ def qr_svd_wrapper_random(A, jitter=1e-12, driver=None, seed=None):
     Q, R = torch.linalg.qr(A, mode='reduced')
     
     # 2. Robust SVD on R (Calling the _random version class)
-    U_prime, S, Vh = RobustSVD_random.apply(R, jitter, driver, seed)
+    U_prime, S, Vh = RobustSVD_random.apply(R, jitter, driver)
     
     # 3. Reconstruct U
     U = Q @ U_prime
@@ -409,11 +407,11 @@ def benchmark_svd_full(M, N, batch_size=10, num_batches=10, jitter=1e-12,
 
         # D. Robust SVD (Random Jitter) - The new champion
         # Passing seed ensures reproducibility
-        run_and_record("robust_rand", lambda a, j, d: robust_svd_wrapper_random(a, j, d, seed=seed))
+        run_and_record("robust_rand", lambda a, j, d: robust_svd_wrapper_random(a, j, d))
 
         # E. QR-SVD (Random Jitter) - The new champion
         # Passing seed ensures reproducibility
-        run_and_record("qr_rand", lambda a, j, d: qr_svd_wrapper_random(a, j, d, seed=seed))
+        run_and_record("qr_rand", lambda a, j, d: qr_svd_wrapper_random(a, j, d))
 
     # --- 3. Reporting ---
     def avg(val): return val / num_batches
