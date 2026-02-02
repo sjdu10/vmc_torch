@@ -300,6 +300,143 @@ def qr_svd_wrapper_random(A, jitter=1e-12, driver=None):
     return U, S, Vh
 
 
+# ========================================== SVD via Eigen Decomposition ==========================================
+def svd_via_eigh(A, epsilon=1e-16):
+    """
+    通过 Eigh (A^T A 或 A A^T) 计算 SVD。
+    稳定性极高，用于替代总是报错的 torch.linalg.svd。
+    
+    Args:
+        A: (Batch, M, N)
+        epsilon: 用于正则化 S 的倒数，防止除零
+    Returns:
+        U, S, Vh (符合 torch.linalg.svd 的定义)
+    """
+    M, N = A.shape[-2:]
+    
+    # --- Case 1: Tall Matrix (M >= N) ---
+    # 我们计算 P = A^T @ A (尺寸 N x N)
+    if M >= N:
+        P = A.mT @ A
+        
+        # 1. 对称特征分解 (eigh 使用 syevd，非常稳)
+        # L 是特征值 (升序), V 是特征向量 (列向量)
+        L, V = torch.linalg.eigh(P)
+        
+        # 2. 处理特征值 (数值误差可能导致微小的负数，clamp 掉)
+        L = torch.clamp(L, min=0.0)
+        S = torch.sqrt(L)
+        
+        # 3. 排序: eigh 是升序，SVD 需要降序 -> Flip
+        S = torch.flip(S, dims=[-1])
+        V = torch.flip(V, dims=[-1])
+        Vh = V.mT # V 是 P 的特征向量，也是 A 的右奇异向量
+        
+        # 4. 重构 U = A @ V @ S_inv
+        # 为了数值稳定，只对非零 S 做除法
+        # 创建对角矩阵的逆
+        S_safe = S + epsilon
+        inv_S = torch.diag_embed(1.0 / S_safe)
+        
+        U = A @ V @ inv_S
+        
+    # --- Case 2: Wide Matrix (M < N) ---
+    # 我们计算 P = A @ A^T (尺寸 M x M)
+    else:
+        P = A @ A.mT
+        
+        L, U_eig = torch.linalg.eigh(P)
+        
+        L = torch.clamp(L, min=0.0)
+        S = torch.sqrt(L)
+        
+        # 排序
+        S = torch.flip(S, dims=[-1])
+        U = torch.flip(U_eig, dims=[-1]) # U_eig 是 P 的特征向量，也是 A 的左奇异向量
+        
+        # 重构 Vh = S_inv @ U^T @ A
+        S_safe = S + epsilon
+        inv_S = torch.diag_embed(1.0 / S_safe)
+        
+        # V = A^T @ U @ S_inv -> Vh = V^T = S_inv @ U^T @ A
+        Vh = inv_S @ U.mT @ A
+
+    return U, S, Vh
+
+class RobustSVD_EIG(torch.autograd.Function):
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(A, jitter, driver): 
+        # 1. Normalization (依然推荐保留)
+        scale = torch.amax(torch.abs(A), dim=(-2, -1), keepdim=True)
+        scale = torch.where(scale < 1e-16, torch.ones_like(scale), scale)
+        A_norm = A / scale
+
+        # 2. 使用 EIG 替代 SVD
+        U, S_norm, Vh = svd_via_eigh(A_norm)
+        
+        # 3. 还原 S
+        S = S_norm * scale.squeeze(-1)
+        
+        return U, S, Vh
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        U, S, Vh = output
+        ctx.save_for_backward(U, S, Vh)
+
+    @staticmethod
+    def backward(ctx, dU, dS, dVh):
+        U, S, Vh = ctx.saved_tensors
+        
+        M = U.size(-2)
+        N = Vh.size(-1)
+        K = S.size(-1)
+        eye_K = torch.eye(K, dtype=U.dtype, device=U.device)
+        epsilon = 1e-12
+
+        # Use safe_inverse_random
+        F = S.unsqueeze(-2) - S.unsqueeze(-1)
+        F = safe_inverse_random(F, epsilon=epsilon)
+        F = F * (1 - eye_K) 
+
+        G = S.unsqueeze(-2) + S.unsqueeze(-1)
+        G = safe_inverse_random(G, epsilon=epsilon)
+        G = G * (1 - eye_K)
+
+        UdU = U.mT @ dU
+        VdV = Vh @ dVh.mT
+
+        Su = (F + G) * (UdU - UdU.mT) / 2
+        Sv = (F - G) * (VdV - VdV.mT) / 2
+        
+        # NaN Guard
+        Su = torch.nan_to_num(Su, nan=0.0, posinf=0.0, neginf=0.0)
+        Sv = torch.nan_to_num(Sv, nan=0.0, posinf=0.0, neginf=0.0)
+
+        dA = U @ (Su + Sv + torch.diag_embed(dS)) @ Vh
+        
+        # Handle non-square contributions
+        S_inv = safe_inverse_random(S, epsilon=epsilon)
+        
+        if M > K:
+            term1 = (dU * S_inv.unsqueeze(-2)) @ Vh
+            term2 = U @ (U.mT @ term1)
+            delta = term1 - term2
+            dA = dA + delta
+            
+        if N > K:
+            term1 = (U * S_inv.unsqueeze(-2)) @ dVh
+            term2 = term1 @ (Vh.mT @ Vh)
+            delta = term1 - term2
+            dA = dA + delta
+
+        return dA, None, None
+    
+def robust_svd_eig_wrapper(A, jitter=1e-12, driver=None):
+    return RobustSVD_EIG.apply(A, jitter, driver)
+
 # ========================================== Benchmarking Suite ==========================================
 
 def benchmark_svd_full(M, N, batch_size=10, num_batches=10, jitter=1e-12, 
@@ -320,7 +457,7 @@ def benchmark_svd_full(M, N, batch_size=10, num_batches=10, jitter=1e-12,
     print(f"{'='*100}")
 
     # Initialize metrics dictionary for 5 methods
-    methods = ["std", "robust_id", "qr_id", "robust_rand", "qr_rand"]
+    methods = ["std", "robust_id", "qr_id", "robust_rand", "qr_rand", "eigh_ref"]
     metrics = {m: {"diff_U": 0., "diff_S": 0., "recon": 0.} for m in methods}
     
     # Helper to align signs
@@ -413,33 +550,39 @@ def benchmark_svd_full(M, N, batch_size=10, num_batches=10, jitter=1e-12,
         # Passing seed ensures reproducibility
         run_and_record("qr_rand", lambda a, j, d: qr_svd_wrapper_random(a, j, d))
 
+        # F. Eigh-based SVD (for reference, not compared)
+        run_and_record("eigh_ref", robust_svd_eig_wrapper)
+
     # --- 3. Reporting ---
     def avg(val): return val / num_batches
 
-    print(f"\n{'Metric':<25} | {'Std SVD':<12} | {'Robust(Id)':<12} | {'QR(Id)':<12} | {'Robust(Rand)':<12} | {'QR(Rand)':<12}")
-    print("-" * 90)
+    print(f"\n{'Metric':<25} | {'Std SVD':<12} | {'Robust(Id)':<12} | {'QR(Id)':<12} | {'Robust(Rand)':<12} | {'QR(Rand)':<12} | {'Eigh(Ref)':<12}")
+    print("-" * 120)
     
     # Recon Error
     print(f"{'Recon Error':<25} | {avg(metrics['std']['recon']):<12.2e} | "
           f"{avg(metrics['robust_id']['recon']):<12.2e} | "
           f"{avg(metrics['qr_id']['recon']):<12.2e} | "
           f"{avg(metrics['robust_rand']['recon']):<12.2e} | "
-          f"{avg(metrics['qr_rand']['recon']):<12.2e}")
+          f"{avg(metrics['qr_rand']['recon']):<12.2e} | "
+          f"{avg(metrics['eigh_ref']['recon']):<12.2e}")
     
     # Diff S
     print(f"{'Diff S (vs Std)':<25} | {'-':<12} | "
           f"{avg(metrics['robust_id']['diff_S']):<12.2e} | "
           f"{avg(metrics['qr_id']['diff_S']):<12.2e} | "
           f"{avg(metrics['robust_rand']['diff_S']):<12.2e} | "
-          f"{avg(metrics['qr_rand']['diff_S']):<12.2e}")
+          f"{avg(metrics['qr_rand']['diff_S']):<12.2e} | "
+          f"{avg(metrics['eigh_ref']['diff_S']):<12.2e}")
 
     # Diff U (Ignore if large, as discussed)
     print(f"{'Diff U (vs Std)':<25} | {'-':<12} | "
           f"{avg(metrics['robust_id']['diff_U']):<12.2e} | "
           f"{avg(metrics['qr_id']['diff_U']):<12.2e} | "
           f"{avg(metrics['robust_rand']['diff_U']):<12.2e} | "
-          f"{avg(metrics['qr_rand']['diff_U']):<12.2e}")
-    print("-" * 90)
+          f"{avg(metrics['qr_rand']['diff_U']):<12.2e} | "
+          f"{avg(metrics['eigh_ref']['diff_U']):<12.2e}")
+    print("-" * 120)
 
     # Analysis
     best_recon = min(avg(metrics['qr_id']['recon']), avg(metrics['qr_rand']['recon']))
@@ -455,8 +598,8 @@ if __name__ == "__main__":
     # 1. Test Degenerate Case (The Killer Case)
     # Using a slightly larger matrix to increase chance of collision
     benchmark_svd_full(M=64, N=32, batch_size=20, num_batches=10, 
-                       jitter=1e-10, condition_mode='degenerate')
+                       jitter=1e-12, condition_mode='degenerate')
     
     # 2. Test Ill-Conditioned Case
     benchmark_svd_full(M=64, N=32, batch_size=20, num_batches=10, 
-                       jitter=1e-10, condition_mode='decay')
+                       jitter=1e-12, condition_mode='decay')
