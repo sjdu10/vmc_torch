@@ -437,6 +437,16 @@ class RobustSVD_EIG(torch.autograd.Function):
 def robust_svd_eig_wrapper(A, jitter=1e-12, driver=None):
     return RobustSVD_EIG.apply(A, jitter, driver)
 
+def robust_svd_err_catcher_wrapper(A, jitter=1e-12, driver=None):
+    """
+    Wrapper that tries standard Robust SVD first,
+    falls back to EIG-based SVD on failure.
+    """
+    try:
+        return RobustSVD.apply(A, jitter, driver)
+    except RuntimeError as e:
+        return RobustSVD_EIG.apply(A, jitter, driver)
+
 # ========================================== Benchmarking Suite ==========================================
 
 def benchmark_svd_full(M, N, batch_size=10, num_batches=10, jitter=1e-12, 
