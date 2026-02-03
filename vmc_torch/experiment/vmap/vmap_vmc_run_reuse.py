@@ -18,14 +18,15 @@ from vmc_torch.experiment.vmap.vmap_models import (
 from vmc_torch.experiment.vmap.vmap_modules import distributed_minres_solver, run_sampling_phase_reuse
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
-from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
+from vmc_torch.experiment.vmap.vmap_torch_utils import robust_svd_err_catcher_wrapper
 from vmc_torch.optimizer import DecayScheduler
 # ==============================================================================
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
 SVD_JITTER = 1e-10
-ar.register_function('torch', 'linalg.svd', lambda x: RobustSVD.apply(x, SVD_JITTER))
+driver = None
+ar.register_function('torch','linalg.svd', lambda x: robust_svd_err_catcher_wrapper(x, jitter=SVD_JITTER, driver=driver))
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
