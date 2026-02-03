@@ -3,15 +3,15 @@ import cotengra as ctg
 
 # quimb
 import quimb.tensor as qtn
-import quimb as qu
+# import quimb as qu
 
 # torch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mpi4py import MPI
-from quimb.tensor.tensor_2d import Rotator2D, pairwise
-from torch.func import vmap
+from quimb.tensor.tn2d.core import Rotator2D, pairwise
+# from torch.func import vmap
 from vmc_torch.fermion_utils import (
     calculate_phase_from_adjacent_trans_dict,
     decompose_permutation_into_transpositions,
