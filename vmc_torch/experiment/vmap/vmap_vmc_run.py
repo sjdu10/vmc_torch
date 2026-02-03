@@ -92,12 +92,7 @@ init_kwargs.pop('dtype_str')
 #     },
 #     **init_kwargs
 # )
-# fpeps_model = Transformer_fPEPS_Model_Conv2d(
-#     tn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
-fpeps_model = Transformer_fPEPS_Model_Cluster(
+fpeps_model = Transformer_fPEPS_Model_Conv2d(
     tn=peps,
     dtype=model_dtype,
     contract_boundary_opts={
@@ -107,6 +102,16 @@ fpeps_model = Transformer_fPEPS_Model_Cluster(
     },
     **init_kwargs
 )
+# fpeps_model = Transformer_fPEPS_Model_Cluster(
+#     tn=peps,
+#     dtype=model_dtype,
+#     contract_boundary_opts={
+#         'mode': 'mps',
+#         'equalize_norms': 1.0,
+#         'canonize': True,
+#     },
+#     **init_kwargs
+# )
 
 # fpeps_model = Transformer_fPEPS_Model_UNet(
 #     tn=peps,
