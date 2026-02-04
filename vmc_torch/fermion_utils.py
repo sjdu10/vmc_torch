@@ -6,9 +6,9 @@ import numpy
 import quimb.tensor as qtn
 import autoray as ar
 from autoray import do
-from quimb.tensor.tensor_core import  *
+# from quimb.tensor.tensor_core import  *
 from quimb.tensor.tensor_core import bonds, tags_to_oset, rand_uuid
-from quimb.tensor.tensor_2d import Rotator2D, pairwise
+from quimb.tensor.tn2d.core import Rotator2D, pairwise
 from vmc_torch.global_var import DEBUG
 import ast
 import pickle
