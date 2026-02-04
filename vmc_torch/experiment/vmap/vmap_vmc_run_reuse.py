@@ -24,7 +24,7 @@ from vmc_torch.optimizer import DecayScheduler
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
-SVD_JITTER = 1e-10
+SVD_JITTER = 1e-16
 driver = None
 ar.register_function('torch','linalg.svd', lambda x: robust_svd_err_catcher_wrapper(x, jitter=SVD_JITTER, driver=driver))
 # ==============================================================================
@@ -103,12 +103,12 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(2e3) 
-B = 200
+Ns = int(4e3) 
+B = 400
 B_grad = B//4
 vmc_steps = 50
 init_step = 0
-burn_in_steps = 0
+burn_in_steps = 10
 learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10

@@ -861,7 +861,8 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
                 
                 grads_pytree_chunks.append(tree_map(lambda x: x.detach(), grads_chunk))
                 amps_chunks.append(amps_c.detach())
-                
+                del grads_chunk
+                del amps_c
                 fpeps_model.zero_grad()
 
 
