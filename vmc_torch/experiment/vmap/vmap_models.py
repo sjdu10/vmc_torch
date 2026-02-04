@@ -2,6 +2,7 @@ import quimb as qu
 import quimb.tensor as qtn
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from typing import Optional
 from vmc_torch.nn_sublayers import SelfAttn_block_pos
@@ -512,12 +513,13 @@ def get_params_ftn(ftn):
 # =============================================================================================================
 class fPEPS_Model_reuse(nn.Module):
 
-    def __init__(self, tn, max_bond, dtype=torch.float64):
+    def __init__(self, tn, max_bond, dtype=torch.float64, contract_boundary_opts={}, **kwargs):
         import quimb as qu
         import quimb.tensor as qtn
         super().__init__()
 
         params, skeleton = qtn.pack(tn)
+        self.contract_boundary_opts = contract_boundary_opts
         self.dtype = dtype
         self.skeleton = skeleton
         self.Lx = tn.Lx
@@ -536,6 +538,8 @@ class fPEPS_Model_reuse(nn.Module):
         # register the flat list parameters
         self.params = torch.nn.ParameterList(
             [torch.as_tensor(x, dtype=self.dtype) for x in params_flat])
+        
+        self.radius = 0
 
     def cache_bMPS_skeleton(self, x):
         params = qu.utils.tree_unflatten(self.params, self.params_pytree)
@@ -546,7 +550,7 @@ class fPEPS_Model_reuse(nn.Module):
             tns.site_ind(site): x[i]
             for i, site in enumerate(tns.sites)
         })
-        env_x = amp.compute_x_environments(max_bond=self.chi, cutoff=0.0)
+        env_x = amp.compute_x_environments(max_bond=self.chi, cutoff=0.0, **self.contract_boundary_opts)
         bMPS_params_dict = {}
         for key, tn in env_x.items():
             bMPS_params, skeleton = pack_ftn(tn)
@@ -678,7 +682,8 @@ class fPEPS_Model_reuse(nn.Module):
                     updated_bMPS.contract_boundary_from_xmin_(
                         max_bond=self.chi,
                         cutoff=0.0,
-                        xrange=[row_id - 1, row_id])
+                        xrange=[row_id - 1, row_id],
+                        **self.contract_boundary_opts)
                 updated_bMPS_params = get_params_ftn(updated_bMPS)
                 pytree_params, _ = qu.utils.tree_flatten(updated_bMPS_params,
                                                          get_ref=True)
@@ -696,7 +701,8 @@ class fPEPS_Model_reuse(nn.Module):
                     updated_bMPS.contract_boundary_from_xmax_(
                         max_bond=self.chi,
                         cutoff=0.0,
-                        xrange=[row_id, row_id + 1])
+                        xrange=[row_id, row_id + 1],
+                        **self.contract_boundary_opts)
                 updated_bMPS_params = get_params_ftn(updated_bMPS)
                 pytree_params, _ = qu.utils.tree_flatten(updated_bMPS_params,
                                                          get_ref=True)
@@ -743,7 +749,8 @@ class fPEPS_Model_reuse(nn.Module):
                     updated_bMPS.contract_boundary_from_ymin_(
                         max_bond=self.chi,
                         cutoff=0.0,
-                        yrange=[col_id - 1, col_id])
+                        yrange=[col_id - 1, col_id],
+                        **self.contract_boundary_opts)
                 updated_bMPS_params = get_params_ftn(updated_bMPS)
                 pytree_params, _ = qu.utils.tree_flatten(updated_bMPS_params,
                                                          get_ref=True)
@@ -761,7 +768,8 @@ class fPEPS_Model_reuse(nn.Module):
                     updated_bMPS.contract_boundary_from_ymax_(
                         max_bond=self.chi,
                         cutoff=0.0,
-                        yrange=[col_id, col_id + 1])
+                        yrange=[col_id, col_id + 1],
+                        **self.contract_boundary_opts)
                 updated_bMPS_params = get_params_ftn(updated_bMPS)
                 pytree_params, _ = qu.utils.tree_flatten(updated_bMPS_params,
                                                          get_ref=True)
@@ -854,10 +862,12 @@ class fPEPS_Model_reuse(nn.Module):
         if self.chi > 0:
             amp.contract_boundary_from_ymin_(max_bond=self.chi,
                                              cutoff=0.0,
-                                             yrange=[0, amp.Ly // 2 - 1])
+                                             yrange=[0, amp.Ly // 2 - 1],
+                                             **self.contract_boundary_opts)
             amp.contract_boundary_from_ymax_(max_bond=self.chi,
                                              cutoff=0.0,
-                                             yrange=[amp.Ly // 2, amp.Ly - 1])
+                                             yrange=[amp.Ly // 2, amp.Ly - 1],
+                                             **self.contract_boundary_opts)
 
         return amp.contract()
 
@@ -960,7 +970,9 @@ class fPEPS_Model_reuse(nn.Module):
             selected_cols=selected_cols,
         )
 
-
+# ==============================================================================
+# Helper Module: Self-Attention and Transformer Layers
+# ==============================================================================
 class SelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, **mha_kwargs):
         super().__init__()
@@ -991,18 +1003,18 @@ class SelfAttention(nn.Module):
     
 class TransformerLayer(nn.Module):
     """
-    单个 Transformer 层 (Pre-Norm 结构)
-    结构: Input -> LayerNorm -> SelfAttention -> Residual Add -> Output
+    Single Transformer layer (Pre-Norm Architecture)
+    Input -> LayerNorm -> SelfAttention -> Residual Add -> Output
     """
     def __init__(self, embed_dim, num_heads, dtype=torch.float32):
         super().__init__()
         self.embed_dim = embed_dim
         self.dtype = dtype
         
-        # Pre-Norm 放在 Attention 之前
+        # Pre-Norm before Attention
         self.norm = nn.LayerNorm(embed_dim, dtype=dtype)
         
-        # 你的自定义 Attention 模块
+        # self-attention module
         self.attn = SelfAttention(
             embed_dim=embed_dim, num_heads=num_heads
         )
@@ -1011,7 +1023,7 @@ class TransformerLayer(nn.Module):
     def forward(self, x):
         # x: (Batch, L, D)
         
-        # Pre-Norm: 先 Norm 再进 Attention
+        # Pre-Norm
         residual = x
         x_norm = self.norm(x)
         
@@ -1023,9 +1035,9 @@ class TransformerLayer(nn.Module):
 
 class SelfAttn_block_pos_batched(nn.Module):
     """ 
-    支持多层堆叠的 Self-attention block with positional encoding 
+    Multi-layer Self-attention block with positional encoding 
     Args:
-        depth (int): Transformer block 的层数 (default: 1)
+        depth (int): number of Transformer block  (default: 1)
     """
     def __init__(
         self, n_site, num_classes, embed_dim, attention_heads, depth=1, dtype=torch.float32
@@ -1747,6 +1759,13 @@ def get_receptive_field_2d(Lx, Ly, r, site_index_map=lambda i, j, Lx, Ly: i * Ly
     """
         Get the receptive field (OBC) for each site in a square lattice graph.
         Default ordering is zig-zag ordering.
+        Args:
+            Lx (int): Lattice size in x direction.
+            Ly (int): Lattice size in y direction.
+            r (int): Receptive field radius.
+            site_index_map (function): Function to map (i, j) to site index.
+        Returns:
+            dict: A dictionary mapping site index to list of neighbor site indices.
     """
     receptive_field = {}
     for i in range(Lx):
@@ -2090,7 +2109,525 @@ class Transformer_fPEPS_Model_Cluster(BasefPEPSBackflowModel):
 
         # 3. Finalize initialization
         self.finish_initialization(init_perturbation_scale)
-        
+
+
+class Transformer_fPEPS_Model_Cluster_reuse(nn.Module):
+
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        nn_hidden_dim,
+        embed_dim,
+        attn_heads,
+        radius=1,
+        init_perturbation_scale=1e-5,
+        dtype=torch.float64,
+        contract_boundary_opts={},
+        **kwargs,
+    ):
+        import quimb as qu
+        import quimb.tensor as qtn
+        super().__init__()
+
+        params, skeleton = qtn.pack(tn)
+        self.contract_boundary_opts = contract_boundary_opts
+        self.dtype = dtype
+        self.skeleton = skeleton
+        self.skeleton.exponent = 0
+        self.Lx = tn.Lx
+        self.Ly = tn.Ly
+        self.bMPS_x_skeletons = {}
+        self.bMPS_y_skeletons = {}
+        self.bMPS_params_x_in_dims = None
+        self.bMPS_params_y_in_dims = None
+        self.chi = max_bond
+
+        # Flatten TN parameters into a single list and a PyTree structure
+        ftn_params_flat, ftn_params_pytree = qu.utils.tree_flatten(params, get_ref=True)
+        self.ftn_params_pytree = ftn_params_pytree
+
+        # Register TN parameters as a ParameterList so optimizer can see them
+        self.ftn_params = torch.nn.ParameterList([
+            torch.as_tensor(x, dtype=self.dtype) for x in ftn_params_flat
+        ])
+
+        # Metadata for reconstruction inside vmap
+        self.ftn_params_shape = [p.shape for p in self.ftn_params]
+        self.ftn_params_sizes = [p.numel() for p in self.ftn_params] 
+        self.ftn_params_length = sum(self.ftn_params_sizes)
+
+        self.nn_backflow_generator = LocalClusterBackflow(
+            lx=tn.Lx,
+            ly=tn.Ly,
+            radius=radius,
+            phys_dim=tn.phys_dim(),
+            embed_dim=embed_dim,
+            attn_heads=attn_heads,
+            hidden_dim=nn_hidden_dim,
+            param_sizes=self.ftn_params_sizes,
+            dtype=self.dtype
+        )
+        self.radius = radius
+        self._receptive_field = get_receptive_field_2d(
+            tn.Lx, tn.Ly, radius, site_index_map=lambda i, j, Lx, Ly: i * Ly + j
+        )
+
+        self.nn_backflow = self.nn_backflow_generator
+        self.nn_param_names = None
+        self.nn_eta = nn_eta
+        self.params = None
+        # 1. Register NN parameter names for functional_call
+        self.nn_param_names = [name for name, _ in self.nn_backflow.named_parameters()]
+        # 2. Combine all params into one list for the optimizer
+        # Order: [TN Params ... NN Params]
+        self.params = nn.ParameterList(list(self.ftn_params) + list(self.nn_backflow.parameters()))
+
+        # initialize the last NN layer to have small weights
+        self._init_weights_for_perturbation(init_perturbation_scale)
+    
+    def _init_weights_for_perturbation(self, scale):
+        target_module = self.nn_backflow_generator if self.nn_backflow_generator else self.nn_backflow
+        if hasattr(target_module, 'initialize_output_scale'):
+            target_module.initialize_output_scale(scale)
+        else:
+            # Fallback for simple structures
+            print(f"Warning: {type(target_module).__name__} does not implement 'initialize_output_scale'.")
+            # Try to guess standard layers (Sequential/ModuleList)
+            last_layer = None
+            if isinstance(target_module, nn.Sequential):
+                last_layer = target_module[-1]
+            
+            if last_layer and hasattr(last_layer, 'weight'):
+                 print(f" -> Initializing last layer {type(last_layer).__name__} with scale {scale}")
+                 torch.nn.init.normal_(last_layer.weight, mean=0.0, std=scale)
+                 if last_layer.bias is not None: 
+                     torch.nn.init.zeros_(last_layer.bias)
+    
+    def _get_single_amp(self, x, params):
+        """
+            Get the single amplitude tn for input x
+        """
+        n_ftn = len(self.ftn_params)
+        ftn_params = params[:n_ftn]
+        nn_params = params[n_ftn:]
+        nn_params_dict = dict(zip(self.nn_param_names, nn_params))
+
+        # detect if x is batched
+        if x.dim() == 1:
+            nn_output = torch.func.functional_call(self.nn_backflow, nn_params_dict, x.unsqueeze(0)).squeeze(0)
+        else:
+            nn_output = torch.func.functional_call(self.nn_backflow, nn_params_dict, x)
+
+        ftn_params_vector = nn.utils.parameters_to_vector(ftn_params)
+        nnftn_params_vector = ftn_params_vector + self.nn_eta * nn_output
+        nnftn_params = []
+        pointer = 0
+        for shape in self.ftn_params_shape:
+            length = torch.prod(torch.tensor(shape)).item()
+            nnftn_params.append(nnftn_params_vector[pointer:pointer+length].view(shape))
+            pointer += length
+        nnftn_params = qu.utils.tree_unflatten(nnftn_params, self.ftn_params_pytree)
+        tns = qtn.unpack(nnftn_params, self.skeleton)
+        amp = tns.isel({tns.site_ind(site): x[i] for i, site in enumerate(tns.sites)})
+        return amp
+
+    def cache_bMPS_skeleton(self, x):
+        amp = self._get_single_amp(x, self.params)
+        env_x = amp.compute_x_environments(max_bond=self.chi, cutoff=0.0)
+        bMPS_params_dict = {}
+        for key, tn in env_x.items():
+            bMPS_params, skeleton = pack_ftn(tn)
+            env_x[key] = skeleton
+            bMPS_params_dict[key] = bMPS_params
+
+        self.bMPS_x_skeletons = env_x
+        bMPS_params_x_in_dims = qu.utils.tree_map(lambda _: 0,
+                                                  bMPS_params_dict)
+        self.bMPS_params_x_in_dims = bMPS_params_x_in_dims
+
+        env_y = amp.compute_y_environments(max_bond=self.chi, cutoff=0.0)
+        bMPS_params_dict = {}
+        for key, tn in env_y.items():
+            bMPS_params, skeleton = pack_ftn(tn)
+            env_y[key] = skeleton
+            bMPS_params_dict[key] = bMPS_params
+        self.bMPS_y_skeletons = env_y
+        bMPS_params_y_in_dims = qu.utils.tree_map(lambda _: 0,
+                                                  bMPS_params_dict)
+        self.bMPS_params_y_in_dims = bMPS_params_y_in_dims
+
+    def cache_bMPS_params_vmap(self, x):
+        # return a pytree (dict) of bMPS params for x and y environments
+        # For fermions, need to record every tensor's fermionic info too.
+        params = self.params
+
+        def cache_bMPS_params_single(x_single, params):
+            amp = self._get_single_amp(x_single, params)
+            env_x = amp.compute_x_environments(max_bond=self.chi, cutoff=0.0)
+            bMPS_params_x_dict = {}
+            for key, btn in env_x.items():
+                bMPS_params = get_params_ftn(btn)
+                bMPS_params_x_dict[key] = bMPS_params
+            bMPS_params_y_dict = {}
+            env_y = amp.compute_y_environments(max_bond=self.chi, cutoff=0.0)
+            for key, btn in env_y.items():
+                bMPS_params = get_params_ftn(btn)
+                bMPS_params_y_dict[key] = bMPS_params
+
+            return bMPS_params_x_dict, bMPS_params_y_dict
+
+        return torch.vmap(
+            cache_bMPS_params_single,
+            in_dims=(0, None),
+        )(x, params)
+
+    def cache_bMPS_params_any_direction_vmap(self, x, direction='x'):
+        # return a pytree (dict) of bMPS params for x or y environments
+        params = self.params
+
+        def cache_bMPS_params_x_single(x_single, params):
+            amp = self._get_single_amp(x_single, params)
+            env_x = amp.compute_x_environments(max_bond=self.chi, cutoff=0.0)
+            amp_val = (env_x[('xmin', self.Lx // 2)]
+                       | env_x[('xmax', self.Lx // 2 - 1)]).contract()
+            bMPS_params_x_dict = {}
+            for key, btn in env_x.items():
+                bMPS_params = get_params_ftn(btn)
+                bMPS_params_x_dict[key] = bMPS_params
+            return bMPS_params_x_dict, amp_val
+
+        def cache_bMPS_params_y_single(x_single, params):
+            amp = self._get_single_amp(x_single, params)
+            env_y = amp.compute_y_environments(max_bond=self.chi, cutoff=0.0)
+            amp_val = (env_y[('ymin', self.Ly // 2)]
+                       | env_y[('ymax', self.Ly // 2 - 1)]).contract()
+            bMPS_params_y_dict = {}
+            for key, btn in env_y.items():
+                bMPS_params = get_params_ftn(btn)
+                bMPS_params_y_dict[key] = bMPS_params
+            return bMPS_params_y_dict, amp_val
+
+        if direction == 'x':
+            return torch.vmap(
+                cache_bMPS_params_x_single,
+                in_dims=(0, None),
+            )(x, params)
+        else:
+            return torch.vmap(
+                cache_bMPS_params_y_single,
+                in_dims=(0, None),
+            )(x, params)
+
+    def update_bMPS_params_to_row_vmap(self,
+                                       x,
+                                       row_id,
+                                       bMPS_params_x_batched,
+                                       from_which='xmin'):
+        params = self.params
+
+        # update the bMPS params to a specific row_id for all samples in the batch
+        if from_which == 'xmin':
+            row_edge = max(0, row_id - self.radius)
+        else:
+            row_edge = min(self.Ly - 1, row_id + self.radius)
+
+        def update_bMPS_params_x_single(x_single, params, row_id,
+                                        bMPS_params_x, from_which):
+            bMPS_key = (from_which, row_id)
+            amp = self._get_single_amp(x_single, params)
+            bMPS_to_row = unpack_ftn(bMPS_params_x[bMPS_key],
+                                     self.bMPS_x_skeletons[bMPS_key])
+            row_tn = amp.select([amp.row_tag(row_id)], which='any')
+            # MPO-MPS two row TN
+            updated_bMPS = (bMPS_to_row | row_tn)
+            # contract to get the updated bMPS, row_id+1 for xmin, row_id-1 for xmax
+            if from_which == 'xmin':
+                if row_id == 0:
+                    updated_bMPS = row_tn
+                else:
+                    updated_bMPS.contract_boundary_from_xmin_(
+                        max_bond=self.chi,
+                        cutoff=0.0,
+                        xrange=[row_id - 1, row_id],
+                        **self.contract_boundary_opts)
+                updated_bMPS_params = get_params_ftn(updated_bMPS)
+                pytree_params, _ = qu.utils.tree_flatten(updated_bMPS_params,
+                                                         get_ref=True)
+                _, pytree = qu.utils.tree_flatten(bMPS_params_x[(from_which,
+                                                                 row_id + 1)],
+                                                  get_ref=True)
+                updated_bMPS_params = qu.utils.tree_unflatten(
+                    pytree_params, pytree)
+                bMPS_params_x[(from_which, row_id +
+                               1)] = updated_bMPS_params  # inplace update
+            else:
+                if row_id == amp.Ly - 1:
+                    updated_bMPS = row_tn
+                else:
+                    updated_bMPS.contract_boundary_from_xmax_(
+                        max_bond=self.chi,
+                        cutoff=0.0,
+                        xrange=[row_id, row_id + 1],
+                        **self.contract_boundary_opts)
+                updated_bMPS_params = get_params_ftn(updated_bMPS)
+                pytree_params, _ = qu.utils.tree_flatten(updated_bMPS_params,
+                                                         get_ref=True)
+                _, pytree = qu.utils.tree_flatten(bMPS_params_x[(from_which,
+                                                                 row_id - 1)],
+                                                  get_ref=True)
+                updated_bMPS_params = qu.utils.tree_unflatten(
+                    pytree_params, pytree)
+                bMPS_params_x[(from_which, row_id -
+                               1)] = updated_bMPS_params  # inplace update
+            return bMPS_params_x
+
+        return torch.vmap(
+            update_bMPS_params_x_single,
+            in_dims=(0, None, None, self.bMPS_params_x_in_dims, None),
+        )(x, params, row_edge, bMPS_params_x_batched, from_which)
+
+    def update_bMPS_params_to_col_vmap(self,
+                                       x,
+                                       col_id,
+                                       bMPS_params_y_batched,
+                                       from_which='ymin'):
+        params = self.params
+        if from_which == 'ymin':
+            col_edge = max(0, col_id - self.radius)
+        else:
+            col_edge = min(self.Lx - 1, col_id + self.radius)
+
+        def update_bMPS_params_y_single(x_single, params, col_id,
+                                        bMPS_params_y, from_which):
+            bMPS_key = (from_which, col_id)
+            amp = self._get_single_amp(x_single, params)
+            bMPS_to_col = unpack_ftn(bMPS_params_y[bMPS_key],
+                                     self.bMPS_y_skeletons[bMPS_key])
+            col_tn = amp.select([amp.col_tag(col_id)], which='any')
+            # MPO-MPS two col TN
+            updated_bMPS = (bMPS_to_col | col_tn)
+            # contract to get the updated bMPS, col_id+1 for ymin, col_id-1 for ymax
+            if from_which == 'ymin':
+                if col_id == 0:
+                    updated_bMPS = col_tn
+                else:
+                    updated_bMPS.contract_boundary_from_ymin_(
+                        max_bond=self.chi,
+                        cutoff=0.0,
+                        yrange=[col_id - 1, col_id],
+                        **self.contract_boundary_opts)
+                updated_bMPS_params = get_params_ftn(updated_bMPS)
+                pytree_params, _ = qu.utils.tree_flatten(updated_bMPS_params,
+                                                         get_ref=True)
+                _, pytree = qu.utils.tree_flatten(bMPS_params_y[(from_which,
+                                                                 col_id + 1)],
+                                                  get_ref=True)
+                updated_bMPS_params = qu.utils.tree_unflatten(
+                    pytree_params, pytree)
+                bMPS_params_y[(from_which, col_id +
+                               1)] = updated_bMPS_params  # inplace update
+            else:
+                if col_id == amp.Lx - 1:
+                    updated_bMPS = col_tn
+                else:
+                    updated_bMPS.contract_boundary_from_ymax_(
+                        max_bond=self.chi,
+                        cutoff=0.0,
+                        yrange=[col_id, col_id + 1],
+                        **self.contract_boundary_opts)
+                updated_bMPS_params = get_params_ftn(updated_bMPS)
+                pytree_params, _ = qu.utils.tree_flatten(updated_bMPS_params,
+                                                         get_ref=True)
+                _, pytree = qu.utils.tree_flatten(bMPS_params_y[(from_which,
+                                                                 col_id - 1)],
+                                                  get_ref=True)
+                updated_bMPS_params = qu.utils.tree_unflatten(
+                    pytree_params, pytree)
+                bMPS_params_y[(from_which, col_id -
+                               1)] = updated_bMPS_params  # inplace update
+            return bMPS_params_y
+
+        return torch.vmap(
+            update_bMPS_params_y_single,
+            in_dims=(0, None, None, self.bMPS_params_y_in_dims, None),
+        )(x, params, col_edge, bMPS_params_y_batched, from_which)
+
+    def amp_tn(self, x):
+        return self._get_single_amp(x, self.params)
+
+    def amplitude(
+        self,
+        x,
+        params,
+        bMPS_keys=None,
+        bMPS_params_xmin=None,
+        bMPS_params_xmax=None,
+        bMPS_params_ymin=None,
+        bMPS_params_ymax=None,
+        selected_rows=None,
+        selected_cols=None,
+    ):
+        amp = self._get_single_amp(x, params)
+
+        # replace the x-environment with the cached one
+        if bMPS_params_xmin is not None and bMPS_params_xmax is not None and bMPS_keys is not None:
+            bMPS_min = unpack_ftn(bMPS_params_xmin,
+                                  self.bMPS_x_skeletons[bMPS_keys[0]])
+            bMPS_max = unpack_ftn(bMPS_params_xmax,
+                                  self.bMPS_x_skeletons[bMPS_keys[1]])
+            rows = amp.select([amp.row_tag(row) for row in selected_rows],
+                              which='any')
+            amp_reuse = (bMPS_min | rows | bMPS_max)
+            amp_reuse.view_as_(
+                qtn.PEPS,
+                site_tag_id=amp._site_tag_id,
+                x_tag_id=amp._x_tag_id,
+                y_tag_id=amp._y_tag_id,
+                Lx=amp._Lx,
+                Ly=amp._Ly,
+                site_ind_id=amp._site_ind_id,
+            )
+            # num_rows = selected_rows[-1] - selected_rows[0] + 1
+            # if self.chi > 0:
+            #     amp_reuse.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1], bMPS_keys[0][1]+num_rows//2-1], **self.contract_boundary_opts)
+            #     amp_reuse.contract_boundary_from_xmax_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1]+num_rows//2, bMPS_keys[1][1]+1], **self.contract_boundary_opts)
+            return amp_reuse.contract()
+        # replace the y-environment with the cached one
+        if bMPS_params_ymin is not None and bMPS_params_ymax is not None and bMPS_keys is not None:
+            bMPS_min = unpack_ftn(bMPS_params_ymin,
+                                  self.bMPS_y_skeletons[bMPS_keys[0]])
+            bMPS_max = unpack_ftn(bMPS_params_ymax,
+                                  self.bMPS_y_skeletons[bMPS_keys[1]])
+            cols = amp.select([amp.col_tag(col) for col in selected_cols],
+                              which='any')
+            amp_reuse = (bMPS_min | cols | bMPS_max)
+            amp_reuse.view_as_(
+                qtn.PEPS,
+                site_tag_id=amp._site_tag_id,
+                x_tag_id=amp._x_tag_id,
+                y_tag_id=amp._y_tag_id,
+                Lx=amp._Lx,
+                Ly=amp._Ly,
+                site_ind_id=amp._site_ind_id,
+            )
+            # num_cols = selected_cols[-1] - selected_cols[0] + 1
+            # if self.chi > 0:
+            #     amp_reuse.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1], bMPS_keys[0][1]+num_cols//2-1], **self.contract_boundary_opts)
+            #     amp_reuse.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1]+num_cols//2, bMPS_keys[1][1]+1], **self.contract_boundary_opts)
+            return amp_reuse.contract()
+
+        if self.chi > 0:
+            amp.contract_boundary_from_ymin_(max_bond=self.chi,
+                                             cutoff=0.0,
+                                             yrange=[0, amp.Ly // 2 - 1],
+                                             **self.contract_boundary_opts)
+            amp.contract_boundary_from_ymax_(max_bond=self.chi,
+                                             cutoff=0.0,
+                                             yrange=[amp.Ly // 2, amp.Ly - 1],
+                                             **self.contract_boundary_opts)
+
+        return amp.contract()
+
+    def vamp(
+        self,
+        x,
+        params,
+        bMPS_keys=None,
+        bMPS_params_xmin=None,
+        bMPS_params_xmax=None,
+        bMPS_params_ymin=None,
+        bMPS_params_ymax=None,
+        selected_rows=None,
+        selected_cols=None,
+    ):
+        params = self.params
+        if bMPS_params_xmin is not None and bMPS_params_xmax is not None:
+            return torch.vmap(
+                self.amplitude,
+                in_dims=(
+                    0,
+                    None,
+                    None,
+                    self.bMPS_params_x_in_dims[bMPS_keys[0]],
+                    self.bMPS_params_x_in_dims[bMPS_keys[1]],
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )(x, params, bMPS_keys, bMPS_params_xmin, bMPS_params_xmax,
+              bMPS_params_ymin, bMPS_params_ymax, selected_rows, selected_cols)
+
+        if bMPS_params_ymin is not None and bMPS_params_ymax is not None:
+            return torch.vmap(
+                self.amplitude,
+                in_dims=(
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.bMPS_params_y_in_dims[bMPS_keys[0]],
+                    self.bMPS_params_y_in_dims[bMPS_keys[1]],
+                    None,
+                    None,
+                ),
+            )(x, params, bMPS_keys, bMPS_params_xmin, bMPS_params_xmax,
+              bMPS_params_ymin, bMPS_params_ymax, selected_rows, selected_cols)
+
+        return torch.vmap(
+            self.amplitude,
+            in_dims=(0, None, None, None, None, None, None, None, None),
+        )(
+            x,
+            params,
+            bMPS_keys,
+            bMPS_params_xmin,
+            bMPS_params_xmax,
+            bMPS_params_ymin,
+            bMPS_params_ymax,
+            selected_rows,
+            selected_cols,
+        )
+
+    def forward(
+        self,
+        x,
+        bMPS_params_x_batched=None,
+        bMPS_params_y_batched=None,
+        selected_rows=None,
+        selected_cols=None,
+    ):
+        bMPS_params_xmin = None
+        bMPS_params_xmax = None
+        bMPS_params_ymin = None
+        bMPS_params_ymax = None
+        bMPS_keys = None
+
+        if selected_rows is not None:
+            bMPS_keys = [('xmin', min(selected_rows)),
+                         ('xmax', max(selected_rows))]
+            bMPS_params_xmin = bMPS_params_x_batched[bMPS_keys[0]]
+            bMPS_params_xmax = bMPS_params_x_batched[bMPS_keys[1]]
+        if selected_cols is not None:
+            bMPS_keys = [('ymin', min(selected_cols)),
+                         ('ymax', max(selected_cols))]
+            bMPS_params_ymin = bMPS_params_y_batched[bMPS_keys[0]]
+            bMPS_params_ymax = bMPS_params_y_batched[bMPS_keys[1]]
+
+        return self.vamp(
+            x,
+            self.params,
+            bMPS_keys=bMPS_keys,
+            bMPS_params_xmin=bMPS_params_xmin,
+            bMPS_params_xmax=bMPS_params_xmax,
+            bMPS_params_ymin=bMPS_params_ymin,
+            bMPS_params_ymax=bMPS_params_ymax,
+            selected_rows=selected_rows,
+            selected_cols=selected_cols,
+        )
 
 class Transformer_fPEPS_Model_DConv2d(nn.Module):
     def __init__(
@@ -2424,103 +2961,11 @@ class Transformer_fPEPS_Model_GlobalMLP(nn.Module):
     vamp = Transformer_fPEPS_Model_DConv2d.vamp
     forward = Transformer_fPEPS_Model_DConv2d.forward
 
-
-class Transformer_fPEPS_Model_Fourier(nn.Module):
-    def __init__(
-        self,
-        tn,
-        max_bond,
-        nn_eta,
-        nn_hidden_dim,
-        embed_dim,
-        attn_heads,
-        attn_depth=1,
-        init_perturbation_scale=1e-5,
-        dtype=torch.float64,
-        **kwargs,
-    ):
-        super().__init__()
-        
-        # === 1. TN Setup ===
-        params, skeleton = qtn.pack(tn)
-        self.dtype = dtype
-        self.skeleton = skeleton
-        self.chi = max_bond
-        
-        ftn_params_flat, ftn_params_pytree = qu.utils.tree_flatten(params, get_ref=True)
-        self.ftn_params_pytree = ftn_params_pytree
-        self.ftn_params = torch.nn.ParameterList([
-            torch.as_tensor(x, dtype=self.dtype) for x in ftn_params_flat
-        ])
-        self.ftn_params_shape = [p.shape for p in self.ftn_params]
-        self.ftn_params_sizes = [p.numel() for p in self.ftn_params] 
-        self.ftn_params_length = sum(self.ftn_params_sizes)
-        
-        # === 2. NN Setup ===
-        self.nn_hidden_dim = nn_hidden_dim
-        self.embed_dim = embed_dim
-        
-        self.attn_block = SelfAttn_block_pos_batched(
-            n_site=len(tn.sites),
-            num_classes=tn.phys_dim(),
-            embed_dim=self.embed_dim,
-            attention_heads=attn_heads,
-            depth=attn_depth,
-            dtype=self.dtype,
-        )
-        
-        # --- Backflow Generator: Fourier (Spectral) ---
-        self.nn_backflow_generator = FourierBackflow(
-            lx=self.skeleton.Lx,
-            ly=self.skeleton.Ly,
-            embed_dim=self.embed_dim,
-            hidden_dim=self.nn_hidden_dim,
-            param_sizes=self.ftn_params_sizes,
-            dtype=self.dtype
-        )
-        
-        self.nn_backflow = nn.Sequential(
-            self.attn_block,
-            self.nn_backflow_generator
-        )
-
-        self.nn_eta = nn_eta
-        self.nn_param_names = [name for name, _ in self.nn_backflow.named_parameters()]
-        self.params = nn.ParameterList(list(self.ftn_params) + list(self.nn_backflow.parameters()))
-        
-        self._init_weights_for_perturbation(scale=init_perturbation_scale)
-    
-    def _init_weights_for_perturbation(self, scale=1e-5):
-        backflow_module = self.nn_backflow_generator
-        # FourierBackflow 的最后一层通常是 conv2
-        output_layer = backflow_module.conv2
-        
-        if isinstance(output_layer, (torch.nn.Linear, torch.nn.Conv2d)):
-            print(f" -> [Fourier] Clamping output layer weights to scale {scale}")
-            torch.nn.init.normal_(output_layer.weight, mean=0.0, std=scale)
-            if output_layer.bias is not None:
-                torch.nn.init.zeros_(output_layer.bias)
-                
-        # Init attention
-        for m in self.attn_block.modules():
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
-
-    def _get_name(self):
-        return 'Transformer_fPEPS_Model_Fourier'
-
-    # ... (Reuse Logic) ...
-    tn_contraction = Transformer_fPEPS_Model_DConv2d.tn_contraction
-    vamp = Transformer_fPEPS_Model_DConv2d.vamp
-    forward = Transformer_fPEPS_Model_DConv2d.forward
-
 # ==============================================================================
 # Basic Transformer fPEPS Model without advanced backflow generators
 # Old models
 # ==============================================================================
-import torch.nn.functional as F
+
 class Transformer_fPEPS_Model(nn.Module):
     def __init__(self, tn, max_bond, nn_eta, nn_hidden_dim, embed_dim, attn_heads, dtype=torch.float64, **kwargs):
         import quimb as qu

@@ -307,7 +307,7 @@ def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, see
                 new_proposed_fxs,
                 bMPS_params_x_batched=B_bMPS_params_x_dict,
                 bMPS_params_y_batched=None,
-                selected_rows=(row,),
+                selected_rows=list(range(max(0,row-v_model.radius), min(v_model.Lx, row+v_model.radius+1))),
                 selected_cols=None,
             )
             proposed_amps = new_proposed_amps
@@ -364,7 +364,7 @@ def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, see
                 bMPS_params_x_batched=None,
                 bMPS_params_y_batched=B_bMPS_params_y_dict,
                 selected_rows=None,
-                selected_cols=(col,),
+                selected_cols=list(range(max(0,col-v_model.radius), min(v_model.Ly, col+v_model.radius+1))),
             )
             if benchmark_model is not None and verbose:
                 benchmark_amps = benchmark_model(new_proposed_fxs)
@@ -570,6 +570,12 @@ def evaluate_energy_reuse(fxs, v_model, H, current_amps, verbose=False, benchmar
         eta, coeffs = H.get_conn(fx)
         for i_eta in range(len(eta)):
             r, c, pos = detect_changed_row_col_pair(fx, eta[i_eta])
+            if r:
+                pos = list(range(max(0,min(pos)-v_model.radius), min(v_model.Lx, max(pos)+v_model.radius+1))) if pos is not None else None
+            elif c:
+                pos = list(range(max(0,min(pos)-v_model.radius), min(v_model.Ly, max(pos)+v_model.radius+1))) if pos is not None else None
+            else:
+                pos = None
             conn_eta_indices.append( (fx_ind, i_eta, r, c, pos) )
 
         conn_eta_num.append(len(eta))

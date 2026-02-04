@@ -13,7 +13,7 @@ import autoray as ar
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
 from vmc_torch.experiment.vmap.vmap_models import (
-    fPEPS_Model_reuse
+    Transformer_fPEPS_Model_Cluster_reuse
 )
 from vmc_torch.experiment.vmap.vmap_modules import distributed_minres_solver, run_sampling_phase_reuse
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
@@ -65,7 +65,7 @@ model_config = {
     'embed_dim': 16,
     'attn_depth': 1,
     'attn_heads': 4,
-    'nn_hidden_dim': 4, #peps.nsites,
+    'nn_hidden_dim': D, #peps.nsites,
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
@@ -82,17 +82,16 @@ init_kwargs.pop('dtype_str')
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
-fpeps_model = fPEPS_Model_reuse(
+fpeps_model = Transformer_fPEPS_Model_Cluster_reuse(
     tn=peps,
-    max_bond=chi,
     dtype=model_dtype,
     contract_boundary_opts={
         'mode': 'mps',
         'equalize_norms': 1.0,
         'canonize': True,
     },
+    **init_kwargs
 )
-fpeps_model.radius = 0  # Set the radius for local updates
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 
     print(f'Model Params: {n_params}')
@@ -105,7 +104,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 # VMC Hyperparams
 Ns = int(10) 
 B = 10
-B_grad = 10//2
+B_grad = 10
 vmc_steps = 50
 init_step = 0
 burn_in_steps = 0
@@ -136,7 +135,7 @@ get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_
 
 # Init State
 fxs = torch.stack([random_initial_config(N_f, peps.nsites) for _ in range(B)]).to(torch.long)
-fpeps_model.cache_bMPS_skeleton(fxs[0]) if isinstance(fpeps_model, fPEPS_Model_reuse) else None
+fpeps_model.cache_bMPS_skeleton(fxs[0]) if isinstance(fpeps_model, Transformer_fPEPS_Model_Cluster_reuse) else None
 stats = {
     "Np": n_params,
     "sample size": Ns,

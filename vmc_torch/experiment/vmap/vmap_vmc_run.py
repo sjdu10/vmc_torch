@@ -45,9 +45,9 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 4
-N_f = Lx * Ly - 2
-D, chi = 4, 8
+Lx, Ly = 6, 6
+N_f = Lx * Ly
+D, chi = 4, 16
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -82,17 +82,7 @@ model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-# fpeps_model = fPEPS_Model(
-#     tn=peps,
-#     dtype=model_dtype,
-#     contract_boundary_opts={
-#         'mode': 'mps',
-#         'equalize_norms': 1.0,
-#         'canonize': True,
-#     },
-#     **init_kwargs
-# )
-fpeps_model = Transformer_fPEPS_Model_Conv2d(
+fpeps_model = fPEPS_Model(
     tn=peps,
     dtype=model_dtype,
     contract_boundary_opts={
@@ -102,6 +92,16 @@ fpeps_model = Transformer_fPEPS_Model_Conv2d(
     },
     **init_kwargs
 )
+# fpeps_model = Transformer_fPEPS_Model_Conv2d(
+#     tn=peps,
+#     dtype=model_dtype,
+#     contract_boundary_opts={
+#         'mode': 'mps',
+#         'equalize_norms': 1.0,
+#         'canonize': True,
+#     },
+#     **init_kwargs
+# )
 # fpeps_model = Transformer_fPEPS_Model_Cluster(
 #     tn=peps,
 #     dtype=model_dtype,
@@ -136,8 +136,8 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(1000) 
-B = 100
+Ns = int(100) 
+B = 10
 B_grad = B // 2
 vmc_steps = 50
 init_step = 0
