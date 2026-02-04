@@ -195,8 +195,15 @@ for svmc in range(init_step, vmc_steps + init_step):
     # Master (Rank 0) participates in Allreduce but contributes 0 data
     
     dp, t_sr, info = distributed_minres_solver(
-        local_grads, local_amps, local_energies,
-        energy_mean, total_samples, n_params, diag_shift, COMM
+        local_grads,
+        local_amps,
+        local_energies,
+        energy_mean,
+        total_samples,
+        n_params,
+        diag_shift,
+        COMM,
+        rtol=5e-5,
     )
     
     if RANK == 0:
