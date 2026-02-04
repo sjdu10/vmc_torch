@@ -541,6 +541,7 @@ class fPEPS_Model_reuse(nn.Module):
         
         self.radius = 0
 
+    @torch.no_grad()
     def cache_bMPS_skeleton(self, x):
         params = qu.utils.tree_unflatten(self.params, self.params_pytree)
         tns = qtn.unpack(
@@ -572,6 +573,10 @@ class fPEPS_Model_reuse(nn.Module):
         bMPS_params_y_in_dims = qu.utils.tree_map(lambda _: 0,
                                                   bMPS_params_dict)
         self.bMPS_params_y_in_dims = bMPS_params_y_in_dims
+        del env_x
+        del env_y
+        del bMPS_params_dict
+
 
     def cache_bMPS_params_vmap(self, x):
         # return a pytree (dict) of bMPS params for x and y environments
@@ -2233,6 +2238,7 @@ class Transformer_fPEPS_Model_Cluster_reuse(nn.Module):
         amp = tns.isel({tns.site_ind(site): x[i] for i, site in enumerate(tns.sites)})
         return amp
 
+    @torch.no_grad()
     def cache_bMPS_skeleton(self, x):
         amp = self._get_single_amp(x, self.params)
         env_x = amp.compute_x_environments(max_bond=self.chi, cutoff=0.0)

@@ -858,11 +858,13 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
                 b_end = min(b_start + B_grad, B)
                 fxs_chunk = fxs[b_start:b_end]
                 grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
-                amps_c = amps_c.detach()
-                grads_pytree_chunks.append(grads_chunk)
-                amps_chunks.append(amps_c)
+                
+                grads_pytree_chunks.append(tree_map(lambda x: x.detach(), grads_chunk))
+                amps_chunks.append(amps_c.detach())
                 
                 del grads_chunk, amps_c
+                fpeps_model.zero_grad()
+
 
             # 5. Concatenate results
             amps = torch.cat(amps_chunks, dim=0)
