@@ -210,13 +210,13 @@ def run_sampling_phase(
                             active_rank_ids.remove(source_rank)
                     if verbose:
                         print(f"\n[Master] Sample target reached ({n_collected}).", flush=True)
-                    break
+                    # break
                 
             else:
                 if n_collected >= Ns:
                     if verbose:
                         print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}", flush=True)
-                    break
+                    # break
                 time.sleep(0.001)
         
         if verbose:
@@ -396,15 +396,14 @@ def run_sampling_phase_reuse(
                             active_rank_ids.remove(source_rank)
                     if verbose:
                         print(f"\n[Master] Sample target reached ({n_collected}).", flush=True)
-                    break
+                    # break
                 
             else:
                 if n_collected >= Ns:
                     if verbose:
                         print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}", flush=True)
-                    break
+                    # break
                 time.sleep(0.001)
-        
         if verbose:
             print('Sampling phase should be done now.', flush=True)
             

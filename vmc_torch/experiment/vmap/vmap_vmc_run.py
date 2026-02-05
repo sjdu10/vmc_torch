@@ -29,7 +29,7 @@ from vmc_torch.optimizer import DecayScheduler
 import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
-SVD_JITTER = 1e-10
+SVD_JITTER = 1e-12
 driver = None
 # ar.register_function('torch','linalg.svd', lambda x: robust_svd_wrapper(x, jitter=SVD_JITTER, driver=driver))
 # ar.register_function('torch','linalg.svd', lambda x: robust_svd_eig_wrapper(x, jitter=SVD_JITTER, driver=driver))
