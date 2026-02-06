@@ -12,13 +12,13 @@ from vmc_torch.experiment.vmap.GPU.GPU_vmap_utils import sample_next, evaluate_e
 from vmc_torch.experiment.vmap.vmap_models import PEPS_Model, fPEPS_Model
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch, spin_Heisenberg_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
-from vmc_torch.experiment.vmap.vmap_torch_utils import RobustSVD
+from vmc_torch.experiment.vmap.vmap_torch_utils import robust_svd_err_catcher_wrapper
 import autoray as ar
 import quimb.tensor as qtn
 
-JITTER = 1e-10
+JITTER = 1e-16
 driver = None
-ar.register_function('torch', 'linalg.svd', lambda x, **kwargs: RobustSVD.apply(x, jitter_strength=JITTER, driver=driver))
+ar.register_function('torch', 'linalg.svd', lambda x: robust_svd_err_catcher_wrapper(x, jitter=JITTER, driver=driver))
 
 # ==========================================
 # 1. 初始化 Distributed 环境 (GPU Native)
@@ -54,11 +54,11 @@ torch.manual_seed(42 + RANK)
 # ==========================================
 # 2. 参数设置与模型加载
 # ==========================================
-Lx, Ly = 8, 8
+Lx, Ly = 2, 2
 nsites = Lx * Ly
-N_f = nsites - 8
+N_f = nsites
 D = 4
-chi = 8
+chi = -1
 
 # 路径配置 (保持你的原样)
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
@@ -122,7 +122,7 @@ graph = H.graph
 # ==========================================
 # 3. 采样配置
 # ==========================================
-Total_Ns = int(32)  # 总样本数
+Total_Ns = int(4096)  # 总样本数
 # 确保每个 Rank 分到的样本数是整数
 assert Total_Ns % WORLD_SIZE == 0, f"Total samples {Total_Ns} must be divisible by World Size {WORLD_SIZE}"
 samples_per_rank = Total_Ns // WORLD_SIZE
@@ -131,7 +131,9 @@ samples_per_rank = Total_Ns // WORLD_SIZE
 # 如果显存够，可以直接设为 samples_per_rank，这样一步到位
 # 如果显存不够，可以设小一点，循环多次累积
 batch_size_per_rank = samples_per_rank
-grad_batch_size = 16
+if RANK == 0:
+    print(f"Each Rank sampling {samples_per_rank} samples with batch size {batch_size_per_rank}")
+grad_batch_size = 512
 # 确保初始化 walkers 在 GPU 上
 fxs_list = [random_initial_config(N_f, nsites, seed=42+_) for _ in range(batch_size_per_rank)]
 fxs = torch.stack(fxs_list).to(device)

@@ -18,7 +18,9 @@ from vmc_torch.experiment.vmap.vmap_models import (
     Transformer_fPEPS_Model_Cluster,
     Transformer_fPEPS_Model_DConv2d,
     fTN_backflow_attn_Tensorwise_Model_vmap,
-    fPEPS_Model
+    fPEPS_Model,
+    LoRA_fPEPS_Model,
+    LoRA_NNfPEPS_Model
 )
 from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_vec
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
@@ -45,9 +47,9 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 6, 6
-N_f = Lx * Ly
-D, chi = 4, 16
+Lx, Ly = 4, 2
+N_f = Lx * Ly - 2
+D, chi = 4, -1
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -82,9 +84,22 @@ model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 # Model
-fpeps_model = fPEPS_Model(
+# fpeps_model = LoRA_fPEPS_Model(
+#     tn=peps,
+#     dtype=model_dtype,
+#     lora_rank=12,
+#     contract_boundary_opts={
+#         'mode': 'mps',
+#         'equalize_norms': 1.0,
+#         'canonize': True,
+#     },
+#     **init_kwargs
+# )
+fpeps_model = LoRA_NNfPEPS_Model(
     tn=peps,
     dtype=model_dtype,
+    lora_rank=4,
+    hidden_dim=4,
     contract_boundary_opts={
         'mode': 'mps',
         'equalize_norms': 1.0,
@@ -92,6 +107,16 @@ fpeps_model = fPEPS_Model(
     },
     **init_kwargs
 )
+# fpeps_model = fPEPS_Model(
+#     tn=peps,
+#     dtype=model_dtype,
+#     contract_boundary_opts={
+#         'mode': 'mps',
+#         'equalize_norms': 1.0,
+#         'canonize': True,
+#     },
+#     **init_kwargs
+# )
 # fpeps_model = Transformer_fPEPS_Model_Conv2d(
 #     tn=peps,
 #     dtype=model_dtype,
@@ -136,12 +161,12 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(100) 
-B = 10
+Ns = int(8e3) 
+B = 400
 B_grad = B // 2
-vmc_steps = 50
-init_step = 0
-burn_in_steps = 0
+vmc_steps = 200
+init_step = 50
+burn_in_steps = 5
 learning_rate = 0.1
 diag_shift = 1e-5
 save_state_every = 10
@@ -161,7 +186,7 @@ curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
 COMM.Bcast(curr_params.detach().numpy(), root=0)
 curr_params = curr_params.to(model_dtype)
 # require gradient
-torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), curr_params)
+# torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), curr_params)
 torch.nn.utils.vector_to_parameters(curr_params, fpeps_model.parameters())
 COMM.Barrier()
 
@@ -259,7 +284,7 @@ for svmc in range(init_step, vmc_steps + init_step):
         new_params = curr_params - lr * dp_tensor
         COMM.Bcast(new_params.detach().numpy(), root=0)
         new_params = new_params.to(model_dtype)
-        torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), new_params)
+        # torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), new_params)
         torch.nn.utils.vector_to_parameters(new_params, fpeps_model.parameters())
 
     # --- Step 5: Logging (Master Only) ---

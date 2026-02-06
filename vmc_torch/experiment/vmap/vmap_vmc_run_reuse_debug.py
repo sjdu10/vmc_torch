@@ -13,7 +13,8 @@ import autoray as ar
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
 from vmc_torch.experiment.vmap.vmap_models import (
-    fPEPS_Model_reuse
+    fPEPS_Model_reuse,
+    Transformer_fPEPS_Model_Cluster_reuse
 )
 from vmc_torch.experiment.vmap.vmap_modules import sample_next_reuse, evaluate_energy_reuse
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
@@ -39,7 +40,7 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 Lx, Ly = 8, 8
 N_f = Lx * Ly - 8
-D, chi = 8, 32
+D, chi = 8, 24
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -65,12 +66,12 @@ model_config = {
     'embed_dim': 16,
     'attn_depth': 1,
     'attn_heads': 4,
-    'nn_hidden_dim': 4, #peps.nsites,
+    'nn_hidden_dim': D, #peps.nsites,
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
     'jitter_svd': 0,
-    'uniform_kernel': 0,
+    'uniform_kernel': 0, 
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
 model_dtype = dtype_map[model_config['dtype_str']]
@@ -82,17 +83,27 @@ init_kwargs.pop('dtype_str')
 #     dtype=model_dtype,
 #     **init_kwargs
 # )
-fpeps_model = fPEPS_Model_reuse(
+fpeps_model = Transformer_fPEPS_Model_Cluster_reuse(
     tn=peps,
-    max_bond=chi,
     dtype=model_dtype,
     contract_boundary_opts={
         'mode': 'mps',
-        'equalize_norms': 1.0,
+        # 'equalize_norms': 1.0,
         'canonize': True,
     },
+    **init_kwargs
 )
-fpeps_model.radius = 0  # Set the radius for local updates
+# fpeps_model = fPEPS_Model_reuse(
+#     tn=peps,
+#     max_bond=chi,
+#     dtype=model_dtype,
+#     contract_boundary_opts={
+#         'mode': 'mps',
+#         'equalize_norms': 1.0,
+#         'canonize': True,
+#     },
+# )
+# fpeps_model.radius = 0  # Set the radius for local updates
 n_params = sum(p.numel() for p in fpeps_model.parameters())
 if RANK == 0: 
     print(f'Model Params: {n_params}')
@@ -105,7 +116,7 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 # VMC Hyperparams
 Ns = int(10) 
 B = 10
-B_grad = 1
+B_grad = 2
 vmc_steps = 50
 init_step = 0
 burn_in_steps = 0
@@ -136,7 +147,7 @@ get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_
 
 # Init State
 fxs = torch.stack([random_initial_config(N_f, peps.nsites) for _ in range(B)]).to(torch.long)
-fpeps_model.cache_bMPS_skeleton(fxs[0]) if isinstance(fpeps_model, fPEPS_Model_reuse) else None
+fpeps_model.cache_bMPS_skeleton(fxs[0])
 stats = {
     "Np": n_params,
     "sample size": Ns,
@@ -154,10 +165,15 @@ get_grads_func = get_grads
 # 2. Main VMC Loop
 # ==============================================================================
 for svmc in range(init_step, vmc_steps + init_step):
-    # t00 = MPI.Wtime()
-    # fxs, current_amps = sample_next_reuse(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
-    # t11 = MPI.Wtime()
-    # energy_batch, local_energies_batch = evaluate_energy_reuse(fxs, model, hamiltonian, current_amps, verbose=False)
-    # t22 = MPI.Wtime()
+    t00 = MPI.Wtime()
+    print(f"Rank {RANK} starts sampling batch with {fxs.shape[0]} configs.", flush=True)
+    fxs, current_amps = sample_next_reuse(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+    t11 = MPI.Wtime()
+    # with torch.no_grad():
+    #     current_amps = model(fxs)
+    print(f"Rank {RANK} finished sampling batch. Starts energy evaluation.", flush=True)
+    energy_batch, local_energies_batch = evaluate_energy_reuse(fxs, model, hamiltonian, current_amps, verbose=False)
+    t22 = MPI.Wtime()
+    print(f"Rank {RANK} finished energy evaluation. Starts grad evaluation.", flush=True)
     grads_vec_batch, amps_batch = get_grads_func(fxs, model)
     t33 = MPI.Wtime()

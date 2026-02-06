@@ -39,7 +39,7 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 Lx, Ly = 8, 8
 N_f = Lx * Ly - 8
-D, chi = 4, 16
+D, chi = 8, 24
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -87,7 +87,7 @@ fpeps_model = Transformer_fPEPS_Model_Cluster_reuse(
     dtype=model_dtype,
     contract_boundary_opts={
         'mode': 'mps',
-        'equalize_norms': 1.0,
+        # 'equalize_norms': 1.0,
         'canonize': True,
     },
     **init_kwargs
@@ -107,7 +107,7 @@ B = 10
 B_grad = 2
 vmc_steps = 50
 init_step = 0
-burn_in_steps = 1
+burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10
@@ -136,7 +136,7 @@ get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_
 
 # Init State
 fxs = torch.stack([random_initial_config(N_f, peps.nsites) for _ in range(B)]).to(torch.long)
-fpeps_model.cache_bMPS_skeleton(fxs[0]) if isinstance(fpeps_model, Transformer_fPEPS_Model_Cluster_reuse) else None
+fpeps_model.cache_bMPS_skeleton(fxs[0])
 stats = {
     "Np": n_params,
     "sample size": Ns,
@@ -146,6 +146,15 @@ stats = {
     "variance": [],
 }
 
+if RANK == 1:  # 假设你想调试 Rank 0
+    import debugpy
+    # 监听 5678 端口
+    debugpy.listen(("localhost", 5678))
+    print(f"Rank {RANK} is waiting for debugger to attach...", flush=True)
+    # 这一行会让程序暂停，直到你按调试按钮连接上来
+    debugpy.wait_for_client() 
+    print(f"Rank {RANK} debugger attached!", flush=True)
+    
 # ==============================================================================
 # 2. Main VMC Loop
 # ==============================================================================

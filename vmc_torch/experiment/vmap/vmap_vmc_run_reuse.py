@@ -37,8 +37,8 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 6, 6
-N_f = Lx * Ly
+Lx, Ly = 4, 4
+N_f = Lx * Ly - 2
 D, chi = 4, 16
 t, U = 1.0, 8.0
 
@@ -88,9 +88,10 @@ fpeps_model = fPEPS_Model_reuse(
     dtype=model_dtype,
     contract_boundary_opts={
         'mode': 'mps',
-        'equalize_norms': 1.0,
+        # 'equalize_norms': 1.0,
         'canonize': True,
     },
+    debug=True
 )
 fpeps_model.radius = 0  # Set the radius for local updates
 n_params = sum(p.numel() for p in fpeps_model.parameters())
@@ -103,12 +104,12 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(1e2) 
-B = 10
+Ns = int(2e1) 
+B = 20
 B_grad = B // 2
 vmc_steps = 50
 init_step = 0
-burn_in_steps = 10
+burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10

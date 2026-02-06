@@ -281,6 +281,7 @@ def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, see
     B_bMPS_params_x_dict, current_amps = v_model.cache_bMPS_params_any_direction_vmap(fxs, direction='x')
     for row, edges in graph.row_edges.items():
         for edge in edges:
+            # print(f"Processing edge {edge} in row {row}", flush=True)
             i, j = edge
             proposed_fxs, new_flags = [], []
             fx_id = 0
@@ -337,6 +338,7 @@ def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, see
     B_bMPS_params_y_dict, current_amps = v_model.cache_bMPS_params_any_direction_vmap(fxs, direction='y')
     for col, edges in graph.col_edges.items():
         for edge in edges:
+            # print(f"Processing edge {edge} in col {col}", flush=True)
             i, j = edge
             proposed_fxs, new_flags = [], []
             fx_id = 0

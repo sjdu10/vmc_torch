@@ -5,10 +5,6 @@ import random
 # from mpi4py import MPI
 from torch.utils._pytree import tree_map, tree_flatten
 
-# comm = MPI.COMM_WORLD
-# RANK = comm.Get_rank()
-# SIZE = comm.Get_size()
-
 #=== Utility functions for Metropolis-Hastings sampling ===#
 
 def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25, seed=None):
@@ -307,7 +303,7 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
 
             # Aggregate results
             amps = torch.cat(amps_chunks, dim=0)
-            if amps.dim() == 1: amps = amps.unsqueeze(-1)
+            # if amps.dim() == 1: amps = amps.unsqueeze(-1)
             
             # Helper to concatenate leaves of the gradient PyTree
             def concat_leaves(*leaves):

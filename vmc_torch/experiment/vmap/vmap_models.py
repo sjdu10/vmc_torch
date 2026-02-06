@@ -455,6 +455,124 @@ class fPEPS_Model(nn.Module):
         return self.vamp(x, self.params)
 
 
+class LoRA_fPEPS_Model(nn.Module):
+    def __init__(self, tn, max_bond, lora_rank=8, dtype=torch.float64, compile=False, contract_boundary_opts={}, **kwargs):
+        super().__init__()
+        
+        # 1. Basic configuration
+        self.dtype = dtype
+        self.chi = max_bond
+        self.contract_boundary_opts = contract_boundary_opts
+        self.lora_rank = lora_rank
+        
+        # 2. Extract TN structure and parameters
+        # params_flat: list of numpy arrays representing raw tensor blocks
+        params, skeleton = qtn.pack(tn)
+        self.skeleton = skeleton
+        params_flat, params_pytree = qu.utils.tree_flatten(params, get_ref=True)
+        self.params_pytree = params_pytree
+
+        # 3. Register Fixed Tensors as BUFFERS
+        # By using register_buffer, these tensors are part of state_dict (for saving/loading)
+        # but are NOT returned by model.parameters(), keeping your trainable parameter count minimal.
+        self.fixed_tensors = [] 
+        for i, x in enumerate(params_flat):
+            name = f"fixed_tensor_{i}"
+            t = torch.as_tensor(x, dtype=self.dtype).detach()
+            self.register_buffer(name, t)
+            self.fixed_tensors.append(t) 
+
+        # 4. Register LoRA Parameters (Trainable)
+        # We use Batched CP decomposition to maintain the block structure (N_b, D/2, ..., d/2)
+        self.lora_sites = nn.ModuleList()
+        for tensor_data in params_flat:
+            shape = tensor_data.shape
+            n_blocks = shape[0]      # Number of symmetry blocks (N_b)
+            phys_dims = shape[1:]    # Virtual and physical legs (D/2, ..., d/2)
+            
+            factors = nn.ParameterList()
+            for dim_size in phys_dims:
+                # Initialize with small noise so delta_T starts near zero
+                # Each factor shape: (N_b, Rank, Dim)
+                factor = torch.randn(n_blocks, lora_rank, dim_size, dtype=self.dtype) * 0.01
+                factors.append(nn.Parameter(factor))
+            self.lora_sites.append(factors)
+
+        # 5. Vmap setup for batched amplitude calculation
+        self._vmapped_amplitude = torch.vmap(
+            self.amplitude,
+            in_dims=(0, None),
+            randomness='different',
+        )
+        if compile:
+            self._vmapped_amplitude = torch.compile(
+                self._vmapped_amplitude, fullgraph=False, mode="default"
+            )
+
+    @property
+    def params(self):
+        """
+        Custom property for compute_grads.
+        Returns only the trainable LoRA factors as a nested list (PyTree).
+        """
+        return [[p for p in site] for site in self.lora_sites]
+
+    def _reconstruct_params(self, lora_params_structure=None):
+        """
+        Reconstruct the full tensors: T = T_fixed + CP_Reconstruct(LoRA_factors).
+        Supports functional injection of parameters for torch.func compatibility.
+        """
+        # Use provided params (from vmap/grad) or fallback to internal parameters
+        iter_params = lora_params_structure if lora_params_structure is not None else self.lora_sites
+
+        current_params_flat = []
+        for fixed_t, factors in zip(self.fixed_tensors, iter_params):
+            # n_phys_dims excludes the N_b dimension
+            n_phys_dims = len(fixed_t.shape) - 1 
+            
+            # Build Batched CP Einsum string
+            # e.g., "xra, xrb, xrc, xrd, xre -> xabcde"
+            input_subs = [f"xr{chr(97+i)}" for i in range(n_phys_dims)] 
+            output_sub = "x" + "".join([chr(97+i) for i in range(n_phys_dims)])
+            eq = f"{','.join(input_subs)}->{output_sub}"
+            
+            # delta_t matches the shape of fixed_t (N_b, ...)
+            delta_t = torch.einsum(eq, *factors)
+            current_params_flat.append(fixed_t + delta_t)
+            
+        return qu.utils.tree_unflatten(current_params_flat, self.params_pytree)
+
+    def amplitude(self, x, params):
+        """
+        Core physics: compute amplitude for a single configuration x.
+        """
+        tn = qtn.unpack(params, self.skeleton)
+        amp = tn.isel({tn.site_ind(site): x[i] for i, site in enumerate(tn.sites)})
+        
+        # Boundary contraction for PEPS
+        if self.chi > 0:
+            amp.contract_boundary_from_xmin_(
+                max_bond=self.chi, cutoff=0.0, xrange=[0, amp.Lx//2-1], **self.contract_boundary_opts
+            )
+            amp.contract_boundary_from_xmax_(
+                max_bond=self.chi, cutoff=0.0, xrange=[amp.Lx//2, amp.Lx-1], **self.contract_boundary_opts
+            )
+        return amp.contract()
+    
+    def vamp(self, x, params=None):
+        """
+        Batched amplitude calculation compatible with compute_grads(fxs, model, p).
+        """
+        # 1. Reconstruct full tensors (params here refers to LoRA factors)
+        combined_params_pytree = self._reconstruct_params(lora_params_structure=params)
+        
+        # 2. Compute vmapped amplitudes
+        return self._vmapped_amplitude(x, combined_params_pytree)
+
+    def forward(self, x):
+        return self.vamp(x)
+
+
 # ============================= Helper functions for fPEPS with reusing bMPS envs =============================
 def is_vmap_compatible(x):
     """
@@ -529,6 +647,7 @@ class fPEPS_Model_reuse(nn.Module):
         self.bMPS_params_x_in_dims = None
         self.bMPS_params_y_in_dims = None
         self.chi = max_bond
+        self.debug = kwargs.get('debug', False)
 
         # for torch, further flatten pytree into a single list
         params_flat, params_pytree = qu.utils.tree_flatten(params,
@@ -890,7 +1009,7 @@ class fPEPS_Model_reuse(nn.Module):
     ):
         params = qu.utils.tree_unflatten(params, self.params_pytree)
         if bMPS_params_xmin is not None and bMPS_params_xmax is not None:
-            return torch.vmap(
+            amps = torch.vmap(
                 self.amplitude,
                 in_dims=(
                     0,
@@ -905,9 +1024,19 @@ class fPEPS_Model_reuse(nn.Module):
                 ),
             )(x, params, bMPS_keys, bMPS_params_xmin, bMPS_params_xmax,
               bMPS_params_ymin, bMPS_params_ymax, selected_rows, selected_cols)
+            if self.debug:
+                amp_tn_s = [self.amp_tn(x[i]) for i in range(x.shape[0])]
+                amps_benchmark = torch.stack([amp_tn.contract() for amp_tn in amp_tn_s], dim=0)
+                assert torch.allclose(
+                    torch.tensor(amps),
+                    torch.tensor(amps_benchmark),
+                    rtol=1e-3,
+                    atol=1e-3,
+                ), f"Amps with bMPS reuse do not match direct contraction! {amps} vs {amps_benchmark}"
+            return amps
 
         if bMPS_params_ymin is not None and bMPS_params_ymax is not None:
-            return torch.vmap(
+            amps = torch.vmap(
                 self.amplitude,
                 in_dims=(
                     0,
@@ -922,6 +1051,16 @@ class fPEPS_Model_reuse(nn.Module):
                 ),
             )(x, params, bMPS_keys, bMPS_params_xmin, bMPS_params_xmax,
               bMPS_params_ymin, bMPS_params_ymax, selected_rows, selected_cols)
+            if self.debug:
+                amp_tn_s = [self.amp_tn(x[i]) for i in range(x.shape[0])]
+                amps_benchmark = torch.stack([amp_tn.contract() for amp_tn in amp_tn_s], dim=0)
+                assert torch.allclose(
+                    torch.tensor(amps),
+                    torch.tensor(amps_benchmark),
+                    rtol=1e-3,
+                    atol=1e-3,
+                ), f"Amps with bMPS reuse do not match direct contraction! {amps} vs {amps_benchmark}"
+            return amps
 
         return torch.vmap(
             self.amplitude,
@@ -978,6 +1117,7 @@ class fPEPS_Model_reuse(nn.Module):
 # ==============================================================================
 # Helper Module: Self-Attention and Transformer Layers
 # ==============================================================================
+
 class SelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, **mha_kwargs):
         super().__init__()
@@ -2264,6 +2404,7 @@ class Transformer_fPEPS_Model_Cluster_reuse(nn.Module):
                                                   bMPS_params_dict)
         self.bMPS_params_y_in_dims = bMPS_params_y_in_dims
 
+    @torch.no_grad()
     def cache_bMPS_params_vmap(self, x):
         # return a pytree (dict) of bMPS params for x and y environments
         # For fermions, need to record every tensor's fermionic info too.
@@ -2495,10 +2636,10 @@ class Transformer_fPEPS_Model_Cluster_reuse(nn.Module):
                 Ly=amp._Ly,
                 site_ind_id=amp._site_ind_id,
             )
-            # num_rows = selected_rows[-1] - selected_rows[0] + 1
-            # if self.chi > 0:
-            #     amp_reuse.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1], bMPS_keys[0][1]+num_rows//2-1], **self.contract_boundary_opts)
-            #     amp_reuse.contract_boundary_from_xmax_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1]+num_rows//2, bMPS_keys[1][1]+1], **self.contract_boundary_opts)
+            num_rows = selected_rows[-1] - selected_rows[0] + 1
+            if self.chi > 0:
+                amp_reuse.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1], bMPS_keys[0][1]+num_rows//2-1], **self.contract_boundary_opts)
+                amp_reuse.contract_boundary_from_xmax_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1]+num_rows//2, min(bMPS_keys[1][1]+1, self.Lx-1)], **self.contract_boundary_opts)
             return amp_reuse.contract()
         # replace the y-environment with the cached one
         if bMPS_params_ymin is not None and bMPS_params_ymax is not None and bMPS_keys is not None:
@@ -2518,10 +2659,10 @@ class Transformer_fPEPS_Model_Cluster_reuse(nn.Module):
                 Ly=amp._Ly,
                 site_ind_id=amp._site_ind_id,
             )
-            # num_cols = selected_cols[-1] - selected_cols[0] + 1
-            # if self.chi > 0:
-            #     amp_reuse.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1], bMPS_keys[0][1]+num_cols//2-1], **self.contract_boundary_opts)
-            #     amp_reuse.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1]+num_cols//2, bMPS_keys[1][1]+1], **self.contract_boundary_opts)
+            num_cols = selected_cols[-1] - selected_cols[0] + 1
+            if self.chi > 0:
+                amp_reuse.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1], bMPS_keys[0][1]+num_cols//2-1], **self.contract_boundary_opts)
+                amp_reuse.contract_boundary_from_ymax_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1]+num_cols//2, min(bMPS_keys[1][1]+1, self.Ly-1)], **self.contract_boundary_opts)
             return amp_reuse.contract()
 
         if self.chi > 0:
@@ -2966,6 +3107,170 @@ class Transformer_fPEPS_Model_GlobalMLP(nn.Module):
     tn_contraction = Transformer_fPEPS_Model_DConv2d.tn_contraction
     vamp = Transformer_fPEPS_Model_DConv2d.vamp
     forward = Transformer_fPEPS_Model_DConv2d.forward
+
+
+# ==============================================================================
+# LoRA NN-fPEPS Models
+# ==============================================================================
+class FactorGenerator(nn.Module):
+    """
+    A lightweight MLP that generates LoRA factors based on the global configuration x.
+    """
+    def __init__(self, input_dim, output_shapes, hidden_dim=64, dtype=torch.float64):
+        super().__init__()
+        self.output_shapes = output_shapes # List of (N_b, Rank, Dim)
+        
+        # Total number of elements to generate across all factors
+        self.total_elements = sum(torch.prod(torch.tensor(s)).item() for s in output_shapes)
+        
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim, dtype=dtype),
+            nn.Tanh(), # Tanh is often better for wavefunctions than ReLU
+            nn.Linear(hidden_dim, int(self.total_elements), dtype=dtype)
+        )
+
+    def forward(self, x):
+        # x shape: (Batch, N_sites)
+        flat_outputs = self.net(x.to(next(self.parameters()).dtype)) # (Batch, Total_Elements)
+        
+        # Split and reshape into the required factor shapes
+        all_factors = []
+        cursor = 0
+        for shape in self.output_shapes:
+            num_el = int(torch.prod(torch.tensor(shape)).item())
+            # Reshape to (Batch, N_b, Rank, Dim)
+            all_factors.append(flat_outputs[:, cursor:cursor+num_el].view(-1, *shape))
+            cursor += num_el
+        return all_factors
+
+class LoRA_NNfPEPS_Model(nn.Module):
+    def __init__(self, tn, max_bond, lora_rank=8, hidden_dim=64, dtype=torch.float64, **kwargs):
+        super().__init__()
+        self.dtype = dtype
+        self.chi = max_bond
+        self.lora_rank = lora_rank
+        self.n_sites = len(tn.sites)
+        
+        # 1. Extract TN structure
+        params, skeleton = qtn.pack(tn)
+        self.skeleton = skeleton
+        params_flat, params_pytree = qu.utils.tree_flatten(params, get_ref=True)
+        self.params_pytree = params_pytree
+
+        # 2. Register Fixed Tensors as BUFFERS (Keep parameters minimal)
+        self.fixed_tensors = []
+        for i, x in enumerate(params_flat):
+            self.register_buffer(f"fixed_tensor_{i}", torch.as_tensor(x, dtype=self.dtype).detach())
+            self.fixed_tensors.append(getattr(self, f"fixed_tensor_{i}"))
+
+        # 3. Prepare Shapes for the Factor Generator
+        # Each tensor site has multiple factors (one per leg)
+        self.all_factor_shapes = []
+        self.site_factor_counts = []
+        for tensor_data in params_flat:
+            shape = tensor_data.shape # (N_b, D/2, ..., d/2)
+            n_blocks = shape[0]
+            phys_dims = shape[1:]
+            self.site_factor_counts.append(len(phys_dims))
+            for dim_size in phys_dims:
+                self.all_factor_shapes.append((n_blocks, lora_rank, dim_size))
+
+        # 4. Neural Factor Generator
+        # This is the ONLY part with trainable parameters (besides the optional NN weights)
+        self.generator = FactorGenerator(
+            input_dim=self.n_sites, 
+            output_shapes=self.all_factor_shapes, 
+            hidden_dim=hidden_dim, 
+            dtype=dtype
+        )
+
+    @property
+    def params(self):
+        """
+        Returns the generator's parameters for compute_grads.
+        """
+        return list(self.generator.parameters())
+
+    def _reconstruct_params_batched(self, x, generator_params=None):
+        """
+        Reconstruct tensors for each configuration in the batch.
+        Output shape for each tensor: (Batch, N_b, D/2, ..., d/2)
+        """
+        # If generator_params is provided (from torch.func), we use functional call
+        if generator_params is not None:
+            from torch.func import functional_call
+            param_dict = {name: p for name, p in zip([n for n, _ in self.generator.named_parameters()], generator_params)}
+            all_generated_factors = functional_call(self.generator, param_dict, (x,))
+        else:
+            all_generated_factors = self.generator(x)
+
+        current_params_flat_batched = []
+        factor_cursor = 0
+        
+        for fixed_t in self.fixed_tensors:
+            num_factors = len(fixed_t.shape) - 1
+            factors = all_generated_factors[factor_cursor : factor_cursor + num_factors]
+            factor_cursor += num_factors
+            
+            # --- CORRECTED EINSUM LOGIC ---
+            n_phys_dims = len(fixed_t.shape) - 1
+            
+            # We use UPPERCASE for structural indices to avoid collision with 'a','b','c'...
+            # Z: Batch dimension (from x)
+            # S: Symmetry Block dimension (N_b)
+            # R: LoRA Rank dimension
+            # a, b, c... : Physical/Virtual dimensions
+            
+            # Input subscripts: "ZSRa", "ZSRb", "ZSRc" ...
+            input_subs = [f"ZSR{chr(97+i)}" for i in range(n_phys_dims)]
+            
+            # Output subscript: "ZSabcd..." 
+            # Z and S are preserved (batch dims), R is contracted (summed over).
+            output_sub = "ZS" + "".join([chr(97+i) for i in range(n_phys_dims)])
+            
+            eq = f"{','.join(input_subs)}->{output_sub}"
+            
+            # delta_t shape: (Batch, N_b, D/2, D/2, ..., d/2)
+            delta_t = torch.einsum(eq, *factors)
+            
+            # Broadcast the fixed_t background across the Batch dimension
+            # fixed_t: (N_b, ...) -> unsqueeze -> (1, N_b, ...)
+            current_params_flat_batched.append(fixed_t.unsqueeze(0) + delta_t)
+            
+        return current_params_flat_batched
+
+    def amplitude_single(self, x_single, params_single):
+        """
+        Compute amplitude for a single config with its specific reconstructed tensor.
+        """
+        # Unflatten the dict/pytree for quimb
+        params_dict = qu.utils.tree_unflatten(params_single, self.params_pytree)
+        tn = qtn.unpack(params_dict, self.skeleton)
+        
+        amp = tn.isel({tn.site_ind(site): x_single[i] for i, site in enumerate(tn.sites)})
+        if self.chi > 0:
+            # Boundary contraction
+            amp.contract_boundary_from_xmin_(max_bond=self.chi, xrange=[0, amp.Lx//2-1])
+            amp.contract_boundary_from_xmax_(max_bond=self.chi, xrange=[amp.Lx//2, amp.Lx-1])
+        return amp.contract()
+
+    def vamp(self, x, params=None):
+        """
+        Overridden vamp to handle config-dependent tensors.
+        """
+        # 1. Generate tensors for each x in the batch
+        # batched_tensors: List of Tensors, each (Batch, N_b, ...)
+        batched_tensors = self._reconstruct_params_batched(x, generator_params=params)
+        
+        # 2. Map amplitude calculation over the batch
+        # We need to slice batched_tensors along the 0-th dimension inside vmap
+        def compute_single(x_i, *tensors_i):
+            return self.amplitude_single(x_i, tensors_i)
+
+        return torch.vmap(compute_single)(x, *batched_tensors)
+
+    def forward(self, x):
+        return self.vamp(x)
 
 # ==============================================================================
 # Basic Transformer fPEPS Model without advanced backflow generators
