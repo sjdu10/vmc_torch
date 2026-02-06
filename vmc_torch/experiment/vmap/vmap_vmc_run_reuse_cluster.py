@@ -37,9 +37,9 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 8, 8
-N_f = Lx * Ly - 8
-D, chi = 8, 24
+Lx, Ly = 4, 2
+N_f = Lx * Ly - 2
+D, chi = 4, -1
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -69,7 +69,6 @@ model_config = {
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
-    'jitter_svd': 0,
     'uniform_kernel': 0,
 }
 dtype_map = {'float64': torch.float64, 'float32': torch.float32}
@@ -102,12 +101,12 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(10) 
-B = 10
-B_grad = 2
+Ns = int(20) 
+B = 2
+B_grad = B//2
 vmc_steps = 50
 init_step = 0
-burn_in_steps = 0
+burn_in_steps = 5
 learning_rate = 0.1
 diag_shift = 1e-4
 save_state_every = 10
@@ -121,8 +120,7 @@ if init_step > 0:
     fpeps_model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
     if RANK == 0: 
         print(f'Loaded step {init_step}')
-        
-# Broadcast RANK 0 parameters to all ranks (Important to ensure the training makes sense -- train the same model!!)
+# Ensure same model parameters are used across all ranks
 curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
 COMM.Bcast(curr_params.detach().numpy(), root=0)
 curr_params = curr_params.to(model_dtype)
@@ -146,14 +144,14 @@ stats = {
     "variance": [],
 }
 
-if RANK == 1:  # 假设你想调试 Rank 0
-    import debugpy
-    # 监听 5678 端口
-    debugpy.listen(("localhost", 5678))
-    print(f"Rank {RANK} is waiting for debugger to attach...", flush=True)
-    # 这一行会让程序暂停，直到你按调试按钮连接上来
-    debugpy.wait_for_client() 
-    print(f"Rank {RANK} debugger attached!", flush=True)
+# if RANK == 1:  # 假设你想调试 Rank 0
+#     import debugpy
+#     # 监听 5678 端口
+#     debugpy.listen(("localhost", 5678))
+#     print(f"Rank {RANK} is waiting for debugger to attach...", flush=True)
+#     # 这一行会让程序暂停，直到你按调试按钮连接上来
+#     debugpy.wait_for_client() 
+#     print(f"Rank {RANK} debugger attached!", flush=True)
     
 # ==============================================================================
 # 2. Main VMC Loop

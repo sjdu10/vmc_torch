@@ -958,8 +958,8 @@ class fPEPS_Model_reuse(nn.Module):
                 Ly=tns._Ly,
                 site_ind_id=tns._site_ind_id,
             )
-            # if self.chi > 0:
-            #     amp_reuse.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1], bMPS_keys[1][1]+1])
+            if self.chi > 0:
+                amp_reuse.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1], min(bMPS_keys[1][1]+1, self.Lx-1)], **self.contract_boundary_opts)
             return amp_reuse.contract()
         # replace the y-environment with the cached one
         if bMPS_params_ymin is not None and bMPS_params_ymax is not None and bMPS_keys is not None:
@@ -979,8 +979,8 @@ class fPEPS_Model_reuse(nn.Module):
                 Ly=tns._Ly,
                 site_ind_id=tns._site_ind_id,
             )
-            # if self.chi > 0:
-            #     amp_reuse.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1], bMPS_keys[1][1]+1])
+            if self.chi > 0:
+                amp_reuse.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1], min(bMPS_keys[1][1]+1, self.Ly-1)], **self.contract_boundary_opts)
             return amp_reuse.contract()
 
         if self.chi > 0:
@@ -2315,10 +2315,6 @@ class Transformer_fPEPS_Model_Cluster_reuse(nn.Module):
             dtype=self.dtype
         )
         self.radius = radius
-        self._receptive_field = get_receptive_field_2d(
-            tn.Lx, tn.Ly, radius, site_index_map=lambda i, j, Lx, Ly: i * Ly + j
-        )
-
         self.nn_backflow = self.nn_backflow_generator
         self.nn_param_names = None
         self.nn_eta = nn_eta
@@ -2689,7 +2685,7 @@ class Transformer_fPEPS_Model_Cluster_reuse(nn.Module):
         selected_rows=None,
         selected_cols=None,
     ):
-        params = self.params
+        # params = self.params
         if bMPS_params_xmin is not None and bMPS_params_xmax is not None:
             return torch.vmap(
                 self.amplitude,

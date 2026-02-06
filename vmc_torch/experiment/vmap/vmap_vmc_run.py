@@ -95,18 +95,18 @@ init_kwargs.pop('dtype_str')
 #     },
 #     **init_kwargs
 # )
-fpeps_model = LoRA_NNfPEPS_Model(
-    tn=peps,
-    dtype=model_dtype,
-    lora_rank=4,
-    hidden_dim=4,
-    contract_boundary_opts={
-        'mode': 'mps',
-        'equalize_norms': 1.0,
-        'canonize': True,
-    },
-    **init_kwargs
-)
+# fpeps_model = LoRA_NNfPEPS_Model(
+#     tn=peps,
+#     dtype=model_dtype,
+#     lora_rank=4,
+#     hidden_dim=4,
+#     contract_boundary_opts={
+#         'mode': 'mps',
+#         'equalize_norms': 1.0,
+#         'canonize': True,
+#     },
+#     **init_kwargs
+# )
 # fpeps_model = fPEPS_Model(
 #     tn=peps,
 #     dtype=model_dtype,
@@ -127,16 +127,16 @@ fpeps_model = LoRA_NNfPEPS_Model(
 #     },
 #     **init_kwargs
 # )
-# fpeps_model = Transformer_fPEPS_Model_Cluster(
-#     tn=peps,
-#     dtype=model_dtype,
-#     contract_boundary_opts={
-#         'mode': 'mps',
-#         'equalize_norms': 1.0,
-#         'canonize': True,
-#     },
-#     **init_kwargs
-# )
+fpeps_model = Transformer_fPEPS_Model_Cluster(
+    tn=peps,
+    dtype=model_dtype,
+    contract_boundary_opts={
+        'mode': 'mps',
+        'equalize_norms': 1.0,
+        'canonize': True,
+    },
+    **init_kwargs
+)
 
 # fpeps_model = Transformer_fPEPS_Model_UNet(
 #     tn=peps,
@@ -165,7 +165,7 @@ Ns = int(8e3)
 B = 400
 B_grad = B // 2
 vmc_steps = 200
-init_step = 50
+init_step = 0
 burn_in_steps = 5
 learning_rate = 0.1
 diag_shift = 1e-5

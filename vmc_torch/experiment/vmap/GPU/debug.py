@@ -1,3 +1,7 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ["OMP_NUM_THREADS"] = '1'
 import torch
 import pickle
 from vmc_torch.experiment.vmap.vmap_torch_utils import robust_svd_err_catcher_wrapper
@@ -9,11 +13,11 @@ import quimb.tensor as qtn
 from vmc_torch.experiment.vmap.GPU.GPU_vmap_utils import random_initial_config
 from vmc_torch.experiment.vmap.vmap_models import fPEPS_Model
 
-# --- Global Configurations ---
-JITTER = 1e-16
-driver = None
-# Register robust SVD for stability
-ar.register_function('torch', 'linalg.svd', lambda x: robust_svd_err_catcher_wrapper(x, jitter=JITTER, driver=driver))
+# # --- Global Configurations ---
+# JITTER = 1e-16
+# driver = None
+# # Register robust SVD for stability
+# ar.register_function('torch', 'linalg.svd', lambda x: robust_svd_err_catcher_wrapper(x, jitter=JITTER, driver=driver))
 
 
 # 设置默认精度
@@ -27,11 +31,11 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # ==========================================
 # 2. 参数设置与模型加载
 # ==========================================
-Lx, Ly = 8, 8
+Lx, Ly = 16, 4
 N_f = Lx * Ly
 nsites = Lx * Ly
 D = 8
-chi = D
+chi = -1
 
 # 路径配置 (保持你的原样)
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
@@ -84,40 +88,48 @@ c_fpeps_model_cpu = torch.compile(fpeps_model_cpu, mode="default", fullgraph=Fal
 # 3. 采样配置
 # ==========================================
 
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
 
+start_event.record()
 def record_time(batch_size):
     # 确保初始化 walkers 在 GPU 上
     fxs_list = [random_initial_config(N_f, nsites, seed=42+_) for _ in range(batch_size)]
     fxs = torch.stack(fxs_list).to(device)
     fxs_cpu = fxs.cpu()
 
-    # ==========================================
-    # warm up for compilation timing
-    # ==========================================
-    with torch.no_grad():
-        # c_fpeps_model(fxs)
-        fpeps_model(fxs)
-        # c_fpeps_model_cpu(fxs_cpu)
-        fpeps_model_cpu(fxs_cpu)
+    # 创建 Event
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
-    t0 = time.time()
-    # with torch.no_grad():
-        # c_fpeps_model(fxs)
-    t1 = time.time()
-    # print(f"Compiled GPU model forward time: {t1 - t0} seconds")
     with torch.no_grad():
+        # Warm up
         fpeps_model(fxs)
-    t2 = time.time()
-    print(f"Uncompiled GPU model forward time: {t2 - t1} seconds")
-    # with torch.no_grad():
-    #     c_fpeps_model_cpu(fxs_cpu)
+        
+        # 记录开始
+        start_event.record()
+        
+        fpeps_model(fxs)
+        
+        # 记录结束
+        end_event.record()
+
+    # 依然需要同步，但只是为了在 CPU 侧读取 Event 的结果
+    torch.cuda.synchronize()
+    
+    # 单位是毫秒 (ms)，需要除以 1000 换算成秒
+    gpu_time = start_event.elapsed_time(end_event) / 1000.0
+    print(f"GPU forward time: {gpu_time:.6f} s")
+    
+    # CPU Timing (CPU 不需要 synchronize)
     t3 = time.time()
-    # print(f"Compiled CPU model forward time: {t3 - t2} seconds")
     with torch.no_grad():
         fpeps_model_cpu(fxs_cpu)
     t4 = time.time()
-    print(f"Uncompiled CPU model forward time: {t4 - t3} seconds")
-    return t2 - t1, t4 - t3
+    cpu_time = t4 - t3
+    print(f"CPU forward time: {cpu_time:.6f} s")
+    
+    return gpu_time, cpu_time
 
 
 if __name__ == "__main__":
