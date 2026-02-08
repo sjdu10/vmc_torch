@@ -31,11 +31,11 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # ==========================================
 # 2. 参数设置与模型加载
 # ==========================================
-Lx, Ly = 16, 4
+Lx, Ly = 8, 8
 N_f = Lx * Ly
 nsites = Lx * Ly
-D = 8
-chi = -1
+D = 10
+chi = D
 
 # 路径配置 (保持你的原样)
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'

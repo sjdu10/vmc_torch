@@ -12,7 +12,7 @@ import json
 import autoray as ar
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
-from vmc_torch.experiment.vmap.vmap_models import (
+from vmc_torch.experiment.vmap.models import (
     Transformer_fPEPS_Model_Conv2d,
     Transformer_fPEPS_Model_GlobalMLP,
     Transformer_fPEPS_Model_Cluster,
@@ -20,7 +20,8 @@ from vmc_torch.experiment.vmap.vmap_models import (
     fTN_backflow_attn_Tensorwise_Model_vmap,
     fPEPS_Model,
     LoRA_fPEPS_Model,
-    LoRA_NNfPEPS_Model
+    LoRA_NNfPEPS_Model_Cluster,
+    Conv2D_Shared_fPEPS_Model_Cluster
 )
 from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_vec
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
@@ -47,9 +48,9 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 2
-N_f = Lx * Ly - 2
-D, chi = 4, -1
+Lx, Ly = 8, 8
+N_f = Lx * Ly - 8
+D, chi = 8, 24
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -73,7 +74,7 @@ model_config = {
     'embed_dim': 16,
     'attn_depth': 1,
     'attn_heads': 4,
-    'nn_hidden_dim': D, #peps.nsites, D
+    'nn_hidden_dim': 16, #peps.nsites, D
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
@@ -95,11 +96,11 @@ init_kwargs.pop('dtype_str')
 #     },
 #     **init_kwargs
 # )
-# fpeps_model = LoRA_NNfPEPS_Model(
+# fpeps_model = Conv2D_Shared_fPEPS_Model_Cluster(
 #     tn=peps,
 #     dtype=model_dtype,
-#     lora_rank=4,
-#     hidden_dim=4,
+#     layers=1,
+#     kernel_size=3,
 #     contract_boundary_opts={
 #         'mode': 'mps',
 #         'equalize_norms': 1.0,
@@ -161,12 +162,12 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(8e3) 
-B = 400
-B_grad = B // 2
-vmc_steps = 200
+Ns = int(9) 
+B = 1 # Total batch size for gradient estimation (across all ranks)
+B_grad = max(1, B//2)
+vmc_steps = 5
 init_step = 0
-burn_in_steps = 5
+burn_in_steps = 0
 learning_rate = 0.1
 diag_shift = 1e-5
 save_state_every = 10

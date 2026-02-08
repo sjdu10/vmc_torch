@@ -175,48 +175,34 @@ def run_sampling_phase(
                 status = MPI.Status()
                 buf = np.empty(1, dtype=np.int32)
                 comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
-                has_sent_cmd = 0
                 source_rank = status.Get_source()
                 finished_batch = buf[0]
                 
                 if finished_batch > 0:
                     n_collected += finished_batch
                     pbar.update(finished_batch)
-                    # pbar.refresh()
                 
                 next_batch = B
                 if n_dispatched < Ns:
                     cmd = np.array([CMD_CONTINUE], dtype=np.int32)
                     comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                    has_sent_cmd = 1
                     n_dispatched += next_batch
                     if verbose:
                         print(f"[Master] Dispatched {next_batch} samples to Rank {source_rank}. Total dispatched: {n_dispatched}.", flush=True)
                 else:
                     cmd = np.array([CMD_STOP], dtype=np.int32)
                     comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                    has_sent_cmd = 1
                     active_workers -= 1
                     if source_rank in active_rank_ids:
                         active_rank_ids.remove(source_rank)
                         if verbose:
                             print(f'[Master] Kill rank {source_rank} with {finished_batch} samples. Remaining num of active workers: {len(active_rank_ids)}, {active_workers}', flush=True)
                 
-                if n_collected >= Ns:
-                    cmd = np.array([CMD_STOP], dtype=np.int32)
-                    if has_sent_cmd == 0:
-                        comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                        if source_rank in active_rank_ids:
-                            active_rank_ids.remove(source_rank)
-                    if verbose:
-                        print(f"\n[Master] Sample target reached ({n_collected}).", flush=True)
-                    # break
-                
             else:
                 if n_collected >= Ns:
                     if verbose:
-                        print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}", flush=True)
-                    # break
+                        print(f"\n[Master] Waiting for {active_workers} workers to finish burn-in.", flush=True)
+                        time.sleep(0.1) # yield CPU to let stragglers finish burn-in
                 time.sleep(0.001)
         
         if verbose:
@@ -361,49 +347,36 @@ def run_sampling_phase_reuse(
                 status = MPI.Status()
                 buf = np.empty(1, dtype=np.int32)
                 comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
-                has_sent_cmd = 0
                 source_rank = status.Get_source()
                 finished_batch = buf[0]
                 
                 if finished_batch > 0:
                     n_collected += finished_batch
                     pbar.update(finished_batch)
-                    # pbar.refresh()
                 
                 next_batch = B
                 if n_dispatched < Ns:
                     cmd = np.array([CMD_CONTINUE], dtype=np.int32)
                     comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                    has_sent_cmd = 1
                     n_dispatched += next_batch
                     if verbose:
                         print(f"[Master] Dispatched {next_batch} samples to Rank {source_rank}. Total dispatched: {n_dispatched}.", flush=True)
                 else:
                     cmd = np.array([CMD_STOP], dtype=np.int32)
                     comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                    has_sent_cmd = 1
                     active_workers -= 1
                     if source_rank in active_rank_ids:
                         active_rank_ids.remove(source_rank)
                         if verbose:
                             print(f'[Master] Kill rank {source_rank} with {finished_batch} samples. Remaining num of active workers: {len(active_rank_ids)}, {active_workers}', flush=True)
                 
-                if n_collected >= Ns:
-                    cmd = np.array([CMD_STOP], dtype=np.int32)
-                    if has_sent_cmd == 0:
-                        comm.Send([cmd, MPI.INT], dest=source_rank, tag=TAG_CMD)
-                        if source_rank in active_rank_ids:
-                            active_rank_ids.remove(source_rank)
-                    if verbose:
-                        print(f"\n[Master] Sample target reached ({n_collected}).", flush=True)
-                    # break
-                
             else:
                 if n_collected >= Ns:
                     if verbose:
-                        print(f"\n[Master] Sample target reached ({n_collected}). Abandoning {active_workers} stragglers: {active_rank_ids}", flush=True)
-                    # break
+                        print(f"\n[Master] Waiting for {active_workers} workers to finish burn-in.", flush=True)
+                        time.sleep(0.1) # yield CPU to let stragglers finish burn-in
                 time.sleep(0.001)
+        
         if verbose:
             print('Sampling phase should be done now.', flush=True)
             
