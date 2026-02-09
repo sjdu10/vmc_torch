@@ -772,7 +772,8 @@ class fPEPS_Model_reuse(nn.Module):
                 site_ind_id=tns._site_ind_id,
             )
             if self.chi > 0:
-                amp_reuse.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1], min(bMPS_keys[1][1]+1, self.Lx-1)], **self.contract_boundary_opts)
+                if len(amp_reuse.tensors) > 2*self.Ly:
+                    amp_reuse.contract_boundary_from_xmin_(max_bond=self.chi, cutoff=0.0, xrange=[bMPS_keys[0][1], min(bMPS_keys[0][1]+1, self.Lx-1)], **self.contract_boundary_opts)
             return amp_reuse.contract()
         # replace the y-environment with the cached one
         if bMPS_params_ymin is not None and bMPS_params_ymax is not None and bMPS_keys is not None:
@@ -793,7 +794,8 @@ class fPEPS_Model_reuse(nn.Module):
                 site_ind_id=tns._site_ind_id,
             )
             if self.chi > 0:
-                amp_reuse.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1], min(bMPS_keys[1][1]+1, self.Ly-1)], **self.contract_boundary_opts)
+                if len(amp_reuse.tensors) > 2*self.Lx:
+                    amp_reuse.contract_boundary_from_ymin_(max_bond=self.chi, cutoff=0.0, yrange=[bMPS_keys[0][1], min(bMPS_keys[0][1]+1, self.Ly-1)], **self.contract_boundary_opts)
             return amp_reuse.contract()
 
         if self.chi > 0:
