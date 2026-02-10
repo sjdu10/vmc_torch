@@ -188,11 +188,15 @@ def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25, **
 
 # Batched Metropolis-Hastings updates
 @torch.inference_mode()
-def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False, seed=None):
+def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False, seed=None, show_pbar=False):
     current_amps = fpeps_model(fxs)
     B = len(fxs)
     n = 0
     t0 = time.time()
+    if show_pbar:
+        from tqdm import tqdm
+        total_edges = graph.n_edges
+        pbar = tqdm(total=total_edges, desc="MH Sampling")
     for row, edges in graph.row_edges.items():
         for edge in edges:
             n += 1
@@ -231,6 +235,8 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False, seed=N
                 if random.random() < accept_prob[k].item():
                     fxs[k] = proposed_fxs[k]
                     current_amps[k] = proposed_amps[k]
+            if show_pbar:
+                pbar.update(1)
 
     for col, edges in graph.col_edges.items():
         for edge in edges:
@@ -267,6 +273,8 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False, seed=N
                 if random.random() < accept_prob[k].item():
                     fxs[k] = proposed_fxs[k]
                     current_amps[k] = proposed_amps[k]
+            if show_pbar:
+                pbar.update(1)
     t1 = time.time()
     if verbose:
         if RANK == 1:
@@ -275,10 +283,28 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25,verbose=False, seed=N
 
 # Batched Metropolis-Hastings updates with reuse of cached bMPS params
 @torch.inference_mode()
-def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, seed=None, benchmark_model=None):
+def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, seed=None, benchmark_model=None, show_pbar=False):
+    """
+        Args:
+            fxs: (B, N) Tensor of configurations.
+            v_model: Variational fPEPS model with methods for caching and updating bMPS params.
+            graph: Graph object with row_edges and col_edges defining nearest neighbor pairs.
+            hopping_rate: Probability of proposing hopping vs exchange.
+            verbose: Whether to print verbose output.
+            seed: Random seed for reproducibility (optional).
+            benchmark_model: Optional model to compute amplitudes for proposed configs for benchmarking reuse correctness.
+        Returns:
+            fxs: Updated (B, N) Tensor of configurations after one MH sweep.
+            current_amps: (B,) Tensor of amplitudes for the updated configurations.
+    """
     B = fxs.shape[0]
     # cache bMPS params along x direction first for reuse
     B_bMPS_params_x_dict, current_amps = v_model.cache_bMPS_params_any_direction_vmap(fxs, direction='x')
+    if show_pbar:
+        from tqdm import tqdm
+        total_edges = graph.n_edges
+        pbar = tqdm(total=total_edges, desc="MH Sampling with Reuse")
+            
     for row, edges in graph.row_edges.items():
         for edge in edges:
             # print(f"Processing edge {edge} in row {row}", flush=True)
@@ -323,6 +349,8 @@ def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, see
                 if random.random() < accept_probs[k].item():
                     fxs[k] = proposed_fxs[k]
                     current_amps[k] = proposed_amps[k]
+            if show_pbar:
+                pbar.update(1)
         
         # update bMPS params to next row for reuse
         if row == v_model.Lx - 1:
@@ -380,6 +408,8 @@ def sample_next_reuse(fxs, v_model, graph, hopping_rate=0.25, verbose=False, see
                 if random.random() < accept_probs[k].item():
                     fxs[k] = proposed_fxs[k]
                     current_amps[k] = proposed_amps[k]
+            if show_pbar:
+                pbar.update(1)
         
         # update bMPS params to next col for reuse
         if col == v_model.Ly - 1:
@@ -459,7 +489,7 @@ def sample_next_vec(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, s
     return fxs, current_amps
 
 @torch.inference_mode()
-def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False):
+def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False, show_pbar=False):
     r"""Calculate local energy and energy expectation value for a batch of configurations.
 
     Math:
@@ -475,9 +505,10 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False):
         H: Hamiltonian object with method get_conn(config) that returns connected configurations and coefficients.
         current_amps: (B,) Tensor of amplitudes for fxs.
         verbose: Whether to print verbose output.
-
+        show_pbar: Whether to show a progress bar.
     Returns:
         energy: Scalar Tensor of energy expectation value.
+
         local_energies: (B,) Tensor of local energies for each configuration.
     """
     B = fxs.shape[0]
@@ -499,7 +530,19 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False):
             print(f'Prepared batched conn_etas and coeffs: {conn_etas.shape}, {conn_eta_coeffs.shape} (batch size {B})')
 
     # calculate amplitudes for connected configs, in the future consider TN reuse to speed up calculation, TN reuse is controlled by a param that is not batched over (control flow?)
-    conn_amps = torch.cat([fpeps_model(conn_etas[i:i+B]) for i in range(0, conn_etas.shape[0], B)])
+    conn_amps = []
+    if show_pbar:
+        from tqdm import tqdm
+        pbar = tqdm(total=conn_etas.shape[0], desc="Calculating connected amplitudes")
+    for i in range(0, conn_etas.shape[0], B):
+        batch_etas = conn_etas[i:i+B]
+        batch_amps = fpeps_model(batch_etas)
+        conn_amps.append(batch_amps)
+        if show_pbar:
+            pbar.update(batch_etas.shape[0])
+    if show_pbar:
+        pbar.close()
+    conn_amps = torch.cat(conn_amps, dim=0)
 
     # Local energy \sum_{s'} H_{s,s'} <s'|psi>/<s|psi>
 
@@ -525,7 +568,7 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False):
     return energy, local_energies
 
 @torch.inference_mode()
-def evaluate_energy_reuse(fxs, v_model, H, current_amps, verbose=False, benchmark_model=None):
+def evaluate_energy_reuse(fxs, v_model, H, current_amps, verbose=False, show_pbar=False, benchmark_model=None):
     t0 = time.time()
     # Label each connected config with which sample it comes from to enable reuse
     B = fxs.shape[0]
@@ -624,6 +667,9 @@ def evaluate_energy_reuse(fxs, v_model, H, current_amps, verbose=False, benchmar
     # Preallocate result container
     total_conns = conn_etas.shape[0]
     conn_amps = torch.zeros(total_conns, dtype=current_amps.dtype, device=fxs.device)
+    if show_pbar:
+        from tqdm import tqdm
+        pbar = tqdm(total=total_conns, desc="Calculating connected amplitudes with reuse")
     
     # A. Handle diagonal terms (Direct Copy)
     if len(diagonal_parent_indices) > 0:
@@ -633,6 +679,8 @@ def evaluate_energy_reuse(fxs, v_model, H, current_amps, verbose=False, benchmar
         parents = torch.tensor(diagonal_parent_indices, device=fxs.device)
         # Direct copy: <x|psi>
         conn_amps[diag_locs] = current_amps[parents]
+    if show_pbar:
+        pbar.update(diagonal_mask.sum().item())
 
     # B. Handle non-diagonal terms (Grouped Vmap Contraction)
     # Fetch the corresponding Batched Environment Dictionary in the pytree
@@ -654,38 +702,51 @@ def evaluate_energy_reuse(fxs, v_model, H, current_amps, verbose=False, benchmar
         global_idxs = data['global_idxs']  # positions within conn_etas
         parent_idxs = data['parent_idxs']  # originating from which fxs[i]
         
-        # 1. target configs x'
-        # Note: conn_etas is a large tensor, slicing directly
-        target_configs = conn_etas[global_idxs] # (Batch_Group, N_sites)
-        
-        # 2. corresponding parent indices (for environment slicing)
-        subset_parents = torch.tensor(parent_idxs, device=fxs.device)
-        
-        # 3. slice environment parameters
-        subset_env_x = slice_env_dict(B_bMPS_params_x_dict, subset_parents)
-        subset_env_y = slice_env_dict(B_bMPS_params_y_dict, subset_parents)
-        
-        # 4. reuse forward
-        if mode == 'row':
-            amps_group = v_model(
-                target_configs,
-                bMPS_params_x_batched=subset_env_x,
-                bMPS_params_y_batched=subset_env_y,
-                selected_rows=indices,
-                selected_cols=None
-            )
-        else: # col
-            amps_group = v_model(
-                target_configs,
-                bMPS_params_x_batched=subset_env_x,
-                bMPS_params_y_batched=subset_env_y,
-                selected_rows=None,
-                selected_cols=indices
-            )
+        amps_group = torch.zeros(len(global_idxs), dtype=current_amps.dtype, device=fxs.device)
+        # Divide the idxs into chunks of size B to feed into vmap
+        for start in range(0, len(global_idxs), B):
+            end = min(start + B, len(global_idxs))
+            batch_global_idxs = global_idxs[start:end]
+            batch_parent_idxs = parent_idxs[start:end]
+            # 1. target configs x'
+            # Note: conn_etas is a large tensor, slicing directly
+            target_configs = conn_etas[batch_global_idxs] # (Batch_Group, N_sites)
+            
+            # 2. corresponding parent indices (for environment slicing)
+            subset_parents = torch.tensor(batch_parent_idxs, device=fxs.device)
+            
+            # 3. slice environment parameters
+            subset_env_x = slice_env_dict(B_bMPS_params_x_dict, subset_parents)
+            subset_env_y = slice_env_dict(B_bMPS_params_y_dict, subset_parents)
+            
+            # 4. reuse forward
+            if mode == 'row':
+                amps_group_loc = v_model(
+                    target_configs,
+                    bMPS_params_x_batched=subset_env_x,
+                    bMPS_params_y_batched=subset_env_y,
+                    selected_rows=indices,
+                    selected_cols=None
+                )
+            else: # col
+                amps_group_loc = v_model(
+                    target_configs,
+                    bMPS_params_x_batched=subset_env_x,
+                    bMPS_params_y_batched=subset_env_y,
+                    selected_rows=None,
+                    selected_cols=indices
+                )
+            amps_group[start:end] = amps_group_loc
             
         # 5. fill back results into Tensor
         locs = torch.tensor(global_idxs, device=fxs.device)
         conn_amps[locs] = amps_group
+        
+        if show_pbar:
+            pbar.update(len(global_idxs))
+    
+    if show_pbar:
+        pbar.close()
 
     # --------------------------------------------------------------------------
     # 3. Compute Local Energy
@@ -818,7 +879,15 @@ def flatten_params(parameters):
         vec.append(param.reshape(-1))
     return torch.cat(vec)
 
-def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=False, vmap_grad=False):
+def compute_grads(fxs, fpeps_model, vectorize=True, vmap_grad=False, batch_size=None, verbose=False, show_pbar=False):
+    """
+    Returns
+    -------
+    batched_grads_vec : Tensor
+        Gradients of amplitudes of shape (B, Np).
+    amps : Tensor
+        Amplitudes for fxs of shape (B,).
+    """
     if vectorize:
         # Vectorized gradient calculation
         # need per sample gradient of amplitude -- jacobian
@@ -855,6 +924,10 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
             grads_pytree_chunks = []
             amps_chunks = []
             
+            if show_pbar:
+                from tqdm import tqdm
+                pbar = tqdm(total=B, desc="Computing gradients with vmap(grad)")
+            
             t0 = time.time()
             for b_start in range(0, B, B_grad):
                 b_end = min(b_start + B_grad, B)
@@ -863,37 +936,108 @@ def compute_grads(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=Fal
                 
                 grads_pytree_chunks.append(tree_map(lambda x: x.detach(), grads_chunk))
                 amps_chunks.append(amps_c.detach())
-                del grads_chunk
-                del amps_c
                 fpeps_model.zero_grad()
+                if show_pbar:
+                    pbar.update(fxs_chunk.shape[0])
+            if show_pbar:
+                pbar.close()
 
-
-            # 5. Concatenate results
-            amps = torch.cat(amps_chunks, dim=0)
-            if amps.dim() == 1: amps = amps.unsqueeze(-1)
-            def concat_leaves(*leaves):
-                return torch.cat(leaves, dim=0)
-            full_grads_pytree = tree_map(concat_leaves, *grads_pytree_chunks)
-
-            # 6. Flatten to vector (B, Np)
-            leaves, _ = tree_flatten(full_grads_pytree)
-            # Each leaf is now (B, Param_Shape)
-            # Flatten start_dim=1 -> (B, Param_Size)
-            flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
-            batched_grads_vec = torch.cat(flat_leaves, dim=1)
+            # # 5. Concatenate results
+            # amps = torch.cat(amps_chunks, dim=0)
+            # if amps.dim() == 1: 
+            #     amps = amps.unsqueeze(-1)
+            # def concat_leaves(*leaves):
+            #     return torch.cat(leaves, dim=0)
+            # full_grads_pytree = tree_map(concat_leaves, *grads_pytree_chunks)
+            # # 6. Flatten to vector (B, Np)
+            # leaves, _ = tree_flatten(full_grads_pytree)
+            # # Each leaf is now (B, Param_Shape)
+            # # Flatten start_dim=1 -> (B, Param_Size)
+            # flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
+            # batched_grads_vec = torch.cat(flat_leaves, dim=1)
             
-            batched_grads_vec = batched_grads_vec.detach()
-            fpeps_model.zero_grad()
+            # batched_grads_vec = batched_grads_vec.detach()
+            # fpeps_model.zero_grad()
+            
+            # ---------------------------------------------------------
+            # Optimization 1: Pre-calculate sizes to allocate memory ONCE
+            # ---------------------------------------------------------
+            # We assume all chunks have the same parameter structure.
+            # Get the structure and total param count from the first chunk.
+            first_chunk_grads, spec = tree_flatten(grads_pytree_chunks[0])
+
+            # Calculate total number of parameters (columns)
+            # Easier way: just sum the product of dimensions starting from dim 1
+            Np = sum(leaf.shape[1:].numel() for leaf in first_chunk_grads)
+
+            # Calculate total batch size (rows)
+            B_total = sum(chunk.shape[0] for chunk in amps_chunks)
+
+            # Allocate the FINAL memory block immediately
+            # Use the same dtype and device as your chunks to avoid conversion copies
+            dtype = first_chunk_grads[0].dtype
+            device = first_chunk_grads[0].device
+
+            batched_grads_vec = torch.empty((B_total, Np), dtype=dtype, device=device)
+            amps = torch.empty((B_total, 1), dtype=amps_chunks[0].dtype, device=device)
+
+            # ---------------------------------------------------------
+            # Optimization 2: Fill in-place and delete chunks immediately
+            # ---------------------------------------------------------
+            current_row = 0
+
+            for i, (grad_chunk_pytree, amp_chunk) in enumerate(zip(grads_pytree_chunks, amps_chunks)):
+                # 1. Handle Amps
+                batch_size = amp_chunk.shape[0]
+                
+                # Flatten amps if necessary and copy to pre-allocated buffer
+                if amp_chunk.dim() == 1:
+                    amp_chunk = amp_chunk.unsqueeze(-1)
+                amps[current_row : current_row + batch_size] = amp_chunk
+                
+                # 2. Handle Grads
+                # Flatten the PyTree for this chunk
+                leaves, _ = tree_flatten(grad_chunk_pytree)
+                
+                # We construct the row for this chunk by flattening and concatenating ONLY this chunk
+                # Ideally, we would write directly into batched_grads_vec, but leaves are separate tensors.
+                # We can perform one localized cat/flatten per chunk, which is much smaller than global cat.
+                
+                # Flatten each leaf: (B_chunk, ...) -> (B_chunk, N_param_i)
+                flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
+                
+                # Concatenate columns to make (B_chunk, Np)
+                chunk_flat_vec = torch.cat(flat_leaves, dim=1)
+                
+                # Write into the master tensor
+                batched_grads_vec[current_row : current_row + batch_size] = chunk_flat_vec
+                
+                # 3. CRITICAL: Aggressive Cleanup
+                # Delete the source chunks immediately to free memory for the next operations
+                # (Python's GC will reclaim this if ref count hits 0)
+                grads_pytree_chunks[i] = None
+                amps_chunks[i] = None
+                del chunk_flat_vec, flat_leaves, leaves, grad_chunk_pytree, amp_chunk
+                
+                current_row += batch_size
+
+            # ---------------------------------------------------------
+            # Optimization 3: Clean up and Safety Checks
+            # ---------------------------------------------------------
+            # Clear the lists themselves
+            del grads_pytree_chunks, amps_chunks
+            
+            # =================================================
             
             t1 = time.time()
             if verbose and RANK == 1:
                 print(f"Single Batched vmap(grad) time: {t1 - t0}")
-
             # Detect if batched_grads_vec contains NaN or Inf
             if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
                 print(f"NaN or Inf detected in batched_grads_vec in RANK {RANK}")
                 comm.Abort(1)
             return batched_grads_vec, amps
+
         else:
             params_pytree = (
                 list(fpeps_model.params)

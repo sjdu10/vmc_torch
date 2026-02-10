@@ -3,13 +3,11 @@ os.environ["OPENBLAS_NUM_THREADS"] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
 import torch
-import pickle
 from vmc_torch.experiment.vmap.vmap_torch_utils import robust_svd_err_catcher_wrapper
 import autoray as ar
 import time
 import symmray as sr
 
-import quimb.tensor as qtn
 from vmc_torch.experiment.vmap.GPU.GPU_vmap_utils import random_initial_config
 from vmc_torch.experiment.vmap.vmap_models import fPEPS_Model
 
@@ -35,7 +33,7 @@ Lx, Ly = 8, 8
 N_f = Lx * Ly
 nsites = Lx * Ly
 D = 10
-chi = D
+chi = 20
 
 # 路径配置 (保持你的原样)
 pwd = '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/data'
@@ -92,35 +90,39 @@ start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 
 start_event.record()
-def record_time(batch_size):
+def record_time(batch_size, gpu=True):
     # 确保初始化 walkers 在 GPU 上
     fxs_list = [random_initial_config(N_f, nsites, seed=42+_) for _ in range(batch_size)]
     fxs = torch.stack(fxs_list).to(device)
     fxs_cpu = fxs.cpu()
 
     # 创建 Event
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    if gpu:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        with torch.no_grad():
+            
+            # Warm up
+            fpeps_model(fxs)
+            
+            # 记录开始
+            start_event.record()
+            
+            fpeps_model(fxs)
+            
+            # 记录结束
+            end_event.record()
 
-    with torch.no_grad():
-        # Warm up
-        fpeps_model(fxs)
-        
-        # 记录开始
-        start_event.record()
-        
-        fpeps_model(fxs)
-        
-        # 记录结束
-        end_event.record()
-
-    # 依然需要同步，但只是为了在 CPU 侧读取 Event 的结果
-    torch.cuda.synchronize()
+        # 依然需要同步，但只是为了在 CPU 侧读取 Event 的结果
+        torch.cuda.synchronize()
     
-    # 单位是毫秒 (ms)，需要除以 1000 换算成秒
-    gpu_time = start_event.elapsed_time(end_event) / 1000.0
-    print(f"GPU forward time: {gpu_time:.6f} s")
-    
+        # 单位是毫秒 (ms)，需要除以 1000 换算成秒
+        gpu_time = start_event.elapsed_time(end_event) / 1000.0
+        print(f"GPU forward time: {gpu_time:.6f} s")
+    else:
+        gpu_time = -0.1 # 占位符，表示不测 GPU 时间
+        
     # CPU Timing (CPU 不需要 synchronize)
     t3 = time.time()
     with torch.no_grad():
@@ -139,7 +141,7 @@ if __name__ == "__main__":
     CPU_times = []
     for bs in batch_sizes:
         print(f"Testing batch size: {bs}")
-        gpu_time, cpu_time = record_time(bs)
+        gpu_time, cpu_time = record_time(bs, gpu=False)
         GPU_times.append(gpu_time)
         CPU_times.append(cpu_time)
 

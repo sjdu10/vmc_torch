@@ -39,7 +39,7 @@ torch.random.manual_seed(42 + RANK)
 # ==============================================================================
 Lx, Ly = 4, 4
 N_f = Lx * Ly - 2
-D, chi = 4, 16
+D, chi = 4,16
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -91,7 +91,7 @@ fpeps_model = fPEPS_Model_reuse(
         # 'equalize_norms': 1.0,
         'canonize': True,
     },
-    debug=True
+    debug=False
 )
 fpeps_model.radius = 0  # Set the radius for local updates
 n_params = sum(p.numel() for p in fpeps_model.parameters())
@@ -104,10 +104,10 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(2e1) 
-B = 20
-B_grad = B // 2
-vmc_steps = 50
+Ns = int(10) 
+B = 10
+B_grad = max(B//2, 1)
+vmc_steps = 3
 init_step = 0
 burn_in_steps = 0
 learning_rate = 0.1
