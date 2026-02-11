@@ -160,6 +160,17 @@ def run_sampling_phase(
     # max_n_local = abs(-(Ns / (size-1)) // B) * B # take ceiling 
 
     t0 = MPI.Wtime()
+
+    if should_burn_in:
+        if rank != 0:
+            current_step = 0
+            while current_step < burn_in_steps:
+                fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+                current_step += 1
+        else:
+            pass
+    
+    gentle_barrier(comm, sleep_interval=0.01) # ensure all ranks finish burn-in before master starts dispatching tasks
     
     # --- Branch A: Master (Rank 0) ---
     if rank == 0:
@@ -217,13 +228,6 @@ def run_sampling_phase(
     # --- Branch B: Worker ---
     else:
         try:
-            if should_burn_in:
-                current_step = 0
-                while current_step < burn_in_steps:
-                    fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
-                    current_step += 1
-
-
             last_finished_batch = 0
             while True:
                 # 1. Request / Report
@@ -332,6 +336,17 @@ def run_sampling_phase_reuse(
     # max_n_local = abs(-(Ns / (size-1)) // B) * B # take ceiling 
 
     t0 = MPI.Wtime()
+
+    if should_burn_in:
+        if rank != 0:
+            current_step = 0
+            while current_step < burn_in_steps:
+                fxs, _ = sample_next(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
+                current_step += 1
+        else:
+            pass
+    
+    gentle_barrier(comm, sleep_interval=0.01) # ensure all ranks finish burn-in before master starts dispatching tasks
     
     # --- Branch A: Master (Rank 0) ---
     if rank == 0:
@@ -389,13 +404,6 @@ def run_sampling_phase_reuse(
     # --- Branch B: Worker ---
     else:
         try:
-            if should_burn_in:
-                current_step = 0
-                while current_step < burn_in_steps:
-                    fxs, _ = sample_next_reuse(fxs, model, graph, hopping_rate=sampling_hopping_rate, verbose=False)
-                    current_step += 1
-
-
             last_finished_batch = 0
             while True:
                 # 1. Request / Report
