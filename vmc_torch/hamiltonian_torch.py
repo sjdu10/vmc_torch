@@ -8,7 +8,6 @@ from vmc_torch.fermion_utils import (
     from_quimb_config_to_netket_config,
     calc_phase_symmray,
     calc_phase_netket,
-    calc_phase_correction_netket_symmray,
 )
 
 
@@ -321,8 +320,8 @@ class Spin(Hilbert):
 
 # ==== Graph Definitions ====
 class Graph:
-    def __init__(self):
-        self._edges = None
+    def __init__(self, edges=None):
+        self._edges = edges
         self._site_index_map = None
         self.n_nodes = None
     
@@ -336,7 +335,7 @@ class Graph:
     
     @property
     def n_edges(self):
-        return len(self._edges)
+        return len(self._edges) if self._edges is not None else 0
     
     @property
     def site_index_map(self):

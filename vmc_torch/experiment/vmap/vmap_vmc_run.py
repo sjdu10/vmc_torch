@@ -19,6 +19,7 @@ from vmc_torch.experiment.vmap.models import (
     Transformer_fPEPS_Model_DConv2d,
     fTN_backflow_attn_Tensorwise_Model_vmap,
     fPEPS_Model,
+    Conv2D_bulk_only_fPEPS_Model_Cluster,
     LoRA_fPEPS_Model,
     LoRA_NNfPEPS_Model_Cluster,
     Conv2D_Shared_fPEPS_Model_Cluster
@@ -48,8 +49,8 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 16
-N_f = Lx * Ly - 8
+Lx, Ly = 4, 4
+N_f = Lx * Ly - 2
 D, chi = 4, -1
 t, U = 1.0, 8.0
 
@@ -96,21 +97,11 @@ init_kwargs.pop('dtype_str')
 #     },
 #     **init_kwargs
 # )
-# fpeps_model = Conv2D_Shared_fPEPS_Model_Cluster(
-#     tn=peps,
-#     dtype=model_dtype,
-#     layers=1,
-#     kernel_size=3,
-#     contract_boundary_opts={
-#         'mode': 'mps',
-#         'equalize_norms': 1.0,
-#         'canonize': True,
-#     },
-#     **init_kwargs
-# )
-fpeps_model = fPEPS_Model(
+fpeps_model = Conv2D_bulk_only_fPEPS_Model_Cluster(
     tn=peps,
     dtype=model_dtype,
+    layers=1,
+    kernel_size=3,
     contract_boundary_opts={
         'mode': 'mps',
         'equalize_norms': 1.0,
@@ -118,6 +109,16 @@ fpeps_model = fPEPS_Model(
     },
     **init_kwargs
 )
+# fpeps_model = fPEPS_Model(
+#     tn=peps,
+#     dtype=model_dtype,
+#     contract_boundary_opts={
+#         'mode': 'mps',
+#         'equalize_norms': 1.0,
+#         'canonize': True,
+#     },
+#     **init_kwargs
+# )
 # fpeps_model = Transformer_fPEPS_Model_Conv2d(
 #     tn=peps,
 #     dtype=model_dtype,
@@ -167,7 +168,7 @@ B = 10 # Total batch size for gradient estimation (across all ranks)
 B_grad = max(1, B//2)
 vmc_steps = 5
 init_step = 0
-burn_in_steps = 20
+burn_in_steps = 1
 learning_rate = 0.1
 diag_shift = 1e-5
 save_state_every = 10

@@ -635,7 +635,6 @@ def evaluate_energy_reuse(fxs, v_model, H, current_amps, verbose=False, show_pba
     # within row/col group, further group by position
 
     # select the indices where r==True and c==False
-    # TODO: modify this part, form the pytree with batched leaves to input to reusbale PEPS amplitude calculation [x]
     tasks_map = {} # Key: (mode, indices_tuple), Value: lists of (global_idx, parent_idx)
     
     # Record which are "diagonal terms" (x' == x), these do not need recomputation and can directly reuse current amplitudes

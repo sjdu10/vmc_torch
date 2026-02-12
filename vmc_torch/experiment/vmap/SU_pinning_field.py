@@ -6,9 +6,9 @@ from SU_func import (
     run_z2SU_from_u1SU,
 )
 
-Lx, Ly = 16, 4
+Lx, Ly = 12, 4
 D0 = 4
-N_f = Lx*Ly - 8
+N_f = Lx*Ly - 6
 t = 1.0
 U = 8.0
 mu = 0.0
