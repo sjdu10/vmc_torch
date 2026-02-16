@@ -350,7 +350,7 @@ def run_sampling_phase_reuse(
     grad_time = 0.0
     
     # Pre-allocate buffers: upper bound on samples this worker could collect
-    max_n_local = int(np.ceil(Ns / max(size - 1, 1) / B) + 1) * B
+    max_n_local = int(np.ceil(Ns / max(size - 1, 1) / B)) * B
     res_energies = None  # lazily allocated after first batch (to learn n_params)
     res_grads = None
     res_amps = None
