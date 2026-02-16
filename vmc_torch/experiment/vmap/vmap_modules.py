@@ -153,11 +153,12 @@ def run_sampling_phase(
     local_energy_time = 0.0
     grad_time = 0.0
     
-    E_loc_vec = []
-    amps_vec = []
-    grads_vec_list = []
+    # Pre-allocate buffers: upper bound on samples this worker could collect
+    max_n_local = int(np.ceil(Ns / max(size - 1, 1) / B)) * B
+    res_energies = None  # lazily allocated after first batch (to learn n_params)
+    res_grads = None
+    res_amps = None
     n_local = 0
-    # max_n_local = abs(-(Ns / (size-1)) // B) * B # take ceiling 
 
     t0 = MPI.Wtime()
 
@@ -169,9 +170,9 @@ def run_sampling_phase(
                 current_step += 1
         else:
             pass
-    
+
     gentle_barrier(comm, sleep_interval=0.01) # ensure all ranks finish burn-in before master starts dispatching tasks
-    
+
     # --- Branch A: Master (Rank 0) ---
     if rank == 0:
         pbar = tqdm(total=Ns, desc=f"Step {svmc} Sampling", unit="samples")
@@ -179,7 +180,7 @@ def run_sampling_phase(
         n_dispatched = 0
         active_workers = size - 1
         active_rank_ids = set(range(1, size))
-        
+
         while active_workers > 0:
             has_message = comm.Iprobe(source=MPI.ANY_SOURCE, tag=TAG_REQ)
             if has_message:
@@ -188,11 +189,11 @@ def run_sampling_phase(
                 comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
                 source_rank = status.Get_source()
                 finished_batch = buf[0]
-                
+
                 if finished_batch > 0:
                     n_collected += finished_batch
                     pbar.update(finished_batch)
-                
+
                 next_batch = B
                 if n_dispatched < Ns:
                     cmd = np.array([CMD_CONTINUE], dtype=np.int32)
@@ -208,17 +209,17 @@ def run_sampling_phase(
                         active_rank_ids.remove(source_rank)
                         if verbose:
                             print(f'[Master] Kill rank {source_rank} with {finished_batch} samples. Remaining num of active workers: {len(active_rank_ids)}, {active_workers}', flush=True)
-                
+
             else:
                 if n_collected >= Ns:
                     if verbose:
                         print(f"\n[Master] Waiting for {active_workers} workers to finish burn-in.", flush=True)
                         time.sleep(0.1) # yield CPU to let stragglers finish burn-in
                 time.sleep(0.001)
-        
+
         if verbose:
             print('Sampling phase should be done now.', flush=True)
-            
+
         pbar.close()
 
         if len(active_rank_ids) > 0:
@@ -233,14 +234,14 @@ def run_sampling_phase(
                 # 1. Request / Report
                 buf = np.array([last_finished_batch], dtype=np.int32)
                 comm.Send([buf, MPI.INT], dest=0, tag=TAG_REQ)
-                
+
                 # 2. Wait Command
                 cmd = np.empty(1, dtype=np.int32)
                 comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
 
                 if cmd[0] == CMD_STOP:
                     break
-                
+
                 # 3. Compute
                 # try:
                 t00 = MPI.Wtime()
@@ -255,35 +256,54 @@ def run_sampling_phase(
                 local_energy_time += t22 - t11
                 grad_time += t33 - t22
 
-                # Offload
-                E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
-                amps_vec.append(amps_batch.detach().cpu().numpy())
-                grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
-                
-                last_finished_batch = fxs.shape[0]
-                n_local += last_finished_batch
-                
-                del local_energies_batch, grads_vec_batch, amps_batch
+                # Offload into pre-allocated buffers
+                b = fxs.shape[0]
+                e_np = local_energies_batch.detach().cpu().numpy().ravel()
+                g_np = grads_vec_batch.detach().cpu().numpy()
+                a_np = amps_batch.detach().cpu().numpy().ravel()
+
+                # Lazy allocation on first batch (now we know n_params)
+                if res_energies is None:
+                    n_params = g_np.shape[-1]
+                    res_energies = np.empty(max_n_local, dtype=np.float64)
+                    res_grads = np.empty((max_n_local, n_params), dtype=np.float64)
+                    res_amps = np.empty(max_n_local, dtype=np.float64)
+
+                # Grow buffer if needed (rare: worker got more batches than expected)
+                if n_local + b > res_energies.shape[0]:
+                    new_cap = max(res_energies.shape[0] * 2, n_local + b)
+                    res_energies = np.resize(res_energies, new_cap)
+                    res_grads.resize((new_cap, res_grads.shape[1]), refcheck=False)
+                    res_amps = np.resize(res_amps, new_cap)
+
+                res_energies[n_local:n_local + b] = e_np
+                res_grads[n_local:n_local + b] = g_np
+                res_amps[n_local:n_local + b] = a_np
+
+                last_finished_batch = b
+                n_local += b
+
+                del local_energies_batch, grads_vec_batch, amps_batch, e_np, g_np, a_np
         except Exception as e:
             import traceback
             error_msg = traceback.format_exc()
             print(f"!!! Rank {rank} CRASHED with FATAL ERROR !!!\n{error_msg}", flush=True)
             sys.stdout.flush()
             comm.Abort(1)
-    
+
     # Rest the CPU until all ranks finish
     gentle_barrier(comm, sleep_interval=0.01)
-    
-    # Pack Results
+
+    # Trim buffers to actual size (views, no copy)
     if n_local > 0:
-        res_energies = np.concatenate(E_loc_vec)
-        res_grads = np.concatenate(grads_vec_list)
-        res_amps = np.concatenate(amps_vec)
+        res_energies = res_energies[:n_local]
+        res_grads = res_grads[:n_local]
+        res_amps = res_amps[:n_local]
     else:
         res_energies = np.array([], dtype=np.float64)
         res_grads = np.array([], dtype=np.float64)
         res_amps = np.array([], dtype=np.float64)
-        
+
     stats = {
         'n_local': n_local,
         't_sample': sample_time,
@@ -329,11 +349,12 @@ def run_sampling_phase_reuse(
     local_energy_time = 0.0
     grad_time = 0.0
     
-    E_loc_vec = []
-    amps_vec = []
-    grads_vec_list = []
+    # Pre-allocate buffers: upper bound on samples this worker could collect
+    max_n_local = int(np.ceil(Ns / max(size - 1, 1) / B) + 1) * B
+    res_energies = None  # lazily allocated after first batch (to learn n_params)
+    res_grads = None
+    res_amps = None
     n_local = 0
-    # max_n_local = abs(-(Ns / (size-1)) // B) * B # take ceiling 
 
     t0 = MPI.Wtime()
 
@@ -345,9 +366,9 @@ def run_sampling_phase_reuse(
                 current_step += 1
         else:
             pass
-    
+
     gentle_barrier(comm, sleep_interval=0.01) # ensure all ranks finish burn-in before master starts dispatching tasks
-    
+
     # --- Branch A: Master (Rank 0) ---
     if rank == 0:
         pbar = tqdm(total=Ns, desc=f"Step {svmc} Sampling", unit="samples")
@@ -355,7 +376,7 @@ def run_sampling_phase_reuse(
         n_dispatched = 0
         active_workers = size - 1
         active_rank_ids = set(range(1, size))
-        
+
         while active_workers > 0:
             has_message = comm.Iprobe(source=MPI.ANY_SOURCE, tag=TAG_REQ)
             if has_message:
@@ -364,11 +385,11 @@ def run_sampling_phase_reuse(
                 comm.Recv([buf, MPI.INT], source=MPI.ANY_SOURCE, tag=TAG_REQ, status=status)
                 source_rank = status.Get_source()
                 finished_batch = buf[0]
-                
+
                 if finished_batch > 0:
                     n_collected += finished_batch
                     pbar.update(finished_batch)
-                
+
                 next_batch = B
                 if n_dispatched < Ns:
                     cmd = np.array([CMD_CONTINUE], dtype=np.int32)
@@ -384,17 +405,17 @@ def run_sampling_phase_reuse(
                         active_rank_ids.remove(source_rank)
                         if verbose:
                             print(f'[Master] Kill rank {source_rank} with {finished_batch} samples. Remaining num of active workers: {len(active_rank_ids)}, {active_workers}', flush=True)
-                
+
             else:
                 if n_collected >= Ns:
                     if verbose:
                         print(f"\n[Master] Waiting for {active_workers} workers to finish burn-in.", flush=True)
                         time.sleep(0.1) # yield CPU to let stragglers finish burn-in
                 time.sleep(0.001)
-        
+
         if verbose:
             print('Sampling phase should be done now.', flush=True)
-            
+
         pbar.close()
 
         if len(active_rank_ids) > 0:
@@ -409,14 +430,14 @@ def run_sampling_phase_reuse(
                 # 1. Request / Report
                 buf = np.array([last_finished_batch], dtype=np.int32)
                 comm.Send([buf, MPI.INT], dest=0, tag=TAG_REQ)
-                
+
                 # 2. Wait Command
                 cmd = np.empty(1, dtype=np.int32)
                 comm.Recv([cmd, MPI.INT], source=0, tag=TAG_CMD)
 
                 if cmd[0] == CMD_STOP:
                     break
-                
+
                 # 3. Compute
                 # try:
                 t00 = MPI.Wtime()
@@ -431,35 +452,54 @@ def run_sampling_phase_reuse(
                 local_energy_time += t22 - t11
                 grad_time += t33 - t22
 
-                # Offload
-                E_loc_vec.append(local_energies_batch.detach().cpu().numpy())
-                amps_vec.append(amps_batch.detach().cpu().numpy())
-                grads_vec_list.append(grads_vec_batch.detach().cpu().numpy())
-                
-                last_finished_batch = fxs.shape[0]
-                n_local += last_finished_batch
-                
-                del local_energies_batch, grads_vec_batch, amps_batch
+                # Offload into pre-allocated buffers
+                b = fxs.shape[0]
+                e_np = local_energies_batch.detach().cpu().numpy().ravel()
+                g_np = grads_vec_batch.detach().cpu().numpy()
+                a_np = amps_batch.detach().cpu().numpy().ravel()
+
+                # Lazy allocation on first batch (now we know n_params)
+                if res_energies is None:
+                    n_params = g_np.shape[-1]
+                    res_energies = np.empty(max_n_local, dtype=np.float64)
+                    res_grads = np.empty((max_n_local, n_params), dtype=np.float64)
+                    res_amps = np.empty(max_n_local, dtype=np.float64)
+
+                # Grow buffer if needed (rare: worker got more batches than expected)
+                if n_local + b > res_energies.shape[0]:
+                    new_cap = max(res_energies.shape[0] * 2, n_local + b)
+                    res_energies = np.resize(res_energies, new_cap)
+                    res_grads.resize((new_cap, res_grads.shape[1]), refcheck=False)
+                    res_amps = np.resize(res_amps, new_cap)
+
+                res_energies[n_local:n_local + b] = e_np
+                res_grads[n_local:n_local + b] = g_np
+                res_amps[n_local:n_local + b] = a_np
+
+                last_finished_batch = b
+                n_local += b
+
+                del local_energies_batch, grads_vec_batch, amps_batch, e_np, g_np, a_np
         except Exception as e:
             import traceback
             error_msg = traceback.format_exc()
             print(f"!!! Rank {rank} CRASHED with FATAL ERROR !!!\n{error_msg}", flush=True)
             sys.stdout.flush()
             comm.Abort(1)
-    
+
     # Rest the CPU until all ranks finish
     gentle_barrier(comm, sleep_interval=0.01)
-    
-    # Pack Results
+
+    # Trim buffers to actual size (views, no copy)
     if n_local > 0:
-        res_energies = np.concatenate(E_loc_vec)
-        res_grads = np.concatenate(grads_vec_list)
-        res_amps = np.concatenate(amps_vec)
+        res_energies = res_energies[:n_local]
+        res_grads = res_grads[:n_local]
+        res_amps = res_amps[:n_local]
     else:
         res_energies = np.array([], dtype=np.float64)
         res_grads = np.array([], dtype=np.float64)
         res_amps = np.array([], dtype=np.float64)
-        
+
     stats = {
         'n_local': n_local,
         't_sample': sample_time,

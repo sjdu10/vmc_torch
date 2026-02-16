@@ -11,7 +11,7 @@ from vmc_torch.experiment.tn_model import wavefunctionModel
 
 # VMAP-compatible PEPS model
 class PEPS_Model(nn.Module):
-    def __init__(self, tn, max_bond, dtype=torch.float64):
+    def __init__(self, tn, max_bond, dtype=torch.float64, **kwargs):
         import quimb as qu
         import quimb.tensor as qtn
         super().__init__()
@@ -65,6 +65,7 @@ class circuit_TNF_2d_Model(nn.Module):
         mode='projector3d',
         from_which="zmax",
         max_bond=None,
+        max_bond_final=None,
         dtype=torch.float32,
     ):
         super().__init__()
@@ -73,6 +74,7 @@ class circuit_TNF_2d_Model(nn.Module):
         self.depth = depth
         # self.second_order_reflect = second_order_reflect
         self.max_bond = max_bond if (type(max_bond) is int and max_bond > 0) else None
+        self.max_bond_final = max_bond_final if (type(max_bond_final) is int and max_bond_final > 0) else None
         if self.max_bond is None:
             self.tree = None
         self.from_which = from_which
@@ -104,6 +106,11 @@ class circuit_TNF_2d_Model(nn.Module):
         self.params = torch.nn.ParameterList([
             torch.as_tensor(x, dtype=self.dtype) for x in params_flat
         ])
+        
+        self._vamp = torch.vmap(
+            self.amplitude,
+            in_dims=(0, None),
+        )
 
     def form_gated_tns_tnf(
         self,
@@ -252,12 +259,13 @@ class circuit_TNF_2d_Model(nn.Module):
                         inplace=True,
                         which="all",
                     )
+                
                 main_tnf, inverse_peps = amp.partition(f'ROUND_{depth}', inplace=True)
                 gates_tn, init_peps = main_tnf.partition(f'ROUND_{0}', inplace=True)
                 init_outer_inds = qtn.bonds(gates_tn, init_peps)
                 init_peps.reindex_(dict(zip(init_outer_inds, self.site_inds)))
 
-                inverse_peps.outer_inds(), inverse_peps.tensors
+                # inverse_peps.outer_inds(), inverse_peps.tensors
                 outer_inds = inverse_peps.outer_inds()
                 inverse_peps.reindex_({outer_inds[i]: self.site_inds[i] for i in range(len(outer_inds))})
                 main_tnf.reindex_({outer_inds[i]: self.site_inds[i] for i in range(len(outer_inds))})
@@ -287,6 +295,7 @@ class circuit_TNF_2d_Model(nn.Module):
                         
 
                         contracted_ts = inverse_peps.pop_tensor(contracted_ts_tid)
+                        
                         tln, *maybe_svals, trn = contracted_ts.split(
                             left_inds=bnds_l,
                             right_inds=bnds_r,
@@ -294,22 +303,40 @@ class circuit_TNF_2d_Model(nn.Module):
                             get="tensors",
                             max_bond=self.max_bond,
                             cutoff=0.0,
-                            absorb='left'
+                            absorb='left',
                         )
                         # remove temp tags
                         tln.tags.remove('gate-temp')
                         trn.tags.remove('gate-temp')
+                        tln.modify(tags = [f'ROUND_{d}', f'I{where[0][0]},{where[0][1]}', f'X{where[0][0]}', f'Y{where[0][1]}'])
+                        trn.modify(tags = [f'ROUND_{d}', f'I{where[1][0]},{where[1][1]}', f'X{where[1][0]}', f'Y{where[1][1]}'])
                         inverse_peps = (inverse_peps | tln | trn)
                         inverse_peps.view_like_(amp)
-                amp_val = (init_peps | inverse_peps).contract()
+                
+                amp_double_layer = (init_peps | inverse_peps)
+                amp_double_layer.view_as_(
+                    qtn.PEPS,
+                    site_tag_id="I{},{}",
+                    x_tag_id="X{}",
+                    y_tag_id="Y{}",
+                    Lx=inverse_peps.Lx,
+                    Ly=inverse_peps.Ly,
+                    site_ind_id="k{},{}",
+                )
+                # amp_val = amp_double_layer.contract()
+                amp_val = amp_double_layer.contract_boundary_from(
+                    from_which='xmin',
+                    max_bond=self.max_bond_final,
+                    cutoff=0.0,
+                    yrange=(0, amp_double_layer.Ly - 1),
+                    xrange=(0, amp_double_layer.Lx - 1),
+                    mode='mps',
+                ).contract()
         return amp_val
     
     def vamp(self, x, params):
         params = qu.utils.tree_unflatten(params, self.params_pytree)
-        return torch.vmap(
-            self.amplitude,
-            in_dims=(0, None),
-        )(x, params)
+        return self._vamp(x, params)
 
     def forward(self, x):
         return self.vamp(x, self.params)

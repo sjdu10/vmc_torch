@@ -13,22 +13,12 @@ import autoray as ar
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
 from vmc_torch.experiment.vmap.models import (
-    Transformer_fPEPS_Model_Conv2d,
-    Transformer_fPEPS_Model_GlobalMLP,
-    Transformer_fPEPS_Model_Cluster,
-    Transformer_fPEPS_Model_DConv2d,
-    fTN_backflow_attn_Tensorwise_Model_vmap,
-    fPEPS_Model,
-    Conv2D_bulk_only_fPEPS_Model_Cluster,
-    LoRA_fPEPS_Model,
-    LoRA_NNfPEPS_Model_Cluster,
-    Conv2D_Shared_fPEPS_Model_Cluster,
-    Conv2D_Geometric_fPEPS_Model_Cluster
+    Conv2D_Geometric_fPEPS_Model_Cluster,
 )
-from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver, run_sampling_phase_vec
+from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
-from vmc_torch.experiment.vmap.vmap_torch_utils import robust_svd_wrapper, qr_svd_wrapper, robust_svd_wrapper_random, qr_svd_wrapper_random, robust_svd_eig_wrapper, robust_svd_err_catcher_wrapper
+from vmc_torch.experiment.vmap.vmap_torch_utils import robust_svd_err_catcher_wrapper
 from vmc_torch.optimizer import DecayScheduler
 # ==============================================================================
 import warnings
@@ -36,8 +26,6 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 SVD_JITTER = 1e-12
 driver = None
-# ar.register_function('torch','linalg.svd', lambda x: robust_svd_wrapper(x, jitter=SVD_JITTER, driver=driver))
-# ar.register_function('torch','linalg.svd', lambda x: robust_svd_eig_wrapper(x, jitter=SVD_JITTER, driver=driver))
 ar.register_function('torch','linalg.svd', lambda x: robust_svd_err_catcher_wrapper(x, jitter=SVD_JITTER, driver=driver))
 # ==============================================================================
 COMM = MPI.COMM_WORLD
@@ -51,8 +39,8 @@ torch.set_num_threads(1)
 # 1. Initialization & Configuration
 # ==============================================================================
 Lx, Ly = 4, 2
-N_f = Lx * Ly - 2
-D, chi = 4, -1
+N_f = 6
+D, chi = 4, -2
 t, U = 1.0, 8.0
 
 # Load PEPS
@@ -62,21 +50,20 @@ params_path = f'{pwd}/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/'
 params = pickle.load(open(params_path + f'peps_su_params{appendix}.pkl', 'rb'))
 skeleton = pickle.load(open(params_path + f'peps_skeleton{appendix}.pkl', 'rb'))
 peps = qtn.unpack(params, skeleton)
-for ts in peps.tensors: 
+for ts in peps.tensors:
     ts.modify(data=ts.data.to_flat()*4)
-for site in peps.sites: 
+for site in peps.sites:
     peps[site].data._label = site
-    peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1)) # Important for U1->Z2 fPEPS
-# peps.apply_to_arrays(lambda x: x.to(torch.float64))
+    peps[site].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1))
 # ==============================================================================
-# Model Configuration (Define this FIRST)
+# Model Configuration
 # ==============================================================================
 model_config = {
     'max_bond': chi,
     'embed_dim': 16,
     'attn_depth': 1,
     'attn_heads': 4,
-    'nn_hidden_dim': peps.nsites, #peps.nsites, D
+    'nn_hidden_dim': peps.nsites,
     'init_perturbation_scale': 1e-3,
     'nn_eta': 1,
     'dtype_str': 'float64',
@@ -86,18 +73,7 @@ dtype_map = {'float64': torch.float64, 'float32': torch.float32}
 model_dtype = dtype_map[model_config['dtype_str']]
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
-# Model
-# fpeps_model = LoRA_fPEPS_Model(
-#     tn=peps,
-#     dtype=model_dtype,
-#     lora_rank=12,
-#     contract_boundary_opts={
-#         'mode': 'mps',
-#         'equalize_norms': 1.0,
-#         'canonize': True,
-#     },
-#     **init_kwargs
-# )
+
 fpeps_model = Conv2D_Geometric_fPEPS_Model_Cluster(
     tn=peps,
     dtype=model_dtype,
@@ -110,53 +86,12 @@ fpeps_model = Conv2D_Geometric_fPEPS_Model_Cluster(
     },
     **init_kwargs
 )
-# fpeps_model = fPEPS_Model(
-#     tn=peps,
-#     dtype=model_dtype,
-#     contract_boundary_opts={
-#         'mode': 'mps',
-#         'equalize_norms': 1.0,
-#         'canonize': True,
-#     },
-#     **init_kwargs
-# )
-# fpeps_model = Transformer_fPEPS_Model_Conv2d(
-#     tn=peps,
-#     dtype=model_dtype,
-#     contract_boundary_opts={
-#         'mode': 'mps',
-#         'equalize_norms': 1.0,
-#         'canonize': True,
-#     },
-#     **init_kwargs
-# )
-# fpeps_model = Transformer_fPEPS_Model_Cluster(
-#     tn=peps,
-#     dtype=model_dtype,
-#     contract_boundary_opts={
-#         'mode': 'mps',
-#         'equalize_norms': 1.0,
-#         'canonize': True,
-#     },
-#     **init_kwargs
-# )
-
-# fpeps_model = Transformer_fPEPS_Model_UNet(
-#     tn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
-
-# fpeps_model = fTN_backflow_attn_Tensorwise_Model_vmap(
-#     ftn=peps,
-#     dtype=model_dtype,
-#     **init_kwargs
-# )
-
 
 n_params = sum(p.numel() for p in fpeps_model.parameters())
-if RANK == 0: 
+if RANK == 0:
     print(f'Model Params: {n_params}')
+    print(f'Lattice: {Lx}x{Ly}, N_f={N_f}, D={D}, chi={chi}')
+    print(f'MPI Size: {SIZE} (1 master + {SIZE-1} workers)')
 
 # Hamiltonian
 H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -164,32 +99,26 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(5e3) 
-B = 250 # Total batch size for gradient estimation (across all ranks)
+Ns = 4000
+B = 500
 B_grad = max(1, B//2)
-vmc_steps = 900
+vmc_steps = 50
 init_step = 0
 burn_in_steps = 10
 learning_rate = 0.1
 diag_shift = 1e-5
-save_state_every = 10
+save_state_every = 50
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-2)
 
-# Load Checkpoint
-file_path = f'{params_path}/{fpeps_model._get_name()}/chi={chi}/'
-fpeps_model.debug_file = file_path
-if init_step > 0:
-    ckpt_path = file_path + f'checkpoint_step_{init_step}.pt'
-    fpeps_model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
-    if RANK == 0: 
-        print(f'Loaded step {init_step}')
+if RANK == 0:
+    print(f'Ns={Ns}, B={B}, B_grad={B_grad}')
+    print(f'Workers={SIZE-1}, samples per worker per sweep={B}')
+    print(f'Expected sweeps per worker: ~{Ns // ((SIZE-1)*B)}')
 
-# Broadcast RANK 0 parameters to all ranks (Important to ensure the training makes sense -- train the same model!!)
+# Broadcast RANK 0 parameters to all ranks
 curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
 COMM.Bcast(curr_params.detach().numpy(), root=0)
 curr_params = curr_params.to(model_dtype)
-# require gradient
-# torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), curr_params)
 torch.nn.utils.vector_to_parameters(curr_params, fpeps_model.parameters())
 COMM.Barrier()
 
@@ -198,8 +127,6 @@ get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_
 
 # Init State
 fxs = torch.stack([random_initial_config(N_f, peps.nsites) for _ in range(B)]).to(torch.long)
-# rfxs = random_initial_config(N_f, peps.nsites)
-# fxs = rfxs.unsqueeze(0).repeat(B, 1).to(torch.long) # test with identical initial states
 stats = {
     "Np": n_params,
     "sample size": Ns,
@@ -212,11 +139,11 @@ stats = {
 # ==============================================================================
 # 2. Main VMC Loop
 # ==============================================================================
+step_times = []
 for svmc in range(init_step, vmc_steps + init_step):
     t_start = MPI.Wtime()
-    
-    # --- Step 1: Sampling Phase (Modularized) ---
-    # fxs is updated and returned for the next step (Markov Chain)
+
+    # --- Step 1: Sampling Phase ---
     (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = (
         run_sampling_phase(
             svmc=svmc,
@@ -232,31 +159,22 @@ for svmc in range(init_step, vmc_steps + init_step):
             size=SIZE,
             should_burn_in=svmc==init_step,
             burn_in_steps=burn_in_steps,
-            verbose=True
+            verbose=False
         )
     )
-    # if RANK == 1:
-    #     print(fxs)
-    
+
     # --- Step 2: Aggregation Phase ---
-    # Gather statistics for logging
     all_energies_list = COMM.allgather(local_energies)
-    # Filter out empty arrays (from Master)
     valid_energies = [e for e in all_energies_list if e.size > 0]
     all_energies_global = np.concatenate(valid_energies)
-    
+
     energy_mean = np.mean(all_energies_global)
     energy_var = np.var(all_energies_global)
     total_samples = all_energies_global.shape[0]
-    
-    if RANK == 1:
-        print(f' Rank {RANK} | N={sample_stats["n_local"]} | T_samp={sample_stats["t_sample"]:.2f} T_E={sample_stats["t_energy"]:.2f} T_G={sample_stats["t_grad"]:.2f}, MKL={os.environ["MKL_NUM_THREADS"]}')
 
     COMM.Barrier()
-    
+
     # --- Step 3: Optimization Phase (SR) ---
-    # Now this is just a single function call!
-    # Master (Rank 0) participates in Allreduce but contributes 0 data
     dp, t_sr, info = distributed_minres_solver(
         local_grads=local_grads,
         local_amps=local_amps,
@@ -268,18 +186,8 @@ for svmc in range(init_step, vmc_steps + init_step):
         comm=COMM,
         rtol=5e-5
     )
-    
-    if RANK == 0:
-        print(f" Step {svmc} Energy: {energy_mean/peps.nsites:.6f} +/- {np.sqrt(energy_var/total_samples)/peps.nsites:.6f}")
-        print(f" Total Samples: {total_samples}, per Rank: {total_samples//SIZE}")
-        print(f" Batch Size: {B}, Grad Batch Size: {B_grad}, MKL: {os.environ['MKL_NUM_THREADS']}")
-        print(f" Total Time: {MPI.Wtime() - t_start:.4f}s")
-        print(f" Sample Time: {total_sample_time:.4f}s")
-        print(f" SR Time: {t_sr:.4f}s, Info: {info}\n")
-        
 
     # --- Step 4: Parameter Update ---
-    # dp is already available on all ranks due to distributed solver
     with torch.no_grad():
         dp_tensor = torch.tensor(dp, device='cpu', dtype=model_dtype)
         curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
@@ -287,34 +195,30 @@ for svmc in range(init_step, vmc_steps + init_step):
         new_params = curr_params - lr * dp_tensor
         COMM.Bcast(new_params.detach().numpy(), root=0)
         new_params = new_params.to(model_dtype)
-        # torch.utils._pytree.tree_map(lambda x: x.requires_grad_(True), new_params)
         torch.nn.utils.vector_to_parameters(new_params, fpeps_model.parameters())
 
-    # --- Step 5: Logging (Master Only) ---
+    # --- Step 5: Logging ---
     t_end = MPI.Wtime()
+    step_time = t_end - t_start
+    step_times.append(step_time)
+
     if RANK == 0:
-        if not os.path.exists(file_path): 
-            os.makedirs(file_path)
-        
-        # Text Log
-        log_file = file_path + f'vmc_mpi_log_{init_step}.txt'
-        if svmc == 0 and os.path.exists(log_file): os.remove(log_file)
-        with open(log_file, 'a') as f:
-            f.write(f'STEP {svmc}:\nEnergy: {energy_mean/peps.nsites}\
-                    \nErr: {np.sqrt(energy_var/total_samples)/peps.nsites}\
-                    \nN: {total_samples}\
-                    \nTotal Time: {t_end - t_start}\
-                    \nTotal Sample Time: {total_sample_time}\
-                    \nSR Time: {t_sr}\n\n')
-        
-        # JSON Stats
-        stats['mean'].append(energy_mean/peps.nsites)
-        stats['error'].append(np.sqrt(energy_var/total_samples)/peps.nsites)
-        stats['variance'].append(energy_var/peps.nsites**2)
-        stats['sample size'] = total_samples
-        with open(file_path + f'vmc_mpi_stats_{init_step}.json', 'w') as f:
-            json.dump(stats, f, indent=4)
-            
-        # Checkpoint
-        if (svmc + 1) % save_state_every == 0:
-            torch.save(fpeps_model.state_dict(), file_path + f'checkpoint_step_{svmc+1}.pt')
+        print(f"Step {svmc:3d} | E/site: {energy_mean/peps.nsites:.6f} +/- {np.sqrt(energy_var/total_samples)/peps.nsites:.6f} | N={total_samples} | T_total={step_time:.2f}s T_samp={total_sample_time:.2f}s T_SR={t_sr:.2f}s")
+
+# ==============================================================================
+# 3. Summary
+# ==============================================================================
+if RANK == 0:
+    print(f"\n{'='*60}")
+    print(f"SUMMARY ({Lx}x{Ly}, N_f={N_f}, Conv2D_Geometric)")
+    print(f"{'='*60}")
+    print(f"Total steps: {vmc_steps}")
+    print(f"Avg time/step: {np.mean(step_times):.2f}s")
+    print(f"Avg time/step (excl. first): {np.mean(step_times[1:]):.2f}s")
+    print(f"Min time/step: {np.min(step_times):.2f}s")
+    print(f"Max time/step: {np.max(step_times):.2f}s")
+    print(f"Final E/site: {stats['mean'][-1] if stats['mean'] else energy_mean/peps.nsites:.6f}")
+
+    stats['mean'].append(energy_mean/peps.nsites)
+    stats['error'].append(np.sqrt(energy_var/total_samples)/peps.nsites)
+    stats['variance'].append(energy_var/peps.nsites**2)
