@@ -19,7 +19,7 @@ from vmc_torch.experiment.vmap.vmap_models import (
     fTN_backflow_attn_Tensorwise_Model_vmap
 )
 from vmc_torch.experiment.vmap.vmap_utils import sample_next, evaluate_energy
-from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase, distributed_minres_solver
+from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase_v0 as run_sampling_phase, distributed_minres_solver_v0 as distributed_minres_solver
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
 from vmc_torch.experiment.tn_model import init_weights_to_zero
 # ==============================================================================

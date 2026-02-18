@@ -138,7 +138,7 @@ for svmc in range(init_step, vmc_steps + init_step):
     
     # --- Step 1: Sampling Phase (Modularized) ---
     # fxs is updated and returned for the next step (Markov Chain)
-    (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = (
+    (local_energies, local_O), fxs, sample_stats, total_sample_time = (
         run_sampling_phase(
             svmc,
             Ns,
@@ -178,8 +178,7 @@ for svmc in range(init_step, vmc_steps + init_step):
     # Master (Rank 0) participates in Allreduce but contributes 0 data
     
     dp, t_sr, info = distributed_minres_solver(
-        local_grads=local_grads,
-        local_amps=local_amps,
+        local_O=local_O,
         local_energies=local_energies,
         energy_mean=energy_mean,
         total_samples=total_samples,

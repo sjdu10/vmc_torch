@@ -1,3 +1,10 @@
+"""
+Test script: verify run_sampling_phase + distributed_minres_solver
+produce correct VMC optimization (energy should decrease over 10 steps).
+
+Run with:
+    mpirun -np 4 /home/sijingdu/TNVMC/VMC_code/clean_symmray/bin/python test_4x2_oloc_run.py
+"""
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
@@ -8,16 +15,17 @@ import quimb.tensor as qtn
 import pickle
 from functools import partial
 import torch
-import json
 import autoray as ar
 # ==============================================================================
 from vmc_torch.experiment.vmap.vmap_utils import compute_grads, random_initial_config
 from vmc_torch.experiment.vmap.models import (
     Conv2D_Geometric_fPEPS_Model_Cluster,
 )
-from vmc_torch.experiment.vmap.vmap_modules import run_sampling_phase_v0 as run_sampling_phase, distributed_minres_solver_v0 as distributed_minres_solver
+from vmc_torch.experiment.vmap.vmap_modules import (
+    run_sampling_phase,
+    distributed_minres_solver,
+)
 from vmc_torch.hamiltonian_torch import spinful_Fermi_Hubbard_square_lattice_torch
-from vmc_torch.experiment.tn_model import init_weights_to_zero
 from vmc_torch.experiment.vmap.vmap_torch_utils import robust_svd_err_catcher_wrapper
 from vmc_torch.optimizer import DecayScheduler
 # ==============================================================================
@@ -25,8 +33,7 @@ import warnings
 warnings.filterwarnings("ignore")
 # ==============================================================================
 SVD_JITTER = 1e-12
-driver = None
-ar.register_function('torch','linalg.svd', lambda x: robust_svd_err_catcher_wrapper(x, jitter=SVD_JITTER, driver=driver))
+ar.register_function('torch', 'linalg.svd', lambda x: robust_svd_err_catcher_wrapper(x, jitter=SVD_JITTER, driver=None))
 # ==============================================================================
 COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
@@ -44,11 +51,9 @@ D, chi = 4, -2
 t, U = 1.0, 8.0
 
 # Load PEPS
-u1z2 = True
-appendix = '_U1SU' if u1z2 else ''
 params_path = f'{pwd}/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/'
-params = pickle.load(open(params_path + f'peps_su_params{appendix}.pkl', 'rb'))
-skeleton = pickle.load(open(params_path + f'peps_skeleton{appendix}.pkl', 'rb'))
+params = pickle.load(open(params_path + 'peps_su_params_U1SU.pkl', 'rb'))
+skeleton = pickle.load(open(params_path + 'peps_skeleton_U1SU.pkl', 'rb'))
 peps = qtn.unpack(params, skeleton)
 for ts in peps.tensors:
     ts.modify(data=ts.data.to_flat()*4)
@@ -69,8 +74,7 @@ model_config = {
     'dtype_str': 'float64',
     'uniform_kernel': 0,
 }
-dtype_map = {'float64': torch.float64, 'float32': torch.float32}
-model_dtype = dtype_map[model_config['dtype_str']]
+model_dtype = torch.float64
 init_kwargs = model_config.copy()
 init_kwargs.pop('dtype_str')
 
@@ -102,18 +106,16 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 Ns = 4000
 B = 500
 B_grad = max(1, B//2)
-vmc_steps = 50
+vmc_steps = 10
 init_step = 0
 burn_in_steps = 10
 learning_rate = 0.1
 diag_shift = 1e-5
-save_state_every = 50
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-2)
 
 if RANK == 0:
     print(f'Ns={Ns}, B={B}, B_grad={B_grad}')
     print(f'Workers={SIZE-1}, samples per worker per sweep={B}')
-    print(f'Expected sweeps per worker: ~{Ns // ((SIZE-1)*B)}')
 
 # Broadcast RANK 0 parameters to all ranks
 curr_params = torch.nn.utils.parameters_to_vector(fpeps_model.parameters())
@@ -127,24 +129,18 @@ get_grads = partial(compute_grads, vectorize=True, vmap_grad=True, batch_size=B_
 
 # Init State
 fxs = torch.stack([random_initial_config(N_f, peps.nsites) for _ in range(B)]).to(torch.long)
-stats = {
-    "Np": n_params,
-    "sample size": Ns,
-    "model_config": model_config,
-    "mean": [],
-    "error": [],
-    "variance": [],
-}
 
 # ==============================================================================
-# 2. Main VMC Loop
+# 2. Main VMC Loop (using oloc variants)
 # ==============================================================================
 step_times = []
+energy_history = []
+
 for svmc in range(init_step, vmc_steps + init_step):
     t_start = MPI.Wtime()
 
-    # --- Step 1: Sampling Phase ---
-    (local_energies, local_grads, local_amps), fxs, sample_stats, total_sample_time = (
+    # --- Step 1: Sampling Phase (oloc variant) ---
+    (local_energies, local_O), fxs, sample_stats, total_sample_time = (
         run_sampling_phase(
             svmc=svmc,
             Ns=Ns,
@@ -174,10 +170,9 @@ for svmc in range(init_step, vmc_steps + init_step):
 
     COMM.Barrier()
 
-    # --- Step 3: Optimization Phase (SR) ---
+    # --- Step 3: Optimization Phase (oloc SR solver) ---
     dp, t_sr, info = distributed_minres_solver(
-        local_grads=local_grads,
-        local_amps=local_amps,
+        local_O=local_O,
         local_energies=local_energies,
         energy_mean=energy_mean,
         total_samples=total_samples,
@@ -202,23 +197,34 @@ for svmc in range(init_step, vmc_steps + init_step):
     step_time = t_end - t_start
     step_times.append(step_time)
 
+    e_per_site = energy_mean / peps.nsites
+    energy_history.append(e_per_site)
+
     if RANK == 0:
-        print(f"Step {svmc:3d} | E/site: {energy_mean/peps.nsites:.6f} +/- {np.sqrt(energy_var/total_samples)/peps.nsites:.6f} | N={total_samples} | T_total={step_time:.2f}s T_samp={total_sample_time:.2f}s T_SR={t_sr:.2f}s")
+        print(f"Step {svmc:3d} | E/site: {e_per_site:.6f} +/- {np.sqrt(energy_var/total_samples)/peps.nsites:.6f} | N={total_samples} | T_total={step_time:.2f}s T_samp={total_sample_time:.2f}s T_SR={t_sr:.2f}s")
 
 # ==============================================================================
-# 3. Summary
+# 3. Summary & Verification
 # ==============================================================================
 if RANK == 0:
     print(f"\n{'='*60}")
-    print(f"SUMMARY ({Lx}x{Ly}, N_f={N_f}, Conv2D_Geometric)")
+    print(f"VERIFICATION ({Lx}x{Ly}, N_f={N_f}, oloc variants)")
     print(f"{'='*60}")
     print(f"Total steps: {vmc_steps}")
     print(f"Avg time/step: {np.mean(step_times):.2f}s")
-    print(f"Avg time/step (excl. first): {np.mean(step_times[1:]):.2f}s")
-    print(f"Min time/step: {np.min(step_times):.2f}s")
-    print(f"Max time/step: {np.max(step_times):.2f}s")
-    print(f"Final E/site: {stats['mean'][-1] if stats['mean'] else energy_mean/peps.nsites:.6f}")
+    print(f"Energy history (E/site):")
+    for i, e in enumerate(energy_history):
+        print(f"  Step {i}: {e:.6f}")
 
-    stats['mean'].append(energy_mean/peps.nsites)
-    stats['error'].append(np.sqrt(energy_var/total_samples)/peps.nsites)
-    stats['variance'].append(energy_var/peps.nsites**2)
+    e_first = energy_history[0]
+    e_last = energy_history[-1]
+    e_min = min(energy_history)
+    print(f"\nFirst E/site:  {e_first:.6f}")
+    print(f"Last E/site:   {e_last:.6f}")
+    print(f"Min E/site:    {e_min:.6f}")
+    print(f"Delta (last-first): {e_last - e_first:.6f}")
+
+    if e_last < e_first:
+        print("\nPASSED: Energy decreased over VMC steps.")
+    else:
+        print("\nWARNING: Energy did NOT decrease. Check implementation.")

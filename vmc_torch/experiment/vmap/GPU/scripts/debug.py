@@ -8,7 +8,7 @@ import autoray as ar
 import time
 import symmray as sr
 
-from vmc_torch.experiment.vmap.GPU.GPU_vmap_utils import random_initial_config
+from vmc_torch.experiment.vmap.GPU.vmc_utils import random_initial_config
 from vmc_torch.experiment.vmap.vmap_models import fPEPS_Model
 
 # # --- Global Configurations ---

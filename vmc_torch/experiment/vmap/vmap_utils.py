@@ -454,14 +454,22 @@ def sample_next_vec(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, s
         if not new_flags.any():
             continue
         
-        # 2. Compute Amplitudes (only for changed samples)
-        # Note: Initialize proposed_amps to current_amps even for unchanged samples
+        # 2. Compute Amplitudes — pad to fixed batch size B to
+        # avoid torch.compile recompilation on varying shapes
         proposed_amps = current_amps.clone()
-        
-        # Compute model only for parts where new_flags is True
-        new_proposed_fxs = proposed_fxs[new_flags]
-        new_proposed_amps = fpeps_model(new_proposed_fxs)
-        proposed_amps[new_flags] = new_proposed_amps
+        n_changed = new_flags.sum().item()
+
+        if n_changed == B:
+            # All changed — no padding needed
+            new_proposed_amps = fpeps_model(proposed_fxs)
+            proposed_amps = new_proposed_amps
+        else:
+            # Pad changed configs to size B with copies of first row
+            changed_fxs = proposed_fxs[new_flags]
+            padded_fxs = proposed_fxs.clone()
+            padded_fxs[:n_changed] = changed_fxs
+            padded_amps = fpeps_model(padded_fxs)
+            proposed_amps[new_flags] = padded_amps[:n_changed]
         
         # 3. Accept/Reject (fully vectorized, no .item() calls)
         # Ratio calculation
@@ -837,12 +845,25 @@ def evaluate_energy_vec(fxs, fpeps_model, H, current_amps, verbose=False):
     # Record how many connected configurations each sample has, for later reconstruction
     conn_eta_num = torch.tensor(conn_eta_num, device=device) # (B,)
 
-    # 2. Batch compute connected amplitudes
-    # This is a large matrix operation with high efficiency
-    chunk_size = B # Or larger, depending on available memory
+    # 2. Batch compute connected amplitudes — pad last chunk to
+    # fixed size B to avoid torch.compile recompilation
+    chunk_size = B
+    total_conn = conn_etas.shape[0]
     conn_amps_list = []
-    for i in range(0, conn_etas.shape[0], chunk_size):
-        conn_amps_list.append(fpeps_model(conn_etas[i:i+chunk_size]))
+    for i in range(0, total_conn, chunk_size):
+        chunk = conn_etas[i:i + chunk_size]
+        actual = chunk.shape[0]
+        if actual < chunk_size:
+            # Pad with copies of first row (result discarded)
+            pad = chunk_size - actual
+            chunk = torch.cat([
+                chunk,
+                chunk[:1].expand(pad, -1),
+            ], dim=0)
+            out = fpeps_model(chunk)
+            conn_amps_list.append(out[:actual])
+        else:
+            conn_amps_list.append(fpeps_model(chunk))
     conn_amps = torch.cat(conn_amps_list)
 
     # 3. Vectorized computation of Local Energies (eliminate CPU loop)
@@ -868,6 +889,176 @@ def evaluate_energy_vec(fxs, fpeps_model, H, current_amps, verbose=False):
         print(f'Energy: {energy.item()}')
 
     return energy, local_energies
+
+
+def compute_grads_vec(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=False, vmap_grad=False, **kwargs):
+    """
+    Vectorized gradient computation mirroring compute_grads_gpu.
+
+    Parameters
+    ----------
+    fxs : Tensor, shape (B, N_sites)
+    fpeps_model : model with .params and .vamp()
+    vectorize : bool
+        If True use functional transforms (jacrev or vmap+grad).
+        If False fall back to sequential per-sample backward.
+    batch_size : int or None
+        Chunk size for memory-limited execution.
+    verbose : bool
+    vmap_grad : bool
+        If True use vmap(grad); otherwise use jacrev (default).
+
+    Returns
+    -------
+    batched_grads_vec : Tensor, shape (B, Np)
+    amps : Tensor, shape (B,) or (B, 1)
+    """
+    if vectorize:
+        params_pytree = (
+            list(fpeps_model.params)
+            if isinstance(fpeps_model.params, torch.nn.ParameterList)
+            else dict(fpeps_model.params)
+            if isinstance(fpeps_model.params, torch.nn.ParameterDict)
+            else fpeps_model.params
+        )
+
+        # ------------------------------------------------------------------
+        # Path A: vmap(grad) — efficient for per-sample scalar grad
+        # ------------------------------------------------------------------
+        if vmap_grad:
+            B = fxs.shape[0]
+            B_grad = batch_size if batch_size is not None else B
+
+            def single_sample_amp_func(x_i, p):
+                amp = fpeps_model.vamp(x_i.unsqueeze(0), p).squeeze(0)
+                return amp, amp
+
+            grad_vmap_fn = torch.vmap(
+                torch.func.grad(single_sample_amp_func, argnums=1, has_aux=True),
+                in_dims=(0, None)
+            )
+
+            grads_pytree_chunks = []
+            amps_chunks = []
+
+            t0 = time.time()
+            for b_start in range(0, B, B_grad):
+                b_end = min(b_start + B_grad, B)
+                fxs_chunk = fxs[b_start:b_end]
+                grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
+                amps_c = amps_c.detach()
+                grads_pytree_chunks.append(grads_chunk)
+                amps_chunks.append(amps_c)
+                del grads_chunk, amps_c
+
+            amps = torch.cat(amps_chunks, dim=0)
+
+            def concat_leaves(*leaves):
+                return torch.cat(leaves, dim=0)
+
+            full_grads_pytree = tree_map(concat_leaves, *grads_pytree_chunks)
+            leaves, _ = tree_flatten(full_grads_pytree)
+            flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
+            batched_grads_vec = torch.cat(flat_leaves, dim=1)
+
+            batched_grads_vec = batched_grads_vec.detach()
+            fpeps_model.zero_grad()
+
+            t1 = time.time()
+            if verbose and RANK == 1:
+                print(f"Batched vmap(grad) time: {t1 - t0:.4f}s")
+
+        # ------------------------------------------------------------------
+        # Path B: jacrev — standard Jacobian reverse mode
+        # ------------------------------------------------------------------
+        else:
+            def g(x, p):
+                results = fpeps_model.vamp(x, p)
+                return results, results
+
+            if batch_size is None:
+                t0 = time.time()
+                jac_pytree, amps = torch.func.jacrev(g, argnums=1, has_aux=True)(fxs, params_pytree)
+                t1 = time.time()
+                if verbose and RANK == 1:
+                    print(f"Full Batch Jacobian time: {t1 - t0:.4f}s")
+            else:
+                B = fxs.shape[0]
+                B_grad = batch_size
+                jac_pytree_list = []
+                amps_list = []
+                t0 = time.time()
+                for b_start in range(0, B, B_grad):
+                    b_end = min(b_start + B_grad, B)
+                    jac_pytree_b, amps_b = torch.func.jacrev(g, argnums=1, has_aux=True)(
+                        fxs[b_start:b_end], params_pytree
+                    )
+                    amps_b = amps_b.detach()
+                    jac_pytree_b = tree_map(lambda x: x.detach(), jac_pytree_b)
+                    jac_pytree_list.append(jac_pytree_b)
+                    amps_list.append(amps_b)
+                    del jac_pytree_b, amps_b
+                jac_pytree = tree_map(lambda *leaves: torch.cat(leaves, dim=0), *jac_pytree_list)
+                amps = torch.cat(amps_list, dim=0)
+                t1 = time.time()
+                if verbose and RANK == 1:
+                    print(f"Chunked Jacobian time: {t1 - t0:.4f}s")
+
+            leaves, _ = tree_flatten(jac_pytree)
+            leaves_flattened = [leaf.flatten(start_dim=1) for leaf in leaves]
+            batched_grads_vec = torch.cat(leaves_flattened, dim=1)
+
+            if amps.dim() == 1:
+                amps.unsqueeze_(1)
+
+            batched_grads_vec = batched_grads_vec.detach()
+            amps = amps.detach()
+            if 'jac_pytree' in locals():
+                del jac_pytree
+            fpeps_model.zero_grad()
+
+        # ------------------------------------------------------------------
+        # Safety checks
+        # ------------------------------------------------------------------
+        if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
+            print(f"NaN or Inf detected in batched_grads_vec in RANK {RANK}")
+            comm.Abort(1)
+
+        return batched_grads_vec, amps
+
+    else:
+        # ------------------------------------------------------------------
+        # Non-vectorized sequential fallback
+        # ------------------------------------------------------------------
+        amps = []
+        batched_grads_vec = []
+        t0 = time.time()
+
+        def flatten_grads(model):
+            grads_list = []
+            for p in model.parameters():
+                if p.grad is not None:
+                    grads_list.append(p.grad.flatten())
+                else:
+                    grads_list.append(torch.zeros_like(p).flatten())
+            return torch.cat(grads_list)
+
+        for fx in fxs:
+            amp = fpeps_model(fx.unsqueeze(0))
+            amps.append(amp)
+            amp.backward()
+            current_grads = flatten_grads(fpeps_model)
+            batched_grads_vec.append(current_grads)
+            fpeps_model.zero_grad()
+
+        t1 = time.time()
+        if verbose and RANK == 1:
+            print(f"Sequential time: {t1 - t0:.4f}s")
+
+        amps = torch.stack(amps, dim=0)
+        batched_grads_vec = torch.stack(batched_grads_vec, dim=0)
+
+        return batched_grads_vec, amps
 
 
 def flatten_params(parameters):

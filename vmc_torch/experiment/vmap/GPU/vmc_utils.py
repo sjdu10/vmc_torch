@@ -166,13 +166,23 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, **kwa
         if not new_flags.any():
             continue
         
-        # Compute Amplitudes (only for changed ones)
+        # Compute Amplitudes — pad to fixed batch size B to
+        # avoid torch.compile recompilation on varying shapes
         proposed_amps = current_amps.clone()
-        
-        # Only compute model for positions where new_flags is True
-        new_proposed_fxs = proposed_fxs[new_flags]
-        new_proposed_amps = fpeps_model(new_proposed_fxs)
-        proposed_amps[new_flags] = new_proposed_amps
+        n_changed = new_flags.sum().item()
+
+        if n_changed == B:
+            # All changed — no padding needed
+            new_proposed_amps = fpeps_model(proposed_fxs)
+            proposed_amps = new_proposed_amps
+        else:
+            # Pad changed configs to size B with copies of first
+            changed_fxs = proposed_fxs[new_flags]
+            padded_fxs = proposed_fxs.clone()
+            padded_fxs[:n_changed] = changed_fxs
+            # Remaining slots already filled (clone of proposed_fxs)
+            padded_amps = fpeps_model(padded_fxs)
+            proposed_amps[new_flags] = padded_amps[:n_changed]
         
         # Accept/Reject (fully vectorized, no .item() calls)
         ratio = (proposed_amps.abs()**2) / (current_amps.abs()**2 + 1e-18)
@@ -212,11 +222,25 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False, **kwargs):
     # Record number of connected configurations for each sample
     conn_eta_num = torch.tensor(conn_eta_num, device=device)
 
-    # Batch compute connected amplitudes
+    # Batch compute connected amplitudes — pad last chunk to
+    # fixed size B to avoid torch.compile recompilation
     chunk_size = B
+    total_conn = conn_etas.shape[0]
     conn_amps_list = []
-    for i in range(0, conn_etas.shape[0], chunk_size):
-        conn_amps_list.append(fpeps_model(conn_etas[i:i+chunk_size]))
+    for i in range(0, total_conn, chunk_size):
+        chunk = conn_etas[i:i + chunk_size]
+        actual = chunk.shape[0]
+        if actual < chunk_size:
+            # Pad with copies of first row (result discarded)
+            pad = chunk_size - actual
+            chunk = torch.cat([
+                chunk,
+                chunk[:1].expand(pad, -1),
+            ], dim=0)
+            out = fpeps_model(chunk)
+            conn_amps_list.append(out[:actual])
+        else:
+            conn_amps_list.append(fpeps_model(chunk))
     conn_amps = torch.cat(conn_amps_list)
 
     # Vectorized local energy calculation (eliminate CPU loop)
