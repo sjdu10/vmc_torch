@@ -202,25 +202,34 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, **kwa
 
 @torch.inference_mode()
 def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False, **kwargs):
+    import numpy as np
     B = fxs.shape[0]
     device = fxs.device
-    
-    # Prepare connected configurations (Hamiltonian Logic - still on CPU)
-    conn_eta_num = []
-    conn_etas = []
-    conn_eta_coeffs = []
-    
-    for fx in fxs:
-        eta, coeffs = H.get_conn(fx)
-        conn_eta_num.append(len(eta))
-        conn_etas.append(torch.as_tensor(eta, device=device))
-        conn_eta_coeffs.append(torch.as_tensor(coeffs, device=device))
-        
-    conn_etas = torch.cat(conn_etas, dim=0)
-    conn_eta_coeffs = torch.cat(conn_eta_coeffs, dim=0)
-    
-    # Record number of connected configurations for each sample
-    conn_eta_num = torch.tensor(conn_eta_num, device=device)
+
+    # --- GPU-batched path: zero CPU round-trips ---
+    if hasattr(H, '_hop_list'):
+        conn_etas, conn_eta_coeffs, batch_ids = H.get_conn_batch_gpu(fxs)
+        conn_eta_num = torch.bincount(batch_ids, minlength=B)
+
+    # --- Fallback: one bulk CPU→GPU transfer instead of per-sample uploads ---
+    else:
+        fxs_cpu = fxs.cpu()
+        all_etas_np, all_coeffs_np, conn_eta_num_list = [], [], []
+        for fx in fxs_cpu:
+            eta, coeffs = H.get_conn(fx)
+            conn_eta_num_list.append(len(eta))
+            all_etas_np.append(np.asarray(eta))
+            all_coeffs_np.append(np.asarray(coeffs))
+        conn_etas = torch.tensor(
+            np.concatenate(all_etas_np), device=device
+        )
+        conn_eta_coeffs = torch.tensor(
+            np.concatenate(all_coeffs_np), device=device, dtype=torch.float64
+        )
+        conn_eta_num = torch.tensor(conn_eta_num_list, device=device)
+        batch_ids = torch.repeat_interleave(
+            torch.arange(B, device=device), conn_eta_num
+        )
 
     # Batch compute connected amplitudes — pad last chunk to
     # fixed size B to avoid torch.compile recompilation
@@ -243,9 +252,7 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False, **kwargs):
             conn_amps_list.append(fpeps_model(chunk))
     conn_amps = torch.cat(conn_amps_list)
 
-    # Vectorized local energy calculation (eliminate CPU loop)
-    batch_ids = torch.repeat_interleave(torch.arange(B, device=device), conn_eta_num)
-    
+    # Vectorized local energy calculation
     current_amps_expanded = current_amps[batch_ids]
     
     # Compute each term: H_s's * (psi_s' / psi_s)
@@ -256,9 +263,6 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False, **kwargs):
     local_energies.index_add_(0, batch_ids, terms)
 
     energy = torch.mean(local_energies)
-    
-    # if verbose and RANK == 0:
-    #     print(f'Energy: {energy.item()}')
 
     return energy, local_energies
 
@@ -348,11 +352,7 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
             
             t1 = time.time()
             if verbose:
-                 # Assuming RANK is available globally or passed implicitly
-                 try:
-                     if RANK == 0: print(f"GPU Batched vmap(grad) time: {t1 - t0:.4f}s")
-                 except NameError:
-                     print(f"GPU Batched vmap(grad) time: {t1 - t0:.4f}s")
+                print(f"GPU Batched vmap(grad) time: {t1 - t0:.4f}s")
 
         # ------------------------------------------------------------------
         # Path B: jacrev - Standard Jacobian Reverse Mode

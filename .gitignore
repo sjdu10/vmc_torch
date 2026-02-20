@@ -19,5 +19,6 @@ __pycache__/
 vmc_torch.egg-info/
 *.sqlite
 *.nsys-rep
+*.pt.trace.json
 vmc_torch/experiment/vmap/data
 vmc_torch/experiment/vmap/debug

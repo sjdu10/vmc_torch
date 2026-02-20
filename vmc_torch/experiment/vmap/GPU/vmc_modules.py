@@ -28,7 +28,6 @@ from vmc_torch.experiment.vmap.GPU.vmc_utils import (
 # ===========================================================================
 # Sampling Phase
 # ===========================================================================
-@torch.inference_mode()
 def run_sampling_phase_gpu(
     fxs,
     model,
@@ -108,21 +107,16 @@ def run_sampling_phase_gpu(
         local_grads /= local_amps.unsqueeze(1)
         # Now local_grads IS O_loc
 
-        # Move to CPU numpy (frees GPU memory for next batch)
-        local_energies_list.append(
-            local_E[:needed].detach().cpu().numpy()
-        )
-        local_O_list.append(
-            local_grads[:needed].detach().cpu().numpy()
-        )
+        local_energies_list.append(local_E[:needed].detach())
+        local_O_list.append(local_grads[:needed].detach())
 
         current_count += needed
 
         # Explicit cleanup
         del local_grads, local_amps, local_E
 
-    local_energies = np.concatenate(local_energies_list)
-    local_O = np.concatenate(local_O_list)
+    local_energies = torch.cat(local_energies_list, dim=0)   # (Ns,) GPU
+    local_O = torch.cat(local_O_list, dim=0)                 # (Ns, Np) GPU
 
     sample_time = time.time() - t_start
 
@@ -134,6 +128,7 @@ def run_sampling_phase_gpu(
             f"({n_sweeps} sweeps x B={B}), "
             f"T={sample_time:.2f}s"
         )
+        # local_energies is a GPU tensor — .shape[0] works fine
 
     return (local_energies, local_O), fxs, sample_time
 
@@ -150,6 +145,7 @@ def distributed_minres_solver_gpu(
     diag_shift,
     rtol=1e-4,
     maxiter=100,
+    run_SR=True,
 ):
     """
     Distributed SR solver using MINRES with torch.distributed.all_reduce.
@@ -177,6 +173,11 @@ def distributed_minres_solver_gpu(
         info: MINRES convergence flag
     """
     t0 = time.time()
+    # Accept GPU tensors — convert to numpy once here, not inside matvec
+    if isinstance(local_O, torch.Tensor):
+        local_O = local_O.cpu().numpy()
+    if isinstance(local_energies, torch.Tensor):
+        local_energies = local_energies.cpu().numpy()
     n_local = local_energies.shape[0]
     world_size = dist.get_world_size()
 
@@ -204,6 +205,11 @@ def distributed_minres_solver_gpu(
     mean_O = global_sum_O / total_samples
     mean_EO = global_sum_EO / total_samples
     energy_grad = mean_EO - energy_mean * mean_O  # (Np,)
+
+    if not run_SR:
+        # Just return the energy gradient (no SR solve)
+        t1 = time.time()
+        return energy_grad, t1 - t0, None
 
     # --- MINRES solver with matvec (no Np x Np matrix) ---
     if world_size == 1:
@@ -253,6 +259,7 @@ def minSR_solver_gpu(
     n_params,
     diag_shift=1e-4,
     device=None,
+    do_SR=True,
 ):
     """
     MinSR direct solver: gather O_loc to rank 0, solve in sample space.
@@ -274,64 +281,118 @@ def minSR_solver_gpu(
         sr_time: float
         info: 0 (success) or error flag
     """
-    t0 = time.time()
-    if device is None:
-        device = torch.device('cuda')
+    if do_SR:
+        t0 = time.time()
+        if device is None:
+            device = torch.device('cuda')
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
 
-    # Convert to GPU tensors
-    local_O_t = torch.tensor(
-        local_O, device=device, dtype=torch.float64
-    ).contiguous()
-    local_E_t = torch.tensor(
-        local_energies, device=device, dtype=torch.float64
-    ).contiguous()
+        # Accept GPU tensors — skip re-upload if already on device
+        if isinstance(local_O, torch.Tensor):
+            local_O_t = local_O.to(
+                device=device, dtype=torch.float64
+            ).contiguous()
+            local_E_t = local_energies.to(
+                device=device, dtype=torch.float64
+            ).contiguous()
+        else:
+            local_O_t = torch.tensor(
+                local_O, device=device, dtype=torch.float64
+            ).contiguous()
+            local_E_t = torch.tensor(
+                local_energies, device=device, dtype=torch.float64
+            ).contiguous()
 
-    if world_size > 1:
-        # Gather O_loc and energies across ranks
-        total_O_t = torch.zeros(
-            (total_samples, n_params),
-            device=device, dtype=torch.float64,
+        if world_size > 1:
+            # Gather O_loc and energies across ranks
+            total_O_t = torch.zeros(
+                (total_samples, n_params),
+                device=device, dtype=torch.float64,
+            )
+            total_E_t = torch.zeros(
+                total_samples, device=device, dtype=torch.float64,
+            )
+            dist.all_gather_into_tensor(total_O_t, local_O_t)
+            dist.all_gather_into_tensor(total_E_t, local_E_t)
+        else:
+            total_O_t = local_O_t
+            total_E_t = local_E_t
+
+        info = 0
+        dp_t = torch.zeros(
+            n_params, device=device, dtype=torch.float64
         )
-        total_E_t = torch.zeros(
-            total_samples, device=device, dtype=torch.float64,
-        )
-        dist.all_gather_into_tensor(total_O_t, local_O_t)
-        dist.all_gather_into_tensor(total_E_t, local_E_t)
+
+        if rank == 0:
+            O_mean = torch.mean(total_O_t, dim=0)
+            O_centered = total_O_t - O_mean.unsqueeze(0)
+            O_sk = O_centered / np.sqrt(total_samples)
+            E_s = (total_E_t - energy_mean) / np.sqrt(total_samples)
+
+            # Gram matrix T = O_sk @ O_sk^T  (Ns x Ns)
+            T = O_sk @ O_sk.T
+            T += diag_shift * torch.eye(
+                total_samples, device=device, dtype=torch.float64,
+            )
+
+            try:
+                x = torch.linalg.solve(T, E_s)
+            except RuntimeError:
+                x = torch.linalg.lstsq(T, E_s).solution
+                info = 1
+
+            dp_t = O_sk.T @ x
+
+        if world_size > 1:
+            dist.broadcast(dp_t, src=0)
+
+        dp = dp_t.cpu().numpy()
+        t1 = time.time()
+        return dp, t1 - t0, info
     else:
-        total_O_t = local_O_t
-        total_E_t = local_E_t
+        # Compute energy gradient only (no SR solve)
+        t0 = time.time()
+        if device is None:
+            device = torch.device('cuda')
 
-    info = 0
-    dp_t = torch.zeros(
-        n_params, device=device, dtype=torch.float64
-    )
+        # Accept GPU tensors
+        if isinstance(local_O, torch.Tensor):
+            local_O = local_O.to(device=device, dtype=torch.float64)
+            local_energies = local_energies.to(
+                device=device, dtype=torch.float64
+            )
+        else:
+            local_O = torch.tensor(
+                local_O, device=device, dtype=torch.float64
+            )
+            local_energies = torch.tensor(
+                local_energies, device=device, dtype=torch.float64
+            )
 
-    if rank == 0:
-        O_mean = torch.mean(total_O_t, dim=0)
-        O_centered = total_O_t - O_mean.unsqueeze(0)
-        O_sk = O_centered / np.sqrt(total_samples)
-        E_s = (total_E_t - energy_mean) / np.sqrt(total_samples)
+        world_size = dist.get_world_size()
+        n_local = local_energies.shape[0]
 
-        # Gram matrix T = O_sk @ O_sk^T  (Ns x Ns)
-        T = O_sk @ O_sk.T
-        T += diag_shift * torch.eye(
-            total_samples, device=device, dtype=torch.float64,
-        )
+        if n_local > 0:
+            local_sum_O = local_O.sum(dim=0)                      # (Np,)
+            local_sum_EO = local_energies @ local_O               # (Np,)
+        else:
+            local_sum_O = torch.zeros(
+                n_params, device=device, dtype=torch.float64
+            )
+            local_sum_EO = torch.zeros(
+                n_params, device=device, dtype=torch.float64
+            )
 
-        try:
-            x = torch.linalg.solve(T, E_s)
-        except RuntimeError:
-            x = torch.linalg.lstsq(T, E_s).solution
-            info = 1
+        if world_size > 1:
+            dist.all_reduce(local_sum_O, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
 
-        dp_t = O_sk.T @ x
+        mean_O = local_sum_O / total_samples
+        mean_EO = local_sum_EO / total_samples
+        energy_grad = (mean_EO - energy_mean * mean_O).cpu().numpy()
 
-    if world_size > 1:
-        dist.broadcast(dp_t, src=0)
+        t1 = time.time()
+        return energy_grad, t1 - t0, None
 
-    dp = dp_t.cpu().numpy()
-    t1 = time.time()
-    return dp, t1 - t0, info

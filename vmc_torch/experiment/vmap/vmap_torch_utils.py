@@ -447,6 +447,50 @@ def robust_svd_err_catcher_wrapper(A, jitter=1e-12, driver=None):
     except RuntimeError as e:
         return RobustSVD_EIG.apply(A, jitter, driver)
 
+
+# ========== Size/device-aware dispatch ==========
+
+def qr_via_svd(x):
+    """QR via SVD for GPU small matrices. A = USVh -> Q=U, R=diag(S)@Vh."""
+    U, S, Vh = robust_svd_err_catcher_wrapper(x)
+    R = S.unsqueeze(-1) * Vh
+    return U, R
+
+
+def size_aware_qr(x):
+    """Size/device-aware QR. Uses SVD-based QR on GPU for n<=32.
+
+    cuSOLVER's batched Jacobi kernel (n<=32) makes SVD ~10-15x faster
+    than QR on GPU for small matrices. QR has no fused batched kernel
+    and spawns ~3k sub-kernel launches per call.
+    On CPU or for n>32, standard QR (Householder) is used.
+    """
+    n = min(x.shape[-2], x.shape[-1])
+    if x.is_cuda and n <= 32:
+        return qr_via_svd(x)
+    return torch.linalg.qr(x)
+
+
+def size_aware_svd(x, jitter=1e-12, driver=None):
+    """Size/device-aware SVD. Uses EIG-based+MAGMA on GPU for n>32.
+
+    For n<=32, cuSOLVER's fused Jacobi kernel is fast (~0.4ms).
+    For n>32, Jacobi is unavailable and cuSOLVER SVD jumps to ~70ms.
+    MAGMA eigh avoids this cliff (~4ms for all n), so we route
+    through RobustSVD_EIG with MAGMA backend for large GPU matrices.
+    On CPU, always uses default RobustSVD.
+    """
+    n = min(x.shape[-2], x.shape[-1])
+    if x.is_cuda and n > 32:
+        prev = torch.backends.cuda.preferred_linalg_library()
+        torch.backends.cuda.preferred_linalg_library('magma')
+        try:
+            return RobustSVD_EIG.apply(x, jitter, driver)
+        finally:
+            torch.backends.cuda.preferred_linalg_library(prev)
+    return robust_svd_err_catcher_wrapper(x, jitter=jitter, driver=driver)
+
+
 # ========================================== Benchmarking Suite ==========================================
 
 def benchmark_svd_full(M, N, batch_size=10, num_batches=10, jitter=1e-12, 

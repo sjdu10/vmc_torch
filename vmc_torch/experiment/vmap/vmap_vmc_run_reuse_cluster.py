@@ -143,15 +143,6 @@ stats = {
     "error": [],
     "variance": [],
 }
-
-# if RANK == 1:  # 假设你想调试 Rank 0
-#     import debugpy
-#     # 监听 5678 端口
-#     debugpy.listen(("localhost", 5678))
-#     print(f"Rank {RANK} is waiting for debugger to attach...", flush=True)
-#     # 这一行会让程序暂停，直到你按调试按钮连接上来
-#     debugpy.wait_for_client() 
-#     print(f"Rank {RANK} debugger attached!", flush=True)
     
 # ==============================================================================
 # 2. Main VMC Loop

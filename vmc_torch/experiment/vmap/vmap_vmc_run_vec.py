@@ -48,8 +48,8 @@ torch.set_num_threads(1)
 # ==============================================================================
 # 1. Initialization & Configuration
 # ==============================================================================
-Lx, Ly = 4, 2
-N_f = Lx * Ly - 2
+Lx, Ly = 2, 2
+N_f = Lx * Ly
 D, chi = 4, -1
 t, U = 1.0, 8.0
 
@@ -107,14 +107,14 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
 )
 
 # VMC Hyperparams
-Ns = int(5e3)
-B = 250
+Ns = int(2e3)
+B = 200
 B_grad = max(1, B//2)
-vmc_steps = 900
+vmc_steps = 10
 init_step = 0
 burn_in_steps = 10
 learning_rate = 0.1
-diag_shift = 1e-5
+diag_shift = 1e-4
 save_state_every = 10
 scheduler = DecayScheduler(init_lr=learning_rate, decay_rate=0.9, patience=50, min_lr=1e-2)
 

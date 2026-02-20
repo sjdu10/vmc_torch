@@ -960,6 +960,13 @@ def run_sampling_phase(
                         tag=TAG_CMD,
                     )
                     n_dispatched += B
+                    if verbose:
+                        print(
+                            f"[Master] Dispatched {B} samples "
+                            f"to Rank {source_rank}. "
+                            f"Total: {n_dispatched}.",
+                            flush=True,
+                        )
                 else:
                     cmd = np.array(
                         [CMD_STOP], dtype=np.int32
@@ -972,6 +979,13 @@ def run_sampling_phase(
                     active_workers -= 1
                     if source_rank in active_rank_ids:
                         active_rank_ids.remove(source_rank)
+                        if verbose:
+                            print(
+                                f'[Master] Kill rank '
+                                f'{source_rank}. Remaining: '
+                                f'{active_workers}',
+                                flush=True,
+                            )
             else:
                 time.sleep(0.001)
 

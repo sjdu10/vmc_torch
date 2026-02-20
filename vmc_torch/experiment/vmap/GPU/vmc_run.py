@@ -27,7 +27,12 @@ from vmc_torch.hamiltonian_torch import (
     spinful_Fermi_Hubbard_square_lattice_torch
 )
 from vmc_torch.experiment.vmap.vmap_torch_utils import (
-    robust_svd_err_catcher_wrapper
+    size_aware_qr,
+    size_aware_svd,
+)
+
+from vmc_torch.experiment.vmap.GPU.vmc_utils import (
+    sample_next, evaluate_energy, compute_grads_gpu,
 )
 
 # --- Global Configurations ---
@@ -35,12 +40,11 @@ JITTER = 1e-16
 driver = None
 ar.register_function(
     'torch', 'linalg.svd',
-    lambda x: robust_svd_err_catcher_wrapper(
-        x, jitter=JITTER, driver=driver
-    ),
+    lambda x: size_aware_svd(x, jitter=JITTER, driver=driver),
 )
+ar.register_function('torch', 'linalg.qr', size_aware_qr)
 
-torch.set_default_dtype(torch.float64)
+torch.set_default_dtype(torch.float32)
 
 # ==========================================
 # 1. Distributed Environment Setup
@@ -70,11 +74,11 @@ torch.manual_seed(42 + RANK)
 # ==========================================
 # 2. Physics & Model Configuration
 # ==========================================
-Lx, Ly = 4, 4
+Lx, Ly = 4, 2
 nsites = Lx * Ly
 N_f = nsites - 2
 D = 4
-chi = -1
+chi = 4
 
 pwd = (
     '/home/sijingdu/TNVMC/VMC_code/vmc_torch/'
@@ -121,7 +125,7 @@ fpeps_model.to(device)
 # Optional: export + compile for GPU speedup
 # torch.export captures quimb/symmray ops as pure aten graph,
 # then vmap + compile fuses into CUDA kernels (~10x for chi=-1)
-USE_EXPORT_COMPILE = True
+USE_EXPORT_COMPILE = False
 if USE_EXPORT_COMPILE:
     example_x = random_initial_config(N_f, nsites, seed=0).to(device)
     if RANK == 0:
@@ -149,12 +153,13 @@ H = spinful_Fermi_Hubbard_square_lattice_torch(
     gpu=True,
 )
 graph = H.graph
+H.precompute_hops_gpu(device)
 
 # ==========================================
 # 3. Sampling & VMC Settings
 # ==========================================
-B = 500
-Ns_per_rank = 2000
+B = 128
+Ns_per_rank = 2048
 grad_batch_size = max(1, B // 2)
 
 if RANK == 0:
@@ -176,9 +181,10 @@ fxs = torch.stack([
 # Training Hyperparameters
 vmc_steps = 10
 learning_rate = 0.1
-diag_shift = 5e-5
+diag_shift = 1e-4
 save_state_every = 10
-burn_in_steps = 10
+burn_in_steps = 0
+run_SR = True
 use_minSR = False  # False: distributed MINRES
 
 # Output paths
@@ -193,9 +199,7 @@ os.makedirs(output_dir, exist_ok=True)
 if RANK == 0:
     print("\n--- Warmup (1 sweep) ---")
 t_warm = time.time()
-from vmc_torch.experiment.vmap.GPU.vmc_utils import (
-    sample_next, evaluate_energy, compute_grads_gpu,
-)
+
 with torch.inference_mode():
     fxs, amps = sample_next(fxs, fpeps_model, graph)
     if RANK == 0:
@@ -241,22 +245,18 @@ for step in range(vmc_steps):
             verbose=False,
         )
     )
-
+    # print(f'local O norm: {np.linalg.norm(local_O):.3e}') BUG: local_O is 0, grad not passing through??
     t_sample_end = time.time()
 
     # --- Step 2: Global energy statistics ---
     n_local = local_energies.shape[0]
     Total_Ns = n_local * WORLD_SIZE
 
-    local_E_sum = torch.tensor(
-        local_energies.sum(), device=device
-    )
+    local_E_sum = local_energies.sum()   # already on device
     dist.all_reduce(local_E_sum, op=dist.ReduceOp.SUM)
     energy_mean = local_E_sum.item() / Total_Ns
 
-    local_E_sq_sum = torch.tensor(
-        (local_energies ** 2).sum(), device=device
-    )
+    local_E_sq_sum = (local_energies ** 2).sum()   # already on device
     dist.all_reduce(local_E_sq_sum, op=dist.ReduceOp.SUM)
     energy_var = (
         local_E_sq_sum.item() / Total_Ns - energy_mean ** 2
@@ -273,6 +273,7 @@ for step in range(vmc_steps):
             n_params=n_params,
             diag_shift=diag_shift,
             device=device,
+            run_SR=run_SR
         )
     else:
         dp, t_sr, info = distributed_minres_solver_gpu(
@@ -283,6 +284,7 @@ for step in range(vmc_steps):
             n_params=n_params,
             diag_shift=diag_shift,
             rtol=5e-5,
+            run_SR=run_SR
         )
 
     # --- Step 4: Parameter Update ---

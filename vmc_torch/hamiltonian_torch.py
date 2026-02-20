@@ -668,6 +668,103 @@ class spinful_Fermi_Hubbard_square_lattice_torch(Hamiltonian):
         super().__init__(H, hi, graph)
         self.gpu = gpu
 
+    def precompute_hops_gpu(self, device):
+        """Call once after init to precompute hop metadata for GPU-batched get_conn."""
+        import torch
+        N = self.hilbert.n_orbitals // 2  # N_sites
+        hop_list = []   # (i_netket, j_netket, coeff, p_symmray, q_symmray)
+        diag_list = []  # (site_quimb, coeff)
+        for key, value in self._H.items():
+            if len(key) == 3:
+                i0, j0, spin = key
+                # netket orbital indices
+                i_net = i0 if spin == 1 else i0 + N
+                j_net = j0 if spin == 1 else j0 + N
+                # symmray positions: up↔2*site+1, down↔2*site+0
+                p_sym = 2 * i0 + (1 if spin == 1 else 0)
+                q_sym = 2 * j0 + (1 if spin == 1 else 0)
+                if p_sym > q_sym:
+                    p_sym, q_sym = q_sym, p_sym
+                hop_list.append((i_net, j_net, value, p_sym, q_sym))
+            elif len(key) == 1:
+                diag_list.append((key[0], value))
+        self._hop_list = hop_list
+        self._diag_list = diag_list
+        self._gpu_device = device
+
+    def get_conn_batch_gpu(self, fxs):
+        """
+        Batched get_conn on GPU. No Python loop over samples.
+
+        Args:
+            fxs: (B, N_sites) int64 GPU tensor (quimb encoding)
+        Returns:
+            conn_etas:   (total_conn, N_sites) int64 GPU tensor
+            conn_coeffs: (total_conn,) float64 GPU tensor
+            batch_ids:   (total_conn,) int64 GPU tensor
+        """
+        import torch
+        B, N = fxs.shape
+        device = fxs.device
+
+        # Build netket representation: (B, 2*N)
+        spin_up = ((fxs == 2) | (fxs == 3)).long()    # (B, N)
+        spin_down = ((fxs == 1) | (fxs == 3)).long()  # (B, N)
+        netket = torch.cat([spin_up, spin_down], dim=1)  # (B, 2*N)
+
+        # Build symmray representation: [d0, u0, d1, u1, ...]  (B, 2*N)
+        symmray = torch.stack(
+            [spin_down, spin_up], dim=-1
+        ).reshape(B, 2 * N)  # (B, 2*N)
+
+        all_etas, all_coeffs, all_bids = [], [], []
+
+        # --- Hopping terms ---
+        for i_net, j_net, coeff, p_sym, q_sym in self._hop_list:
+            valid = netket[:, i_net] != netket[:, j_net]  # (B,) bool
+            if not valid.any():
+                continue
+            idx = valid.nonzero(as_tuple=True)[0]  # (k,)
+
+            # Swap i_net and j_net in the valid netket configs
+            new_netket = netket[idx].clone()       # (k, 2*N)
+            tmp = new_netket[:, i_net].clone()
+            new_netket[:, i_net] = new_netket[:, j_net]
+            new_netket[:, j_net] = tmp
+
+            # Convert back: netket → quimb
+            su = new_netket[:, :N]
+            sd = new_netket[:, N:]
+            new_fxs = su * 2 + sd  # (k, N)
+
+            # Phase: count symmray occupancies in (p_sym, q_sym) open interval
+            between = symmray[idx, p_sym + 1:q_sym].sum(dim=-1) % 2  # (k,)
+            phases = 1.0 - 2.0 * between.double()  # +1 or -1
+
+            all_etas.append(new_fxs)
+            all_coeffs.append(phases * coeff)
+            all_bids.append(idx)
+
+        # --- Diagonal (on-site U) terms ---
+        for site, coeff in self._diag_list:
+            valid = fxs[:, site] == 3  # (B,) bool
+            if not valid.any():
+                continue
+            idx = valid.nonzero(as_tuple=True)[0]
+            all_etas.append(fxs[idx])
+            all_coeffs.append(
+                torch.full(
+                    (len(idx),), coeff,
+                    device=device, dtype=torch.float64,
+                )
+            )
+            all_bids.append(idx)
+
+        conn_etas = torch.cat(all_etas, dim=0)
+        conn_coeffs = torch.cat(all_coeffs, dim=0)
+        batch_ids = torch.cat(all_bids, dim=0)
+        return conn_etas, conn_coeffs, batch_ids
+
     def get_conn(self, sigma_quimb):
         """
         Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
