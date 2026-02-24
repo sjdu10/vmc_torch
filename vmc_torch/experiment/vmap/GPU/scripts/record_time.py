@@ -48,7 +48,7 @@ chi = 10
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 has_gpu = device.type == "cuda"
 
-batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
+batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 N_WARMUP = 1
 N_REPS = 2
 
