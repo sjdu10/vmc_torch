@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --time=12:00:00
+#SBATCH --job-name=SU
+#SBATCH --partition=expansion
+#SBATCH --reservation=changroup_standingres  # Specify the reservation name
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=64
+#SBATCH --mail-user=sdu2@caltech.edu   # email address
+#SBATCH --mem=96G
+
+date
+# export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+python ./SU_run.py
+date

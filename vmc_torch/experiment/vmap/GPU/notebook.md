@@ -320,7 +320,138 @@ For chi=10, boundary contraction matrices are ~10x10 (well within Jacobi n<=32 t
 
 **Status:** Script written, awaiting execution.
 
+## 2026-02-20: Patching eigh dispatch — cusolverDnXsyevBatched for all n
+
+### Context
+`torch.linalg.eigh` has an 80-120x performance cliff at n=33 because PyTorch gates the batched cuSOLVER path (`syevjBatched` / `XsyevBatched`) behind `n <= 32`. PR #155695 (merged June 2025) added `cusolverDnXsyevBatched` wrappers but only inside the existing n<=32 branch — the dispatch logic was never updated. JAX fixed this in Sep 2025 (jax-ml/jax#31375).
+
+### Approach
+Instead of rebuilding all of PyTorch from source (which requires ~30GB RAM for CUDA compilation), we wrote a lightweight C++ extension (`my_eigh.cpp`) that calls `cusolverDnXsyevBatched` directly via `torch.utils.cpp_extension.load`. Compiles in ~2 seconds.
+
+### Files
+- `GPU/scripts/my_eigh.cpp` — C++ extension calling cusolverDnXsyevBatched unconditionally
+- `GPU/scripts/eigh_batched_ext.cu` — equivalent CUDA extension (same logic, .cu file)
+- `GPU/scripts/test_eigh_cpp.py` — benchmark comparing stock eigh vs custom extension
+- `GPU/scripts/test_eigh_dispatch.py` — benchmark using .cu extension
+
+### Results
+
+**System:** RTX 4080, CUDA 12.8, PyTorch 2.10.0+cu128, float64.
+
+**Correctness:** eigenvalue max |diff| = 0, residual ||Av - λv|| = 2.1e-13 (same order as stock 1.7e-13). PASS.
+
+**B=64:**
+
+| n | stock (ms) | custom (ms) | speedup |
+|---|---|---|---|
+| 32 | 1.05 | 0.88 | 1.2x |
+| 33 | 77.2 | 1.68 | **46x** |
+| 48 | 97.3 | 1.77 | **55x** |
+| 64 | 122 | 2.34 | **52x** |
+| 128 | 316 | 9.88 | **32x** |
+
+**B=1024:**
+
+| n | stock (ms) | custom (ms) | speedup |
+|---|---|---|---|
+| 32 | 8.30 | 7.81 | 1.1x |
+| 33 | 1137 | 15.1 | **75x** |
+| 48 | 1491 | 21.9 | **68x** |
+| 64 | 1874 | 30.4 | **62x** |
+| 128 | 4783 | 145.7 | **33x** |
+
+### Conclusions
+1. **cusolverDnXsyevBatched works for all n** — cliff completely eliminated
+2. **32-75x speedup** for n>32, matching JAX's fix
+3. **No regression for n<=32** — custom is slightly faster (1.1-1.5x) since it avoids PyTorch dispatch overhead
+4. **Numerically correct** — residuals match stock PyTorch
+5. This confirms the fix is just a dispatch logic change — the C++ wrappers already exist in PyTorch
+
+### Next steps
+- [ ] File upstream PyTorch PR to update dispatch logic in `BatchLinearAlgebraLib.cpp`
+- [ ] Integrate `my_eigh` into the VMC pipeline for n>32 boundary contraction
+- [ ] Benchmark impact on full VMC step at chi=D where eigh is in the hot path
+
 ### Remaining questions
 - What is the actual GPU speedup from size-aware dispatch at 8x8 D=chi=10?
 - Does the QR-via-SVD advantage hold for larger chi where matrices exceed n=32?
 - How does export+compile interact with the size-aware dispatch?
+- Can we register `my_eigh` via autoray to transparently replace `torch.linalg.eigh`?
+
+### Ablation test: eigh dispatch branching (all B, n, dtype)
+
+**Question:** Does the proposed PyTorch patch (keep non-batched dispatch for B=1, use XsyevBatched only for batched) make sense? Or can we just use XsyevBatched unconditionally?
+
+**Setup:** RTX 4080, CUDA 12.8, PyTorch 2.10.0+cu128, 5 warmup + 10 reps, CUDA events timing.
+
+**Files:** `GPU/scripts/eigh_dispatch/test_eigh_ablation.py`, data saved to `GPU/data/eigh_dispatch/eigh_ablation.npy`.
+
+**Correctness:** All (B, n, dtype) combos pass. For float32, eigenvalue disagreement between stock and XsyevBatched grows with n (up to ~7e-3 at n=512) — expected since different algorithms (syevj vs XsyevBatched). But XsyevBatched residuals ||Av-lv|| are consistently **better** than stock (e.g. 1.5e-7 vs 1.9e-5 at n=512 B=64 f32).
+
+**Key finding — B=1 (non-batched fallback):**
+
+| dtype | n range | XsyevBatched vs stock |
+|---|---|---|
+| f32 | n<=512 | XsyevBatched wins or ties (1.1-3.6x faster) |
+| f64 | n<=32 | XsyevBatched wins (1.2-1.8x) |
+| f64 | n=33-512 | ~tie (0.96-1.12x) |
+
+**Conclusion: The non-batched fallback in the proposed patch is NOT justified.** XsyevBatched is never slower than stock even for B=1. The proposed patch can be simplified to use XsyevBatched unconditionally for all B and n.
+
+**n=32/33 cliff (stock eigh):**
+
+| dtype | B | n=32 | n=33 | ratio |
+|---|---|---|---|---|
+| f32 | 64 | 0.32 ms | 58.1 ms | **182x** |
+| f32 | 1024 | 1.87 ms | 901.8 ms | **482x** |
+| f64 | 64 | 0.90 ms | 69.1 ms | **77x** |
+| f64 | 1024 | 8.03 ms | 1083 ms | **135x** |
+
+Cliff is 2-4x worse for float32 than float64 because stock f32 uses syevj (Jacobi, fast for n<=32) which has no batched path for n>32, while stock f64 uses syevd for all n>32.
+
+**n=512/513 boundary (float32 only):**
+
+| dtype | B | n=512 | n=513 | ratio |
+|---|---|---|---|---|
+| f32 | 1 | 11.75 ms | 3.70 ms | **0.3x** (513 faster!) |
+| f32 | 64 | 758 ms | 233 ms | **0.3x** |
+| f64 | 1 | 10.99 ms | 11.76 ms | 1.1x (no change) |
+| f64 | 64 | 692 ms | 730 ms | 1.1x |
+
+**Surprising:** For float32, n=512 is 3x *slower* than n=513. This is because stock PyTorch uses syevj (Jacobi) for float32 n<=512 but switches to syevd for n>512, and syevj is slower than syevd for large matrices in the non-batched path. This boundary doesn't exist for float64 (syevd for all n>32).
+
+**XsyevBatched speedup (batched, B>=64):**
+
+| B | n | f32 speedup | f64 speedup |
+|---|---|---|---|
+| 64 | 33 | 84x | 40x |
+| 64 | 128 | 84x | 30x |
+| 64 | 512 | 20x | 4.3x |
+| 1024 | 33 | 272x | 72x |
+| 1024 | 128 | 91x | 31x |
+
+Float32 gets ~2x more speedup than float64 because stock f32 dispatch (syevj for n<=512) is particularly slow in the non-batched loop.
+
+**Summary:**
+1. XsyevBatched wins or ties for ALL (B, n, dtype) — can be used unconditionally
+2. Non-batched fallback in proposed patch is unnecessary (simplifies the patch)
+3. The n=32/33 cliff is 77-482x — the batched path fix is critical
+4. Float32 has an additional n=512/513 anomaly (syevj→syevd transition)
+5. XsyevBatched residuals are better than stock for float32 — more numerically stable
+
+### Simplified PyTorch patch (based on ablation results)
+
+The ablation confirms we don't need `#ifdef USE_CUSOLVER_64_BIT_XSYEV_BATCHED` in the dispatch logic. The fix is a one-line change in `BatchLinearAlgebraLib.cpp:~1596`:
+
+```cpp
+// Before:
+if (batchCount(eigenvectors) > 1 && eigenvectors.size(-1) <= 32) {
+// After:
+if (batchCount(eigenvectors) > 1) {
+```
+
+**Why no `#ifdef`?** `apply_syevj_batched` (the function called by this branch) already has the ifdef internally — it calls `cusolverDnXsyevBatched` on CUDA >= 12.6 and falls back to `cusolverDnXsyevjBatched` on older CUDA. The ifdef is in `CUDASolver.h:10-12` (`CUSOLVER_VERSION >= 11701`).
+
+**Why keep `batch > 1`?** Although ablation shows XsyevBatched is never slower even for B=1, there's no benefit to routing B=1 through the batched API — syevj/syevd work fine for single matrices.
+
+Updated `torch_eig_performance.md` with the simplified proposal.

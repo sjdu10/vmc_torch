@@ -1,0 +1,571 @@
+\documentclass[10pt, letterpaper]{article}
+
+% --- 基础设置 ---
+\usepackage[margin=1in, footskip=0.3in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{microtype}
+\usepackage{subcaption}
+\usepackage{graphicx}
+\usepackage[table]{xcolor} % 必须加 [table] 才能用 \rowcolor
+
+% --- 现代排版：消除缩进，增加段距 ---
+\usepackage{parskip} 
+
+% --- 字体建议：使用标准自带但更美观的字体 ---
+\usepackage{mathpazo} % 使用 Palatino 字体，比默认字体更稳重
+\usepackage[scaled=0.95]{inconsolata} % 极佳的代码字体
+
+% --- 颜色定义 (Caltech/Professional Blue) ---
+\definecolor{CaltechBlue}{RGB}{0, 94, 184}
+\definecolor{CodeGray}{gray}{0.96}
+\definecolor{CommentGreen}{RGB}{0, 128, 0}
+
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=CaltechBlue, urlcolor=CaltechBlue, citecolor=CaltechBlue}
+
+% --- 代码块美化 (仿 VS Code 浅色风格) ---
+\usepackage{listings}
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{CodeGray},
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{CommentGreen}\itshape,
+    stringstyle=\color{red!70!black},
+    breaklines=true,
+    frame=none, % 现代感：不要边框，只用背景色
+    xleftmargin=10pt,
+    framesep=5pt,
+    showstringspaces=false,
+    columns=flexible
+}
+
+% 2. 改进 Listings 设置
+\lstset{
+  language=C++,
+  basicstyle=\ttfamily\scriptsize, % 如果 10pt 还是挤，改用 scriptsize
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  breaklines=true,
+  breakatwhitespace=true, % 只在空格处换行，防止截断变量名
+  frame=single,
+  frametrule=0.5pt,
+  rulecolor=\color{gray!40},
+  backgroundcolor=\color{gray!3},
+  showstringspaces=false,
+  columns=flexible, % 允许字符间距微调
+  keepspaces=true,
+  xleftmargin=1.5em, % 增加内边距
+  xrightmargin=1.5em,
+  aboveskip=1em,
+  belowskip=1em,
+}
+
+% 3. 针对表格的建议：如果表格还是太宽
+% 在 \begin{table} 下面加一句 \small 或 \footnotesize
+
+\lstdefinestyle{python}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  breaklines=true,
+  frame=single,
+  framerule=0.5pt,
+  rulecolor=\color{gray!50},
+  backgroundcolor=\color{gray!5},
+  numbers=none,
+  showstringspaces=false,
+  columns=flexible,
+  xleftmargin=1em,
+  xrightmargin=1em,
+}
+
+% --- 标题美化 ---
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries\color{CaltechBlue}}{\thesection}{1em}{}[\titlerule]
+
+\title{\vspace{-1cm} \textbf{\texttt{torch.linalg.eigh}: Analysis of the Performance Cliff at Matrix Size $n=32$} \\ 
+      \large (and cuSOLVER Integration Fix)}
+\author{Sijing Du \\ \small California Institute of Technology}
+\date{February 2026}
+
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\texttt{torch.linalg.eigh} suffers a catastrophic 80--120$\times$ performance
+cliff when the matrix size crosses $n = 32 \to 33$ for batched inputs
+on GPU. The root cause is PyTorch's size-dependent dispatch logic, which only calls
+the genuinely batched cuSOLVER API (\texttt{cusolverDnXsyevBatched}) for
+$n \le 32$, but returns to a sequential \textit{for-loop} for $n>32$. We demonstrate the problem, propose a high-level MAGMA workaround and a low-level fix that calls cuSOLVER \texttt{cusolverDnXsyevBatched} for all matrix size $n$---matching
+JAX's fix (PR~\#31375)---which eliminates the cliff entirely. The fix requires changing a \textbf{single line} of
+dispatch condition in PyTorch's C++ source code.
+\end{abstract}
+
+\paragraph{Test environment.}
+All benchmarks: NVIDIA GeForce RTX~4080, CUDA~12.8,
+PyTorch~2.10.0+cu128, \texttt{float64}, Ubuntu~22.04.5~LTS (WSL2).
+Timing via CUDA events (3~warmup, 5~timed repetitions).
+
+
+%% ================================================================
+\section{Observation in default PyTorch \texttt{eigh} performance}
+\label{sec:observation}
+%% ================================================================
+
+\texttt{torch.linalg.eigh} applied to a batch of $(B, n, n)$ symmetric
+matrices exhibits smooth scaling for $n \le 32$, then an abrupt
+80--140$\times$ slowdown at $n = 33$.
+
+\begin{table}[h]
+\centering
+\caption{Default \texttt{torch.linalg.eigh} timing (ms) vs.\ matrix size $n$.}
+\label{tab:default}
+\begin{tabular}{r rr rr}
+\toprule
+ & \multicolumn{2}{c}{$B = 64$} & \multicolumn{2}{c}{$B = 1024$} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+$n$ & time (ms) & ratio & time (ms) & ratio \\
+\midrule
+  8  & 0.29  &        & 0.91   &         \\
+ 16  & 0.52  &        & 2.86   &         \\
+ 24  & 0.85  &        & 5.49   &         \\
+ 28  & 0.93  &        & 7.22   &         \\
+ 32  & 1.05  & 1.0$\times$  & 8.30   & 1.0$\times$   \\
+\midrule
+ 33  & 77.20 & 73$\times$   & 1137   & 137$\times$   \\
+ 34  & 78.87 & 75$\times$   & 1153   & 139$\times$   \\
+ 40  & 87.37 & 83$\times$   & 1296   & 156$\times$   \\
+ 48  & 97.31 & 93$\times$   & 1491   & 180$\times$   \\
+ 64  & 122.1 & 116$\times$  & 1874   & 226$\times$   \\
+ 96  & 246.2 & 234$\times$  & 3685   & 444$\times$   \\
+128  & 316.0 & 301$\times$  & 4783   & 576$\times$   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Root cause: PyTorch's dispatch heuristics}
+
+The dispatch lives in
+\texttt{aten/src/ATen/native/cuda/linalg/BatchLinearAlgebraLib.cpp},
+function \texttt{linalg\_eigh\_cusolver} (line $\sim$1614):
+
+\begin{lstlisting}
+if (use_cusolver_syevj_batched_
+    && batchCount(eigenvectors) > 1
+    && eigenvectors.size(-1) <= 32) {
+    // genuinely batched: calls cusolverDnXsyevBatched
+    linalg_eigh_cusolver_syevj_batched();
+} else if (scalar_type == kFloat
+           && size >= 32 && size <= 512) {
+    // single-matrix Jacobi, LOOPED over batch
+    linalg_eigh_cusolver_syevj();
+} else {
+    // single-matrix divide-and-conquer, LOOPED
+    linalg_eigh_cusolver_syevd();
+}
+\end{lstlisting}
+
+The branching heuristics:
+\begin{itemize}
+    \item \textbf{$n \le 32$, batch $> 1$}: correctly routes to
+    \texttt{linalg\_eigh\_cusolver\_syevj\_batched()}, which (since
+    PR~\#155695, cuSOLVER~$\ge$~11701) calls
+    \texttt{cusolverDnXsyevBatched}---a new batched API alternative to the legacy \texttt{cusolverDn<t>syevjBatched}. (We find that this is fast even for batched matrices of size $n>32$.)
+
+    \item \textbf{Otherwise}: falls through to the
+    \texttt{else~if} or \texttt{else} branches, which call single-matrix
+    wrappers (\texttt{syevj} or \texttt{syevd}) in a \emph{loop}. Each
+    matrix is solved sequentially with a separate kernel launch. This is
+    where the 80--120$\times$ cliff comes from.
+\end{itemize}
+
+The $n \le 32$ gate for batched input is a leftover from the poor performance of the old \texttt{syevjBatched}
+Jacobi API (see PR~\#53040), which was replaced by the newer/faster 
+\texttt{cusolverDnXsyevBatched} in PR~\#155695 (June~2025). The
+top-level dispatch condition was never updated.
+
+\newpage
+%% ================================================================
+\section{High-level MAGMA workaround (no C++ level change)}
+\label{sec:magma}
+%% ================================================================
+\subsection{MAGMA vs. cuSOLVER for batched linear algebra}
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=1\textwidth]{figs/cuSOLVER_vs_MAGMA_timing.pdf}
+    \caption{Direct comparison of batched linear algebra performance of cuSOLVER and MAGMA}
+    \label{fig1}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    % --- 第一张图 ---
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/cuSOLVER_eigh_svd_qr_timing.pdf}
+        \caption{cuSOLVER (default) batched linalg performance}
+        \label{fig:cusolver}
+    \end{subfigure}
+    \hfill % 在两张图之间插入弹性间距，将它们推向两边
+    % --- 第二张图 ---
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/MAGMA_eigh_svd_qr_timing.pdf}
+        \caption{MAGMA batched linalg performance}
+        \label{fig:magma}
+    \end{subfigure}
+    
+    \caption{Batched linear algebra performance using cuSOLVER (default) (left) and MAGMA (right) backends. (a) Default cuSOLVER backend exhibiting the $n=33$ performance cliff. (b) MAGMA backend showing smooth scaling for \texttt{svd, eigh}. Note that \texttt{QR} is in general slow for both backend for small matrices compared to \texttt{svd, eigh}.}
+    \label{fig:comparison}
+\end{figure}
+
+So for \texttt{eigh}, we can see for batched input matrices of median size ($32<n<256$), MAGMA is faster than pyTorch's current default cuSOLVER call.
+
+\newpage
+\subsection{MAGMA + cuSOLVER dynamic dispatch for \texttt{eigh}}
+
+PyTorch exposes MAGMA as an alternative backend:
+\begin{lstlisting}[style=python]
+torch.backends.cuda.preferred_linalg_library('magma')
+\end{lstlisting}
+
+MAGMA's batched eigensolver has no $n = 32$ cliff and scales smoothly.
+However, it is significantly slower than cuSOLVER's fused kernel for
+$n \le 32$, as shown in Table~\ref{table2}.
+
+\begin{table}[h]
+\centering
+\caption{\texttt{torch.linalg.eigh} performance: cuSOLVER (default) vs.\ MAGMA backend ($B = 64$, \texttt{float64}).}
+\label{tab:magma}
+\begin{tabular}{r rrr}
+\toprule
+$n$ & default (ms) & MAGMA (ms) & MAGMA speedup \\
+\midrule
+ 32 & 0.31  & 2.86  & 0.1$\times$ (slower) \\
+ 33 & 54.52 & 3.15  & 17.3$\times$ \\
+ 48 & 67.00 & 5.43  & 12.3$\times$ \\
+ 64 & 64.45 & 8.37  & 7.7$\times$ \\
+ 96 & 98.29 & 17.00 & 5.8$\times$ \\
+128 & 142.69 & 29.81 & 4.8$\times$ \\
+256 & 302.38 & 480.18 & 0.6$\times$ (slower) \\
+\bottomrule
+\label{table2}
+\end{tabular}
+\end{table}
+
+MAGMA is a valid workaround for $32 < n \le 256$
+(5--17$\times$ faster than default), but default cuSOLVER wins back
+at $n = 256$ (1.7$\times$ faster than MAGMA).
+Thus, we propose the workaround on the PyTorch dispatching level:
+\textbf{For batched \texttt{eigh}, for $n \le 32$ use cuSOLVER (default)
+and for $32 < n \le 256$ use MAGMA.}
+Pseudocode:
+\begin{lstlisting}[style=python]
+    def size_aware_eigh(A):
+    """
+    Heuristic to bypass the n=33 performance cliff in torch.linalg.eigh.
+    """
+    n = A.size(-1)
+
+    # Use MAGMA for the "cliff zone" on GPU
+    if A.is_cuda and A.dim() >= 3 and 32 < n <= 512:
+        with torch.backends.cuda.preferred_linalg_library('magma'):
+            return torch.linalg.eigh(A)
+
+    # Default cuSOLVER path (fast for n <= 32, but slow loop for n > 32)
+    return torch.linalg.eigh(A)
+\end{lstlisting}
+Note that this MAGMA workaround:
+\begin{enumerate}
+    \item \textbf{Requires size-aware dispatch in user code}:
+    \texttt{preferred\_linalg\_library} is process-wide, but it can be
+    toggled locally with save/restore around each call in a matrix-size-dependent manner.  
+    \item \textbf{(Caveat) Suboptimal for $n > 32$}: as we show in
+    Section~\ref{sec:fix}, \texttt{cusolverDnXsyevBatched} is 2--4$\times$
+    faster than MAGMA for the same sizes.
+\end{enumerate}
+
+
+%% ================================================================
+\section{Ultimate solution: dispatch updated cuSOLVER batched
+  \texttt{eigh} (\texttt{cusolverDnXsyevBatched}),
+  as in JAX PR~\#31375}
+\label{sec:fix}
+%% ================================================================
+
+\subsection{The fix}
+
+\texttt{cusolverDnXsyevBatched} (available since cuSOLVER~11.7.1 /
+CUDA~12.6) is a newer batched eigensolver (divide-and-conquer, or Jacobi for $n\le32$) alternative to older \texttt{cusolverDn<t>syevjBatched}. PyTorch already wraps it and uses it
+for $n \le 32$. The fix is to remove the $n \le 32$ gate:
+
+\begin{lstlisting}
+// Proposed change in linalg_eigh_cusolver:
+  // cusolverDnXsyevBatched works for all n when batch size > 1.
+  // See jax-ml/jax#31375 for precedent.
+if (batchCount(eigenvectors) > 1) {
+    linalg_eigh_cusolver_syevj_batched(...);
+} else if (scalar_type == kFloat
+            && size >= 32 && size <= 512) {
+// Non-batched: preserve original dispatch.
+    linalg_eigh_cusolver_syevj(...);
+} else {
+    linalg_eigh_cusolver_syevd(...);
+}
+\end{lstlisting}
+
+This is to route all batched \texttt{eigh} through
+\texttt{cusolverDnXsyevBatched}, replacing the per-matrix
+\texttt{syevd} loop for $n>32$. This fix is probably similar to the approach JAX took in
+\href{https://github.com/jax-ml/jax/pull/31375}{jax-ml/jax\#31375}
+(merged September~2025).
+
+\subsection{Verification via C++ extension}
+
+To verify without rebuilding PyTorch, we wrote a minimal C++ extension
+(\texttt{my\_eigh.cpp}) that calls \texttt{cusolverDnXsyevBatched}
+directly for all matrix sizes, loaded via
+\texttt{torch.utils.cpp\_extension.load}.
+
+\paragraph{Correctness.}
+In our test, the maximum eigenvalue difference $|\Delta|$ w.r.t. results from default \texttt{torch.linalg.eigh} and eigenvector residual
+$\|Av - \lambda v\|$ are required to be smaller than $10^{-10}$ to ensure the correctness of the eigen decomposition. For an example case at ($B=16,\ n=48$), we have verified $|\Delta|=0$ and $\|Av - \lambda v\|=2.13\times10^{-13}$, which pass the correctness test.
+
+\paragraph{Performance.}
+Table~\ref{tab:fix64} and Table~\ref{tab:fix1024} show the results.
+
+\begin{table}[h]
+\centering
+\caption{Default \texttt{eigh} vs.\ \texttt{XsyevBatched} extension
+($B = 64$, \texttt{float64}).}
+\label{tab:fix64}
+\begin{tabular}{r rrr}
+\toprule
+$n$ & default (ms) & XsyevBatched (ms) & speedup \\
+\midrule
+  8  & 0.29  & 0.20  & 1.5$\times$ \\
+ 16  & 0.52  & 0.41  & 1.3$\times$ \\
+ 24  & 0.85  & 0.74  & 1.1$\times$ \\
+ 28  & 0.93  & 0.78  & 1.2$\times$ \\
+ 32  & 1.05  & 0.88  & 1.2$\times$ \\
+\midrule
+ 33  & 77.20 & 1.68  & \textbf{46$\times$} \\
+ 34  & 78.87 & 1.43  & \textbf{55$\times$} \\
+ 40  & 87.37 & 1.53  & \textbf{57$\times$} \\
+ 48  & 97.31 & 1.77  & \textbf{55$\times$} \\
+ 64  & 122.1 & 2.34  & \textbf{52$\times$} \\
+ 96  & 246.2 & 6.74  & \textbf{37$\times$} \\
+128  & 316.0 & 9.88  & \textbf{32$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Default \texttt{eigh} vs.\ \texttt{XsyevBatched} extension
+($B = 1024$, \texttt{float64}).}
+\label{tab:fix1024}
+\begin{tabular}{r rrr}
+\toprule
+$n$ & default (ms) & XsyevBatched (ms) & speedup \\
+\midrule
+  8  & 0.91  & 0.75  & 1.2$\times$ \\
+ 16  & 2.86  & 2.66  & 1.1$\times$ \\
+ 24  & 5.49  & 5.47  & 1.0$\times$ \\
+ 28  & 7.22  & 6.92  & 1.0$\times$ \\
+ 32  & 8.30  & 7.81  & 1.1$\times$ \\
+\midrule
+ 33  & 1137  & 15.06 & \textbf{75$\times$} \\
+ 34  & 1153  & 15.01 & \textbf{77$\times$} \\
+ 40  & 1296  & 17.36 & \textbf{75$\times$} \\
+ 48  & 1491  & 21.89 & \textbf{68$\times$} \\
+ 64  & 1874  & 30.44 & \textbf{62$\times$} \\
+ 96  & 3685  & 96.10 & \textbf{38$\times$} \\
+128  & 4783  & 145.7 & \textbf{33$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comparison: all three methods}
+
+Table~\ref{tab:comparison} summarizes the three dispatch strategies for
+the representative case $B = 64$:
+
+\begin{table}[h]
+\centering
+\caption{Three-way comparison ($B = 64$, \texttt{float64}).
+         Best time per row in \textbf{bold}.}
+\label{tab:comparison}
+\begin{tabular}{r rrr}
+\toprule
+$n$ & default (ms) & MAGMA (ms) & XsyevBatched (ms) \\
+\midrule
+ 32 & \textbf{0.90}  & 4.24  & \textbf{0.88} \\
+ 33 & 69.88 & 4.44  & \textbf{1.68} \\
+ 48 & 93.12 & 7.76  & \textbf{1.77} \\
+ 64 & 116.7 & 10.01 & \textbf{2.34} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{XsyevBatched} is the best of both worlds: fast for $n \le 32$
+(matching current cuSOLVER) \emph{and} fast for $n > 32$
+(2--4$\times$ faster than MAGMA).
+
+\subsection{Summary}
+
+\begin{enumerate}
+    \item The $n = 32 \to 33$ performance cliff is \textbf{completely
+    eliminated}---timing scales smoothly across all~$n$.
+    \item \textbf{32--77$\times$ speedup} for $n > 32$, with no
+    regression for $n \le 32$.
+    \item \textbf{Numerically identical} to default PyTorch (same cuSOLVER
+    API, just called unconditionally).
+    \item The fix is a \textbf{one-line dispatch heuristics change}, using an API PyTorch already wraps.
+    \item This matches what
+    \href{https://github.com/jax-ml/jax/pull/31375}{JAX shipped in
+    September~2025}.
+\end{enumerate}
+
+
+%% ================================================================
+\appendix
+\section{Reproducer}
+\label{app:reproducer}
+
+\begin{lstlisting}[style=python]
+import torch
+
+device = "cuda"
+B = 1024
+dtype = torch.float64
+
+for n in [31, 32, 33, 34, 48, 64]:
+    x = torch.randn(B, n, n, device=device, dtype=dtype)
+    a = (x + x.mT) / 2
+
+    # warmup
+    for _ in range(5):
+        torch.linalg.eigh(a)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(10):
+        torch.linalg.eigh(a)
+    end.record()
+    torch.cuda.synchronize()
+    t = start.elapsed_time(end) / 10
+    print(f"eigh n={n}: {t:.2f} ms")
+\end{lstlisting}
+
+
+\section{C++ extension source (\texttt{my\_eigh.cpp})}
+\label{app:extension}
+
+\begin{lstlisting}
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cusolverDn.h>
+
+static cusolverDnHandle_t get_handle() {
+    static thread_local cusolverDnHandle_t h = nullptr;
+    if (!h) cusolverDnCreate(&h);
+    cusolverDnSetStream(h,
+        c10::cuda::getCurrentCUDAStream().stream());
+    return h;
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+custom_batched_eigh(torch::Tensor input, bool upper) {
+    TORCH_CHECK(input.is_cuda(),
+                "input must be a CUDA tensor");
+    TORCH_CHECK(input.dim() >= 2
+                && input.size(-1) == input.size(-2),
+                "input must be square");
+
+    const auto dtype = input.scalar_type();
+    const int64_t n = input.size(-1);
+    const int64_t batch = input.numel() / (n * n);
+
+    // Clone: cuSOLVER overwrites input with eigenvectors.
+    // Symmetric => row-major == column-major, no transpose needed.
+    auto vectors = input.contiguous().clone();
+    auto values = torch::empty({batch, n}, input.options());
+    auto info = torch::zeros({batch},
+        input.options().dtype(torch::kInt32));
+
+    auto handle = get_handle();
+    cusolverDnParams_t params;
+    cusolverDnCreateParams(&params);
+
+    auto jobz = CUSOLVER_EIG_MODE_VECTOR;
+    auto uplo = upper ? CUBLAS_FILL_MODE_UPPER
+                      : CUBLAS_FILL_MODE_LOWER;
+    auto cuda_dtype = (dtype == torch::kFloat64)
+                      ? CUDA_R_64F : CUDA_R_32F;
+
+    // Query workspace, allocate, compute
+    size_t work_device_sz = 0, work_host_sz = 0;
+    cusolverDnXsyevBatched_bufferSize(
+        handle, params, jobz, uplo, n, cuda_dtype,
+        vectors.data_ptr(), n, cuda_dtype,
+        values.data_ptr(), cuda_dtype,
+        &work_device_sz, &work_host_sz, batch);
+
+    auto work_device = torch::empty(
+        {static_cast<int64_t>(work_device_sz)},
+        input.options().dtype(torch::kUInt8));
+    std::vector<uint8_t> work_host(work_host_sz);
+
+    cusolverDnXsyevBatched(
+        handle, params, jobz, uplo, n, cuda_dtype,
+        vectors.data_ptr(), n, cuda_dtype,
+        values.data_ptr(), cuda_dtype,
+        work_device.data_ptr(), work_device_sz,
+        work_host.data(), work_host_sz,
+        info.data_ptr<int>(), batch);
+
+    cusolverDnDestroyParams(params);
+
+    // cuSOLVER writes column-major eigenvectors into our
+    // row-major buffer; transpose back for PyTorch.
+    vectors = vectors.view({batch, n, n})
+                     .mT().contiguous();
+    auto out_shape = input.sizes().vec();
+    vectors = vectors.reshape(out_shape);
+    auto val_shape = std::vector<int64_t>(
+        out_shape.begin(), out_shape.end() - 1);
+    values = values.reshape(val_shape);
+
+    return {values, vectors};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("eigh", &custom_batched_eigh,
+          "Batched eigh via cusolverDnXsyevBatched",
+          py::arg("input"), py::arg("upper") = false);
+}
+\end{lstlisting}
+
+Load and benchmark:
+\begin{lstlisting}[style=python]
+from torch.utils.cpp_extension import load
+ext = load("my_eigh", sources=["my_eigh.cpp"],
+           extra_cflags=["-O3"],
+           extra_include_paths=[f"{cuda_home}/include"],
+           extra_ldflags=[f"-L{cuda_home}/lib64",
+                          "-lcusolver", "-lcudart"])
+vals, vecs = ext.eigh(A)  # (B,n,n) -> (B,n), (B,n,n)
+\end{lstlisting}
+
+\end{document}
