@@ -455,3 +455,123 @@ if (batchCount(eigenvectors) > 1) {
 **Why keep `batch > 1`?** Although ablation shows XsyevBatched is never slower even for B=1, there's no benefit to routing B=1 through the batched API — syevj/syevd work fine for single matrices.
 
 Updated `torch_eig_performance.md` with the simplified proposal.
+
+## 2026-02-25: Analysis — Extending GPU VMC to non-fermionic Hamiltonians (e.g. bosons)
+
+### Question
+What changes are needed to run VMC with a different Hamiltonian (e.g. Bose-Hubbard)?
+
+### Findings
+Traced through the full GPU VMC pipeline to identify fermion-specific vs generic components.
+
+**Generic (no changes needed):**
+- `VMC.py` — VMC driver loop, warmup, energy stats, SR step, parameter update
+- `vmc_modules.py` — `run_sampling_phase_gpu`, `distributed_minres_solver_gpu`, `minSR_solver_gpu`
+- `optimizer.py` — `SGDGPU`, `AdamGPU`, `DistributedSRMinresGPU`, `MinSRGPU`
+- `models.py` — `fPEPS_Model_GPU`, `PureNN_GPU` (treat `x` as generic indices into physical states)
+- `vmc_utils.py::sample_next` — generic Metropolis accept/reject on |ψ'|²/|ψ|²
+- `vmc_utils.py::evaluate_energy` — generic E_loc = Σ H_{ss'} ψ(s')/ψ(s) via H.get_conn
+- `vmc_utils.py::compute_grads_gpu` — pure autograd
+
+**Fermion-specific (must replace for bosons):**
+1. `vmc_utils.py::propose_exchange_or_hopping_vec` — hardcodes spinful fermion state map {0:empty, 1:↓, 2:↑, 3:↑↓}
+2. `hamiltonian.py` — all existing Hamiltonians are fermionic; need new `get_conn` for bosons
+3. `vmc_utils.py::random_initial_config` — hardcodes alternating spin-up/down initialization
+
+**How to swap via `RunConfig` factories:**
+- `hamiltonian_builder` / `hamiltonian_builder_fn` — plug in boson Hamiltonian builder
+- `walker_initializer_fn` — plug in boson-compatible walker init
+- `sampler_factory` — plug in sampler with boson proposal function
+- No changes needed to `vmc_run.py` itself
+
+### Remaining questions
+- How to handle variable local Hilbert space dimension (fermion: 4 states/site, boson: n_max+1 states/site)?
+- Does `fPEPS_Model_GPU` physical index dimension need to be adjusted for bosonic Hilbert space?
+- For bosons with `n_max > 1`, the exchange proposal needs to handle multi-particle moves — what's the right proposal strategy?
+
+## 2026-02-25: GPU-batched `get_conn` for all Hamiltonian types
+
+### Context
+Only `spinful_Fermi_Hubbard_square_lattice_torch` had GPU-batched `get_conn_batch_gpu`. The other 8 Hamiltonian classes fell back to a slow per-sample CPU `get_conn` loop. This blocks GPU-batched VMC for spin models, spinless fermions, and the spinful chain.
+
+### What we did
+Added 4 GPU mixin classes in `hamiltonian_torch.py` to avoid code duplication:
+
+| Mixin | Shared by |
+|---|---|
+| `SpinlessFermionGPUMixin` | `spinless_Fermi_Hubbard_chain_torch`, `spinless_Fermi_Hubbard_square_lattice_torch` |
+| `SpinfulFermionGPUMixin` | `spinful_Fermi_Hubbard_chain_torch`, `spinful_Fermi_Hubbard_square_lattice_torch` |
+| `SpinHeisenbergGPUMixin` | `spin_Heisenberg_chain_torch`, `spin_Heisenberg_square_lattice_torch` |
+| `SpinTransverseIsingGPUMixin` | `spin_transverse_Ising_chain_torch`, `spin_transverse_Ising_square_lattice_torch` |
+
+Each mixin provides `precompute_hops_gpu(device)` and `get_conn_batch_gpu(fxs)`. The existing inline methods in `spinful_Fermi_Hubbard_square_lattice_torch` were removed (now inherited from mixin). `_Ao` inherits from its parent — no change needed.
+
+**Key physics per mixin:**
+- **Spinless:** binary {0,1}, Jordan-Wigner phase `(-1)^(sum between sites)`, V interaction + chemical potential diagonal terms
+- **Spinful:** quimb encoding {0,1,2,3}, netket↔symmray representation conversion, symmray-convention fermionic phase
+- **Heisenberg:** binary {0,1}, off-diagonal flip `0.5*J` when `sigma_i != sigma_j`, diagonal ZZ `0.25*J*(-1)^|sigma_i-sigma_j|` for ALL samples
+- **Transverse Ising:** binary {0,1}, diagonal ZZ for all samples, off-diagonal spin flip `0.5*h` for all samples
+
+No changes needed to `vmc_utils.py`, `vmc_setup.py`, `vmc_run.py` — they dispatch on `hasattr(H, '_hop_list')`.
+
+### Files changed
+- `hamiltonian_torch.py` — added 4 mixin classes, updated 8 class inheritance lines, removed inline GPU methods from spinful square lattice
+- `GPU/scripts/test_get_conn_batch.py` — expanded with test suites for all 8 Hamiltonian types
+
+### Verification
+All tests pass on RTX 4080. Tested: single config, batch B=64, exhaustive enumeration for small systems.
+
+```
+python GPU/scripts/test_get_conn_batch.py
+# ALL TESTS PASSED (18/18 test cases across 8 Hamiltonian types)
+```
+
+### Next steps
+- [ ] Run full GPU VMC loop with spin Hamiltonians (needs compatible sampler/proposal functions)
+- [ ] Benchmark GPU batch speedup vs CPU per-sample loop for each Hamiltonian type
+
+## 2026-02-25: Rewrite `vmc_run.py` for physicist-readability
+
+### Motivation
+`vmc_run.py` hid physics parameters behind a 30+ field `RunConfig` dataclass with 10 factory callables. A physicist reading `main()` saw `config.hamiltonian_builder_fn(config=config, device=device)` — no idea what Hamiltonian, what `t`, `U`, what boundary conditions. The CPU example (`examples/vmc_run_example.py`) is the gold standard: every physical parameter spelled out explicitly.
+
+### What changed
+
+**`vmc_run.py`:**
+- Removed `RunConfig` dataclass (30+ fields, 10 factory callables)
+- Removed factory functions (`default_sampler_factory`, `default_preconditioner_factory`, `default_optimizer_factory`)
+- Physics is now explicit in `main()`: `H = spinful_Fermi_Hubbard_square_lattice_torch(Lx, Ly, t, U, ...)`, model construction `fPEPS_Model_GPU(tn=peps, max_bond=chi, ...)` inline
+- Added small `VMCConfig` dataclass with only numerical/training knobs (batch_size, lr, etc.)
+- Section headers with `# ==========` for quick scanning
+- Summary prints the physics (system params, not just energy)
+
+**`vmc_setup.py`:**
+- Removed `build_model()`, `build_hamiltonian()`, `print_summary()` — now inline in `vmc_run.py`
+- `load_or_generate_peps(config, tensor_dtype)` → `load_or_generate_peps(Lx, Ly, t, U, N_f, D, seed, dtype)`
+- `initialize_walkers(config, rank, device)` → `initialize_walkers(N_f, N_sites, batch_size, seed, rank, device)`
+- `ensure_output_dir(config)` → `ensure_output_dir(Lx, Ly, t, U, N_f, D)`
+- `setup_linalg_hooks` unchanged
+
+### Verification
+- `python -c "from vmc_torch.experiment.vmap.GPU.vmc_run import main"` — PASS
+- `python -c "from vmc_torch.experiment.vmap.GPU.vmc_setup import ..."` — PASS
+- Grep confirms no other files import `RunConfig`, `build_model`, `build_hamiltonian`, or `print_summary` from these modules
+
+**`vmc_run_v0.py`** (also rewritten):
+- Old version had standalone helper functions (`build_model`, `build_hamiltonian`, `load_peps`, etc.), module-level autoray registration, and stale imports (`vmap_models.fPEPS_Model`)
+- Now uses the same pattern as `vmc_run.py`: explicit physics, `VMCConfig` for numerical knobs, imports from `GPU.models.fPEPS_Model_GPU` and `GPU.vmc_setup`
+- Keeps its distinguishing feature: `on_step_end` callback that saves energy stats to JSON + periodic model checkpoints via `vmc.run_vmc_loop(..., on_step_end=...)`
+- Import check passes
+
+## 2026-02-25: Generic `initialize_walkers` via `init_fn`
+
+### Motivation
+`initialize_walkers` hardcoded spinful-fermion logic (`random_initial_config`), blocking reuse for spin models, spinless fermions, or specific initial states (Neel, CDW).
+
+### Changes
+- **`vmc_setup.py`**: Replaced `(N_f, N_sites, batch_size, ...)` signature with `(init_fn, batch_size, ...)` where `init_fn(seed) -> 1D tensor` is a callable that generates one walker config.
+- **`vmc_run.py`**, **`vmc_run_v0.py`**: Call sites updated to pass `init_fn=lambda seed: random_initial_config(N_f, N_sites, seed=seed)`, preserving identical behavior.
+
+### Verification
+- Import check: all three files parse and import correctly
+- Functional test: `initialize_walkers(init_fn=..., batch_size=4)` produces correct `(4, 8)` int64 tensor with valid spinful configs

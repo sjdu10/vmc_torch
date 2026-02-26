@@ -27,6 +27,9 @@ from vmc_torch.experiment.vmap.GPU.vmc_utils import (
     random_initial_config,
 )
 from vmc_torch.experiment.vmap.models.pureTNS import fPEPS_Model
+from vmc_torch.experiment.vmap.GPU.models import (
+    fPEPS_Model_GPU,
+)
 from vmc_torch.experiment.vmap.vmap_torch_utils import (
     robust_svd_err_catcher_wrapper,
     size_aware_qr,
@@ -39,16 +42,17 @@ from vmc_torch.experiment.vmap.vmap_torch_utils import (
 dtype = torch.float64
 torch.set_default_dtype(dtype)
 
-Lx, Ly = 8, 8
+Lx, Ly = 4, 4
 N_f = Lx * Ly
 nsites = Lx * Ly
-D = 10
-chi = 10
+D = 8
+chi = 8
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 has_gpu = device.type == "cuda"
 
-batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+# batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+batch_sizes = [512]
 N_WARMUP = 1
 N_REPS = 2
 
@@ -80,7 +84,7 @@ def build_models():
     """Build GPU and CPU fPEPS_Model from the same PEPS skeleton."""
     model_gpu = None
     if has_gpu:
-        model_gpu = fPEPS_Model(tn=peps, max_bond=chi, dtype=dtype)
+        model_gpu = fPEPS_Model_GPU(tn=peps, max_bond=chi, dtype=dtype)
         model_gpu.to(device)
     model_cpu = fPEPS_Model(tn=peps, max_bond=chi, dtype=dtype)
     model_cpu.to("cpu")
@@ -274,7 +278,7 @@ def run_benchmark(model_gpu, model_cpu, label, record_gpu=True, record_cpu=True)
 # stock torch.linalg.eigh now uses XsyevBatched for all batched
 # matrices. No C++ extension or eigh monkey-patching needed.
 print()
-qr_via_eigh = False
+qr_via_eigh = True
 print("=" * 60)
 print("MODE C: Size-aware QR + Size-aware SVD with XsyevBatched eigh (via C++ extension)")
 print("  SVD  -> size_aware_svd (Jacobi n<=32, EIG+XsyevBatched n>32)")

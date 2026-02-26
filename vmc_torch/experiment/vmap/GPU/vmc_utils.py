@@ -141,13 +141,38 @@ def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25):
 
 # Batched Metropolis-Hastings updates
 @torch.inference_mode()
-def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, **kwargs):
+def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, compile=False, **kwargs):
+    """One full Metropolis-Hastings sweep over all lattice edges.
+
+    Iterates over every edge in the lattice graph. At each edge (i, j),
+    proposes an exchange or hopping for all B walkers simultaneously,
+    evaluates amplitudes on the proposed configs, and accepts/rejects
+    via the |psi'|^2 / |psi|^2 ratio.
+
+    Args:
+        fxs: Current configurations, (B, N_sites) int64. Modified in-place.
+        fpeps_model: Batched wavefunction model, (B, N_sites) -> (B,).
+        graph: Lattice graph with .row_edges and .col_edges dicts,
+            each mapping direction to list of (i, j) edge tuples.
+        hopping_rate: Probability of proposing a hopping (vs exchange)
+            when sites i, j have different occupations.
+        verbose: Print per-sweep timing breakdown.
+        compile: If True, always evaluate all B configs (no partial
+            batching), suitable for use with torch.compile.
+
+    Returns:
+        fxs: Updated configurations, (B, N_sites) int64.
+        current_amps: Amplitudes at updated configs, (B,).
+    """
     current_amps = fpeps_model(fxs)
     B = fxs.shape[0]
     device = fxs.device
     
     n_updates = 0 
-    
+    if verbose:
+        t0 = time.time()
+        t_propose = 0.0
+        t_forward = 0.0
     # Merge row_edges and col_edges loops to reduce duplicate code
     all_edges = []
     for edges in graph.row_edges.values(): 
@@ -160,7 +185,12 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, **kwa
         i, j = edge
         
         # Call vectorized function directly without list comprehension
+        if verbose:
+            t00 = time.time()
         proposed_fxs, new_flags = propose_exchange_or_hopping_vec(i, j, fxs, hopping_rate)
+        if verbose:
+            t11 = time.time()
+            t_propose += (t11 - t00)
         
         # Quick check: if all samples have no valid update, skip
         if not new_flags.any():
@@ -171,19 +201,25 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, **kwa
         proposed_amps = current_amps.clone()
         n_changed = new_flags.sum().item()
 
-        if n_changed == B:
-            # All changed — no padding needed
+        if verbose:
+            t10 = time.time()
+        if compile:
             new_proposed_amps = fpeps_model(proposed_fxs)
             proposed_amps = new_proposed_amps
         else:
-            # Pad changed configs to size B with copies of first
-            changed_fxs = proposed_fxs[new_flags]
-            padded_fxs = proposed_fxs.clone()
-            padded_fxs[:n_changed] = changed_fxs
-            # Remaining slots already filled (clone of proposed_fxs)
-            padded_amps = fpeps_model(padded_fxs)
-            proposed_amps[new_flags] = padded_amps[:n_changed]
+            if n_changed == B:
+                # All changed
+                new_proposed_amps = fpeps_model(proposed_fxs)
+                proposed_amps = new_proposed_amps
+            else:
+                changed_fxs = proposed_fxs[new_flags]
+                changed_amps = fpeps_model(changed_fxs)
+                proposed_amps[new_flags] = changed_amps
         
+        if verbose:
+            t11 = time.time()
+            t_forward += (t11 - t10)
+            print(f' Edge ({i}, {j}): {n_changed} / {B} samples proposed changes, time for forward pass: {t11-t10:.4f}s, total forward time: {t_forward:.4f}s')
         # Accept/Reject (fully vectorized, no .item() calls)
         ratio = (proposed_amps.abs()**2) / (current_amps.abs()**2 + 1e-18)
         
@@ -197,22 +233,58 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, **kwa
         if accept_mask.any():
             fxs[accept_mask] = proposed_fxs[accept_mask]
             current_amps[accept_mask] = proposed_amps[accept_mask]
-        
+    if verbose:
+        t1 = time.time()
+        print(
+            f"Sample next time: {t1 - t0:.4f}s for {n_updates} edge updates" \
+            f' (avg {((t1 - t0) / n_updates):.4f}s per edge)' \
+            f' (Batch size: {B})'
+        )
+        print(f"  Propose time: {t_propose:.4f}s (avg {t_propose / n_updates:.4f}s per edge)")
+        print(f"  Forward time: {t_forward:.4f}s (avg {t_forward / n_updates:.4f}s per edge)")
     return fxs, current_amps
 
 @torch.inference_mode()
-def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False, **kwargs):
+def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False,**kwargs):
+    """Compute local energies for a batch of configurations.
+
+    For each config fxs[b], obtains connected configs and matrix
+    elements via H.get_conn, evaluates amplitudes on all connected
+    configs, and assembles E_loc[b] = sum_s' H_{s,s'} psi(s')/psi(s).
+
+    Uses GPU-batched get_conn when available (H._hop_list), otherwise
+    falls back to per-sample CPU computation. Connected amplitudes
+    are evaluated in size-B chunks with padding on the last chunk
+    to keep input shapes fixed for torch.compile.
+
+    Args:
+        fxs: Configurations, (B, N_sites) int64.
+        fpeps_model: Batched wavefunction model, (B, N_sites) -> (B,).
+        H: Hamiltonian with get_conn (or get_conn_batch_gpu) method.
+        current_amps: Amplitudes at fxs, (B,).
+        verbose: Print timing breakdown.
+
+    Returns:
+        energy: Mean local energy, scalar.
+        local_energies: Per-sample local energies, (B,).
+    """
     import numpy as np
     B = fxs.shape[0]
     device = fxs.device
-
+    
     # --- GPU-batched path: zero CPU round-trips ---
     if hasattr(H, '_hop_list'):
+        if verbose:
+            t0 = time.time()
         conn_etas, conn_eta_coeffs, batch_ids = H.get_conn_batch_gpu(fxs)
         conn_eta_num = torch.bincount(batch_ids, minlength=B)
+        if verbose:
+            t1 = time.time()
+            print(f"GPU get_conn_batch time: {t1 - t0:.4f}s")
 
     # --- Fallback: one bulk CPU→GPU transfer instead of per-sample uploads ---
     else:
+        print("Warning: H does not support get_conn_batch_gpu, falling back to CPU computation for connected configurations. This may be slow.")
         fxs_cpu = fxs.cpu()
         all_etas_np, all_coeffs_np, conn_eta_num_list = [], [], []
         for fx in fxs_cpu:
@@ -233,6 +305,8 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False, **kwargs):
 
     # Batch compute connected amplitudes — pad last chunk to
     # fixed size B to avoid torch.compile recompilation
+    if verbose:
+        t0 = time.time()
     chunk_size = B
     total_conn = conn_etas.shape[0]
     conn_amps_list = []
@@ -251,6 +325,9 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False, **kwargs):
         else:
             conn_amps_list.append(fpeps_model(chunk))
     conn_amps = torch.cat(conn_amps_list)
+    if verbose:
+        t1 = time.time()
+        print(f"GPU forward for connected configs time: {t1 - t0:.4f}s")
 
     # Vectorized local energy calculation
     current_amps_expanded = current_amps[batch_ids]

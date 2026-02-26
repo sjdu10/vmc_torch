@@ -39,6 +39,7 @@ def run_sampling_phase_gpu(
     burn_in_steps=4,
     hopping_rate=0.25,
     verbose=False,
+    compile=False,
 ):
     """
     Local sampling phase on GPU with inline O_loc computation.
@@ -74,7 +75,7 @@ def run_sampling_phase_gpu(
     if burn_in:
         for _ in range(burn_in_steps):
             fxs, _ = sample_next(
-                fxs, model, graph, hopping_rate=hopping_rate
+                fxs, model, graph, hopping_rate=hopping_rate, compile=compile
             )
 
     local_energies_list = []
@@ -86,7 +87,7 @@ def run_sampling_phase_gpu(
 
         # 1. Sample (one MCMC sweep over B walkers)
         fxs, current_amps = sample_next(
-            fxs, model, graph, hopping_rate=hopping_rate
+            fxs, model, graph, hopping_rate=hopping_rate, compile=compile
         )
 
         # 2. Energy

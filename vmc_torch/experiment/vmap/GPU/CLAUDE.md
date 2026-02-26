@@ -22,23 +22,12 @@ python GPU/scripts/profile_vmc.py
 torchrun --nproc_per_node=1 GPU/scripts/test_export_vmap.py
 ```
 
-All commands should be run from the `experiment/vmap/` directory (the parent). The scripts import via `vmc_torch.experiment.vmap.GPU.*`.
+All commands should be run from the `experiment/vmap/GPU` directory. The scripts import via `vmc_torch.experiment.vmap.GPU.*`.
 
-## Profiling
+## Workflow
 
-```bash
-# CUDA kernel profiling (outputs to GPU/profiles/)
-python GPU/scripts/profile_vmc.py
-
-# View traces:
-#   TensorBoard: tensorboard --logdir GPU/profiles/tb
-#   Perfetto:    open https://ui.perfetto.dev, drag GPU/profiles/chrome_trace.json
-```
-
-Other profiling/benchmark scripts in `scripts/`:
-- `profile_bottleneck.py` — identify bottleneck operations
-- `profile_chi_approx.py` — profile approximate (finite chi) contraction
-- `torch_linalg_timing.py` — benchmark GPU linear algebra ops
+1. **Make Notes** After modifying files in GPU folder, ALWAYS make human-friendly and readable concise notes to notebook.md. DO IT WITHOUT ASKING ME.
+2. **Verify correctness** Always verify your code changes.
 
 ## Architecture
 
@@ -127,23 +116,6 @@ Both `fPEPS_Model_GPU` and `PureNN_GPU` expose the same interface so they're dro
 - `self.forward(x)` — batched `(B, N_sites) -> (B,)`, uses compiled path if available
 - `self.vamp(x, params)` — batched eval with explicit params (for `torch.func.grad`)
 - `self._compiled`, `self._exported` — status flags
-
-## VMC Loop (vmc_run.py)
-
-5-step loop, same structure as CPU but all on GPU:
-
-1. **Sample** — `run_sampling_phase_gpu`: MCMC sweeps, energy eval, gradient computation, inline O_loc = grad/amp
-2. **Aggregate** — `dist.all_reduce` for global energy mean/variance
-3. **SR Solve** — MINRES or MinSR
-4. **Update** — `params -= lr * dp` via `parameters_to_vector` / `vector_to_parameters`
-5. **Log** — energy per site, timing
-
-Key hyperparameters in `vmc_run.py`:
-- `B` — walker batch size per rank (default 128)
-- `Ns_per_rank` — total samples per rank per step (default 2048, accumulates via `ceil(Ns_per_rank/B)` sweeps)
-- `grad_batch_size` — chunk size for gradient computation (default `B//2`)
-- `diag_shift` — SR regularization (default 1e-4)
-- `learning_rate` — parameter update step size (default 0.1)
 
 ## Shape Conventions
 

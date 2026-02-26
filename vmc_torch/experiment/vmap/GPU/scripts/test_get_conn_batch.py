@@ -5,19 +5,21 @@ Compares the new GPU-batched Hamiltonian connectivity
 (get_conn_batch_gpu) against the original per-sample CPU
 get_conn as the ground-truth baseline.
 
-Tests:
-  1. Single config: connected configs and coefficients match exactly.
-  2. Batch of random configs: all match.
-  3. Edge cases: all-empty, all-doubly-occupied, half-filled, doped.
-  4. Larger lattice (3x3) with more hop terms.
+Covers all Hamiltonian types:
+  - Spinful Fermi-Hubbard (square lattice + chain)
+  - Spinless Fermi-Hubbard (chain + square lattice)
+  - Heisenberg (chain + square lattice)
+  - Transverse-field Ising (chain + square lattice)
 
 Run:
     python GPU/scripts/test_get_conn_batch.py
 """
 import sys
 import os
+import time
 import numpy as np
 import torch
+from itertools import combinations
 
 # --- Make sure the package is importable ---
 sys.path.insert(
@@ -30,8 +32,84 @@ sys.path.insert(
 
 from vmc_torch.hamiltonian_torch import (
     spinful_Fermi_Hubbard_square_lattice_torch,
+    spinful_Fermi_Hubbard_chain_torch,
+    spinless_Fermi_Hubbard_chain_torch,
+    spinless_Fermi_Hubbard_square_lattice_torch,
+    spin_Heisenberg_chain_torch,
+    spin_Heisenberg_square_lattice_torch,
+    spin_transverse_Ising_chain_torch,
+    spin_transverse_Ising_square_lattice_torch,
 )
 from vmc_torch.experiment.vmap.GPU.vmc_utils import random_initial_config
+
+
+# ============================================================
+# Config generators
+# ============================================================
+
+def random_spinless_config(N_f, N_sites, seed=None):
+    """Random binary config with exactly N_f occupied sites."""
+    rng = np.random.default_rng(seed)
+    positions = rng.choice(N_sites, size=N_f, replace=False)
+    cfg = torch.zeros(N_sites, dtype=torch.long)
+    cfg[positions] = 1
+    return cfg
+
+
+def random_spin_config(N_sites, total_sz=None, seed=None):
+    """Random binary {0,1} spin config.
+
+    If total_sz is given, constrain to n_up = N/2 + total_sz spins up.
+    """
+    rng = np.random.default_rng(seed)
+    if total_sz is not None:
+        n_up = N_sites // 2 + total_sz
+        positions = rng.choice(N_sites, size=n_up, replace=False)
+        cfg = torch.zeros(N_sites, dtype=torch.long)
+        cfg[positions] = 1
+    else:
+        cfg = torch.tensor(
+            rng.integers(0, 2, size=N_sites), dtype=torch.long
+        )
+    return cfg
+
+
+def all_spinless_configs(N_sites, N_f):
+    """Enumerate all C(N_sites, N_f) binary configs."""
+    cfgs = []
+    for pos in combinations(range(N_sites), N_f):
+        cfg = torch.zeros(N_sites, dtype=torch.long)
+        for p in pos:
+            cfg[p] = 1
+        cfgs.append(cfg)
+    return torch.stack(cfgs)
+
+
+def all_spin_configs(N_sites, total_sz=None):
+    """Enumerate all spin configs (optionally fixed total_sz)."""
+    if total_sz is not None:
+        n_up = N_sites // 2 + total_sz
+        return all_spinless_configs(N_sites, n_up)
+    else:
+        cfgs = []
+        for i in range(2**N_sites):
+            bits = [(i >> b) & 1 for b in range(N_sites)]
+            cfgs.append(torch.tensor(bits, dtype=torch.long))
+        return torch.stack(cfgs)
+
+
+def all_spinful_configs(N_sites, n_up, n_dn):
+    """Enumerate all spinful fermion configs in quimb encoding."""
+    cfgs = []
+    for up_pos in combinations(range(N_sites), n_up):
+        for dn_pos in combinations(range(N_sites), n_dn):
+            cfg = torch.zeros(N_sites, dtype=torch.long)
+            for p in up_pos:
+                cfg[p] += 2
+            for p in dn_pos:
+                cfg[p] += 1
+            cfgs.append(cfg)
+    return torch.stack(cfgs)
 
 
 # ============================================================
@@ -39,31 +117,23 @@ from vmc_torch.experiment.vmap.GPU.vmc_utils import random_initial_config
 # ============================================================
 
 def get_conn_reference(H, fxs_cpu):
-    """
-    Run the original per-sample get_conn on a CPU tensor batch.
-    Returns dict: config_index -> {config_tuple: coeff}.
-    """
+    """Run the original per-sample get_conn on a CPU tensor batch."""
     results = []
     for fx in fxs_cpu:
         etas, coeffs = H.get_conn(fx)
         d = {}
         for eta, c in zip(etas, coeffs):
             key = tuple(int(x) for x in eta)
-            # accumulate if same config appears more than once
             d[key] = d.get(key, 0.0) + float(c)
         results.append(d)
     return results
 
 
 def get_conn_batch_result(H, fxs_gpu):
-    """
-    Run get_conn_batch_gpu and reorganise into the same format
-    as get_conn_reference: list of {config_tuple: coeff}.
-    """
+    """Run get_conn_batch_gpu and reorganise into same format."""
     B = fxs_gpu.shape[0]
     conn_etas, conn_coeffs, batch_ids = H.get_conn_batch_gpu(fxs_gpu)
 
-    # Move to CPU for comparison
     conn_etas_cpu = conn_etas.cpu().numpy()
     conn_coeffs_cpu = conn_coeffs.cpu().numpy()
     batch_ids_cpu = batch_ids.cpu().numpy()
@@ -76,10 +146,7 @@ def get_conn_batch_result(H, fxs_gpu):
 
 
 def compare_results(ref, new, label="", tol=1e-10):
-    """
-    Compare two lists of {config_tuple: coeff} dicts.
-    Returns (n_pass, n_fail, error_messages).
-    """
+    """Compare two lists of {config_tuple: coeff} dicts."""
     n_pass = 0
     n_fail = 0
     errors = []
@@ -87,7 +154,6 @@ def compare_results(ref, new, label="", tol=1e-10):
     assert len(ref) == len(new), "Length mismatch"
 
     for i, (r, n) in enumerate(zip(ref, new)):
-        # Check same set of connected configs
         r_keys = set(r.keys())
         n_keys = set(n.keys())
 
@@ -102,7 +168,6 @@ def compare_results(ref, new, label="", tol=1e-10):
             )
             continue
 
-        # Check coefficients match
         coeff_ok = True
         for key in r_keys:
             diff = abs(r[key] - n[key])
@@ -133,9 +198,246 @@ def run_test(name, H, fxs_cpu, device, verbose=False):
     status = "PASS" if n_fail == 0 else "FAIL"
     print(f"  [{status}] {name}: {n_pass}/{n_pass+n_fail} samples OK")
     if verbose or n_fail > 0:
-        for e in errors[:10]:  # cap output
+        for e in errors[:10]:
             print(e)
     return n_fail == 0
+
+
+# ============================================================
+# Test suites
+# ============================================================
+
+def test_spinful_square(device):
+    """Spinful Fermi-Hubbard square lattice tests."""
+    all_pass = True
+
+    # --- 2x2, half-filling N_f=4 ---
+    print("\n=== Spinful Hubbard Square 2x2, t=1 U=8, N_f=4 ===")
+    Lx, Ly, N_f = 2, 2, 4
+    H = spinful_Fermi_Hubbard_square_lattice_torch(
+        Lx, Ly, 1.0, 8.0, N_f, pbc=False,
+        n_fermions_per_spin=(2, 2), no_u1_symmetry=False, gpu=True,
+    )
+    H.precompute_hops_gpu(device)
+
+    cfg = random_initial_config(N_f, Lx * Ly, seed=0).unsqueeze(0)
+    all_pass &= run_test("single config", H, cfg, device)
+
+    batch = torch.stack([
+        random_initial_config(N_f, Lx * Ly, seed=s) for s in range(64)
+    ])
+    all_pass &= run_test("batch B=64", H, batch, device)
+
+    fxs_all = all_spinful_configs(Lx * Ly, 2, 2)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all)} configs)", H, fxs_all, device
+    )
+
+    # --- 2x2, doped N_f=2 ---
+    print("\n=== Spinful Hubbard Square 2x2, t=1 U=8, N_f=2 (doped) ===")
+    H2 = spinful_Fermi_Hubbard_square_lattice_torch(
+        2, 2, 1.0, 8.0, 2, pbc=False,
+        n_fermions_per_spin=(1, 1), no_u1_symmetry=False, gpu=True,
+    )
+    H2.precompute_hops_gpu(device)
+    batch_d = torch.stack([
+        random_initial_config(2, 4, seed=s) for s in range(32)
+    ])
+    all_pass &= run_test("doped B=32", H2, batch_d, device)
+
+    return all_pass
+
+
+def test_spinful_chain(device):
+    """Spinful Fermi-Hubbard chain tests."""
+    all_pass = True
+
+    print("\n=== Spinful Hubbard Chain L=4, t=1 U=4, N_f=4 ===")
+    L, N_f = 4, 4
+    H = spinful_Fermi_Hubbard_chain_torch(
+        L, 1.0, 4.0, N_f, pbc=False,
+        n_fermions_per_spin=(2, 2), no_u1_symmetry=False,
+    )
+    H.precompute_hops_gpu(device)
+
+    batch = torch.stack([
+        random_initial_config(N_f, L, seed=s) for s in range(64)
+    ])
+    all_pass &= run_test("batch B=64", H, batch, device)
+
+    fxs_all = all_spinful_configs(L, 2, 2)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all)} configs)", H, fxs_all, device
+    )
+
+    return all_pass
+
+
+def test_spinless_chain(device):
+    """Spinless Fermi-Hubbard chain tests."""
+    all_pass = True
+
+    print("\n=== Spinless Hubbard Chain L=6, t=1 V=0.5, N_f=3 ===")
+    L, N_f = 6, 3
+    H = spinless_Fermi_Hubbard_chain_torch(L, 1.0, 0.5, N_f, pbc=False)
+    H.precompute_hops_gpu(device)
+
+    batch = torch.stack([
+        random_spinless_config(N_f, L, seed=s) for s in range(64)
+    ])
+    all_pass &= run_test("batch B=64", H, batch, device)
+
+    fxs_all = all_spinless_configs(L, N_f)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all)} configs)", H, fxs_all, device
+    )
+
+    return all_pass
+
+
+def test_spinless_square(device):
+    """Spinless Fermi-Hubbard square lattice tests."""
+    all_pass = True
+
+    print("\n=== Spinless Hubbard Square 2x3, t=1 V=0.5 mu=0.2, N_f=3 ===")
+    Lx, Ly, N_f = 2, 3, 3
+    H = spinless_Fermi_Hubbard_square_lattice_torch(
+        Lx, Ly, t=1.0, V=0.5, mu=0.2, N_f=N_f, pbc=False,
+    )
+    H.precompute_hops_gpu(device)
+
+    batch = torch.stack([
+        random_spinless_config(N_f, Lx * Ly, seed=s) for s in range(64)
+    ])
+    all_pass &= run_test("batch B=64", H, batch, device)
+
+    fxs_all = all_spinless_configs(Lx * Ly, N_f)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all)} configs)", H, fxs_all, device
+    )
+
+    return all_pass
+
+
+def test_heisenberg_chain(device):
+    """Heisenberg chain tests."""
+    all_pass = True
+
+    print("\n=== Heisenberg Chain L=6, J=1, total_sz=0 ===")
+    L = 6
+    H = spin_Heisenberg_chain_torch(L, J=1.0, pbc=False, total_sz=0)
+    H.precompute_hops_gpu(device)
+
+    batch = torch.stack([
+        random_spin_config(L, total_sz=0, seed=s) for s in range(64)
+    ])
+    all_pass &= run_test("batch B=64", H, batch, device)
+
+    fxs_all = all_spin_configs(L, total_sz=0)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all)} configs)", H, fxs_all, device
+    )
+
+    # Also test L=4 exhaustive without total_sz constraint
+    print("\n=== Heisenberg Chain L=4, J=1, no Sz constraint ===")
+    H4 = spin_Heisenberg_chain_torch(4, J=1.0, pbc=False)
+    H4.precompute_hops_gpu(device)
+    fxs_all4 = all_spin_configs(4)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all4)} configs)", H4, fxs_all4, device
+    )
+
+    return all_pass
+
+
+def test_heisenberg_square(device):
+    """Heisenberg square lattice tests."""
+    all_pass = True
+
+    print("\n=== Heisenberg Square 3x3, J=1, total_sz=0 ===")
+    Lx, Ly = 3, 3
+    N = Lx * Ly
+    H = spin_Heisenberg_square_lattice_torch(
+        Lx, Ly, J=1.0, pbc=False, total_sz=0,
+    )
+    H.precompute_hops_gpu(device)
+
+    batch = torch.stack([
+        random_spin_config(N, total_sz=0, seed=s) for s in range(64)
+    ])
+    all_pass &= run_test("batch B=64", H, batch, device)
+
+    # Exhaustive for 2x2
+    print("\n=== Heisenberg Square 2x2, J=1, total_sz=0 ===")
+    H22 = spin_Heisenberg_square_lattice_torch(
+        2, 2, J=1.0, pbc=False, total_sz=0,
+    )
+    H22.precompute_hops_gpu(device)
+    fxs_all = all_spin_configs(4, total_sz=0)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all)} configs)", H22, fxs_all, device
+    )
+
+    return all_pass
+
+
+def test_ising_chain(device):
+    """Transverse-field Ising chain tests."""
+    all_pass = True
+
+    print("\n=== Transverse Ising Chain L=6, J=1 h=0.5 ===")
+    L = 6
+    H = spin_transverse_Ising_chain_torch(
+        L, J=1.0, h=0.5, pbc=False,
+    )
+    H.precompute_hops_gpu(device)
+
+    batch = torch.stack([
+        random_spin_config(L, seed=s) for s in range(64)
+    ])
+    all_pass &= run_test("batch B=64", H, batch, device)
+
+    # Exhaustive L=4
+    print("\n=== Transverse Ising Chain L=4, J=1 h=0.5 (exhaustive) ===")
+    H4 = spin_transverse_Ising_chain_torch(4, J=1.0, h=0.5, pbc=False)
+    H4.precompute_hops_gpu(device)
+    fxs_all = all_spin_configs(4)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all)} configs)", H4, fxs_all, device
+    )
+
+    return all_pass
+
+
+def test_ising_square(device):
+    """Transverse-field Ising square lattice tests."""
+    all_pass = True
+
+    print("\n=== Transverse Ising Square 3x3, J=1 h=0.5 ===")
+    Lx, Ly = 3, 3
+    N = Lx * Ly
+    H = spin_transverse_Ising_square_lattice_torch(
+        Lx, Ly, J=1.0, h=0.5, pbc=False,
+    )
+    H.precompute_hops_gpu(device)
+
+    batch = torch.stack([
+        random_spin_config(N, seed=s) for s in range(64)
+    ])
+    all_pass &= run_test("batch B=64", H, batch, device)
+
+    # Exhaustive 2x2
+    print("\n=== Transverse Ising Square 2x2, J=1 h=0.5 (exhaustive) ===")
+    H22 = spin_transverse_Ising_square_lattice_torch(
+        2, 2, J=1.0, h=0.5, pbc=False,
+    )
+    H22.precompute_hops_gpu(device)
+    fxs_all = all_spin_configs(4)
+    all_pass &= run_test(
+        f"exhaustive ({len(fxs_all)} configs)", H22, fxs_all, device
+    )
+
+    return all_pass
 
 
 # ============================================================
@@ -143,7 +445,6 @@ def run_test(name, H, fxs_cpu, device, verbose=False):
 # ============================================================
 
 def main():
-    # Use CUDA if available, else CPU (for CI without GPU)
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
         print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
@@ -153,177 +454,21 @@ def main():
 
     all_pass = True
 
-    # ===========================================================
-    # Test suite 1: 2x2 Hubbard, half-filling N_f=4
-    # ===========================================================
-    print("\n=== 2x2 Hubbard, t=1 U=8, N_f=4 (half-filling) ===")
-    Lx, Ly = 2, 2
-    N_f = 4
-    H22 = spinful_Fermi_Hubbard_square_lattice_torch(
-        Lx, Ly, 1.0, 8.0, N_f,
-        pbc=False,
-        n_fermions_per_spin=(N_f // 2, N_f // 2),
-        no_u1_symmetry=False,
-        gpu=True,
-    )
-    H22.precompute_hops_gpu(device)
+    # Spinful fermion tests
+    all_pass &= test_spinful_square(device)
+    all_pass &= test_spinful_chain(device)
 
-    # Test 1a: single config, fixed seed
-    cfg = random_initial_config(N_f, Lx * Ly, seed=0)  # (N,)
-    fxs_single = cfg.unsqueeze(0)  # (1, N)
-    ok = run_test("2x2 single config (seed=0)", H22, fxs_single, device)
-    all_pass = all_pass and ok
+    # Spinless fermion tests
+    all_pass &= test_spinless_chain(device)
+    all_pass &= test_spinless_square(device)
 
-    # Test 1b: batch of 64 random configs
-    batch = torch.stack([
-        random_initial_config(N_f, Lx * Ly, seed=s)
-        for s in range(64)
-    ])
-    ok = run_test("2x2 batch B=64 (seeds 0-63)", H22, batch, device)
-    all_pass = all_pass and ok
+    # Heisenberg spin tests
+    all_pass &= test_heisenberg_chain(device)
+    all_pass &= test_heisenberg_square(device)
 
-    # Test 1c: all possible 2x2 half-filled configs (exhaustive)
-    from itertools import combinations
-    nsites = Lx * Ly
-    all_cfgs = []
-    # Quimb encoding: 0=empty, 1=down, 2=up, 3=both
-    # For half-filling with 2 up + 2 down, enumerate all valid configs
-    for up_pos in combinations(range(nsites), N_f // 2):
-        for dn_pos in combinations(range(nsites), N_f // 2):
-            cfg = torch.zeros(nsites, dtype=torch.long)
-            for p in up_pos:
-                cfg[p] += 2  # add spin-up
-            for p in dn_pos:
-                cfg[p] += 1  # add spin-down
-            all_cfgs.append(cfg)
-    fxs_all = torch.stack(all_cfgs)
-    ok = run_test(
-        f"2x2 exhaustive ({len(all_cfgs)} configs)",
-        H22, fxs_all, device
-    )
-    all_pass = all_pass and ok
-
-    # ===========================================================
-    # Test suite 2: 2x2 Hubbard, doped (N_f=2)
-    # ===========================================================
-    print("\n=== 2x2 Hubbard, t=1 U=8, N_f=2 (doped) ===")
-    N_f2 = 2
-    H22d = spinful_Fermi_Hubbard_square_lattice_torch(
-        Lx, Ly, 1.0, 8.0, N_f2,
-        pbc=False,
-        n_fermions_per_spin=(N_f2 // 2, N_f2 // 2),
-        no_u1_symmetry=False,
-        gpu=True,
-    )
-    H22d.precompute_hops_gpu(device)
-
-    batch_d = torch.stack([
-        random_initial_config(N_f2, Lx * Ly, seed=s)
-        for s in range(32)
-    ])
-    ok = run_test("2x2 doped B=32 (seeds 0-31)", H22d, batch_d, device)
-    all_pass = all_pass and ok
-
-    # ===========================================================
-    # Test suite 3: 2x3 Hubbard, half-filling N_f=6 (3+3)
-    # ===========================================================
-    print("\n=== 2x3 Hubbard, t=1 U=4, N_f=6 (3+3, half-filling) ===")
-    Lx3, Ly3 = 2, 3
-    N_f3 = 6
-    n_up3, n_dn3 = N_f3 // 2, N_f3 // 2
-    H23 = spinful_Fermi_Hubbard_square_lattice_torch(
-        Lx3, Ly3, 1.0, 4.0, N_f3,
-        pbc=False,
-        n_fermions_per_spin=(n_up3, n_dn3),
-        no_u1_symmetry=False,
-        gpu=True,
-    )
-    H23.precompute_hops_gpu(device)
-
-    batch23 = torch.stack([
-        random_initial_config(N_f3, Lx3 * Ly3, seed=s)
-        for s in range(64)
-    ])
-    ok = run_test("2x3 half-filling B=64 (seeds 0-63)", H23, batch23, device)
-    all_pass = all_pass and ok
-
-    # ===========================================================
-    # Test suite 4: 4x4 Hubbard, half-filling N_f=16
-    # ===========================================================
-    print("\n=== 4x4 Hubbard, t=1 U=8, N_f=16 (half-filling) ===")
-    Lx4, Ly4 = 4, 4
-    N_f4 = 16
-    H44 = spinful_Fermi_Hubbard_square_lattice_torch(
-        Lx4, Ly4, 1.0, 8.0, N_f4,
-        pbc=False,
-        n_fermions_per_spin=(N_f4 // 2, N_f4 // 2),
-        no_u1_symmetry=False,
-        gpu=True,
-    )
-    H44.precompute_hops_gpu(device)
-
-    batch44 = torch.stack([
-        random_initial_config(N_f4, Lx4 * Ly4, seed=s)
-        for s in range(128)
-    ])
-    ok = run_test("4x4 batch B=128 (seeds 0-127)", H44, batch44, device)
-    all_pass = all_pass and ok
-
-    # ===========================================================
-    # Test suite 5: Coefficient sign stress test
-    # Use configs with many doubly-occupied sites to stress JW phases
-    # ===========================================================
-    print("\n=== Sign/Phase stress test (2x2, fixed configs) ===")
-    H22_s = H22  # reuse 2x2 half-filling Hamiltonian
-
-    # Hand-crafted configs covering all quimb site values
-    stress_cfgs = torch.tensor([
-        [3, 0, 0, 1],  # doubly-occ, empty, empty, down
-        [0, 3, 1, 0],  # empty, doubly-occ, down, empty
-        [2, 1, 2, 1],  # up, down, up, down
-        [1, 2, 1, 2],  # down, up, down, up
-        [3, 3, 0, 0],  # two doubly-occ (invalid N_f but still test H)
-        [0, 0, 3, 3],  # (same)
-        [2, 2, 1, 1],  # two up, two down
-        [1, 1, 2, 2],  # same, permuted
-    ], dtype=torch.long)
-
-    ok = run_test(
-        "2x2 sign stress (hand-crafted)", H22_s, stress_cfgs, device,
-        verbose=True,
-    )
-    all_pass = all_pass and ok
-
-    # ===========================================================
-    # Test suite 6: Large batch performance check
-    # (not a correctness test, just makes sure it runs)
-    # ===========================================================
-    print("\n=== Large batch B=512 (2x2, no correctness detail) ===")
-    batch_large = torch.stack([
-        random_initial_config(N_f, Lx * Ly, seed=s)
-        for s in range(512)
-    ])
-    import time
-    t0 = time.time()
-    ref_large = get_conn_reference(H22, batch_large)
-    t_ref = time.time() - t0
-
-    t0 = time.time()
-    new_large = get_conn_batch_result(H22, batch_large.to(device))
-    t_new = time.time() - t0
-
-    n_pass, n_fail, errors = compare_results(
-        ref_large, new_large, label="B=512"
-    )
-    status = "PASS" if n_fail == 0 else "FAIL"
-    print(
-        f"  [{status}] B=512: {n_pass}/{n_pass+n_fail} OK "
-        f"| ref={t_ref:.3f}s new={t_new:.3f}s "
-        f"(speedup={t_ref/max(t_new,1e-9):.1f}x)"
-    )
-    all_pass = all_pass and (n_fail == 0)
-    for e in errors[:5]:
-        print(e)
+    # Transverse-field Ising tests
+    all_pass &= test_ising_chain(device)
+    all_pass &= test_ising_square(device)
 
     # ===========================================================
     # Summary
