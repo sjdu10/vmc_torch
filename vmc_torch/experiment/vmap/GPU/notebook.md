@@ -1,5 +1,40 @@
 # GPU VMC Pipeline — Research Notebook
 
+## 2026-02-26: Slater Determinant — Spinful Amplitude Fix + Run Script
+
+### What was done
+
+1. **Fixed `models/slater.py` amplitude for spinful fermions**: The old implementation used `argsort(descending=True)[:Nf]` directly on the quimb config `x ∈ {0,1,2,3}`, which is wrong for spinful fermions. Replaced with proper quimb→netket conversion:
+   - `spin_up[i] = 1` if `x[i] ∈ {2, 3}`, else 0
+   - `spin_dn[i] = 1` if `x[i] ∈ {1, 3}`, else 0
+   - `n = cat([spin_up, spin_dn])` → `(2*N_sites,)` binary occupation
+   - `occupied = argsort(n, descending=True)[:N_f]` (vmap-compatible; `nonzero` has dynamic output shape and is not supported by `torch.vmap`)
+   - `M` shape is now `(2*N_sites, N_f)` matching `SpinfulFermion.n_orbitals`
+
+2. **Created `run_scripts/vmc_run_slater.py`**: VMC run script for `SlaterDeterminant_GPU` on spinful Fermi-Hubbard. Based on `vmc_run_fpeps.py` with differences:
+   - No PEPS loading, no `setup_linalg_hooks` (no SVD/eigh needed)
+   - Uses MinSR by default (Np = 2*N_sites*N_f is small, e.g. 96 for 4x2)
+   - No checkpoint resume (fresh run)
+   - Output dir: `data/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/slater/`
+
+### Verification
+- `amplitude`, `forward` (vmap), `vamp` all produce consistent results
+- `compute_grads_gpu` returns correct shape `(B, Np)` with `Np = 2*N_sites*N_f`
+- Gradient via `vmap(grad)` works correctly
+
+### Run results (4x2 Fermi-Hubbard, t=1.0, U=8.0, N_f=6, single GPU)
+- **Np** = 96 (M shape 16x6)
+- **N_samples** = 4096, MinSR, lr=0.1, 100 steps
+- **First E/site**: 1.074, **Last E/site**: -0.451, **Min E/site**: -0.475
+- Energy decreased steadily. ~0.2s/step (dominated by SR solve).
+- Converged to mean-field variational bound as expected.
+
+### Next steps
+- Compare Slater det E/site against fPEPS results for the same system
+- Try larger systems (4x4, 8x8)
+
+---
+
 ## 2026-02-19: Batched QR Performance Investigation
 
 ### Context
@@ -572,6 +607,333 @@ python GPU/scripts/test_get_conn_batch.py
 - **`vmc_setup.py`**: Replaced `(N_f, N_sites, batch_size, ...)` signature with `(init_fn, batch_size, ...)` where `init_fn(seed) -> 1D tensor` is a callable that generates one walker config.
 - **`vmc_run.py`**, **`vmc_run_v0.py`**: Call sites updated to pass `init_fn=lambda seed: random_initial_config(N_f, N_sites, seed=seed)`, preserving identical behavior.
 
+### Also fixed: export+compile was dead code
+The old `build_model` in `vmc_setup.py` had the `model.export_and_compile()` call. When inlined into `vmc_run.py`, only a comment was left — setting `use_export_compile=True` did nothing. Added the actual export+compile block (gated on `vmc_cfg.use_export_compile`) in both `vmc_run.py` and `vmc_run_v0.py`.
+
 ### Verification
 - Import check: all three files parse and import correctly
 - Functional test: `initialize_walkers(init_fn=..., batch_size=4)` produces correct `(4, 8)` int64 tensor with valid spinful configs
+- `torchrun --nproc_per_node=1 vmc_run.py` with `use_export_compile=True`: runs successfully, energy decreases 0.84 → -0.46 E/site over 10 steps (4x2 Fermi-Hubbard, t=1, U=8, N_f=6, D=10, chi=10, random PEPS init)
+- Warnings are all from upstream (quimb deprecation, torch.compile DeviceCopy constants, PyTorch internal deprecation) — none from our code
+
+## 2026-02-26: Eliminated DeviceCopy warnings in export+compile
+
+### Root cause
+`torch.export` captures symmray's block-sparse index tensors (sector maps, size arrays) as CPU int64 constants (`lifted_tensor_0` through `lifted_tensor_183`). 16 of 184 lifted constants were on CPU. When `torch.compile` processes the vmapped graph, inductor inserts `ir.DeviceCopy` (H2D) for each CPU→GPU transfer, emitting 16 warnings.
+
+Profiling showed 16 H2D memcpy events per forward call, totaling 0.015 ms (0.03% of CUDA time). Small in absolute terms but unnecessary.
+
+### Fix
+Added `_move_exported_constants_to_device()` to `fPEPS_Model_GPU` in `models.py`. Called after `exported.module()` in both `export_and_compile` and `export_only`. Two steps:
+1. Walk `get_attr` nodes, move any CPU tensors to the target GPU device
+2. Patch `_assert_tensor_metadata` nodes that still reference `device='cpu'` — without this, `torch.compile` raises `AssertionError('Tensor device mismatch')`
+
+### Results (4x2, D=chi=10, B=512)
+| Metric | Before | After |
+|---|---|---|
+| DeviceCopy warnings | 16 | 0 |
+| H2D memcpy per call | 16 | 0 |
+| Memcpy CUDA time/call | 0.015 ms | 0.005 ms |
+| Compiled vs eager rel diff | — | 1.8e-13 |
+
+## 2026-02-26: Can we compile the gradient computation?
+
+### Context
+The forward pass uses `export + vmap + compile`, but the gradient path (`compute_grads_gpu`) uses eager `vmap(grad(model.vamp))` where `model.vamp` calls the uncompiled `_vmapped_amplitude`. Question: can we also compile the gradient path?
+
+### Architecture of compiled vs gradient paths
+| Call site | Function | Batch dim | Compiled? |
+|---|---|---|---|
+| `sample_next` | `model.forward()` → `_vmapped_compiled` | always `B` (padded) | Yes |
+| `evaluate_energy` | `model.forward()` → `_vmapped_compiled` | always `B` (padded) | Yes |
+| `compute_grads_gpu` | `model.vamp()` → `_vmapped_amplitude` | `grad_batch_size` chunks | No (eager) |
+
+Different batch sizes between forward (`B`) and gradients (`grad_batch_size`) do NOT trigger recompilation — the gradient path never hits the compiled code at all.
+
+### Benchmark (4x2, D=chi=10, B=512, B_grad=64)
+
+**Path 1 — Eager `vmap(grad(model.vamp))` (current):** 1010 ms
+
+**Path 2 — `vmap(grad(exported_module))` (export, no compile):** 968 ms (1.04x — no speedup). Export eliminates Python dispatch, but without compile to fuse kernels, the backward graph is still many small kernel launches.
+
+**Path 3 — `compile(vmap(grad(exported_module)))`: FAILS.** Triton compilation crashes (`PassManager::run failed`). The backward graph through eigh + boundary contraction is too complex — the fused kernel tries to combine dozens of ops (eigh backward, norm backward, diagonal, permute, etc.) and exceeds Triton's codegen limits.
+
+### Follow-up: does B_grad=1 compile?
+
+Yes — B_grad=1 compiles successfully (~18s compile time). But B_grad=2 already crashes (vmap doubles graph complexity, exceeds Triton limits).
+
+**B_grad=1 is 4.3x slower than eager B_grad=64:** compiled B_grad=1 takes 4248 ms for B=512 (8.3 ms/sample × 512 calls) vs eager B_grad=64 at 979 ms. The per-call Python overhead of invoking the compiled function 512 times individually far outweighs any kernel fusion benefit.
+
+### Conclusion
+- Compiling the gradient path is **not viable**: B_grad≥2 crashes Triton, B_grad=1 is 4.3x slower than eager
+- The backward graph through eigh is fundamentally too complex for Triton when batched
+- Gradient computation is ~1s vs ~10s for sampling+energy — only ~10% of step time, not the bottleneck
+- Possible future paths: (1) larger `grad_batch_size` to reduce loop overhead, (2) wait for Triton/inductor improvements, (3) custom eigh backward to simplify the autograd graph
+
+## 2026-02-26: Decouple sampler from energy/gradient — sampler only does MCMC
+
+### Motivation
+`SamplerGPU.run_sampling_phase` bundled MCMC + local energy + gradients, forcing the sampler to accept `hamiltonian`, `grad_batch_size`, etc. A user wanting a custom MCMC proposal (bosons, spins) had to replace the entire sampling phase. The warmup code already had the right pattern: sampler does MCMC, VMC_GPU calls energy/grad directly.
+
+### Changes
+
+**`sampler.py`** — simplified to pure MCMC:
+- `SamplerGPU` base class now has `step()` and `burn_in()` only
+- `MetropolisExchangeSpinfulSamplerGPU.step()` contains the full Metropolis sweep logic (from `vmc_utils.sample_next`): iterate edges, propose exchange/hopping, evaluate amps, accept/reject
+- Removed: `run_sampling_phase`, `warmup_step`, `sampling_phase_fn`, `sample_next_fn`, `sampling_count_key`
+
+**`VMC.py`** — VMC_GPU owns the sample→energy→grad loop:
+- New `_run_sampling_phase()`: calls `sampler.step()` for MCMC, then `evaluate_energy_fn` and `compute_grads_fn` directly
+- `run_vmc_loop()` uses single code path via `_run_sampling_phase()` (removed if/else sampler vs function-based branching)
+- `run_warmup()` calls `sampler.step()` directly (was `sampler.warmup_step()`)
+- Removed legacy function-based init args: `sampling_phase_fn`, `sample_next_fn`, `sampling_count_key`
+- Kept `evaluate_energy_fn`, `compute_grads_fn`, `distributed_sr_solver_fn`, `min_sr_solver_fn` for pluggability
+
+**No changes to:**
+- `vmc_utils.py` — `sample_next`, `evaluate_energy`, `compute_grads_gpu` stay as standalone functions
+- `vmc_modules.py` — `run_sampling_phase_gpu` stays as standalone convenience for scripts
+- `vmc_run.py`, `vmc_run_v0.py` — already used `sampler=` only, no code changes needed
+
+### Custom sampler example
+```python
+class BosonSamplerGPU(SamplerGPU):
+    def step(self, fxs, model, graph, **kwargs):
+        current_amps = model(fxs)
+        # ... boson-specific proposal + accept/reject ...
+        return fxs, current_amps
+```
+
+### Verification
+- Import checks: all 4 files pass (`sampler.py`, `VMC.py`, `vmc_run.py`, `vmc_run_v0.py`)
+- No external files import removed symbols
+- Functional: `torchrun --nproc_per_node=1 vmc_run_v0.py` runs successfully with correct phase timing output
+
+**Timing (4x2, D=chi=10, B=2048, Ns=4096, export+compile, minSR):**
+```
+Step 7 | E/site: -0.407045 +/- 0.004773 | N=4096 |
+  T_samp=0.5s T_locE=0.3s T_grad=9.4s T_SR=0.69s T_total=10.9s
+```
+Gradient computation dominates at 86% of step time. Sampling (5%) and energy (3%) are negligible. SR solve is 6%.
+
+## 2026-02-26: Break VMC timing into T_samp, T_locE, T_grad
+
+### Motivation
+VMC output only showed a single `T_samp` for the entire sampling phase (MCMC + local energy + gradients). Want to see where time is spent: sampling vs energy evaluation vs gradient computation.
+
+### Changes
+- **`vmc_modules.py::run_sampling_phase_gpu`**: Added per-phase `time.time()` calls for each of the three steps (sample_next, evaluate_energy, compute_grads). Now returns a 4-tuple `(data, fxs, sample_time, phase_times)` where `phase_times = {'t_samp': ..., 't_locE': ..., 't_grad': ...}`.
+- **`sampler.py::SamplerGPU`**: Updated return type annotation to 4-tuple.
+- **`VMC.py::run_vmc_loop`**: Unpacks `phase_times`, prints `T_samp=... T_locE=... T_grad=... T_SR=... T_total=...`. Also includes `phase_times` in `on_step_end` callback dict.
+
+## 2026-02-26: WavefunctionModel_GPU base class
+
+### Motivation
+Adding a new model required ~100 lines of boilerplate: `params`, `_compiled`, `_exported`, `vamp`, `forward`, `export_and_compile`, etc. Goal: user only defines `__init__` and `amplitude`.
+
+### Changes
+
+**`models.py`** — added `WavefunctionModel_GPU` base class:
+- **User must define**: `__init__(params_list=...)` and `amplitude(x, params_list) -> (B,)`.
+- **User may override**: `vamp(x, params)` for model-specific param handling (e.g. quimb pytree unflatten).
+- **Base provides for free**: `self.params` (ParameterList), `_compiled`/`_exported` flags, `forward(x)` with compiled→exported→eager dispatch, `export_and_compile`, `export_only`, `compile_model`, `_move_exported_constants_to_device`.
+- **`_single_sample_amplitude`**: default wraps `amplitude` with unsqueeze/squeeze. Override for natively single-sample models (e.g. quimb TN).
+
+**`fPEPS_Model_GPU(WavefunctionModel_GPU)`**:
+- Overrides `_single_sample_amplitude` (quimb TN contraction is natively single-sample), `vamp` (pytree unflatten), `_amplitude_for_export` (pytree unflatten for export).
+- `amplitude` raises NotImplementedError (single-sample path used via vmap).
+- Deleted: `forward`, `export_and_compile`, `export_only`, `compile_model`, `_move_exported_constants_to_device` — all inherited.
+
+**`PureNN_GPU(WavefunctionModel_GPU)`**:
+- Defines `amplitude(x, params_list)` (the old `_amp_from_params` body).
+- Everything else inherited. Deleted: `vamp`, `forward`, `_compiled`, `_exported`, `compile_model`.
+
+**New file: `models_slater.py`** — `SlaterDeterminant_GPU(WavefunctionModel_GPU)`:
+- Minimal example: single `(n_orbitals, n_fermions)` parameter matrix, `amplitude` computes `det(M[occupied, :])`.
+
+### Verification
+- Import checks: all modules (`models.py`, `models_slater.py`, `vmc_run.py`, `vmc_run_v0.py`) pass.
+- Functional: `PureNN_GPU` and `SlaterDeterminant_GPU` produce correct `(B,)` outputs via `forward` and `vamp`.
+- Gradient: `vmap(grad)` through `vamp` works for both `PureNN_GPU` and `SlaterDeterminant_GPU`.
+- Full pipeline: `torchrun --nproc_per_node=1 vmc_run_v0.py` runs 50 VMC steps, energy decreases 0.95 → -0.70 E/site (4x2, D=chi=10, B=2048, minSR). Same behavior as before refactoring.
+
+## 2026-02-26: GPU models/ subfolder + uniform single-sample base class
+
+### Motivation
+1. **Uniform interface**: All models define a single-sample `amplitude(x, params_list)` where `x` is `(N_sites,)` → scalar. Base class vmaps automatically. No model ever sees `(B, N_sites)`.
+2. **models/ package**: Moved from flat `GPU/models.py` + `GPU/models_slater.py` to a proper `GPU/models/` package mirroring `vmap/models/`.
+3. **Reuse model**: Ported `fPEPS_Model_reuse` from `vmap/models/pureTNS.py` as `fPEPS_Model_reuse_GPU`.
+
+### File structure
+```
+GPU/models/
+    __init__.py     — re-exports all public classes
+    _base.py        — WavefunctionModel_GPU base class
+    pureTNS.py      — fPEPS_Model_GPU, fPEPS_Model_reuse_GPU
+    pureNN.py       — PureNN_GPU
+    slater.py       — SlaterDeterminant_GPU
+```
+
+Deleted: `GPU/models.py`, `GPU/models_slater.py`.
+
+### Key design changes
+- **Base class** (`_base.py`): `amplitude(x, params_list)` is now single-sample `(N_sites,) -> scalar`. `__init__` creates `_vmapped_amplitude = torch.vmap(self.amplitude, ...)`. The old `_single_sample_amplitude` wrapper is gone.
+- **fPEPS_Model_GPU**: `amplitude` is natively single-sample (quimb TN contraction). Overrides `vamp` for pytree unflatten. Overrides `_amplitude_for_export` for export with pytree unflatten.
+- **PureNN_GPU**: `amplitude` operates on `(N_sites,)` — `F.embedding(x, emb_w).reshape(-1)` (flat, no batch dim). Uses default `vamp` from base.
+- **SlaterDeterminant_GPU**: `amplitude` uses `argsort(descending=True)[:Nf]` (no `dim=1`). Uses default `vamp`.
+- **fPEPS_Model_reuse_GPU**: Ported from CPU `fPEPS_Model_reuse`. Full contraction via `amplitude` (inherits export+compile). Reuse via `amplitude_reuse` / `vamp_reuse` / `forward_reuse` (eager vmap). Uses `pack_ftn`/`unpack_ftn`/`get_params_ftn` from `vmap/models/_model_base.py`.
+
+### Verification
+- All imports work: `from vmc_torch.experiment.vmap.GPU.models import X` for all classes.
+- No stale `GPU.models_slater` references remain.
+- PureNN and Slater: `forward(x)` produces `(B,)`, `vmap(grad)` through `vamp` works.
+- All callers (`vmc_run.py`, `vmc_run_v0.py`, `vmc_run_dev.py`, scripts) use `from vmc_torch.experiment.vmap.GPU.models import X` — zero import changes needed.
+
+### Full pipeline verified
+- `torchrun --nproc_per_node=1 vmc_run_v0.py`: 4x2 Fermi-Hubbard, t=1.0, U=8.0, N_f=6, D=chi=10, B=2048, minSR. Energy: 0.95 → -0.70 E/site in 50 steps. Same as before refactoring.
+
+### Checkpoint resume added to `vmc_run_v0.py` and `VMC.py`
+- `VMCConfig.resume_step: int = 0` (0 = fresh start, e.g. 50 = load step-50 checkpoint).
+- Resolves path automatically: `{output_dir}/checkpoint_{model_name}_{resume_step}.pt`.
+- `VMCLoopConfig.step_offset`: passed into the VMC loop so that printed step numbers, `info['step']` in the callback, and checkpoint filenames are all globally offset. E.g. `resume_step=50, vmc_steps=50` → steps 50–99, checkpoints at 60, 70, …
+
+### Run scripts reorganized
+- Deleted `vmc_run_v0.py`. Moved to `run_scripts/vmc_run_fpeps.py`.
+- Output dir now includes `chi=` in path: `.../D={D}/chi={chi}/`.
+- `load_or_generate_peps` now accepts `file_path` kwarg for explicit PEPS location.
+- Updated defaults: `batch_size=4096`, `grad_batch_size=1024`, `vmc_steps=100`.
+
+### GPU/ made standalone (no vmap/ dependencies)
+- Created `GPU/fermion_utils.py`: copied `pack_ftn`/`unpack_ftn`/`get_params_ftn` from `vmap/models/_model_base.py`.
+- Updated `models/pureTNS.py` to import from `GPU.fermion_utils` instead of `vmap.models._model_base`.
+- Updated `vmc_run_dev.py` to import `size_aware_qr`/`size_aware_svd` from `GPU.torch_utils`.
+- Updated all 11 scripts in `scripts/` to import from `GPU.torch_utils` instead of `vmap.vmap_torch_utils`.
+- **Only remaining external deps**: `vmc_torch.hamiltonian_torch` (core lib, stays), `scripts/record_time.py` imports CPU `fPEPS_Model` for benchmark comparison (intentional).
+- GPU/ is now ready to move to `vmc_torch/GPU/` as a standalone package.
+
+### Remaining work
+- Test `fPEPS_Model_reuse_GPU`: create model, call `cache_bMPS_skeleton`, `cache_bMPS_params_vmap`, verify amplitudes match non-reuse model.
+- NN-fTNS hybrid models (Conv, Transformer, LoRA) — future work.
+
+## 2026-02-26: NaN debugging in VMC optimization
+
+### Problem
+Running `vmc_run_fpeps.py` (4x2 Fermi-Hubbard, resume from step 50): after one optimization step, all 4096 amplitudes are NaN. Model parameters went bad after SR update.
+
+### Diagnostics added
+
+**`vmc_utils.py`** (earlier): Enhanced NaN detection in `compute_grads_gpu`:
+- Checks amplitudes for NaN/Inf first
+- For gradient NaN/Inf: reports affected samples count, affected parameter indices, maps flat indices back to `ParameterList` entries with shapes
+
+**`VMC.py`** (this session): Added NaN/Inf checks at three points in the VMC loop:
+1. **Before SR solve**: checks `local_energies` and `local_O` for NaN/Inf
+2. **After SR solve**: checks `dp` (parameter update direction) for NaN/Inf, prints norm of non-bad entries
+3. **After parameter update**: checks updated `model.parameters()` for NaN/Inf. If clean, prints `dp norm` and `params norm` for monitoring.
+
+### Root cause identified
+
+**Problem chain:**
+1. SU-pretrained PEPS has boundary MPS with near-degenerate eigh eigenvalues (gaps as small as 2.6e-8)
+2. The eigh backward formula has `1/(w_i - w_j)` terms → gradients amplified by ~4e+7
+3. Raw `d(psi)/d(params)` is 10^8–10^11 (vs ~0.3 for exact contraction)
+4. O_loc = grad/amp has rms=2e+7, max=8.8e+10
+5. This makes the QGT matrix ill-conditioned: MinSR produces dp~10^63, MINRES produces dp~10^-11 — both unusable
+
+**Evidence (4x2, D=chi=10, SU-loaded scale_factor=4):**
+| Contraction | raw grads rms | O_loc rms | O_loc max |
+|---|---|---|---|
+| chi=-1 (exact, no SVD/eigh) | 3.1e-01 | 3.2e-01 | 2.1e+02 |
+| chi=10 (boundary, eigh) | 1.9e+08 | 8.4e+07 | 1.1e+11 |
+
+**eigh eigenvalue comparison:**
+| State | Condition # max | Min eigenvalue gap | #(gap<1e-3) |
+|---|---|---|---|
+| SU-loaded | 2.35e+11 | 2.64e-08 | 5/8 |
+| Random | 1.92e+05 | 3.52e-02 | 0/8 |
+
+The SU-trained tensors produce near-singular boundary MPS matrices (eigenvalues like `[1.01, 0.94, 8e-7, 4e-8, 1e-10]`). Random PEPS has well-separated eigenvalues (`[8.3, 6.8, 4.5, 3.6, 2.2]`).
+
+### Debug controls added
+- `VMCLoopConfig.debug: bool = False` — gates all `[dbg]` prints in VMC loop
+- `VMCConfig.debug` in run scripts → passed through to VMCLoopConfig
+- NaN/Inf warnings always print regardless of debug flag
+
+### Further investigation: sequential vs vmap
+
+Tested B=16 with sequential per-sample backward vs vmap(grad):
+- **Identical results** — vmap is NOT the issue
+- **Sample 3** has grad_norm=9.8e+04, while most are O(10-40)
+- The problem is **outlier configurations**: specific configs create ill-conditioned intermediate matrices in boundary contraction, producing extreme gradients through the eigh backward
+- With B=4096, the probability of hitting extreme outliers is much higher, explaining O_loc max=8.8e+10
+
+### Root cause (refined)
+
+Not a vmap bug, not a systematic eigh issue. **Specific configurations** create near-degenerate boundary MPS Gram matrices during contraction. The custom `safe_inverse_random` in `RobustSVD_EIG` backward caps F at ~5e5 (Lorentzian with eps=1e-12), but the gradient can still be amplified through the chain of multiple SVD calls + tensor contractions in the boundary MPS.
+
+### SVD call path (important note)
+
+Boundary contraction does **NOT** go through `linalg.svd`. The call chain is:
+```
+autoray linalg.qr → size_aware_qr(via_eigh=True) → qr_via_eigh → RobustSVD_EIG.apply
+```
+So the S values to check are in `RobustSVD_EIG`, not in any `linalg.svd` or `size_aware_svd` function.
+
+### SVD singular values: normal vs outlier sample
+
+Hooked `RobustSVD_EIG.apply` via patching `tu.qr_via_eigh` to log S during forward pass for both normal sample (seed=42) and outlier (seed=45).
+
+**Normal sample (grad_norm=14):** 4 RobustSVD_EIG calls
+| Call | Shape | Condition # | Min s_gap |
+|---|---|---|---|
+| #0 | (2, 5, 50) | 585 / 103 | 0.019 / 0.030 |
+| #1 | (2, 5, 5) | **4.8e+5** / 6e+3 | **1.6e-4** / 7e-4 |
+| #2 | (2, 5, 50) | 328 / 115 | 0.016 / 0.006 |
+| #3 | (2, 5, 5) | **8.5e+4** / 743 | **1.3e-4** / 0.006 |
+
+**Outlier sample (grad_norm=9.8e+4):** 4 RobustSVD_EIG calls
+| Call | Shape | Condition # | Min s_gap |
+|---|---|---|---|
+| #0 | (2, 5, 50) | 237 / 151 | 0.055 / 0.016 |
+| #1 | (2, 5, 5) | **3.7e+10** / **7.5e+8** | **1.1e-4** / **2.8e-9** |
+| #2 | (2, 5, 50) | 378 / 163 | 0.008 / 0.023 |
+| #3 | (2, 5, 5) | **2.5e+29** / **9.7e+29** | **4.5e-10** / **1.4e-6** |
+
+Key findings:
+- SVD #1 and #3 are the (2, 5, 5) boundary MPS Gram matrices — these are ill-conditioned
+- Outlier has **exact zeros** in S: `[0.248, 0.071, 3.3e-5, 4.5e-10, 0.0]` — rank-deficient
+- Min s_gap drops from 1.3e-4 (normal) to **4.5e-10** (outlier)
+- The `F = safe_inverse_random(s_i - s_j, eps=1e-12)` backward term: for gap=4.5e-10, F ≈ 4.5e-10/1e-12 = 450 — bounded by Lorentzian, but multiple SVDs chain together amplifying the gradient through the full contraction
+
+### Why burn-in doesn't help
+
+Increasing burn-in does **not** fix the problem because:
+1. Outlier configs are **valid MCMC states** with non-negligible ψ(x) amplitude (sample 3 has amp=-10.6, not small)
+2. Burn-in removes correlation with initial state, but outlier configs will always exist in the Markov chain at equilibrium
+3. The configs that create ill-conditioned boundary MPS are determined by the arrangement of fermions, not by under-burning
+4. With B=4096 walkers doing many sweeps, encountering rare ill-conditioned configs is inevitable
+
+### How to handle outliers
+
+Standard VMC approaches:
+1. **O_loc clipping** (recommended): `clamp(O_loc, -clip_val, clip_val)` before SR solve. Standard in VMC codes. Clip value typically 5-10× median |O_loc|, or use adaptive percentile-based clipping.
+2. **Gradient norm clipping**: clip per-sample grad norm before forming O_loc
+3. **Winsorization**: replace outlier O_loc values with the boundary percentile value
+4. **chi=-1 (exact contraction)**: gradients are healthy (O_loc~0.3) but O(D^Lx) cost — only feasible for small systems
+5. **Increase Lorentzian epsilon** in `RobustSVD_EIG` backward (from 1e-12 to ~1e-6): damps the F matrix more aggressively for near-degenerate singular values, at the cost of less accurate gradients for well-conditioned cases
+6. **Start from random PEPS**: random PEPS has well-separated S values, avoids the ill-conditioning. Let VMC optimize from scratch rather than from SU-pretrained state.
+
+### O_loc outlier masking — implemented and tested
+
+Added `outlier_clip_factor` to `VMCLoopConfig` (default=5.0). After forming O_loc = grads/amps for the full batch, computes per-sample norms, and masks out (sets O_loc row to 0, replaces E_loc with batch mean) any sample whose |O_loc| norm exceeds `clip_factor × median`.
+
+**Files changed:**
+- `VMC.py`: added `outlier_clip_factor` to `VMCLoopConfig`, masking logic in `_run_sampling_phase` after `torch.cat`
+- `run_scripts/vmc_run_fpeps.py`: added `outlier_clip_factor` to `VMCConfig`, passed through to `VMCLoopConfig`
+
+**Test result** (4x2, D=chi=10, SU-loaded scale_factor=4, MINRES SR):
+- Step 0: dropped 390/4096 (9.5%) — first step, many outliers
+- Steps 1-9: dropped 2-8/4096 (~0.1%) — steady state
+- Energy: -0.617 → -0.665 over 10 steps, steadily decreasing, **no NaN**
+- Threshold ~9×median, median |O_loc|~1.9
+
+Previously this setup produced NaN after 1 step. The outlier masking completely fixes it.

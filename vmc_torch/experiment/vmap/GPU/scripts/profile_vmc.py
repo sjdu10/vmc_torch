@@ -34,7 +34,7 @@ from vmc_torch.experiment.vmap.GPU.models import fPEPS_Model_GPU
 from vmc_torch.hamiltonian_torch import (
     spinful_Fermi_Hubbard_square_lattice_torch,
 )
-from vmc_torch.experiment.vmap.vmap_torch_utils import (
+from vmc_torch.experiment.vmap.GPU.torch_utils import (
     robust_svd_err_catcher_wrapper,
 )
 

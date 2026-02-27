@@ -1,9 +1,13 @@
-"""GPU VMC for spinful Fermi-Hubbard on a square lattice.
+"""GPU VMC for spinful Fermi-Hubbard on a square lattice (with data saving).
+
+Same as vmc_run.py but saves energy stats to JSON and model checkpoints.
 
 Run:
-    torchrun --nproc_per_node=<N> vmc_run.py
-    torchrun --nproc_per_node=1 vmc_run.py   # single GPU
+    torchrun --nproc_per_node=<N> vmc_run_fpeps.py
+    torchrun --nproc_per_node=1 vmc_run_fpeps.py   # single GPU
 """
+import json
+import os
 from dataclasses import dataclass
 
 import torch
@@ -22,12 +26,14 @@ from vmc_torch.experiment.vmap.GPU.hamiltonian import (
 from vmc_torch.experiment.vmap.GPU.models import fPEPS_Model_GPU
 from vmc_torch.experiment.vmap.GPU.optimizer import (
     DistributedSRMinresGPU,
+    MinSRGPU,
     SGDGPU,
 )
 from vmc_torch.experiment.vmap.GPU.sampler import (
     MetropolisExchangeSpinfulSamplerGPU,
 )
 from vmc_torch.experiment.vmap.GPU.vmc_setup import (
+    ensure_output_dir,
     initialize_walkers,
     load_or_generate_peps,
     setup_linalg_hooks,
@@ -35,29 +41,33 @@ from vmc_torch.experiment.vmap.GPU.vmc_setup import (
 from vmc_torch.experiment.vmap.GPU.vmc_utils import random_initial_config
 
 dtype = torch.float64
-
+DEFAULT_DATA_ROOT = (
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/experiment/vmap/GPU/data'
+)
 
 @dataclass
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 2048
+    batch_size: int = 4096
     ns_per_rank: int = 4096
-    grad_batch_size: int = 512
-    vmc_steps: int = 50
+    grad_batch_size: int = 1024
+    vmc_steps: int = 100
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
     burn_in_steps: int = 4
     use_export_compile: bool = True
-    use_min_sr: bool = True
+    use_min_sr: bool = False
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
     save_every: int = 10
-    resume_step: int = 0  # checkpoint step to resume from, 0 = fresh
+    resume_step: int = 100  # checkpoint step to resume from, 0 = fresh
+    debug: bool = False  # print [dbg] diagnostics each step
+    outlier_clip_factor: float = 100.0  # drop O_loc outliers > factor * median
 
 
 def main():
-    setup_linalg_hooks(jitter=1e-16)
+    setup_linalg_hooks(jitter=1e-12)
     torch.set_default_dtype(dtype)
 
     try:
@@ -91,8 +101,12 @@ def main():
         graph = H.graph
 
         # ========== Variational state (fPEPS model) ==========
+        fpeps_base = (
+            f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
+            f"/N={N_f}/Z2/D={D}/"
+        )
         peps = load_or_generate_peps(
-            Lx, Ly, t, U, N_f, D, seed=42, dtype=dtype,
+            Lx, Ly, t, U, N_f, D, seed=42, dtype=dtype, file_path=fpeps_base, scale_factor=4
         )
         model = fPEPS_Model_GPU(
             tn=peps,
@@ -105,22 +119,35 @@ def main():
             },
         )
         model.to(device)
+
+        # ========== Load checkpoint (optional) ==========
+        vmc_cfg = VMCConfig()
+        output_dir = (
+            f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/chi={chi}/"
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        model_name = model._get_name()
+        if vmc_cfg.resume_step > 0:
+            ckpt_path = os.path.join(
+                output_dir,
+                f'checkpoint_{model_name}_{vmc_cfg.resume_step}.pt',
+            )
+            ckpt = torch.load(
+                ckpt_path,
+                map_location=device,
+                weights_only=True,
+            )
+            model.load_state_dict(ckpt)
+            if rank == 0:
+                print(f"Loaded checkpoint: {ckpt_path}")
+
         N_params = sum(p.numel() for p in model.parameters())
         if rank == 0:
             print(
                 f"Model: {N_params} params | "
                 f"{world_size} GPUs | {device}"
             )
-
-        # ========== VMC settings ==========
-        vmc_cfg = VMCConfig(
-            batch_size=512,
-            ns_per_rank=4096,
-            grad_batch_size=64,
-            vmc_steps=10,
-            learning_rate=0.1,
-            diag_shift=5e-5,
-        )
 
         # Export + compile (optional, ~10-40s one-time cost)
         if vmc_cfg.use_export_compile:
@@ -148,13 +175,31 @@ def main():
             seed=42, rank=rank, device=device,
         )
 
+        # ========== Stats tracking ==========
+        stats_file = os.path.join(output_dir, f'stats_{model_name}.json')
+        total_ns = vmc_cfg.ns_per_rank * world_size
+        stats = {
+            'system': f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
+                      f'N_f={N_f}, D={D}, chi={chi}',
+            'Np': N_params,
+            'sample size': total_ns,
+            'mean': [],
+            'error': [],
+            'variance': [],
+        }
+
         # ========== VMC driver ==========
-        vmc = VMC_GPU(
-            sampler=MetropolisExchangeSpinfulSamplerGPU(),
-            preconditioner=DistributedSRMinresGPU(
+        preconditioner = (
+            MinSRGPU()
+            if vmc_cfg.use_min_sr
+            else DistributedSRMinresGPU(
                 rtol=vmc_cfg.sr_rtol,
                 maxiter=vmc_cfg.sr_maxiter,
-            ),
+            )
+        )
+        vmc = VMC_GPU(
+            sampler=MetropolisExchangeSpinfulSamplerGPU(),
+            preconditioner=preconditioner,
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),
@@ -171,6 +216,24 @@ def main():
                 grad_batch_size=vmc_cfg.grad_batch_size,
             ),
         )
+
+        # ========== Data-saving callback ==========
+        def on_step_end(info):
+            if rank != 0:
+                return
+            stats['mean'].append(info['energy_per_site'])
+            stats['error'].append(info['error_per_site'])
+            stats['variance'].append(info['energy_var'])
+            with open(stats_file, 'w') as f:
+                json.dump(stats, f, indent=4)
+
+            step = info['step']  # already global (offset applied)
+            if (step + 1) % vmc_cfg.save_every == 0:
+                ckpt_path = os.path.join(
+                    output_dir,
+                    f'checkpoint_{model_name}_{step + 1}.pt',
+                )
+                torch.save(model.state_dict(), ckpt_path)
 
         energy_history, _ = vmc.run_vmc_loop(
             fxs=fxs,
@@ -192,7 +255,10 @@ def main():
                 use_min_sr=vmc_cfg.use_min_sr,
                 use_export_compile=vmc_cfg.use_export_compile,
                 step_offset=vmc_cfg.resume_step,
+                debug=vmc_cfg.debug,
+                outlier_clip_factor=vmc_cfg.outlier_clip_factor,
             ),
+            on_step_end=on_step_end,
         )
 
         # ========== Summary ==========
@@ -206,6 +272,7 @@ def main():
             print(f"First E/site: {energy_history[0]:.6f}")
             print(f"Last  E/site: {energy_history[-1]:.6f}")
             print(f"Min   E/site: {min(energy_history):.6f}")
+            print(f"Stats saved to: {stats_file}")
             if energy_history[-1] < energy_history[0]:
                 print("\nEnergy decreased.")
             else:

@@ -36,7 +36,7 @@ import autoray as ar
 import quimb as qu
 import quimb.tensor as qtn
 
-from vmc_torch.experiment.vmap.vmap_torch_utils import (
+from vmc_torch.experiment.vmap.GPU.torch_utils import (
     size_aware_qr,
     size_aware_svd,
 )

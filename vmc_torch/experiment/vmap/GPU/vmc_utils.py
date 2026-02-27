@@ -499,13 +499,46 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
         # ------------------------------------------------------------------
         # Safety Checks
         # ------------------------------------------------------------------
+        if torch.isnan(amps).any() or torch.isinf(amps).any():
+            nan_count = torch.isnan(amps).sum().item()
+            inf_count = torch.isinf(amps).sum().item()
+            raise ValueError(
+                f"NaN/Inf in amplitudes: {nan_count} NaN, "
+                f"{inf_count} Inf out of {amps.numel()} samples"
+            )
         if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
-            msg = "NaN or Inf detected in batched_grads_vec"
-            try:
-                print(f"{msg} in RANK {RANK}")
-                comm.Abort(1)
-            except NameError:
-                raise ValueError(msg)
+            nan_mask = torch.isnan(batched_grads_vec)
+            inf_mask = torch.isinf(batched_grads_vec)
+            # Which samples have bad grads?
+            bad_samples = (nan_mask | inf_mask).any(dim=1)
+            n_bad = bad_samples.sum().item()
+            # Which parameters have bad grads?
+            bad_params = (nan_mask | inf_mask).any(dim=0)
+            bad_param_ids = bad_params.nonzero(as_tuple=True)[0]
+            # Map flat param index to (param_idx, offset) in ParameterList
+            param_ranges = []
+            offset = 0
+            for i, p in enumerate(fpeps_model.params):
+                size = p.numel()
+                param_ranges.append((i, offset, offset + size, p.shape))
+                offset += size
+            bad_param_info = []
+            for pid in bad_param_ids[:10].tolist():
+                for (idx, lo, hi, shape) in param_ranges:
+                    if lo <= pid < hi:
+                        bad_param_info.append(
+                            f"  flat[{pid}] -> params[{idx}]"
+                            f"{list(shape)} offset {pid - lo}"
+                        )
+                        break
+            raise ValueError(
+                f"NaN/Inf in gradients: {n_bad}/{fxs.shape[0]} "
+                f"samples affected, "
+                f"{bad_params.sum().item()}/{batched_grads_vec.shape[1]}"
+                f" params affected.\n"
+                f"First bad params:\n"
+                + "\n".join(bad_param_info)
+            )
                 
         return batched_grads_vec, amps
 

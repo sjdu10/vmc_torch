@@ -1,113 +1,213 @@
-from typing import Any, Dict, Optional, Tuple
+import time
+from typing import Tuple
 
 import torch
 
-from vmc_torch.experiment.vmap.GPU.vmc_modules import run_sampling_phase_gpu
-from vmc_torch.experiment.vmap.GPU.vmc_utils import sample_next
+from vmc_torch.experiment.vmap.GPU.vmc_utils import (
+    propose_exchange_or_hopping_vec,
+)
 
 
 class SamplerGPU:
-    """Base sampler interface for GPU VMC drivers."""
+    """Base sampler interface — MCMC only.
 
-    sampling_count_key = "Ns"
+    The sampler only handles Markov chain Monte Carlo
+    (proposing moves, accepting/rejecting). It does NOT
+    evaluate energies or gradients — that is the VMC
+    driver's responsibility.
 
-    def warmup_step(
+    Subclasses must implement step(). burn_in() has a
+    default implementation that calls step() repeatedly.
+    """
+
+    def step(
         self,
         fxs: torch.Tensor,
         model,
         graph,
-        use_export_compile: bool = False,
-        verbose: bool = False,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return sample_next(
-            fxs,
-            model,
-            graph,
-            verbose=verbose,
-            compile=use_export_compile,
-        )
+        """One MCMC sweep over all walkers.
 
-    def run_sampling_phase(
+        Args:
+            fxs: (B, N_sites) int64 walker configs.
+            model: nn.Module with .forward(x) -> (B,).
+            graph: Lattice graph with .row_edges,
+                .col_edges.
+            **kwargs: Sampler-specific options (compile,
+                verbose, etc.)
+
+        Returns:
+            fxs_new: (B, N_sites) int64 updated configs.
+            amps: (B,) float64 amplitudes at fxs_new.
+        """
+        raise NotImplementedError
+
+    def burn_in(
         self,
-        *,
         fxs: torch.Tensor,
         model,
-        hamiltonian,
         graph,
-        ns_per_rank: int,
-        grad_batch_size: int,
-        burn_in: bool,
-        burn_in_steps: int,
-        use_export_compile: bool,
-        sampling_kwargs: Optional[Dict[str, Any]] = None,
-    ):
-        raise NotImplementedError
+        n_steps: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run multiple MCMC sweeps without collecting.
+
+        Args:
+            fxs: (B, N_sites) int64 walker configs.
+            model: nn.Module with .forward(x) -> (B,).
+            graph: Lattice graph.
+            n_steps: Number of burn-in sweeps.
+            **kwargs: Forwarded to step().
+
+        Returns:
+            fxs: (B, N_sites) int64 after burn-in.
+        """
+        for _ in range(n_steps):
+            fxs, _ = self.step(fxs, model, graph, **kwargs)
+        return fxs
 
 
 class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
-    """
-    Default GPU sampler backed by `run_sampling_phase_gpu` and `sample_next`.
+    """Metropolis exchange sampler for spinful fermions.
+
+    Proposes particle exchanges and hoppings on a lattice
+    graph. To create a sampler for different physics
+    (bosons, spins), subclass SamplerGPU and implement
+    step().
+
+    Args:
+        hopping_rate: Fraction of proposals that are
+            hoppings (vs exchanges). Default 0.25.
     """
 
-    def __init__(
-        self,
-        hopping_rate: float = 0.25,
-        sampling_phase_fn=run_sampling_phase_gpu,
-        sample_next_fn=sample_next,
-        sampling_count_key: str = "Ns",
-    ):
+    def __init__(self, hopping_rate: float = 0.25):
         self.hopping_rate = hopping_rate
-        self.sampling_phase_fn = sampling_phase_fn
-        self.sample_next_fn = sample_next_fn
-        self.sampling_count_key = sampling_count_key
 
-    def warmup_step(
+    @torch.inference_mode()
+    def step(
         self,
         fxs: torch.Tensor,
         model,
         graph,
-        use_export_compile: bool = False,
+        compile: bool = False,
         verbose: bool = False,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.sample_next_fn(
-            fxs,
-            model,
-            graph,
-            hopping_rate=self.hopping_rate,
-            verbose=verbose,
-            compile=use_export_compile,
-        )
+        """One Metropolis sweep over all lattice edges.
 
-    def run_sampling_phase(
-        self,
-        *,
-        fxs: torch.Tensor,
-        model,
-        hamiltonian,
-        graph,
-        ns_per_rank: int,
-        grad_batch_size: int,
-        burn_in: bool,
-        burn_in_steps: int,
-        use_export_compile: bool,
-        sampling_kwargs: Optional[Dict[str, Any]] = None,
-    ):
-        kwargs = {} if sampling_kwargs is None else dict(sampling_kwargs)
-        phase_kwargs = dict(
-            fxs=fxs,
-            model=model,
-            hamiltonian=hamiltonian,
-            graph=graph,
-            grad_batch_size=grad_batch_size,
-            burn_in=burn_in,
-            burn_in_steps=burn_in_steps,
-            hopping_rate=self.hopping_rate,
-            verbose=False,
-            compile=use_export_compile,
-        )
-        phase_kwargs[self.sampling_count_key] = ns_per_rank
-        phase_kwargs.update(kwargs)
-        return self.sampling_phase_fn(**phase_kwargs)
+        Iterates over graph.row_edges + graph.col_edges,
+        proposes exchange or hopping for all B walkers at
+        each edge, evaluates amplitudes, and
+        accepts/rejects via |psi'|^2 / |psi|^2.
+
+        Args:
+            fxs: (B, N_sites) int64 walker configs.
+            model: nn.Module with .forward(x) -> (B,).
+            graph: Lattice graph.
+            compile: If True, always evaluate all B configs
+                (no partial batching) for torch.compile.
+            verbose: Print per-edge timing info.
+
+        Returns:
+            fxs: (B, N_sites) int64 updated configs.
+            current_amps: (B,) amplitudes at updated configs.
+        """
+        current_amps = model(fxs)
+        B = fxs.shape[0]
+        device = fxs.device
+
+        n_updates = 0
+        if verbose:
+            t0 = time.time()
+            t_propose = 0.0
+            t_forward = 0.0
+
+        # Collect all edges
+        all_edges = []
+        for edges in graph.row_edges.values():
+            all_edges.extend(edges)
+        for edges in graph.col_edges.values():
+            all_edges.extend(edges)
+
+        for edge in all_edges:
+            n_updates += 1
+            i, j = edge
+
+            if verbose:
+                t00 = time.time()
+            proposed_fxs, new_flags = (
+                propose_exchange_or_hopping_vec(
+                    i, j, fxs, self.hopping_rate,
+                )
+            )
+            if verbose:
+                t11 = time.time()
+                t_propose += t11 - t00
+
+            # Skip if no valid proposals
+            if not new_flags.any():
+                continue
+
+            # Evaluate amplitudes — pad to B for compile
+            proposed_amps = current_amps.clone()
+            n_changed = new_flags.sum().item()
+
+            if verbose:
+                t10 = time.time()
+            if compile:
+                new_proposed_amps = model(proposed_fxs)
+                proposed_amps = new_proposed_amps
+            else:
+                if n_changed == B:
+                    new_proposed_amps = model(proposed_fxs)
+                    proposed_amps = new_proposed_amps
+                else:
+                    changed_fxs = proposed_fxs[new_flags]
+                    changed_amps = model(changed_fxs)
+                    proposed_amps[new_flags] = changed_amps
+
+            if verbose:
+                t11 = time.time()
+                t_forward += t11 - t10
+                print(
+                    f" Edge ({i}, {j}): {n_changed} / {B} "
+                    f"proposed, forward: {t11-t10:.4f}s, "
+                    f"total forward: {t_forward:.4f}s"
+                )
+
+            # Metropolis accept/reject
+            ratio = (
+                (proposed_amps.abs() ** 2)
+                / (current_amps.abs() ** 2 + 1e-18)
+            )
+            probs = torch.rand(B, device=device)
+            accept_mask = new_flags & (probs < ratio)
+
+            if accept_mask.any():
+                fxs[accept_mask] = proposed_fxs[accept_mask]
+                current_amps[accept_mask] = (
+                    proposed_amps[accept_mask]
+                )
+
+        if verbose:
+            t1 = time.time()
+            print(
+                f"Sample next: {t1-t0:.4f}s for "
+                f"{n_updates} edges "
+                f"(avg {(t1-t0)/n_updates:.4f}s/edge, "
+                f"B={B})"
+            )
+            print(
+                f"  Propose: {t_propose:.4f}s "
+                f"(avg {t_propose/n_updates:.4f}s/edge)"
+            )
+            print(
+                f"  Forward: {t_forward:.4f}s "
+                f"(avg {t_forward/n_updates:.4f}s/edge)"
+            )
+
+        return fxs, current_amps
 
 
 __all__ = [

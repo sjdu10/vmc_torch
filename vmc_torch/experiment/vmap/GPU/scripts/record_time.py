@@ -30,7 +30,7 @@ from vmc_torch.experiment.vmap.models.pureTNS import fPEPS_Model
 from vmc_torch.experiment.vmap.GPU.models import (
     fPEPS_Model_GPU,
 )
-from vmc_torch.experiment.vmap.vmap_torch_utils import (
+from vmc_torch.experiment.vmap.GPU.torch_utils import (
     robust_svd_err_catcher_wrapper,
     size_aware_qr,
     size_aware_svd,

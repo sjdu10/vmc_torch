@@ -26,7 +26,7 @@ from vmc_torch.experiment.vmap.GPU.models import (
 from vmc_torch.hamiltonian_torch import (
     spinful_Fermi_Hubbard_square_lattice_torch
 )
-from vmc_torch.experiment.vmap.vmap_torch_utils import (
+from vmc_torch.experiment.vmap.GPU.torch_utils import (
     size_aware_qr,
     size_aware_svd,
 )
@@ -77,8 +77,8 @@ torch.manual_seed(42 + RANK)
 Lx, Ly = 4, 2
 nsites = Lx * Ly
 N_f = nsites - 2
-D = 8
-chi = 8
+D = 4
+chi = -1
 try:
     pwd = (
         '/home/sijingdu/TNVMC/VMC_code/vmc_torch/'
@@ -219,7 +219,7 @@ if RANK == 0:
 t_warm = time.time()
 
 with torch.inference_mode():
-    fxs, amps = sample_next(fxs, fpeps_model, graph)
+    fxs, amps = sample_next(fxs, fpeps_model, graph, compile=USE_EXPORT_COMPILE)
     if RANK == 0:
         print(f"  sample_next:     {time.time()-t_warm:.2f}s")
     t1 = time.time()
@@ -261,6 +261,7 @@ for step in range(vmc_steps):
             burn_in=(step == 0),
             burn_in_steps=burn_in_steps,
             verbose=False,
+            compile=USE_EXPORT_COMPILE
         )
     )
     # print(f'local O norm: {np.linalg.norm(local_O):.3e}') BUG: local_O is 0, grad not passing through??

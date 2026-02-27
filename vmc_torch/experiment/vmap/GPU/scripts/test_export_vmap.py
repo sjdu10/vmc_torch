@@ -17,7 +17,7 @@ import quimb.tensor as qtn
 from vmc_torch.experiment.vmap.GPU.vmc_utils import (
     random_initial_config,
 )
-from vmc_torch.experiment.vmap.vmap_torch_utils import (
+from vmc_torch.experiment.vmap.GPU.torch_utils import (
     robust_svd_err_catcher_wrapper,
 )
 

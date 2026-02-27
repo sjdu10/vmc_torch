@@ -31,18 +31,20 @@ def setup_linalg_hooks(jitter=1e-16, driver=None):
 
 
 def load_or_generate_peps(
-    Lx, Ly, t, U, N_f, D, seed=42, dtype=torch.float64,
-    data_root=DEFAULT_DATA_ROOT,
+    Lx, Ly, t, U, N_f, D, seed=42, dtype=torch.float64, scale_factor=4,
+    data_root=DEFAULT_DATA_ROOT, file_path=None, 
 ):
     """Load a pre-trained fPEPS from disk, or generate a random one."""
     try:
         u1z2 = True
         appendix = '_U1SU' if u1z2 else ''
-
-        base = (
-            f"{data_root}/{Lx}x{Ly}/t={t}_U={U}"
-            f"/N={N_f}/Z2/D={D}/"
-        )
+        if file_path is not None:
+            base = file_path
+        else:
+            base = (
+                f"{data_root}/{Lx}x{Ly}/t={t}_U={U}"
+                f"/N={N_f}/Z2/D={D}/"
+            )
         params_path = base + f"peps_su_params{appendix}.pkl"
         skeleton_path = base + f"peps_skeleton{appendix}.pkl"
 
@@ -54,7 +56,7 @@ def load_or_generate_peps(
         peps = qtn.unpack(params_pkl, skeleton)
 
         for ts in peps.tensors:
-            ts.modify(data=ts.data.to_flat() * 4)
+            ts.modify(data=ts.data.to_flat() * scale_factor)
         for site in peps.sites:
             peps[site].data._label = site
             peps[site].data.indices[-1]._linearmap = (

@@ -69,14 +69,18 @@ def run_sampling_phase_gpu(
         sample_time: float
     """
     B = fxs.shape[0]
-    t_start = time.time()
+    t_samp_total = 0.0
+    t_locE_total = 0.0
+    t_grad_total = 0.0
 
     # Burn-in
     if burn_in:
+        t_burn = time.time()
         for _ in range(burn_in_steps):
             fxs, _ = sample_next(
                 fxs, model, graph, hopping_rate=hopping_rate, compile=compile
             )
+        t_samp_total += time.time() - t_burn
 
     local_energies_list = []
     local_O_list = []
@@ -86,16 +90,21 @@ def run_sampling_phase_gpu(
         needed = min(B, Ns - current_count)
 
         # 1. Sample (one MCMC sweep over B walkers)
+        t0 = time.time()
         fxs, current_amps = sample_next(
             fxs, model, graph, hopping_rate=hopping_rate, compile=compile
         )
+        t_samp_total += time.time() - t0
 
         # 2. Energy
+        t0 = time.time()
         _, local_E = evaluate_energy(
             fxs, model, hamiltonian, current_amps
         )
+        t_locE_total += time.time() - t0
 
         # 3. Grads + inline O_loc (Trick #2)
+        t0 = time.time()
         with torch.enable_grad():
             local_grads, local_amps = compute_grads_gpu(
                 fxs, model,
@@ -107,6 +116,7 @@ def run_sampling_phase_gpu(
         # O_loc = grads / amps (in-place on grads to save memory)
         local_grads /= local_amps.unsqueeze(1)
         # Now local_grads IS O_loc
+        t_grad_total += time.time() - t0
 
         local_energies_list.append(local_E[:needed].detach())
         local_O_list.append(local_grads[:needed].detach())
@@ -119,7 +129,12 @@ def run_sampling_phase_gpu(
     local_energies = torch.cat(local_energies_list, dim=0)   # (Ns,) GPU
     local_O = torch.cat(local_O_list, dim=0)                 # (Ns, Np) GPU
 
-    sample_time = time.time() - t_start
+    sample_time = t_samp_total + t_locE_total + t_grad_total
+    phase_times = {
+        't_samp': t_samp_total,
+        't_locE': t_locE_total,
+        't_grad': t_grad_total,
+    }
 
     if verbose:
         rank = dist.get_rank()
@@ -127,11 +142,13 @@ def run_sampling_phase_gpu(
         print(
             f"  Rank {rank}: {local_energies.shape[0]} samples "
             f"({n_sweeps} sweeps x B={B}), "
-            f"T={sample_time:.2f}s"
+            f"T={sample_time:.2f}s "
+            f"(samp={t_samp_total:.2f} "
+            f"locE={t_locE_total:.2f} "
+            f"grad={t_grad_total:.2f})"
         )
-        # local_energies is a GPU tensor — .shape[0] works fine
 
-    return (local_energies, local_O), fxs, sample_time
+    return (local_energies, local_O), fxs, sample_time, phase_times
 
 
 # ===========================================================================
