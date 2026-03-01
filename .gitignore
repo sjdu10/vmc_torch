@@ -21,4 +21,5 @@ vmc_torch.egg-info/
 *.nsys-rep
 *.pt.trace.json
 vmc_torch/experiment/vmap/data
+vmc_torch/experiment/vmap/GPU/data
 vmc_torch/experiment/vmap/debug
