@@ -567,7 +567,6 @@ class VMC_GPU:
                 diag_shift=config.diag_shift,
                 device=device,
                 run_sr=config.run_sr,
-                use_min_sr=config.use_min_sr,
             )
 
             # --- NaN/Inf check on SR direction ---

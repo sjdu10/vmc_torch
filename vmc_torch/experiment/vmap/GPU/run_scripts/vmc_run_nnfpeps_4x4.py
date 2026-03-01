@@ -59,10 +59,10 @@ CPU_DATA_ROOT = (
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 2048
-    ns_per_rank: int = 2048
+    batch_size: int = 4096*2
+    ns_per_rank: int = 4096*2
     grad_batch_size: int = 1024
-    vmc_steps: int = 10
+    vmc_steps: int = 100
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
     burn_in_steps: int = 0
@@ -98,8 +98,8 @@ def main():
 
         # NN backflow hyperparameters
         nn_eta = 1.0
-        embed_dim = 8
-        hidden_dim = 16
+        embed_dim = 16
+        hidden_dim = N_sites
         kernel_size = 3
         cnn_layers = 1
         init_scale = 1e-5
