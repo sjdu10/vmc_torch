@@ -382,56 +382,52 @@ class VMC_GPU:
                 run_sr=run_sr,
             )
         else:
-            # No preconditioner — raw energy gradient for SGD
+            # No preconditioner — raw energy gradient for SGD.
+            # Stays on GPU: no CPU numpy conversion.
             t0 = time.time()
 
-            if isinstance(local_o, torch.Tensor):
-                local_o_np = local_o.cpu().numpy()
-            else:
-                local_o_np = local_o
-            if isinstance(local_energies, torch.Tensor):
-                local_e_np = local_energies.cpu().numpy()
-            else:
-                local_e_np = local_energies
+            if not isinstance(local_o, torch.Tensor):
+                local_o = torch.tensor(
+                    local_o, device=device,
+                    dtype=torch.float64,
+                )
+            if not isinstance(local_energies, torch.Tensor):
+                local_energies = torch.tensor(
+                    local_energies, device=device,
+                    dtype=torch.float64,
+                )
 
-            n_local = local_e_np.shape[0]
+            n_local = local_energies.shape[0]
             world_size = (
                 dist.get_world_size()
                 if dist.is_initialized() else 1
             )
 
             if n_local > 0:
-                local_sum_O = np.sum(local_o_np, axis=0)
-                local_sum_EO = np.dot(local_e_np, local_o_np)
+                local_sum_O = local_o.sum(dim=0)
+                local_sum_EO = local_energies @ local_o
             else:
-                local_sum_O = np.zeros(
-                    n_params, dtype=np.float64,
+                local_sum_O = torch.zeros(
+                    n_params, device=device,
+                    dtype=torch.float64,
                 )
-                local_sum_EO = np.zeros(
-                    n_params, dtype=np.float64,
+                local_sum_EO = torch.zeros(
+                    n_params, device=device,
+                    dtype=torch.float64,
                 )
 
             if world_size > 1:
-                sum_O_t = torch.tensor(
-                    local_sum_O, device=device,
-                )
-                sum_EO_t = torch.tensor(
-                    local_sum_EO, device=device,
+                dist.all_reduce(
+                    local_sum_O,
+                    op=dist.ReduceOp.SUM,
                 )
                 dist.all_reduce(
-                    sum_O_t, op=dist.ReduceOp.SUM,
+                    local_sum_EO,
+                    op=dist.ReduceOp.SUM,
                 )
-                dist.all_reduce(
-                    sum_EO_t, op=dist.ReduceOp.SUM,
-                )
-                global_sum_O = sum_O_t.cpu().numpy()
-                global_sum_EO = sum_EO_t.cpu().numpy()
-            else:
-                global_sum_O = local_sum_O
-                global_sum_EO = local_sum_EO
 
-            mean_O = global_sum_O / total_samples
-            mean_EO = global_sum_EO / total_samples
+            mean_O = local_sum_O / total_samples
+            mean_EO = local_sum_EO / total_samples
             energy_grad = (
                 mean_EO - energy_mean * mean_O
             )

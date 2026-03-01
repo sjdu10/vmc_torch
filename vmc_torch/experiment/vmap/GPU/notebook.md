@@ -1,5 +1,23 @@
 # GPU VMC Pipeline — Research Notebook
 
+## 2026-03-01: Pure-GPU MINRES for `distributed_minres_solver_gpu`
+
+### Problem
+The MINRES SR solver accepted GPU tensors but immediately moved them to CPU numpy, ran `scipy.sparse.linalg.minres` on CPU, and returned numpy. This caused: (1) large CPU matmuls each MINRES iteration (`(Ns, Np) @ (Np,)` with Ns=4096+, Np=1000+), (2) 2 CPU-GPU transfers per iteration for multi-GPU all_reduce, repeated ~100 times, (3) scipy dependency for a simple algorithm.
+
+### What was done
+- Added `torch_minres()` to `vmc_modules.py`: ~60-line pure-PyTorch MINRES (Paige & Saunders 1975). Lanczos three-term recurrence + Givens rotations + w-vector solution update. One matvec per iteration; all else is O(Np) vector ops. Runs entirely on GPU.
+- Rewrote `distributed_minres_solver_gpu()`: all statistics (`sum_O`, `sum_EO`, `mean_O`, `energy_grad`) computed on GPU via `torch.sum`/`@`/`dist.all_reduce`. Matvec uses `local_O @ x` and `local_O.T @ inner` on GPU. Multi-GPU: `dist.all_reduce` operates on GPU tensors directly (NCCL). Returns GPU tensor `dp` instead of numpy.
+- Added `use_scipy=False` kwarg for fallback to old CPU scipy path (debugging/validation).
+- Rewrote `VMC_GPU.solve_sr_step()` else-branch (no-preconditioner SGD path) to stay on GPU: replaced numpy conversion with `torch.sum`/`@`/`dist.all_reduce`.
+- Updated `PreconditionerGPU.solve` return type from `Tuple[np.ndarray, ...]` to `Tuple[Any, ...]`.
+- No consumer changes needed: `torch.as_tensor(dp, device=device)` is a no-op for GPU tensors.
+
+Files: `vmc_modules.py`, `VMC.py`, `optimizer.py`.
+
+### Verification
+TODO: Run `torchrun --nproc_per_node=1 run_scripts/vmc_run_fpeps.py`, compare energy convergence and SR solve time before/after. Cross-validate with `use_scipy=True`.
+
 ## 2026-03-01: Move `lr_scheduler` and `run_sr` to VMCConfig
 
 Moved `run_sr` and `lr_scheduler` from inline `VMCLoopConfig(...)` calls to the `VMCConfig` dataclass at the top of each run script. This makes all tunable settings visible in one place. `lr_scheduler` is set after `VMCConfig()` construction since it depends on `learning_rate`. Files changed: `vmc_run_fpeps.py`, `vmc_run_fpeps_reuse.py`, `vmc_run_slater.py`, `vmc_run_nnbf.py`, `vmc_run_nnfpeps.py`, `vmc_run_nnfpeps_4x4.py`.

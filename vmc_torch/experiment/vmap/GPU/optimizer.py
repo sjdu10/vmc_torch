@@ -2,7 +2,6 @@ import functools
 import math
 from typing import Any, Optional, Tuple
 
-import numpy as np
 import torch
 
 from vmc_torch.experiment.vmap.GPU.vmc_modules import (
@@ -232,14 +231,20 @@ class PreconditionerGPU:
         diag_shift: float,
         device: torch.device,
         run_sr: bool,
-    ) -> Tuple[np.ndarray, float, Any]:
+    ) -> Tuple[Any, float, Any]:
         raise NotImplementedError
 
 
 class DistributedSRMinresGPU(PreconditionerGPU):
-    def __init__(self, rtol: float = 5e-5, maxiter: int = 100):
+    def __init__(
+        self,
+        rtol: float = 5e-5,
+        maxiter: int = 100,
+        use_scipy: bool = False,
+    ):
         self.rtol = rtol
         self.maxiter = maxiter
+        self.use_scipy = use_scipy
 
     def solve(
         self,
@@ -252,7 +257,7 @@ class DistributedSRMinresGPU(PreconditionerGPU):
         diag_shift: float,
         device: torch.device,
         run_sr: bool,
-    ) -> Tuple[np.ndarray, float, Any]:
+    ) -> Tuple[Any, float, Any]:
         _ = device
         return distributed_minres_solver_gpu(
             local_O=local_o,
@@ -264,6 +269,7 @@ class DistributedSRMinresGPU(PreconditionerGPU):
             rtol=self.rtol,
             maxiter=self.maxiter,
             run_SR=run_sr,
+            use_scipy=self.use_scipy,
         )
 
 
@@ -279,7 +285,7 @@ class MinSRGPU(PreconditionerGPU):
         diag_shift: float,
         device: torch.device,
         run_sr: bool,
-    ) -> Tuple[np.ndarray, float, Any]:
+    ) -> Tuple[Any, float, Any]:
         return minSR_solver_gpu(
             local_O=local_o,
             local_energies=local_energies,

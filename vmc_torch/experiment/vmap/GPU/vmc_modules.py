@@ -11,7 +11,9 @@ Functions:
     run_sampling_phase_gpu  — local sampling + energy + inline O_loc
     distributed_minres_solver_gpu — distributed MINRES via all_reduce
     minSR_solver_gpu        — minSR direct solve (gather to rank 0)
+    torch_minres            — pure-PyTorch MINRES (GPU-native)
 """
+import math
 import time
 import numpy as np
 import torch
@@ -152,6 +154,107 @@ def run_sampling_phase_gpu(
 
 
 # ===========================================================================
+# Pure-PyTorch MINRES (Paige & Saunders 1975)
+# ===========================================================================
+def torch_minres(matvec, b, rtol=1e-5, maxiter=100):
+    """MINRES solver in pure PyTorch — runs entirely on GPU.
+
+    Solves A x = b where A is symmetric (accessed via matvec).
+    Implements Paige & Saunders (1975), mirroring scipy's
+    implementation exactly.
+
+    One matvec call per iteration; all other ops are O(Np) vector
+    arithmetic.  Scalar extractions (.item()) are negligible
+    versus the matvec cost.
+
+    Args:
+        matvec: callable, x -> A @ x (GPU tensor in/out).
+        b: (Np,) right-hand-side GPU tensor.
+        rtol: relative tolerance |r| / |b| < rtol.
+        maxiter: maximum Lanczos iterations.
+
+    Returns:
+        x: (Np,) solution GPU tensor.
+        info: 0 if converged, else maxiter.
+    """
+    b_norm = torch.linalg.norm(b).item()
+    if b_norm == 0:
+        return torch.zeros_like(b), 0
+
+    # Lanczos init: r1 = b, beta1 = ||b||
+    n = b.shape[0]
+    x = torch.zeros_like(b)
+    r1 = b.clone()
+    r2 = b.clone()
+    beta1 = b_norm
+    beta = beta1
+
+    # Givens rotation state
+    cs = -1.0
+    sn = 0.0
+    oldb = 0.0
+    dbar = 0.0
+    epsln = 0.0
+    phibar = beta1
+
+    # w vectors for solution update
+    w = torch.zeros_like(b)
+    w2 = torch.zeros_like(b)
+
+    info = maxiter
+    for itn in range(1, maxiter + 1):
+        # Lanczos step
+        s = 1.0 / beta
+        v = s * r2                          # v_k
+
+        y = matvec(v)
+
+        if itn >= 2:
+            y = y - (beta / oldb) * r1
+
+        alfa = torch.dot(v, y).item()
+        y = y - (alfa / beta) * r2
+
+        r1 = r2
+        r2 = y
+        oldb = beta
+        beta = torch.linalg.norm(r2).item()
+
+        # Apply previous rotation Q_{k-1}
+        oldeps = epsln
+        delta = cs * dbar + sn * alfa
+        gbar = sn * dbar - cs * alfa
+        epsln = sn * beta
+        dbar = -cs * beta
+
+        # Compute new rotation Q_k
+        gamma = math.sqrt(gbar ** 2 + beta ** 2)
+        gamma = max(gamma, 1e-300)
+        cs = gbar / gamma
+        sn = beta / gamma
+        phi = cs * phibar
+        phibar = sn * phibar
+
+        # Update x
+        denom = 1.0 / gamma
+        w1 = w2
+        w2 = w
+        w = (v - oldeps * w1 - delta * w2) * denom
+        x = x + phi * w
+
+        # Convergence: |r| / |b|
+        if abs(phibar) < rtol * b_norm:
+            info = 0
+            break
+
+        if beta == 0.0:
+            info = 0
+            break
+
+    return x, info
+
+
+# ===========================================================================
 # Distributed MINRES SR Solver (via torch.distributed.all_reduce)
 # ===========================================================================
 def distributed_minres_solver_gpu(
@@ -164,6 +267,7 @@ def distributed_minres_solver_gpu(
     rtol=1e-4,
     maxiter=100,
     run_SR=True,
+    use_scipy=False,
 ):
     """
     Distributed SR solver using MINRES with torch.distributed.all_reduce.
@@ -172,95 +276,135 @@ def distributed_minres_solver_gpu(
     for S = (1/N) O^T O - mean_O @ mean_O^T + diag_shift * I
     are computed distributedly via matvec (no Np x Np matrix built).
 
-    For single-GPU (world_size=1), the all_reduce is a no-op and
-    the matvec is pure CPU numpy with zero overhead.
+    By default uses pure-PyTorch MINRES (torch_minres) so everything
+    stays on GPU.  Set use_scipy=True to fall back to the old CPU
+    scipy.sparse.linalg.minres path (for debugging / validation).
 
     Args:
-        local_O: (n_local, Np) numpy array, pre-computed O_loc
-        local_energies: (n_local,) numpy array
-        energy_mean: global mean energy (float)
-        total_samples: total samples across all ranks
-        n_params: number of parameters
-        diag_shift: diagonal regularization
-        rtol: MINRES tolerance
-        maxiter: max MINRES iterations
+        local_O: (n_local, Np) GPU tensor or numpy array.
+        local_energies: (n_local,) GPU tensor or numpy array.
+        energy_mean: global mean energy (float).
+        total_samples: total samples across all ranks.
+        n_params: number of parameters.
+        diag_shift: diagonal regularization.
+        rtol: MINRES tolerance.
+        maxiter: max MINRES iterations.
+        run_SR: if False, return only the energy gradient.
+        use_scipy: if True, use scipy MINRES on CPU (fallback).
 
     Returns:
-        dp: (Np,) numpy array, parameter update
-        sr_time: wall-clock time
-        info: MINRES convergence flag
+        dp: (Np,) GPU tensor (or numpy if use_scipy), param update.
+        sr_time: wall-clock time.
+        info: MINRES convergence flag.
     """
     t0 = time.time()
-    # Accept GPU tensors — convert to numpy once here, not inside matvec
-    if isinstance(local_O, torch.Tensor):
-        local_O = local_O.cpu().numpy()
-    if isinstance(local_energies, torch.Tensor):
-        local_energies = local_energies.cpu().numpy()
-    n_local = local_energies.shape[0]
     world_size = dist.get_world_size()
+    device = torch.device('cuda')
 
-    # --- Compute global statistics via all_reduce ---
-    if n_local > 0:
-        local_sum_O = np.sum(local_O, axis=0)            # (Np,)
-        local_sum_EO = np.dot(local_energies, local_O)   # (Np,)
+    # --- Ensure inputs are GPU tensors ---
+    if not isinstance(local_O, torch.Tensor):
+        local_O = torch.tensor(
+            local_O, device=device, dtype=torch.float64,
+        )
     else:
-        local_sum_O = np.zeros(n_params, dtype=np.float64)
-        local_sum_EO = np.zeros(n_params, dtype=np.float64)
+        local_O = local_O.to(
+            device=device, dtype=torch.float64,
+        )
+    if not isinstance(local_energies, torch.Tensor):
+        local_energies = torch.tensor(
+            local_energies, device=device, dtype=torch.float64,
+        )
+    else:
+        local_energies = local_energies.to(
+            device=device, dtype=torch.float64,
+        )
+    n_local = local_energies.shape[0]
+
+    # --- Compute global statistics via all_reduce on GPU ---
+    if n_local > 0:
+        local_sum_O = local_O.sum(dim=0)              # (Np,)
+        local_sum_EO = local_energies @ local_O       # (Np,)
+    else:
+        local_sum_O = torch.zeros(
+            n_params, device=device, dtype=torch.float64,
+        )
+        local_sum_EO = torch.zeros(
+            n_params, device=device, dtype=torch.float64,
+        )
 
     if world_size > 1:
-        device = torch.device('cuda')
-        sum_O_t = torch.tensor(local_sum_O, device=device)
-        sum_EO_t = torch.tensor(local_sum_EO, device=device)
-        dist.all_reduce(sum_O_t, op=dist.ReduceOp.SUM)
-        dist.all_reduce(sum_EO_t, op=dist.ReduceOp.SUM)
-        global_sum_O = sum_O_t.cpu().numpy()
-        global_sum_EO = sum_EO_t.cpu().numpy()
-    else:
-        # Single rank: no communication needed
-        global_sum_O = local_sum_O
-        global_sum_EO = local_sum_EO
+        dist.all_reduce(local_sum_O, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
 
-    mean_O = global_sum_O / total_samples
-    mean_EO = global_sum_EO / total_samples
-    energy_grad = mean_EO - energy_mean * mean_O  # (Np,)
+    mean_O = local_sum_O / total_samples
+    mean_EO = local_sum_EO / total_samples
+    energy_grad = mean_EO - energy_mean * mean_O  # (Np,) GPU
 
     if not run_SR:
-        # Just return the energy gradient (no SR solve)
         t1 = time.time()
         return energy_grad, t1 - t0, None
 
-    # --- MINRES solver with matvec (no Np x Np matrix) ---
+    # --- MINRES solve ---
+    if use_scipy:
+        # Fallback: move to CPU numpy, use scipy MINRES
+        local_O_np = local_O.cpu().numpy()
+        mean_O_np = mean_O.cpu().numpy()
+        energy_grad_np = energy_grad.cpu().numpy()
+
+        if world_size == 1:
+            def matvec(x):
+                inner = local_O_np.dot(x)
+                Sx = local_O_np.T.dot(inner)
+                Sx /= total_samples
+                Sx -= np.dot(mean_O_np, x) * mean_O_np
+                return Sx + diag_shift * x
+        else:
+            def matvec(x):
+                if n_local > 0:
+                    inner = local_O_np.dot(x)
+                    local_Sx = local_O_np.T.dot(inner)
+                else:
+                    local_Sx = np.zeros_like(x)
+                Sx_t = torch.tensor(local_Sx, device=device)
+                dist.all_reduce(Sx_t, op=dist.ReduceOp.SUM)
+                Sx = Sx_t.cpu().numpy()
+                Sx /= total_samples
+                Sx -= np.dot(mean_O_np, x) * mean_O_np
+                return Sx + diag_shift * x
+
+        A = spla.LinearOperator(
+            (n_params, n_params), matvec=matvec,
+            dtype=np.float64,
+        )
+        dp, info = spla.minres(
+            A, energy_grad_np, rtol=rtol, maxiter=maxiter,
+        )
+        t1 = time.time()
+        return dp, t1 - t0, info
+
+    # --- Pure-GPU MINRES via torch_minres ---
     if world_size == 1:
-        # Single rank: pure numpy matvec, no GPU transfers
-        def matvec(x):
-            inner = local_O.dot(x)           # (n_local,)
-            Sx = local_O.T.dot(inner)         # (Np,)
+        def gpu_matvec(x):
+            inner = local_O @ x               # (n_local,)
+            Sx = local_O.T @ inner             # (Np,)
             Sx /= total_samples
-            Sx -= np.dot(mean_O, x) * mean_O
+            Sx -= torch.dot(mean_O, x) * mean_O
             return Sx + diag_shift * x
     else:
-        # Multi-rank: local matmul + all_reduce of (Np,) vector
-        device = torch.device('cuda')
-
-        def matvec(x):
+        def gpu_matvec(x):
             if n_local > 0:
-                inner = local_O.dot(x)
-                local_Sx = local_O.T.dot(inner)
+                inner = local_O @ x
+                local_Sx = local_O.T @ inner
             else:
-                local_Sx = np.zeros_like(x)
+                local_Sx = torch.zeros_like(x)
+            dist.all_reduce(local_Sx, op=dist.ReduceOp.SUM)
+            local_Sx /= total_samples
+            local_Sx -= torch.dot(mean_O, x) * mean_O
+            return local_Sx + diag_shift * x
 
-            Sx_t = torch.tensor(local_Sx, device=device)
-            dist.all_reduce(Sx_t, op=dist.ReduceOp.SUM)
-            Sx = Sx_t.cpu().numpy()
-
-            Sx /= total_samples
-            Sx -= np.dot(mean_O, x) * mean_O
-            return Sx + diag_shift * x
-
-    A = spla.LinearOperator(
-        (n_params, n_params), matvec=matvec, dtype=np.float64
+    dp, info = torch_minres(
+        gpu_matvec, energy_grad, rtol=rtol, maxiter=maxiter,
     )
-    dp, info = spla.minres(A, energy_grad, rtol=rtol, maxiter=maxiter)
 
     t1 = time.time()
     return dp, t1 - t0, info
