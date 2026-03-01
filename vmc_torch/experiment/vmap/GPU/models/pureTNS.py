@@ -443,6 +443,295 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         )
         return self.amplitude(x, p)
 
+    # ----- Export + compile for reuse patterns -----
+
+    def export_and_compile_reuse(
+        self, example_x, mode='default', verbose=True,
+    ):
+        """Pre-export amplitude_reuse for all reuse patterns.
+
+        For a nearest-neighbor Hamiltonian on Lx x Ly lattice,
+        the possible reuse patterns are:
+          - x-dir, single row r: selected_rows=[r]    (Lx patterns)
+          - x-dir, two rows r,r+1: selected_rows=[r,r+1]  (Lx-1)
+          - y-dir, single col c: selected_cols=[c]    (Ly patterns)
+          - y-dir, two cols c,c+1: selected_cols=[c,c+1]  (Ly-1)
+        Total: 2*(Lx + Ly) - 2 patterns.
+
+        Each pattern is exported via torch.export, vmapped over the
+        batch dimension, and compiled via torch.compile.
+
+        Stores compiled functions in:
+            self._compiled_reuse[(direction, indices_tuple)]
+
+        Args:
+            example_x: (N_sites,) int64 on the target device.
+            mode: torch.compile mode.
+            verbose: Print progress.
+        """
+        import quimb as qu
+        from torch.export import export
+
+        self._compiled_reuse = {}
+        device = example_x.device
+
+        # Compute example bMPS params for slicing
+        x_batch = example_x.unsqueeze(0)  # (1, N_sites)
+        bMPS_x, bMPS_y = self.cache_bMPS_params_vmap(x_batch)
+
+        params_list = list(self.params)
+        n_tn_params = len(params_list)
+
+        patterns = []
+        for direction in ('x', 'y'):
+            L = self.Lx if direction == 'x' else self.Ly
+            for width in (1, 2):
+                for start in range(L - width + 1):
+                    indices = tuple(range(start, start + width))
+                    patterns.append((direction, indices))
+
+        if verbose:
+            print(
+                f"Exporting {len(patterns)} reuse patterns "
+                f"for {self.Lx}x{self.Ly} lattice..."
+            )
+
+        for pat_idx, (direction, indices) in enumerate(patterns):
+            if direction == 'x':
+                bMPS_keys = [
+                    ('xmin', min(indices)),
+                    ('xmax', max(indices)),
+                ]
+                bMPS_min_batched = bMPS_x[bMPS_keys[0]]
+                bMPS_max_batched = bMPS_x[bMPS_keys[1]]
+                in_dims_min = (
+                    self.bMPS_params_x_in_dims[bMPS_keys[0]]
+                )
+                in_dims_max = (
+                    self.bMPS_params_x_in_dims[bMPS_keys[1]]
+                )
+            else:
+                bMPS_keys = [
+                    ('ymin', min(indices)),
+                    ('ymax', max(indices)),
+                ]
+                bMPS_min_batched = bMPS_y[bMPS_keys[0]]
+                bMPS_max_batched = bMPS_y[bMPS_keys[1]]
+                in_dims_min = (
+                    self.bMPS_params_y_in_dims[bMPS_keys[0]]
+                )
+                in_dims_max = (
+                    self.bMPS_params_y_in_dims[bMPS_keys[1]]
+                )
+
+            # Extract single-sample bMPS params for export
+            bMPS_min_single = qu.utils.tree_map(
+                lambda t: t[0], bMPS_min_batched,
+            )
+            bMPS_max_single = qu.utils.tree_map(
+                lambda t: t[0], bMPS_max_batched,
+            )
+
+            # Flatten bMPS params for export
+            bMPS_min_flat, bMPS_min_pytree = (
+                qu.utils.tree_flatten(
+                    bMPS_min_single, get_ref=True,
+                )
+            )
+            bMPS_max_flat, bMPS_max_pytree = (
+                qu.utils.tree_flatten(
+                    bMPS_max_single, get_ref=True,
+                )
+            )
+
+            n_min = len(bMPS_min_flat)
+            n_max = len(bMPS_max_flat)
+
+            # Build the single-sample wrapper
+            selected_rows = (
+                list(indices) if direction == 'x' else None
+            )
+            selected_cols = (
+                list(indices) if direction == 'y' else None
+            )
+            bMPS_keys_frozen = list(bMPS_keys)
+
+            def make_wrapper(
+                _bMPS_keys, _bMPS_min_pytree, _bMPS_max_pytree,
+                _n_tn, _n_min, _selected_rows, _selected_cols,
+                _direction,
+            ):
+                def wrapper(x, *flat_args):
+                    tn_params = list(flat_args[:_n_tn])
+                    min_params = list(
+                        flat_args[_n_tn:_n_tn + _n_min]
+                    )
+                    max_params = list(
+                        flat_args[_n_tn + _n_min:]
+                    )
+                    bMPS_min = qu.utils.tree_unflatten(
+                        min_params, _bMPS_min_pytree,
+                    )
+                    bMPS_max = qu.utils.tree_unflatten(
+                        max_params, _bMPS_max_pytree,
+                    )
+                    if _direction == 'x':
+                        return self.amplitude_reuse(
+                            x,
+                            qu.utils.tree_unflatten(
+                                tn_params, self.params_pytree,
+                            ),
+                            bMPS_keys=_bMPS_keys,
+                            bMPS_params_xmin=bMPS_min,
+                            bMPS_params_xmax=bMPS_max,
+                            selected_rows=_selected_rows,
+                        )
+                    else:
+                        return self.amplitude_reuse(
+                            x,
+                            qu.utils.tree_unflatten(
+                                tn_params, self.params_pytree,
+                            ),
+                            bMPS_keys=_bMPS_keys,
+                            bMPS_params_ymin=bMPS_min,
+                            bMPS_params_ymax=bMPS_max,
+                            selected_cols=_selected_cols,
+                        )
+                return wrapper
+
+            wrapper_fn = make_wrapper(
+                bMPS_keys_frozen, bMPS_min_pytree,
+                bMPS_max_pytree,
+                n_tn_params, n_min,
+                selected_rows, selected_cols, direction,
+            )
+
+            # Export
+            import torch.nn as nn_mod
+
+            class _ReuseModule(nn_mod.Module):
+                def __init__(self_, fn):
+                    super().__init__()
+                    self_._fn = fn
+
+                def forward(self_, x, *flat_args):
+                    return self_._fn(x, *flat_args)
+
+            all_flat_args = (
+                params_list + bMPS_min_flat + bMPS_max_flat
+            )
+
+            try:
+                with torch.no_grad():
+                    exported = export(
+                        _ReuseModule(wrapper_fn),
+                        (example_x, *all_flat_args),
+                    )
+                exported_module = exported.module()
+
+                # Move CPU constants to GPU
+                self._move_exported_constants_to_device(
+                    device,
+                    exported_module=exported_module,
+                )
+
+                # Flatten in_dims for bMPS params
+                in_dims_min_flat, _ = qu.utils.tree_flatten(
+                    in_dims_min, get_ref=True,
+                )
+                in_dims_max_flat, _ = qu.utils.tree_flatten(
+                    in_dims_max, get_ref=True,
+                )
+
+                n_total_args = n_tn_params + n_min + n_max
+                in_dims_tuple = (
+                    (0,)  # x batched
+                    + tuple([None] * n_tn_params)  # TN params
+                    + tuple(in_dims_min_flat)  # bMPS_min
+                    + tuple(in_dims_max_flat)  # bMPS_max
+                )
+
+                vmapped = torch.vmap(
+                    exported_module,
+                    in_dims=in_dims_tuple,
+                )
+                compiled = torch.compile(
+                    vmapped, mode=mode,
+                )
+
+                key = (direction, indices)
+                self._compiled_reuse[key] = {
+                    'fn': compiled,
+                    'bMPS_min_pytree': bMPS_min_pytree,
+                    'bMPS_max_pytree': bMPS_max_pytree,
+                    'n_tn': n_tn_params,
+                    'n_min': n_min,
+                    'bMPS_keys': bMPS_keys_frozen,
+                }
+
+                if verbose:
+                    print(
+                        f"  [{pat_idx+1}/{len(patterns)}] "
+                        f"({direction}, {indices}) OK"
+                    )
+            except Exception as e:
+                if verbose:
+                    print(
+                        f"  [{pat_idx+1}/{len(patterns)}] "
+                        f"({direction}, {indices}) FAILED: {e}"
+                    )
+
+        if verbose:
+            print(
+                f"Exported {len(self._compiled_reuse)}"
+                f"/{len(patterns)} patterns"
+            )
+
+    def _move_exported_constants_to_device(
+        self, device, exported_module=None,
+    ):
+        """Move CPU constants in exported graph to GPU.
+
+        Extended to accept an external exported_module for
+        reuse patterns.
+        """
+        if exported_module is None:
+            # Use the base class version for the main module
+            super()._move_exported_constants_to_device(device)
+            return
+
+        gm = exported_module
+        graph = gm.graph
+        for node in graph.nodes:
+            if node.op != 'get_attr':
+                continue
+            parts = node.target.split('.')
+            parent = gm
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            leaf = parts[-1]
+            tensor = getattr(parent, leaf)
+            if (
+                isinstance(tensor, torch.Tensor)
+                and tensor.device.type == 'cpu'
+            ):
+                setattr(parent, leaf, tensor.to(device))
+
+        for node in graph.nodes:
+            if node.op != 'call_function':
+                continue
+            if '_assert_tensor_metadata' not in str(
+                node.target
+            ):
+                continue
+            kw = dict(node.kwargs)
+            if kw.get('device') == torch.device('cpu'):
+                kw['device'] = device
+                node.kwargs = kw
+
+        graph.lint()
+        gm.recompile()
+
     # ----- forward -----
 
     def forward(self, x):
@@ -463,7 +752,74 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         selected_rows=None,
         selected_cols=None,
     ):
-        """Eager reuse forward path."""
+        """Reuse forward path — compiled if available, else eager.
+
+        Dispatches to pre-compiled reuse function when
+        export_and_compile_reuse has been called and the pattern
+        matches. Falls back to eager vamp_reuse otherwise.
+        """
+        import quimb as qu
+
+        # Determine the reuse key
+        if selected_rows is not None:
+            key = ('x', tuple(selected_rows))
+            bMPS_keys = [
+                ('xmin', min(selected_rows)),
+                ('xmax', max(selected_rows)),
+            ]
+            bMPS_params_xmin = bMPS_params_x_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_xmax = bMPS_params_x_batched[
+                bMPS_keys[1]
+            ]
+        elif selected_cols is not None:
+            key = ('y', tuple(selected_cols))
+            bMPS_keys = [
+                ('ymin', min(selected_cols)),
+                ('ymax', max(selected_cols)),
+            ]
+            bMPS_params_ymin = bMPS_params_y_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_ymax = bMPS_params_y_batched[
+                bMPS_keys[1]
+            ]
+        else:
+            key = None
+
+        # Try compiled path
+        if (
+            key is not None
+            and hasattr(self, '_compiled_reuse')
+            and key in self._compiled_reuse
+        ):
+            entry = self._compiled_reuse[key]
+            params_list = list(self.params)
+
+            if selected_rows is not None:
+                bMPS_min_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_xmin, get_ref=True,
+                )
+                bMPS_max_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_xmax, get_ref=True,
+                )
+            else:
+                bMPS_min_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_ymin, get_ref=True,
+                )
+                bMPS_max_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_ymax, get_ref=True,
+                )
+
+            return entry['fn'](
+                x,
+                *params_list,
+                *bMPS_min_flat,
+                *bMPS_max_flat,
+            )
+
+        # Fallback to eager
         bMPS_params_xmin = None
         bMPS_params_xmax = None
         bMPS_params_ymin = None
@@ -475,15 +831,23 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 ('xmin', min(selected_rows)),
                 ('xmax', max(selected_rows)),
             ]
-            bMPS_params_xmin = bMPS_params_x_batched[bMPS_keys[0]]
-            bMPS_params_xmax = bMPS_params_x_batched[bMPS_keys[1]]
+            bMPS_params_xmin = bMPS_params_x_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_xmax = bMPS_params_x_batched[
+                bMPS_keys[1]
+            ]
         if selected_cols is not None:
             bMPS_keys = [
                 ('ymin', min(selected_cols)),
                 ('ymax', max(selected_cols)),
             ]
-            bMPS_params_ymin = bMPS_params_y_batched[bMPS_keys[0]]
-            bMPS_params_ymax = bMPS_params_y_batched[bMPS_keys[1]]
+            bMPS_params_ymin = bMPS_params_y_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_ymax = bMPS_params_y_batched[
+                bMPS_keys[1]
+            ]
 
         return self.vamp_reuse(
             x, self.params,

@@ -85,7 +85,10 @@ class VMCLoopConfig:
     # O_loc outlier clipping: drop samples whose per-sample
     # |O_loc| norm exceeds clip_factor * median(|O_loc| norms).
     # Set to 0 to disable.  Typical value: 5-10.
-    outlier_clip_factor: float = 5.0
+    outlier_clip_factor: float = 100.0
+    # Optional LR scheduler: callable(step) -> float.
+    # If set, overrides learning_rate each step.
+    lr_scheduler: object = None
 
 
 class VMC_GPU:
@@ -104,16 +107,12 @@ class VMC_GPU:
         optimizer: Optional[OptimizerGPU] = None,
         evaluate_energy_fn: Callable = evaluate_energy,
         compute_grads_fn: Callable = compute_grads_gpu,
-        distributed_sr_solver_fn: Callable = distributed_minres_solver_gpu,
-        min_sr_solver_fn: Callable = minSR_solver_gpu,
     ):
         self.sampler = sampler
         self.preconditioner = preconditioner
         self.optimizer = optimizer
         self.evaluate_energy_fn = evaluate_energy_fn
         self.compute_grads_fn = compute_grads_fn
-        self.distributed_sr_solver_fn = distributed_sr_solver_fn
-        self.min_sr_solver_fn = min_sr_solver_fn
 
     # ----------------------------------------------------------
     # Sampling phase: MCMC + energy + gradients
@@ -370,7 +369,6 @@ class VMC_GPU:
         diag_shift,
         device,
         run_sr,
-        use_min_sr,
     ):
         if self.preconditioner is not None:
             return self.preconditioner.solve(
@@ -383,29 +381,61 @@ class VMC_GPU:
                 device=device,
                 run_sr=run_sr,
             )
+        else:
+            # No preconditioner — raw energy gradient for SGD
+            t0 = time.time()
 
-        if use_min_sr:
-            return self.min_sr_solver_fn(
-                local_O=local_o,
-                local_energies=local_energies,
-                energy_mean=energy_mean,
-                total_samples=total_samples,
-                n_params=n_params,
-                diag_shift=diag_shift,
-                device=device,
-                do_SR=run_sr,
+            if isinstance(local_o, torch.Tensor):
+                local_o_np = local_o.cpu().numpy()
+            else:
+                local_o_np = local_o
+            if isinstance(local_energies, torch.Tensor):
+                local_e_np = local_energies.cpu().numpy()
+            else:
+                local_e_np = local_energies
+
+            n_local = local_e_np.shape[0]
+            world_size = (
+                dist.get_world_size()
+                if dist.is_initialized() else 1
             )
 
-        return self.distributed_sr_solver_fn(
-            local_O=local_o,
-            local_energies=local_energies,
-            energy_mean=energy_mean,
-            total_samples=total_samples,
-            n_params=n_params,
-            diag_shift=diag_shift,
-            rtol=5e-5,
-            run_SR=run_sr,
-        )
+            if n_local > 0:
+                local_sum_O = np.sum(local_o_np, axis=0)
+                local_sum_EO = np.dot(local_e_np, local_o_np)
+            else:
+                local_sum_O = np.zeros(
+                    n_params, dtype=np.float64,
+                )
+                local_sum_EO = np.zeros(
+                    n_params, dtype=np.float64,
+                )
+
+            if world_size > 1:
+                sum_O_t = torch.tensor(
+                    local_sum_O, device=device,
+                )
+                sum_EO_t = torch.tensor(
+                    local_sum_EO, device=device,
+                )
+                dist.all_reduce(
+                    sum_O_t, op=dist.ReduceOp.SUM,
+                )
+                dist.all_reduce(
+                    sum_EO_t, op=dist.ReduceOp.SUM,
+                )
+                global_sum_O = sum_O_t.cpu().numpy()
+                global_sum_EO = sum_EO_t.cpu().numpy()
+            else:
+                global_sum_O = local_sum_O
+                global_sum_EO = local_sum_EO
+
+            mean_O = global_sum_O / total_samples
+            mean_EO = global_sum_EO / total_samples
+            energy_grad = (
+                mean_EO - energy_mean * mean_O
+            )
+            return energy_grad, time.time() - t0, None
 
     # ----------------------------------------------------------
     # Parameter update
@@ -453,7 +483,6 @@ class VMC_GPU:
         rank,
         world_size,
         config: VMCLoopConfig,
-        sampling_kwargs: Optional[Dict[str, Any]] = None,
         on_step_end: Optional[
             Callable[[Dict[str, Any]], None]
         ] = None,
@@ -551,6 +580,12 @@ class VMC_GPU:
                     f"{dp_inf} Inf out of {dp_t.numel()}"
                 )
 
+            if config.lr_scheduler is not None:
+                global_step = step + config.step_offset
+                config.learning_rate = config.lr_scheduler(
+                    global_step,
+                )
+
             self.apply_parameter_update(
                 model, dp, config.learning_rate, device,
             )
@@ -596,10 +631,14 @@ class VMC_GPU:
                 t_s = phase_times.get('t_samp', 0.0)
                 t_e = phase_times.get('t_locE', 0.0)
                 t_g = phase_times.get('t_grad', 0.0)
+                lr_str = (
+                    f" lr={config.learning_rate:.2e}"
+                    if config.lr_scheduler is not None else ""
+                )
                 print(
                     f"Step {global_step:3d} | E/site: "
                     f"{e_per_site:.6f} "
-                    f"+/- {err:.6f} | N={total_ns} | "
+                    f"+/- {err:.6f} | N={total_ns}{lr_str} | "
                     f"T_samp={t_s:.1f}s T_locE={t_e:.1f}s "
                     f"T_grad={t_g:.1f}s T_SR={t_sr:.2f}s "
                     f"T_total={step_time:.1f}s"

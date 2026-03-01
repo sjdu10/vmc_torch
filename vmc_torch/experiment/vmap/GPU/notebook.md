@@ -1,5 +1,255 @@
 # GPU VMC Pipeline — Research Notebook
 
+## 2026-03-01: Move `lr_scheduler` and `run_sr` to VMCConfig
+
+Moved `run_sr` and `lr_scheduler` from inline `VMCLoopConfig(...)` calls to the `VMCConfig` dataclass at the top of each run script. This makes all tunable settings visible in one place. `lr_scheduler` is set after `VMCConfig()` construction since it depends on `learning_rate`. Files changed: `vmc_run_fpeps.py`, `vmc_run_fpeps_reuse.py`, `vmc_run_slater.py`, `vmc_run_nnbf.py`, `vmc_run_nnfpeps.py`, `vmc_run_nnfpeps_4x4.py`.
+
+## 2026-03-01: Raw energy gradient (no SR) in VMC_GPU.solve_sr_step
+
+Implemented the `else` branch in `VMC_GPU.solve_sr_step()` for when `preconditioner is None`. Computes the raw energy gradient `energy_grad = <E*O> - <E><O>` with correct multi-GPU aggregation via `dist.all_reduce` of `local_sum_O` and `local_sum_EO`. Returns `(energy_grad, elapsed_time, None)` matching the preconditioner return signature.
+
+File: `VMC.py`, lines 385–439.
+
+## 2026-02-27: Eliminate torch.compile Graph Breaks in CNN Backflow
+
+### Question
+Profiling showed the CNN dominates NN-fPEPS forward time (240ms out of 241ms at B=4096) and has `torch.compile` graph breaks from: dict iteration (`self.group_indices.items()`), `.tolist()` on tensors, Python scatter loop, and Python list assembly + `torch.cat`. Can we make the CNN fully compile-friendly?
+
+### What was done
+Rewrote `_CNN_Geometric_Backflow_GPU` in `models/NNfTNS.py`:
+- **`__init__`**: Replaced `group_indices` dict with registered buffers (`_gather_0`, `_gather_1`, ...) that auto-follow `.to(device)`. Changed `ModuleDict` → `ModuleList` for heads. Added `_site_order_idx` permutation buffer that maps group-order concatenation → site-order.
+- **`forward`**: Loop over `zip(self._gather_buf_names, self.heads)` (fixed-length Python lists, unrolled by compile), `index_select` for gathering, `head(group_feats).flatten(1)` per group, `torch.cat` in group order, then `out[:, self._site_order_idx]` to reorder. No `.tolist()`, no dict iteration, no dynamic scatter.
+- **`initialize_output_scale`**: Iterate `self.heads` (ModuleList) directly.
+
+### Verification
+- `torch.compile(fullgraph=True)`: **PASS** — zero graph breaks
+- `functional_call + fullgraph=True`: **PASS** — works in the `vamp()` path too
+- Output correctness: **exact match** (max diff = 0.0e+00) between eager and compiled
+- Full model integration (`Conv2D_Geometric_fPEPS_GPU`): NN param names auto-update to `heads.0.weight` (was `heads.CORNER_TL.weight`), `functional_call` works correctly.
+- Test script: `GPU/scripts/test_cnn_compile.py`
+
+### Timing Results (RTX 4080, 4x2 lattice, D=4, chi=-1 exact)
+NN: embed=8, hidden=16, kernel=3, 1 layer. Full model forward (CNN + TN).
+
+| B | Eager | Export+Compile | Speedup |
+|---|---|---|---|
+| 64 | 29.5 ms | 2.4 ms | 12.3x |
+| 256 | 31.9 ms | 7.2 ms | 4.4x |
+| 1024 | 53.3 ms | 26.9 ms | 2.0x |
+| 4096 | 134.6 ms | 106.7 ms | 1.3x |
+
+Speedup largest at small B where kernel launch overhead dominates. At B=4096, Conv2d/Linear GEMMs dominate. Previous export+compile with graph breaks gave only 1.1x; now with zero breaks we get 1.3x.
+
+CNN-only timing at B=4096: eager=106ms, compiled(reduce-overhead)=97.6ms → 1.09x. The CNN is dominated by cuDNN/cuBLAS compute; fusion helps the smaller ops (embedding, coord concat, index_select, permutation).
+
+### Scaling with System Size / Bond Dimension (B=4096, RTX 4080, chi=-1)
+
+| System | CNN (ms) | TN eager (ms) | Total eager (ms) | Compiled (ms) | Speedup |
+|---|---|---|---|---|---|
+| 4x2 D=4 | 106 | 27 | 133 | 112 | 1.19x |
+| 4x2 D=8 | 109 | 30 | 139 | 110 | 1.26x |
+| 4x4 D=4 | 111 | 69 | 180 | 112 | 1.60x |
+| 4x4 D=8 | 131 | 133 | 264 | 163 | 1.62x |
+
+CNN cost is ~flat (~110ms) regardless of D. At larger D, TN dominates and export+compile speedup approaches ~2-3x. The CNN is now the fixed overhead floor.
+
+### Remaining
+- Run VMC test: `torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps.py` to verify energy + timing
+- Consider slimming CNN architecture or using mixed precision (float32 CNN) to reduce the ~110ms floor
+
+## 2026-02-27: Export+Compile for NN-fPEPS Model
+
+### Question
+The NN-fPEPS model (`Conv2D_Geometric_fPEPS_GPU`) works in eager mode but is ~3x slower than pure fPEPS per VMC step (7.5s vs 2.4s). `torch.compile` alone gives no speedup because dynamo cannot trace through quimb/symmray. Can we apply the export+compile pipeline to NN-fPEPS?
+
+### Design
+Key insight: **export only the TN contraction** (quimb/symmray), not the CNN (standard PyTorch ops that dynamo traces natively).
+
+1. `_tn_contraction_for_export(x, nn_output, *ftn_params)` — flat-args wrapper for the TN contraction
+2. `torch.export` traces only the TN part into pure aten-ops FX graph
+3. `torch.vmap` batches the exported TN: `in_dims=(0, 0, None*n_ftn)` — x and nn_output batched, TN params broadcast
+4. Combined forward function: CNN in batch mode (via `functional_call`) -> exported+vmapped TN
+5. `torch.compile` fuses the whole thing
+
+`vamp()` stays unchanged (eager) — used by `compute_grads_gpu` inside `torch.vmap(torch.func.grad(...))`.
+
+### What was done
+- Added to `models/NNfTNS.py`:
+  - `_tn_contraction_for_export()` — flat-args wrapper
+  - `export_and_compile()` — export TN, vmap, build combined forward, compile
+  - `export_only()` — export+vmap without compile (for debugging)
+  - `_move_exported_tn_constants_to_device()` — move symmray CPU constants to GPU
+  - Updated `forward()` dispatch: compiled -> exported -> eager
+- Updated `run_scripts/vmc_run_nnfpeps.py`:
+  - `USE_EXPORT_COMPILE = True` flag
+  - Export+compile block after `model.to(device)`
+  - `VMCWarmupConfig` and `VMCLoopConfig` use `USE_EXPORT_COMPILE`
+
+### Verification
+- Import: OK
+- Syntax: OK
+- Runtime test: `torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps.py` — **passed**
+
+### Results: 4x2 Fermi-Hubbard, t=1, U=8, N_f=6, D=4, chi=-1, Ns=4096, MinSR, lr=0.05, 1 GPU
+
+| Metric | Export+Compile | Eager (baseline) |
+|---|---|---|
+| Export time | 3.3s | N/A |
+| T_total/step | ~7.4s | ~7.5s |
+| T_samp | 2.8s | 2.4s |
+| T_locE | 3.2s | 3.7s |
+| T_grad | 0.8s | 0.8s |
+| E/site (100 steps) | -0.643 -> -0.707 (min -0.708) | -0.643 -> -0.707 |
+
+Compiled vs eager is roughly equivalent. Profiling explains why:
+
+### Forward call breakdown (B=4096, 4x2, D=4, chi=-1)
+
+| Component | Time | % of NN-fPEPS |
+|---|---|---|
+| Pure fPEPS (compiled) | 2.9 ms | — |
+| Pure fPEPS (eager) | 32.1 ms | — (10.9x speedup) |
+| NN-fPEPS (compiled) | 241 ms | 100% |
+| NN-fPEPS (eager) | 277 ms | — (1.1x speedup) |
+| CNN-only | 240 ms | **100%** |
+| Exported TN-only | 26.5 ms | 11% |
+
+**Root cause: CNN dominates.** The TN export works (26.5ms exported TN vs 2.9ms pure fPEPS is same ballpark after adding backflow cat/split ops). But the CNN takes 240ms — it's the bottleneck. The `functional_call` + Python loops in geometric heads likely cause graph breaks in `torch.compile`, so CNN runs in eager mode even inside the compiled function.
+
+Each VMC step makes ~30 forward calls (10 edges sampling + ~20 chunks energy), so 30 * 240ms = 7.2s matches the observed ~7.4s/step.
+
+### Optimization path
+To get real speedup, need to speed up the CNN:
+1. Eliminate graph breaks: replace Python loops/dict iteration in geometric heads with pure tensor ops
+2. Or: pre-compute CNN output once per sweep, reuse for TN calls (CNN output only depends on config, not which edge is being evaluated)
+
+---
+
+## 2026-02-27: Conv2D-Geometric NN-fPEPS Model
+
+### Question
+Port the CPU `Conv2D_Geometric_fPEPS_Model_Cluster` (from `vmap/models/ConvNNfTNS.py`) to the GPU `WavefunctionModel_GPU` framework, combining CNN geometric backflow with fPEPS tensor network contraction.
+
+### What was done
+- Created `models/NNfTNS.py` with two classes:
+  - `_CNN_Geometric_Backflow_GPU(nn.Module)`: CNN backbone + per-geometry-type output heads (up to 9 types: 4 corners, 4 edges, 1 bulk). Shared embedding + coordinate grid + Conv2D backbone -> per-site Linear heads. Output: `(B, total_ftn_params)`.
+  - `Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU)`: Combines CNN backflow + fPEPS TN contraction. Two-level evaluation in `vamp()`: (1) CNN runs on full batch via `functional_call`, (2) `torch.vmap` runs TN contraction per sample with additive backflow `ftn_vector + nn_eta * nn_output`.
+- Parameter layout: `[TN_param_0, ..., TN_param_{N-1}, NN_param_0, ..., NN_param_{M-1}]`.
+- NN module hidden from `nn.Module` child scanning via `self._nn_container = [module]` (same pattern as `AttentionNNBF_GPU`).
+- `amplitude()` also implemented for single-sample eval / export compatibility.
+- Small-init output heads (`init_scale=1e-5`) so model starts near pure fPEPS.
+- Registered in `models/__init__.py`.
+- Created `run_scripts/vmc_run_nnfpeps.py` for 4x2 Fermi-Hubbard test.
+
+### Verification (4x2 lattice, D=4, chi=-1, N_f=6)
+- Import: OK
+- Instantiation: 10976 params (8 TN tensors + 17 NN param groups)
+- Single-sample `amplitude()`: OK
+- Batch `forward()` / `vamp()`: shape `(B,)`, values match
+- Per-sample gradient via `torch.func.grad`: OK (grad norm ~52)
+
+### VMC comparison: 4x2 Fermi-Hubbard, t=1, U=8, N_f=6, D=4, chi=-1 (exact), Ns=4096, MinSR, lr=0.05, 1 GPU
+
+| Model | Np | E/site (step 50) | E/site (step 100) | min E/site | Time/step |
+|---|---|---|---|---|---|
+| Pure fPEPS | 640 | -0.648 | -0.675 | -0.679 | ~2.4s |
+| NN-fPEPS (CNN Geometric, embed=8, hid=16, 2 layers) | 10976 | -0.653 | **-0.683** | **-0.683** | ~7.5s |
+
+NN-fPEPS reaches slightly lower energy (-0.683 vs -0.679). Convergence similar in first 50 steps; NN-fPEPS continues to push lower where pure fPEPS plateaus. Cost: ~3x slower per step.
+
+### torch.compile attempt
+- `torch.compile(model)` runs without error and produces correct results + gradients
+- But gives **no speedup** (0.99x) — dynamo can't trace through vmap + quimb/symmray dispatch
+- Would need `torch.export` on the TN contraction part separately, then compose with CNN
+- The pure fPEPS model gets ~10x from export+compile because export flattens quimb/symmray into aten ops first
+
+### Remaining
+- Tune `nn_eta`, CNN width/depth, number of layers
+- Test on larger lattices (4x4) and with finite chi where backflow may help more
+- Implement export+compile for NN-fPEPS: export only `_tn_contraction`, keep CNN eager
+
+---
+
+## 2026-02-27: NNBF (Neural Network Backflow) Model
+
+### Question
+Add a simple MLP-based neural network backflow model `NNBF_GPU` to the GPU models.
+
+### What was done
+- Rewrote `models/NNBF.py` from a Slater determinant copy to a proper NNBF model: `psi(x) = det((M_base + scale * MLP(n(x)))[occupied, :])`.
+- Input: binary occupation vector `n = [spin_up | spin_dn]` of length `2*N_sites` (no embedding layer). The same `n` is reused for orbital selection via `argsort`.
+- MLP architecture: `n` (binary) -> multi-layer MLP -> reshape to `delta_M`. User-configurable: `hidden_dim`, `n_layers` (default 2), `activation` (tanh/relu/gelu/silu/sigmoid).
+- Output layer initialized to zero so the model starts as a plain Slater determinant; `bf_scale` controls initial correction magnitude.
+- Registered `NNBF_GPU` in `models/__init__.py`.
+
+- Added `AttentionNNBF_GPU` as a second model demonstrating the `torch.func.functional_call` pattern for using standard `nn.Module` layers (nn.Linear, nn.LayerNorm, F.scaled_dot_product_attention) within the params_list interface. Key trick: hide the module in a plain list (`self._nn_container = [mod]`) to prevent double parameter registration, then reconstruct param dict from names in `amplitude()`.
+
+### Attention depth sweep: 4x2 Fermi-Hubbard, t=1, U=8, N_f=6, 1 GPU, B=1024, Ns=1024
+
+200-step VMC (MinSR, lr=0.05, diag_shift=1e-3). Attention uses d_model=32, n_heads=4.
+
+| Model | Np | E/site (step 50) | E/site (step 200) | min E/site |
+|---|---|---|---|---|
+| MLP (h=32, L=2) | 4864 | -0.489 | **-0.554** | **-0.556** |
+| Attn L=1 | 4646 | -0.365 | -0.467 | -0.469 |
+| Attn L=2 | 8934 | -0.386 | -0.506 | -0.509 |
+| Attn L=3 | 13222 | -0.392 | -0.487 | -0.497 |
+| Attn L=4 | 17510 | -0.376 | -0.391 | -0.414 |
+
+Observations:
+- **Larger models do need longer training.** At 50 steps, Attn L=2 was at -0.39; by step 200 it reached -0.51, nearly matching MLP's 50-step result (-0.50).
+- MLP still converges fastest and reaches lowest energy (-0.556).
+- Attn L=2 is the best attention variant (min -0.509), close to MLP despite 2x params.
+- Attn L=3 is still catching up at step 200 (-0.497), may improve further.
+- Attn L=4 (17.5k params) struggles to optimize — converges slowest, worst final energy. Likely needs even more steps, smaller lr, or warmup schedule.
+- Bug fix: output projection was zero-initialized, killing gradients for all preceding attention layers. Changed to `Normal(std=1e-3)` init.
+
+Script: `run_scripts/vmc_run_nnbf.py`. Results: `data/4x2/nnbf_depth_sweep/depth_sweep.json`.
+
+### Remaining
+- Benchmark against plain `SlaterDeterminant_GPU` (no backflow) as lower bound.
+- Try attention on larger systems where long-range correlations may matter more.
+- Try longer runs (500+ steps) for L=3,4 to see if they eventually catch up.
+
+---
+
+## 2026-02-27: bMPS Reuse Port to GPU + 4x4 fPEPS Reuse Run Script
+
+### Question
+Port the bMPS reuse machinery from the CPU pipeline (`vmap/vmap_utils.py` and `vmap/models/pureTNS.py`) to the GPU pipeline, then create a run script for 4x4 spinful Fermi-Hubbard with `fPEPS_Model_reuse_GPU`.
+
+### What was done
+
+1. **`sampler.py` — `MetropolisExchangeSpinfulSamplerReuse_GPU`**: New `SamplerGPU` subclass implementing two-phase bMPS-cached MCMC sweep. Phase 1 sweeps x-direction row edges with `cache_bMPS_params_any_direction_vmap(fxs, 'x')`, evaluates proposals via `forward_reuse(selected_rows=...)`, and incrementally updates via `update_bMPS_params_to_row_vmap`. Phase 2 does the same for y-direction col edges. All proposals/accept-reject are fully vectorized (no Python loop over samples).
+
+2. **`vmc_utils.py` — `detect_changed_row_col_pair` and `evaluate_energy_reuse`**:
+   - `detect_changed_row_col_pair(fx1, fx2, Ly)`: Classifies connected config changes as row-aligned, col-aligned, or diagonal. Compares at most 2 changed sites in 2D coordinates.
+   - `evaluate_energy_reuse(fxs, model, H, current_amps)`: Caches both x/y bMPS for all B walkers, gets connected configs via `get_conn_batch_gpu`, groups them by `(mode, affected_indices)`, evaluates each group with sliced parent bMPS environments via `forward_reuse`, assembles local energies via `index_add_`. Diagonal terms reuse `current_amps` directly.
+   - `_slice_env_dict`: Helper to index into batched bMPS pytree dicts.
+
+3. **`models/pureTNS.py` — `export_and_compile_reuse`**: Pre-exports `amplitude_reuse` for all `2*(Lx+Ly)-2` reuse patterns (14 for 4x4). Each pattern builds a wrapper that takes `(x, *tn_flat, *bMPS_min_flat, *bMPS_max_flat)`, exports via `torch.export`, vmaps over batch dim, and compiles. Stored in `self._compiled_reuse[(direction, indices)]`. `forward_reuse` dispatches to compiled path when available, falls back to eager.
+
+4. **`run_scripts/vmc_run_fpeps_reuse.py`**: Run script for 4x4 Fermi-Hubbard (14 fermions, D=4, chi=4). Uses `fPEPS_Model_reuse_GPU` + `MetropolisExchangeSpinfulSamplerReuse_GPU` + `evaluate_energy_reuse`. Includes `cache_bMPS_skeleton` one-time init and optional `export_and_compile_reuse`.
+
+### Key design decisions
+- **Same `VMC_GPU` driver**: No changes to `VMC.py`. The reuse sampler and energy function are injected via constructor args.
+- **`forward_reuse` dispatch**: Checks `_compiled_reuse` dict first, falls back to eager `vamp_reuse`. This allows gradual adoption of compiled reuse.
+- **Vectorized accept/reject**: Unlike CPU version (Python loop over samples), GPU version uses `torch.rand` + boolean masking.
+
+### Bug fix
+- **Non-contiguous `batch_ids`**: `get_conn_batch_gpu` returns connected configs interleaved by hop type (edge), not contiguous by parent sample. The initial `evaluate_energy_reuse` used an offset-based loop assuming contiguous ordering, causing wrong parent-child associations and assertion failures. Fixed by iterating over all `total_conn` entries and using `batch_ids[k]` to look up the correct parent config.
+
+### Verification
+- All files pass syntax check and imports resolve
+- Runtime test: `torchrun --nproc_per_node=1 run_scripts/vmc_run_fpeps_reuse.py` runs successfully
+
+### Next steps
+- Compare timing per VMC step: reuse vs non-reuse on same 4x4 system
+- Test `export_and_compile_reuse` (set `use_export_compile_reuse=True`)
+- Profile bottleneck: is it `cache_bMPS_params_vmap` or `forward_reuse`?
+
+---
+
 ## 2026-02-26: Slater Determinant — Spinful Amplitude Fix + Run Script
 
 ### What was done

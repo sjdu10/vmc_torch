@@ -7,7 +7,7 @@ from SU_func import (
 )
 
 Lx, Ly = 4, 2
-D0 = 10
+D0 = 4
 N_f = Lx*Ly - 2
 t = 1.0
 U = 8.0
@@ -53,7 +53,7 @@ seed = 42
 #     **su_kwargs,
 # )
 
-D1 = 10
+D1 = 4
 su_kwargs = {
     "compute_energy_per_site": True,
     'compute_energy_opts':{"max_distance":1}, 

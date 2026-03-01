@@ -25,6 +25,7 @@ from vmc_torch.experiment.vmap.GPU.hamiltonian import (
 )
 from vmc_torch.experiment.vmap.GPU.models import fPEPS_Model_GPU
 from vmc_torch.experiment.vmap.GPU.optimizer import (
+    DecayScheduler,
     DistributedSRMinresGPU,
     MinSRGPU,
     SGDGPU,
@@ -56,14 +57,16 @@ class VMCConfig:
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
     burn_in_steps: int = 4
-    use_export_compile: bool = True
+    use_export_compile: bool = False
     use_min_sr: bool = False
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
     save_every: int = 10
-    resume_step: int = 100  # checkpoint step to resume from, 0 = fresh
+    resume_step: int = 0  # checkpoint step to resume from, 0 = fresh
     debug: bool = False  # print [dbg] diagnostics each step
     outlier_clip_factor: float = 100.0  # drop O_loc outliers > factor * median
+    run_sr: bool = True
+    lr_scheduler: object = None  # set after construction
 
 
 def main():
@@ -82,8 +85,8 @@ def main():
         U = 8.0
         N_f = N_sites - 2  # 2 holes
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 10  # PEPS bond dimension
-        chi = 10  # boundary bond dim
+        D = 4  # PEPS bond dimension
+        chi = -1  # boundary bond dim
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -122,6 +125,10 @@ def main():
 
         # ========== Load checkpoint (optional) ==========
         vmc_cfg = VMCConfig()
+        vmc_cfg.lr_scheduler = DecayScheduler(
+            init_lr=vmc_cfg.learning_rate,
+            decay_rate=0.9, patience=50,
+        )
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
             f"t={t}_U={U}/N={N_f}/Z2/D={D}/chi={chi}/"
@@ -251,12 +258,13 @@ def main():
                 learning_rate=vmc_cfg.learning_rate,
                 diag_shift=vmc_cfg.diag_shift,
                 burn_in_steps=vmc_cfg.burn_in_steps,
-                run_sr=True,
+                run_sr=vmc_cfg.run_sr,
                 use_min_sr=vmc_cfg.use_min_sr,
                 use_export_compile=vmc_cfg.use_export_compile,
                 step_offset=vmc_cfg.resume_step,
                 debug=vmc_cfg.debug,
                 outlier_clip_factor=vmc_cfg.outlier_clip_factor,
+                lr_scheduler=vmc_cfg.lr_scheduler,
             ),
             on_step_end=on_step_end,
         )

@@ -28,6 +28,7 @@ All commands should be run from the `experiment/vmap/GPU` directory. The scripts
 
 1. **Make Notes** After modifying files in GPU folder, ALWAYS make human-friendly and readable concise notes to notebook.md. DO IT WITHOUT ASKING ME.
 2. **Verify correctness** Always verify your code changes.
+3. **Commit and push** when asked to commit, write clear and concise commit messages, and push using `git push private main`. 
 
 ## Architecture
 

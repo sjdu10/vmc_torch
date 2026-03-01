@@ -26,6 +26,7 @@ from vmc_torch.experiment.vmap.GPU.hamiltonian import (
 )
 from vmc_torch.experiment.vmap.GPU.models import SlaterDeterminant_GPU
 from vmc_torch.experiment.vmap.GPU.optimizer import (
+    DecayScheduler,
     MinSRGPU,
     SGDGPU,
 )
@@ -55,12 +56,15 @@ class VMCConfig:
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
     burn_in_steps: int = 4
-    use_min_sr: bool = True  # MinSR — Np is small for Slater
+    use_export_compile: bool = True
+    use_min_sr: bool = False  # MinSR if Ns<Np, I prefer minres over MinSR
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
     save_every: int = 10
     debug: bool = False
-    outlier_clip_factor: float = 100.0
+    outlier_clip_factor: float = 100.0 # drop O_loc outliers > factor * median
+    run_sr: bool = True
+    lr_scheduler: object = None  # set after construction
 
 
 def main():
@@ -73,7 +77,7 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 2
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
@@ -115,6 +119,10 @@ def main():
             )
 
         vmc_cfg = VMCConfig()
+        vmc_cfg.lr_scheduler = DecayScheduler(
+            init_lr=vmc_cfg.learning_rate,
+            decay_rate=0.9, patience=50,
+        )
 
         # ========== Output directory ==========
         output_dir = (
@@ -123,6 +131,15 @@ def main():
         )
         os.makedirs(output_dir, exist_ok=True)
         model_name = model._get_name()
+        
+        # Export + compile (optional, ~10-40s one-time cost)
+        if vmc_cfg.use_export_compile:
+            example_x = random_initial_config(
+                N_f, N_sites, seed=0,
+            ).to(device)
+            if rank == 0:
+                print("Running torch.export + compile...")
+            model.export_and_compile(example_x, mode='default')
 
         print_sampling_settings(
             rank,
@@ -175,7 +192,7 @@ def main():
             hamiltonian=H,
             rank=rank,
             config=VMCWarmupConfig(
-                use_export_compile=False,
+                use_export_compile=vmc_cfg.use_export_compile,
                 grad_batch_size=vmc_cfg.grad_batch_size,
             ),
         )
@@ -214,12 +231,13 @@ def main():
                 learning_rate=vmc_cfg.learning_rate,
                 diag_shift=vmc_cfg.diag_shift,
                 burn_in_steps=vmc_cfg.burn_in_steps,
-                run_sr=True,
+                run_sr=vmc_cfg.run_sr,
                 use_min_sr=vmc_cfg.use_min_sr,
-                use_export_compile=False,
+                use_export_compile=vmc_cfg.use_export_compile,
                 step_offset=0,
                 debug=vmc_cfg.debug,
                 outlier_clip_factor=vmc_cfg.outlier_clip_factor,
+                lr_scheduler=vmc_cfg.lr_scheduler,
             ),
             on_step_end=on_step_end,
         )

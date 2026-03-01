@@ -1,3 +1,5 @@
+import functools
+import math
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -7,6 +9,115 @@ from vmc_torch.experiment.vmap.GPU.vmc_modules import (
     distributed_minres_solver_gpu,
     minSR_solver_gpu,
 )
+
+
+# ============================================================
+#  Learning rate schedulers
+# ============================================================
+
+
+class Scheduler:
+    """Base LR scheduler: callable(step) -> learning_rate."""
+
+    def __init__(self, init_lr=1e-3):
+        self.init_lr = init_lr
+
+    def __call__(self, step):
+        raise NotImplementedError
+
+
+class TrivialScheduler(Scheduler):
+    """Constant learning rate."""
+
+    def __call__(self, step):
+        return self.init_lr
+
+
+def continuous_exp_decay(t, patience=50, init_lr=5e-2, rate=0.85):
+    return init_lr * math.exp(-math.log(1 / rate) * t / patience)
+
+
+def discrete_exp_decay(t, patience=50, init_lr=5e-2, rate=0.85):
+    return init_lr * rate ** (t // patience)
+
+
+def polynomial_decay(t, max_iter=1000, init_lr=5e-2, power=1.0):
+    return init_lr * (1 - t / max_iter) ** power
+
+
+def cosine_decay(t, max_iter=1000, init_lr=5e-2):
+    return init_lr * 0.5 * (1 + math.cos(math.pi * t / max_iter))
+
+
+def exponential_decay(t, decay_rate=0.1, decay_step=1, init_lr=5e-2):
+    return init_lr * math.exp(-decay_rate * (t / decay_step))
+
+
+def linear_decay(t, max_iter=1000, init_lr=5e-2):
+    return init_lr * (1 - t / max_iter)
+
+
+class DecayScheduler(Scheduler):
+    """Configurable LR decay scheduler.
+
+    Args:
+        init_lr: initial learning rate.
+        decay_rate: decay rate (meaning depends on type).
+        patience: steps between discrete decays.
+        min_lr: floor for learning rate.
+        type: one of 'continuous_exp', 'discrete_exp', 'polynomial',
+              'cosine', 'exponential', 'linear'.
+        **kwargs: forwarded to the decay function (e.g. max_iter).
+    """
+
+    def __init__(
+        self,
+        init_lr=1e-3,
+        decay_rate=0.9,
+        patience=100,
+        min_lr=1e-4,
+        type='continuous_exp',
+        **kwargs,
+    ):
+        super().__init__(init_lr)
+        self.min_lr = min_lr
+        if type == 'discrete_exp':
+            self.decay_func = functools.partial(
+                discrete_exp_decay,
+                init_lr=init_lr, rate=decay_rate,
+                patience=patience,
+            )
+        elif type == 'continuous_exp':
+            self.decay_func = functools.partial(
+                continuous_exp_decay,
+                init_lr=init_lr, rate=decay_rate,
+                patience=patience,
+            )
+        elif type == 'polynomial':
+            self.decay_func = functools.partial(
+                polynomial_decay,
+                init_lr=init_lr, power=1 / decay_rate,
+                **kwargs,
+            )
+        elif type == 'cosine':
+            self.decay_func = functools.partial(
+                cosine_decay, init_lr=init_lr, **kwargs,
+            )
+        elif type == 'exponential':
+            self.decay_func = functools.partial(
+                exponential_decay,
+                init_lr=init_lr, decay_rate=decay_rate,
+                **kwargs,
+            )
+        elif type == 'linear':
+            self.decay_func = functools.partial(
+                linear_decay, init_lr=init_lr, **kwargs,
+            )
+        else:
+            raise ValueError(f"Unknown decay type: {type}")
+
+    def __call__(self, step):
+        return max(self.decay_func(step), self.min_lr)
 
 
 class OptimizerGPU:
@@ -182,6 +293,9 @@ class MinSRGPU(PreconditionerGPU):
 
 
 __all__ = [
+    "Scheduler",
+    "TrivialScheduler",
+    "DecayScheduler",
     "OptimizerGPU",
     "SGDGPU",
     "AdamGPU",

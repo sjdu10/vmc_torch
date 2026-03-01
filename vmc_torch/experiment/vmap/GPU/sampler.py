@@ -210,7 +210,178 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
         return fxs, current_amps
 
 
+class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
+    """Metropolis exchange sampler with bMPS environment reuse.
+
+    Two-phase sweep: first x-direction (row edges) with cached
+    x-boundary MPS, then y-direction (col edges) with cached
+    y-boundary MPS. After processing each row/col, the boundary
+    MPS is incrementally updated rather than recomputed from
+    scratch.
+
+    Requires model to be fPEPS_Model_reuse_GPU with
+    cache_bMPS_skeleton() already called.
+
+    Args:
+        hopping_rate: Fraction of proposals that are
+            hoppings (vs exchanges). Default 0.25.
+    """
+
+    def __init__(self, hopping_rate: float = 0.25):
+        self.hopping_rate = hopping_rate
+
+    @torch.inference_mode()
+    def step(
+        self,
+        fxs: torch.Tensor,
+        model,
+        graph,
+        compile: bool = False,
+        verbose: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One MCMC sweep with bMPS environment reuse.
+
+        Phase 1: sweep row edges using x-direction bMPS.
+        Phase 2: sweep col edges using y-direction bMPS.
+
+        Args:
+            fxs: (B, N_sites) int64 walker configs.
+            model: fPEPS_Model_reuse_GPU with cache_bMPS_skeleton
+                already called.
+            graph: Lattice graph with .row_edges, .col_edges.
+            compile: Unused (kept for interface compat).
+            verbose: Print per-phase timing info.
+
+        Returns:
+            fxs: (B, N_sites) int64 updated configs.
+            current_amps: (B,) amplitudes at updated configs.
+        """
+        B = fxs.shape[0]
+        device = fxs.device
+
+        if verbose:
+            t0 = time.time()
+
+        # ---- Phase 1: x-direction (row edges) ----
+        bMPS_x, current_amps = (
+            model.cache_bMPS_params_any_direction_vmap(
+                fxs, direction='x',
+            )
+        )
+
+        for row, edges in graph.row_edges.items():
+            for edge in edges:
+                i, j = edge
+                proposed_fxs, new_flags = (
+                    propose_exchange_or_hopping_vec(
+                        i, j, fxs, self.hopping_rate,
+                    )
+                )
+                if not new_flags.any():
+                    continue
+
+                # Determine which rows to contract
+                selected_rows = list(range(
+                    max(0, row - model.radius),
+                    min(model.Lx, row + model.radius + 1),
+                ))
+
+                # Evaluate all B configs (must match bMPS batch)
+                proposed_amps = model.forward_reuse(
+                    proposed_fxs,
+                    bMPS_params_x_batched=bMPS_x,
+                    selected_rows=selected_rows,
+                )
+
+                # Vectorized Metropolis accept/reject
+                ratio = (
+                    (proposed_amps.abs() ** 2)
+                    / (current_amps.abs() ** 2 + 1e-18)
+                )
+                probs = torch.rand(B, device=device)
+                accept_mask = new_flags & (probs < ratio)
+
+                if accept_mask.any():
+                    fxs[accept_mask] = proposed_fxs[accept_mask]
+                    current_amps[accept_mask] = (
+                        proposed_amps[accept_mask]
+                    )
+
+            # Update bMPS to next row
+            if row < model.Lx - 1:
+                bMPS_x = model.update_bMPS_params_to_row_vmap(
+                    fxs, row, bMPS_x, from_which='xmin',
+                )
+
+        if verbose:
+            t1 = time.time()
+            print(
+                f"Phase 1 (x-dir row edges): {t1 - t0:.4f}s"
+            )
+
+        # ---- Phase 2: y-direction (col edges) ----
+        if verbose:
+            t0 = time.time()
+
+        bMPS_y, current_amps = (
+            model.cache_bMPS_params_any_direction_vmap(
+                fxs, direction='y',
+            )
+        )
+
+        for col, edges in graph.col_edges.items():
+            for edge in edges:
+                i, j = edge
+                proposed_fxs, new_flags = (
+                    propose_exchange_or_hopping_vec(
+                        i, j, fxs, self.hopping_rate,
+                    )
+                )
+                if not new_flags.any():
+                    continue
+
+                selected_cols = list(range(
+                    max(0, col - model.radius),
+                    min(model.Ly, col + model.radius + 1),
+                ))
+
+                proposed_amps = model.forward_reuse(
+                    proposed_fxs,
+                    bMPS_params_y_batched=bMPS_y,
+                    selected_cols=selected_cols,
+                )
+
+                ratio = (
+                    (proposed_amps.abs() ** 2)
+                    / (current_amps.abs() ** 2 + 1e-18)
+                )
+                probs = torch.rand(B, device=device)
+                accept_mask = new_flags & (probs < ratio)
+
+                if accept_mask.any():
+                    fxs[accept_mask] = proposed_fxs[accept_mask]
+                    current_amps[accept_mask] = (
+                        proposed_amps[accept_mask]
+                    )
+
+            # Update bMPS to next col
+            if col < model.Ly - 1:
+                bMPS_y = model.update_bMPS_params_to_col_vmap(
+                    fxs, col, bMPS_y, from_which='ymin',
+                )
+
+        if verbose:
+            t1 = time.time()
+            print(
+                f"Phase 2 (y-dir col edges): {t1 - t0:.4f}s"
+            )
+
+        return fxs, current_amps
+
+
 __all__ = [
     "SamplerGPU",
     "MetropolisExchangeSpinfulSamplerGPU",
+    "MetropolisExchangeSpinfulSamplerReuse_GPU",
 ]
