@@ -183,7 +183,14 @@ def main():
         )
 
         # ========== Stats tracking ==========
-        stats_file = os.path.join(output_dir, f'stats_{model_name}.json')
+        step_tag = (
+            f'_from{vmc_cfg.resume_step}'
+            if vmc_cfg.resume_step > 0 else ''
+        )
+        stats_file = os.path.join(
+            output_dir,
+            f'stats_{model_name}{step_tag}.json',
+        )
         total_ns = vmc_cfg.ns_per_rank * world_size
         stats = {
             'system': f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
