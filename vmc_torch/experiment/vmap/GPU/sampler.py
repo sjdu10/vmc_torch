@@ -173,7 +173,8 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
                 print(
                     f" Edge ({i}, {j}): {n_changed} / {B} "
                     f"proposed, forward: {t11-t10:.4f}s, "
-                    f"total forward: {t_forward:.4f}s"
+                    f"total forward: {t_forward:.4f}s, "
+                    f"progress: {n_updates}/{len(all_edges)}"
                 )
 
             # Metropolis accept/reject

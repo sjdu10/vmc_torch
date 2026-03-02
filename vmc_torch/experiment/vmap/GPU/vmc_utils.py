@@ -311,6 +311,8 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False,**kwargs):
     total_conn = conn_etas.shape[0]
     conn_amps_list = []
     for i in range(0, total_conn, chunk_size):
+        if verbose:
+            t00 = time.time()
         chunk = conn_etas[i:i + chunk_size]
         actual = chunk.shape[0]
         if actual < chunk_size:
@@ -324,6 +326,10 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False,**kwargs):
             conn_amps_list.append(out[:actual])
         else:
             conn_amps_list.append(fpeps_model(chunk))
+        if verbose:
+            print(f"  Evaluating connected amplitudes: chunk {i // chunk_size + 1} / {(total_conn + chunk_size - 1) // chunk_size}, "
+                  f"delta t_forward: {time.time() - t00:.4f}s, "
+                  f"total t_forward: {time.time() - t0:.4f}s")
     conn_amps = torch.cat(conn_amps_list)
     if verbose:
         t1 = time.time()

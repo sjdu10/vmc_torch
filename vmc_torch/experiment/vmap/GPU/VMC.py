@@ -316,6 +316,7 @@ class VMC_GPU:
             t1 = time.time()
             _, evals = self.evaluate_energy_fn(
                 fxs, model, hamiltonian, amps,
+                verbose=config.verbose,
             )
             if rank == 0 and config.verbose:
                 print(
