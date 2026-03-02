@@ -1,5 +1,11 @@
 # GPU VMC Pipeline — Research Notebook
 
+## 2026-03-01: Sync model params across ranks before VMC
+
+Added `VMC_GPU._sync_params(model)` — broadcasts all model parameters from rank 0 to all other ranks via `dist.broadcast`. Called at the start of both `run_warmup()` and `run_vmc_loop()`. Prevents silent divergence if ranks initialize with different params (e.g., random PEPS fallback with per-rank seeds). No-op for single GPU.
+
+File: `VMC.py`.
+
 ## 2026-03-01: Pure-GPU MINRES for `distributed_minres_solver_gpu`
 
 ### Problem

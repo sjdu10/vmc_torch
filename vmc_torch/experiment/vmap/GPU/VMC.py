@@ -270,6 +270,20 @@ class VMC_GPU:
         )
 
     # ----------------------------------------------------------
+    # Parameter sync
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _sync_params(model):
+        """Broadcast model params from rank 0 to all ranks."""
+        if not dist.is_initialized():
+            return
+        if dist.get_world_size() <= 1:
+            return
+        for p in model.parameters():
+            dist.broadcast(p.data, src=0)
+
+    # ----------------------------------------------------------
     # Warmup
     # ----------------------------------------------------------
 
@@ -282,6 +296,8 @@ class VMC_GPU:
         rank,
         config: VMCWarmupConfig,
     ):
+        self._sync_params(model)
+
         if rank == 0 and config.verbose:
             print("\n--- Warmup (1 sweep) ---")
         t_warm = time.time()
@@ -484,6 +500,8 @@ class VMC_GPU:
         ] = None,
     ):
         device = next(model.parameters()).device
+        self._sync_params(model)
+
         if rank == 0 and config.show_progress:
             print(f"\n--- VMC ({config.vmc_steps} steps) ---")
             vmc_pbar = tqdm(
