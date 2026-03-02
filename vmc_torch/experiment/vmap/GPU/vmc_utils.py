@@ -697,13 +697,9 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                 # Compute gradients and amplitudes for the chunk
                 grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
                 
-                # Detach to free compute graph immediately.
-                # amps may be a view, so use .detach() (reassignment
-                # drops the only ref to the original).
-                # Pytree leaves: .detach_() in-place avoids keeping
-                # old refs alive across chunks.
+                # Detach to free compute graph
                 amps_c = amps_c.detach()
-                tree_map(lambda x: x.detach_(), grads_chunk)
+                grads_chunk = tree_map(lambda x: x.detach(), grads_chunk)
 
                 grads_pytree_chunks.append(grads_chunk)
                 amps_chunks.append(amps_c)
@@ -770,9 +766,9 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                         fxs[b_start:b_end], params_pytree
                     )
                     
-                    # Detach to free compute graph immediately
+                    # Detach to free compute graph
                     amps_b = amps_b.detach()
-                    tree_map(lambda x: x.detach_(), jac_pytree_b)
+                    jac_pytree_b = tree_map(lambda x: x.detach(), jac_pytree_b)
 
                     jac_pytree_list.append(jac_pytree_b)
                     amps_list.append(amps_b)
