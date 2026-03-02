@@ -1,5 +1,13 @@
 # GPU VMC Pipeline — Research Notebook
 
+## 2026-03-02: Fix GPU memory not released between inference and grad phases
+
+**Problem:** In `run_warmup()`, after MCMC sampling + energy eval (under `torch.inference_mode()`), GPU memory from model forward passes was not released before gradient computation. PyTorch's CUDA caching allocator retains freed blocks for reuse rather than returning them to CUDA.
+
+**Fix:**
+- `VMC.py` `run_warmup()`: After the `inference_mode()` block, explicitly `del amps, evals` and call `torch.cuda.empty_cache()` before `compute_grads`. This is a one-time transition so `empty_cache()` cost is negligible.
+- `VMC.py` main loop + `vmc_modules.py` `run_sampling_phase_gpu()`: `del amps`/`del current_amps` between energy eval and grad computation. **No `empty_cache()` in the loop** — that would force re-allocation from CUDA on every iteration, slower than letting the caching allocator reuse blocks. The `del` makes blocks available in the cache for the grad step to reuse.
+
 ## 2026-03-01: Sync model params across ranks before VMC
 
 Added `VMC_GPU._sync_params(model)` — broadcasts all model parameters from rank 0 to all other ranks via `dist.broadcast`. Called at the start of both `run_warmup()` and `run_vmc_loop()`. Prevents silent divergence if ranks initialize with different params (e.g., random PEPS fallback with per-rank seeds). No-op for single GPU.

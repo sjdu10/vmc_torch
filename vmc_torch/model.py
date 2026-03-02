@@ -7703,6 +7703,180 @@ class NNBF(wavefunctionModel):
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
 
+
+class NNBF_QC(wavefunctionModel):
+    """Multi-determinant neural network backflow for ab initio QC.
+
+    Following Liu & Clark, PRB 110, 115137 (2024).
+
+    Ansatz:
+      psi(n) = sum_{d=1}^{D} det((M_d + F_d(n))[occ_rows, :])
+
+    where:
+      - n is an occupation vector of length n_orbitals (= 2M
+        spin-orbitals in netket format)
+      - M_d are (n_orbitals, n_fermions) orbital matrices
+      - F_d(n) is a NN-generated backflow correction of same shape
+      - The determinant is n_fermions x n_fermions (combined
+        spin-up + spin-down)
+      - D is the number of determinants
+
+    Args:
+        hilbert: SpinfulFermion Hilbert space
+        n_determinants: number of determinant terms (D)
+        hidden_dim: NN hidden layer width
+        n_hidden_layers: number of hidden layers in the NN
+        param_dtype: parameter dtype
+        nn_eta: backflow coupling strength (0 = pure SD)
+        kernel_init: optional initializer for M matrices
+    """
+
+    def __init__(
+        self,
+        hilbert,
+        n_determinants=1,
+        hidden_dim=256,
+        n_hidden_layers=2,
+        param_dtype=torch.float32,
+        nn_eta=1.0,
+        kernel_init=None,
+    ):
+        super(NNBF_QC, self).__init__()
+
+        self.hilbert = hilbert
+        self.param_dtype = param_dtype
+        self.nn_eta = nn_eta
+        self.n_det = n_determinants
+
+        n_orb = hilbert.n_orbitals  # 2M spin-orbitals
+        n_ferm = hilbert.n_fermions
+        self.n_orb = n_orb
+        self.n_ferm = n_ferm
+
+        # D orbital matrices: (D, n_orbitals, n_fermions)
+        if kernel_init is not None:
+            M_init = kernel_init(
+                torch.empty(
+                    n_determinants, n_orb, n_ferm,
+                    dtype=param_dtype,
+                )
+            )
+        else:
+            M_init = torch.randn(
+                n_determinants, n_orb, n_ferm,
+                dtype=param_dtype,
+            ) * 0.01
+        self.M = nn.Parameter(M_init)
+
+        # Build NN: occupation vector -> backflow correction
+        layers = []
+        layers.append(nn.Linear(n_orb, hidden_dim))
+        layers.append(nn.GELU())
+        for _ in range(n_hidden_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(
+            nn.Linear(hidden_dim, n_determinants * n_orb * n_ferm)
+        )
+        self.nn_backflow = nn.Sequential(*layers)
+        self.nn_backflow.to(param_dtype)
+
+        # Zero-init last layer so F(n) ≈ 0 at start
+        with torch.no_grad():
+            self.nn_backflow[-1].weight.zero_()
+            self.nn_backflow[-1].bias.zero_()
+
+        self.param_shapes = [
+            param.shape for param in self.parameters()
+        ]
+        self.model_structure = {
+            'NNBF_QC': {
+                'n_orbitals': n_orb,
+                'n_fermions': n_ferm,
+                'n_determinants': n_determinants,
+                'hidden_dim': hidden_dim,
+                'n_hidden_layers': n_hidden_layers,
+                'nn_eta': nn_eta,
+            }
+        }
+
+    def init_hf(self, n_alpha, n_beta):
+        """Initialize M[0] as block-diagonal HF orbital matrix.
+
+        For the HF configuration where the first n_alpha up-MOs
+        and first n_beta down-MOs are occupied, sets M[0] so
+        that the HF determinant = 1.
+
+        Netket ordering: [up_0..up_{M-1} | down_0..down_{M-1}]
+        Occupied rows for HF: up_0..up_{n_alpha-1},
+                               down_0..down_{n_beta-1}
+        = indices [0..n_alpha-1, M_half..M_half+n_beta-1]
+
+        We set M[0][occ_row_i, i] = 1, rest = 0, so the
+        extracted submatrix is identity.
+        """
+        M_half = self.n_orb // 2
+        with torch.no_grad():
+            self.M[0].zero_()
+            # Up-spin block
+            for i in range(n_alpha):
+                self.M[0, i, i] = 1.0
+            # Down-spin block
+            for i in range(n_beta):
+                self.M[0, M_half + i, n_alpha + i] = 1.0
+
+    def amplitude(self, x, **kwargs):
+        """Compute amplitude for a batch of quimb configs.
+
+        Args:
+            x: (B, M_sites) tensor in quimb encoding
+        Returns:
+            (B,) tensor of amplitudes
+        """
+        batch_amps = []
+        for x_i in x:
+            n_i = from_quimb_config_to_netket_config(x_i)
+            if not isinstance(n_i, torch.Tensor):
+                n_i = torch.tensor(
+                    n_i, dtype=self.param_dtype
+                )
+            else:
+                n_i = n_i.to(self.param_dtype)
+
+            amp = self._single_amplitude(n_i)
+            batch_amps.append(amp)
+        return torch.stack(batch_amps)
+
+    def _single_amplitude(self, n):
+        """Compute amplitude for a single netket-format config.
+
+        Args:
+            n: (n_orbitals,) occupation vector
+        Returns:
+            scalar amplitude
+        """
+        # Occupied orbital indices
+        R = torch.nonzero(n, as_tuple=False).squeeze(-1)
+
+        # Backflow correction: (D * n_orb * n_ferm,)
+        if self.nn_eta != 0:
+            F_flat = self.nn_backflow(n)
+            F = F_flat.reshape(
+                self.n_det, self.n_orb, self.n_ferm
+            )
+            M_eff = self.M + F * self.nn_eta
+        else:
+            M_eff = self.M
+
+        # Sum of determinants over D
+        amp = torch.zeros(1, dtype=self.param_dtype)
+        for d in range(self.n_det):
+            # Extract n_ferm x n_ferm submatrix
+            A = M_eff[d][R]  # (n_ferm, n_ferm)
+            amp = amp + torch.linalg.det(A)
+        return amp.squeeze()
+
+
 class NNBF_attention(wavefunctionModel):
     """Assuming total Sz=0."""
 

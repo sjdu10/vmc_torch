@@ -105,6 +105,10 @@ def run_sampling_phase_gpu(
         )
         t_locE_total += time.time() - t0
 
+        # Free sampling/energy tensors so allocator
+        # can reuse their blocks for grad computation
+        del current_amps
+
         # 3. Grads + inline O_loc (Trick #2)
         t0 = time.time()
         with torch.enable_grad():

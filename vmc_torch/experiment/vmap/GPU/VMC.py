@@ -163,21 +163,25 @@ class VMC_GPU:
 
         while current_count < ns_per_rank:
             needed = min(B, ns_per_rank - current_count)
+            with torch.inference_mode():
+                # 1. MCMC sweep
+                t0 = time.time()
+                fxs, amps = self.sampler.step(
+                    fxs, model, graph,
+                    compile=use_export_compile,
+                )
+                t_samp += time.time() - t0
 
-            # 1. MCMC sweep
-            t0 = time.time()
-            fxs, amps = self.sampler.step(
-                fxs, model, graph,
-                compile=use_export_compile,
-            )
-            t_samp += time.time() - t0
+                # 2. Local energy
+                t0 = time.time()
+                _, local_E = self.evaluate_energy_fn(
+                    fxs, model, hamiltonian, amps,
+                )
+                t_locE += time.time() - t0
 
-            # 2. Local energy
-            t0 = time.time()
-            _, local_E = self.evaluate_energy_fn(
-                fxs, model, hamiltonian, amps,
-            )
-            t_locE += time.time() - t0
+            # Free sampling/energy tensors so allocator
+            # can reuse their blocks for grad computation
+            del amps
 
             # 3. Gradients -> O_loc
             t0 = time.time()
@@ -323,6 +327,9 @@ class VMC_GPU:
                     f"  evaluate_energy: "
                     f"{time.time() - t1:.2f}s"
                 )
+        # Free inference-phase tensors before grad computation
+        del amps, evals
+        torch.cuda.empty_cache()
 
         t2 = time.time()
         with torch.enable_grad():
@@ -342,7 +349,7 @@ class VMC_GPU:
                 f"{time.time() - t_warm:.2f}s"
             )
 
-        del grads, amps2, evals
+        del grads, amps2
         return fxs
 
     # ----------------------------------------------------------

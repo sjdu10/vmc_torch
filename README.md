@@ -56,7 +56,7 @@ An example plot (from Ref.[1]) of the VMC training curves for various Ans\"atze 
 
 This code is the result of the research detailed in:
 
-[1] **"Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems"** - Si-Jing Du, Ao Chen, and Garnet Kin-Lic Chan - [arXiv:2506.08329](https://arxiv.org/abs/2506.08329)
+[1] **"Neuralized Fermionic Tensor Networks for Quantum Many-Body Systems"** - Si-Jing Du, Ao Chen, and Garnet Kin-Lic Chan - [Phys. Rev. B 113, 085134](https://doi.org/10.1103/x8vl-qf14)
 
 [2] **Tensor Network Computations That Capture Strict Variationality, Volume Law Behavior, and the Efficient Representation of Neural Network States** - Wen-Yuan Liu*, Si-Jing Du*, Ruojing Peng, Johnnie Gray and Garnet Kin-Lic Chan - [Phys. Rev. Lett. 133, 260404](https://doi.org/10.1103/PhysRevLett.133.260404)
 
