@@ -190,7 +190,7 @@ def main():
             print(
                 f"Model: {model_name} | {N_params} params | "
                 f"TN: {model.n_ftn} tensors, "
-                f"NN: {len(model._nn_param_names)} params"
+                f"NN: {sum(p.numel() for p in list(model.parameters())[-len(model._nn_param_names):])} params"
             )
             print(
                 f"nn_eta={nn_eta}, embed={embed_dim}, "

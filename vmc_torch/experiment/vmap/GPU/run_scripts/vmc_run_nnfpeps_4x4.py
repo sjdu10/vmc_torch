@@ -78,7 +78,7 @@ class VMCConfig:
 
 
 def main():
-    setup_linalg_hooks(jitter=1e-12)
+    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=True)
     torch.set_default_dtype(dtype)
 
     try:
@@ -198,7 +198,7 @@ def main():
             print(
                 f"Model: {model_name} | {N_params} params | "
                 f"TN: {model.n_ftn} tensors, "
-                f"NN: {len(model._nn_param_names)} params"
+                f"NN: {sum(p.numel() for p in list(model.parameters())[-len(model._nn_param_names):])} params"
             )
             print(
                 f"nn_eta={nn_eta}, embed={embed_dim}, "

@@ -17,7 +17,7 @@ DEFAULT_DATA_ROOT = (
 )
 
 
-def setup_linalg_hooks(jitter=1e-16, driver=None):
+def setup_linalg_hooks(jitter=1e-16, driver=None, qr_via_eigh=True):
     ar.register_function(
         'torch',
         'linalg.svd',
@@ -26,7 +26,7 @@ def setup_linalg_hooks(jitter=1e-16, driver=None):
     ar.register_function(
         'torch',
         'linalg.qr',
-        lambda x: size_aware_qr(x, via_eigh=True, jitter=jitter),
+        lambda x: size_aware_qr(x, via_eigh=qr_via_eigh, jitter=jitter),
     )
 
 

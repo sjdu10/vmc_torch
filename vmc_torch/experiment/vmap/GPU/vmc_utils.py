@@ -697,14 +697,15 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                 # Compute gradients and amplitudes for the chunk
                 grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
                 
-                # IMPORTANT: Detach to free graph memory immediately
-                amps_c = amps_c.detach()
-                
+                # Detach in-place to free compute graph immediately
+                # (.detach_() strips grad_fn from the tensor itself;
+                #  .detach() only creates a new view, leaving the
+                #  original graph alive until GC collects it.)
+                amps_c.detach_()
+                tree_map(lambda x: x.detach_(), grads_chunk)
+
                 grads_pytree_chunks.append(grads_chunk)
                 amps_chunks.append(amps_c)
-                
-                # Explicit delete to help garbage collector
-                del grads_chunk, amps_c
 
             # Aggregate results
             amps = torch.cat(amps_chunks, dim=0)
@@ -735,6 +736,9 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
         # Path B: jacrev - Standard Jacobian Reverse Mode
         # ------------------------------------------------------------------
         else:
+            # Deprecated warning: jacrev path is less memory efficient and may OOM on large batches, prefer vmap(grad) with chunking
+            Warning = ("jacrev path is less memory efficient and may OOM on large batches, "
+                       "prefer vmap(grad) with chunking. This path will be removed in future versions.")
             def g(x, p):
                 results = fpeps_model.vamp(x, p)
                 return results, results
@@ -765,14 +769,12 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                         fxs[b_start:b_end], params_pytree
                     )
                     
-                    # Detach to save memory
-                    amps_b = amps_b.detach()
-                    jac_pytree_b = tree_map(lambda x: x.detach(), jac_pytree_b)
-                    
+                    # Detach in-place to free compute graph immediately
+                    amps_b.detach_()
+                    tree_map(lambda x: x.detach_(), jac_pytree_b)
+
                     jac_pytree_list.append(jac_pytree_b)
                     amps_list.append(amps_b)
-                    
-                    del jac_pytree_b, amps_b
 
                 # Concatenate results
                 jac_pytree = tree_map(lambda *leaves: torch.cat(leaves, dim=0), *jac_pytree_list)

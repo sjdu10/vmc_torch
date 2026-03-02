@@ -70,7 +70,7 @@ class VMCConfig:
 
 
 def main():
-    setup_linalg_hooks(jitter=1e-12)
+    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=True)
     torch.set_default_dtype(dtype)
 
     try:
