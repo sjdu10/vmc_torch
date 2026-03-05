@@ -258,6 +258,9 @@ def robust_svd_wrapper(A, jitter=1e-12, driver=None):
     """
     return RobustSVD.apply(A, jitter, driver)
 
+
+# QR via SVD wrappers
+
 def qr_svd_wrapper(A, jitter=1e-12, driver=None):
     """
     QR-based SVD wrapper for stability on CPU/GPU.
@@ -447,6 +450,87 @@ def robust_svd_err_catcher_wrapper(A, jitter=1e-12, driver=None):
         return RobustSVD.apply(A, jitter, driver)
     except RuntimeError as e:
         return RobustSVD_EIG.apply(A, jitter, driver)
+
+# ========== Cholesky QR dispatch ================
+
+def qr_via_cholesky(x, jitter=1e-12, adaptive_jitter=False):
+    """QR via Cholesky decomposition of the Gram matrix.
+
+    Tall/square (M >= N):
+      1. G = A^T A + jitter * I   (N x N, SPD)
+      2. Cholesky: G = L L^T, R = L^T  (upper triangular)
+      3. Q = A R^{-1}  (via triangular solve)
+
+    Wide (M < N):
+      1. Cholesky QR on A[:, :M]  (the leading M x M square block)
+         to obtain Q (M x M, orthogonal)
+      2. R = Q^T A  (M x N, upper trapezoidal)
+
+    Faster than Householder QR but numerically stable only
+    when A is reasonably well-conditioned (kappa <~ 1e8).
+    All ops are torch-native and support autograd.
+
+    Args:
+        x: (..., M, N) tensor.
+        jitter: scalar added to Gram diagonal for regularization.
+        adaptive_jitter: if True, scale jitter by ||A||_F^2 so that
+            the effective regularization is jitter * ||A||_F^2 * I.
+            Bounds the condition number of G to ~1/jitter regardless
+            of the matrix scale. Stabilizes backward for
+            ill-conditioned matrices.
+
+    Returns:
+        Q: (..., M, K) with orthonormal columns, K = min(M, N).
+        R: (..., K, N) upper triangular (tall/square) or
+           upper trapezoidal (wide).
+    """
+    M, N = x.shape[-2:]
+
+    if adaptive_jitter:
+        # ||A||_F^2 per batch element, kept as (..., 1, 1) for broadcasting
+        scale = (x * x).sum(dim=(-2, -1), keepdim=True)
+        jitter_val = jitter * scale.squeeze(-1).squeeze(-1)
+    else:
+        jitter_val = jitter
+
+    if M >= N:
+        # Tall/square: standard Cholesky QR on full A
+        G = x.mT @ x  # (..., N, N)
+        eye = torch.eye(N, device=G.device, dtype=G.dtype)
+        if adaptive_jitter:
+            G = G + jitter_val[..., None, None] * eye
+        else:
+            G = G + jitter_val * eye
+
+        L = torch.linalg.cholesky(G)  # (..., N, N) lower tri
+        R = L.mT                       # (..., N, N) upper tri
+
+        # Q = A R^{-1} via solving L Q^T = A^T
+        QT = torch.linalg.solve_triangular(
+            L, x.mT, upper=False
+        )  # (..., N, M)
+        Q = QT.mT  # (..., M, N)
+    else:
+        # Wide: Cholesky QR on leading M columns to get Q,
+        # then R = Q^T A
+        A1 = x[..., :M]  # (..., M, M)
+        G = A1.mT @ A1   # (..., M, M)
+        eye = torch.eye(M, device=G.device, dtype=G.dtype)
+        if adaptive_jitter:
+            G = G + jitter_val[..., None, None] * eye
+        else:
+            G = G + jitter_val * eye
+
+        L = torch.linalg.cholesky(G)  # (..., M, M) lower tri
+
+        # Q from A1: solve L Q^T = A1^T
+        QT = torch.linalg.solve_triangular(
+            L, A1.mT, upper=False
+        )  # (..., M, M)
+        Q = QT.mT   # (..., M, M) orthogonal
+        R = Q.mT @ x  # (..., M, N)
+
+    return Q, R
 
 
 # ========== Size/device-aware dispatch ==========
@@ -779,14 +863,140 @@ def benchmark_svd_full(M, N, batch_size=10, num_batches=10, jitter=1e-12,
         print("If QR(Rand) matches QR(Id) in accuracy but survives where others fail, it's the winner.")
 
 
+def benchmark_qr_cholesky(device='cpu', dtype=torch.float64):
+    """Benchmark qr_via_cholesky vs torch.linalg.qr.
+
+    Tests reconstruction, orthogonality, column-span agreement,
+    and autograd across tall, square, wide, and batched shapes.
+    """
+    print(f"\n{'='*80}")
+    print("BENCHMARK: qr_via_cholesky vs torch.linalg.qr")
+    print(f"Device={device} | Dtype={dtype}")
+    print(f"{'='*80}")
+
+    # --- 1. Shape sweep (tall, square, wide, batched) ---
+    shapes = [
+        # (shape,         label)
+        ((8, 4),          "tall 8x4"),
+        ((16, 16),        "square 16x16"),
+        ((64, 32),        "tall 64x32"),
+        ((128, 64),       "tall 128x64"),
+        ((4, 8),          "wide 4x8"),
+        ((16, 64),        "wide 16x64"),
+        ((32, 128),       "wide 32x128"),
+        ((10, 64, 32),    "batch tall"),
+        ((5, 128, 64),    "batch tall lg"),
+        ((10, 16, 64),    "batch wide"),
+        ((8, 32, 128),    "batch wide lg"),
+        ((8, 16, 16),     "batch square"),
+    ]
+
+    print(f"\n{'label':<16} {'shape':<16} | "
+          f"{'||A-QR||':<12} {'||QtQ-I||':<12} "
+          f"{'span diff':<12} {'ref ||A-QR||':<12} "
+          f"{'Q shape':<14} {'R shape':<14}")
+    print("-" * 120)
+
+    for shape, label in shapes:
+        A = torch.randn(*shape, device=device, dtype=dtype)
+        Q_c, R_c = qr_via_cholesky(A)
+        Q_ref, R_ref = torch.linalg.qr(A, mode='reduced')
+
+        K = min(shape[-2], shape[-1])
+        eye_K = torch.eye(K, device=device, dtype=dtype)
+
+        recon = torch.norm(A - Q_c @ R_c).item()
+        ortho = torch.norm(Q_c.mT @ Q_c - eye_K).item()
+
+        # Column-span agreement: Q_c @ Q_c^T @ Q_ref ≈ Q_ref
+        proj = Q_c @ (Q_c.mT @ Q_ref)
+        span_diff = torch.norm(proj - Q_ref).item()
+
+        ref_recon = torch.norm(A - Q_ref @ R_ref).item()
+
+        q_shape = str(tuple(Q_c.shape))
+        r_shape = str(tuple(R_c.shape))
+
+        print(f"{label:<16} {str(shape):<16} | "
+              f"{recon:<12.2e} {ortho:<12.2e} "
+              f"{span_diff:<12.2e} {ref_recon:<12.2e} "
+              f"{q_shape:<14} {r_shape:<14}")
+
+    # --- 2. Condition number sweep (tall + wide) ---
+    for (M_s, N_s), tag in [((64, 32), "tall"), ((16, 64), "wide")]:
+        K_s = min(M_s, N_s)
+        print(f"\n--- Condition number sweep ({M_s}x{N_s}, {tag}) ---")
+        print(f"{'kappa':<12} | {'||A-QR||':<12} {'||QtQ-I||':<12} "
+              f"{'ref ||A-QR||':<12}")
+        print("-" * 60)
+
+        for log_kappa in [0, 4, 8, 12, 15]:
+            U_gen, _ = torch.linalg.qr(
+                torch.randn(M_s, M_s, device=device, dtype=dtype)
+            )
+            V_gen, _ = torch.linalg.qr(
+                torch.randn(N_s, N_s, device=device, dtype=dtype)
+            )
+            S_gen = torch.logspace(
+                0, -log_kappa, steps=K_s,
+                device=device, dtype=dtype
+            )
+            A = U_gen[:, :K_s] @ torch.diag(S_gen) @ V_gen[:K_s, :]
+
+            Q_c, R_c = qr_via_cholesky(A)
+            Q_ref, R_ref = torch.linalg.qr(A, mode='reduced')
+
+            eye_K = torch.eye(
+                K_s, device=device, dtype=dtype
+            )
+            recon = torch.norm(A - Q_c @ R_c).item()
+            ortho = torch.norm(Q_c.mT @ Q_c - eye_K).item()
+            ref_recon = torch.norm(A - Q_ref @ R_ref).item()
+
+            print(f"1e{log_kappa:<9} | {recon:<12.2e} "
+                  f"{ortho:<12.2e} {ref_recon:<12.2e}")
+
+    # --- 3. Autograd gradcheck (tall, square, wide, batched) ---
+    print("\n--- Autograd gradcheck ---")
+    grad_shapes = [
+        ((8, 4),       "tall"),
+        ((6, 6),       "square"),
+        ((4, 8),       "wide"),
+        ((16, 8),      "tall lg"),
+        ((8, 16),      "wide lg"),
+        ((5, 12, 6),   "batch tall"),
+        ((3, 6, 12),   "batch wide"),
+        ((4, 8, 8),    "batch square"),
+    ]
+    for shape, tag in grad_shapes:
+        A_check = torch.randn(
+            *shape, device=device, dtype=torch.float64,
+            requires_grad=True
+        )
+        try:
+            passed = torch.autograd.gradcheck(
+                qr_via_cholesky, (A_check,),
+                eps=1e-6, atol=1e-4
+            )
+            status = 'PASS' if passed else 'FAIL'
+        except Exception:
+            status = 'FAIL (ill-conditioned Cholesky backward)'
+        print(f"  {tag:<14} {str(shape):<16} gradcheck: {status}")
+
+    print(f"\n{'='*80}")
+
+
 if __name__ == "__main__":
     torch.manual_seed(42)
-    
-    # 1. Test Degenerate Case (The Killer Case)
-    # Using a slightly larger matrix to increase chance of collision
-    benchmark_svd_full(M=64, N=32, batch_size=20, num_batches=10, 
-                       jitter=1e-12, condition_mode='degenerate')
-    
-    # 2. Test Ill-Conditioned Case
-    benchmark_svd_full(M=64, N=32, batch_size=20, num_batches=10, 
-                       jitter=1e-12, condition_mode='decay')
+
+    # # 1. Test Degenerate Case (The Killer Case)
+    # # Using a slightly larger matrix to increase chance of collision
+    # benchmark_svd_full(M=64, N=32, batch_size=20, num_batches=10,
+    #                    jitter=1e-12, condition_mode='degenerate')
+
+    # # 2. Test Ill-Conditioned Case
+    # benchmark_svd_full(M=64, N=32, batch_size=20, num_batches=10,
+    #                    jitter=1e-12, condition_mode='decay')
+
+    # 3. Cholesky QR benchmark
+    benchmark_qr_cholesky()

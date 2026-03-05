@@ -8,29 +8,36 @@ import torch
 from vmc_torch.GPU.torch_utils import (
     size_aware_qr,
     size_aware_svd,
+    qr_via_cholesky,
 )
-from vmc_torch.GPU.vmc_utils import random_initial_config
-
 DEFAULT_DATA_ROOT = (
     '/home/sijingdu/TNVMC/VMC_code/vmc_torch/'
     'vmc_torch/experiment/vmap/data'
 )
 
 
-def setup_linalg_hooks(jitter=1e-16, driver=None, qr_via_eigh=True, randomize_svd=False):
-    if not randomize_svd:
-        ar.register_function(
-            'torch',
-            'linalg.svd',
-            lambda x: size_aware_svd(x, jitter=jitter, driver=driver),
-        )
-    else:
-        ...
+def setup_linalg_hooks(jitter=1e-16, driver=None, qr_via_eigh=True, cholesky_qr=False, cholesky_qr_adaptive_jitter=False):
     ar.register_function(
         'torch',
-        'linalg.qr',
-        lambda x: size_aware_qr(x, via_eigh=qr_via_eigh, jitter=jitter),
+        'linalg.svd',
+        lambda x: size_aware_svd(x, jitter=jitter, driver=driver),
     )
+    if qr_via_eigh and cholesky_qr:
+        raise ValueError("Cannot use both qr_via_eigh and cholesky_qr at the same time.")
+    if cholesky_qr:
+        ar.register_function(
+            "torch",
+            "linalg.qr",
+            lambda x: qr_via_cholesky(x, jitter=jitter, adaptive_jitter=cholesky_qr_adaptive_jitter),
+        )
+    elif qr_via_eigh:
+        ar.register_function(
+            'torch',
+            'linalg.qr',
+            lambda x: size_aware_qr(x, via_eigh=qr_via_eigh, jitter=jitter),
+        )
+    else:
+        pass  # use default torch.linalg.qr without autoray hook
 
 
 def load_or_generate_peps(

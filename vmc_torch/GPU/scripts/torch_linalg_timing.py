@@ -19,6 +19,7 @@ import time
 
 import numpy as np
 import torch
+from vmc_torch.GPU.torch_utils import qr_via_eigh, qr_via_cholesky
 
 # ==========================================
 # Config
@@ -205,3 +206,88 @@ else:
 # np.save(npy_path, data)
 # print(f"\nData saved to {npy_path}")
 # print("Plot in GPU/notebooks/linalg_timing.ipynb")
+
+
+# ==========================================
+# QR method comparison:
+#   native QR  vs  QR-via-SVD-via-eigh  vs  QR-via-Cholesky
+# ==========================================
+def run_qr_benchmark(dtype, B_qr=64):
+    """Compare three QR methods across matrix sizes for a given dtype."""
+    dtype_name = str(dtype).split(".")[-1]
+    print(f"\n{'='*72}")
+    print(f"QR METHOD COMPARISON  |  B={B_qr}  |  dtype={dtype_name}")
+    print(f"{'='*72}")
+
+    # n values: dense around the n=32 Jacobi threshold, sparser above
+    ns = list(range(4, 36, 4)) + [36, 48, 64, 96, 128]
+
+    native_times = []
+    eigh_times = []
+    chol_times = []
+
+    w = 10
+    print(
+        f"  {'n':>4} | {'native QR':>{w}} | "
+        f"{'QR-eigh':>{w}} | {'QR-chol':>{w}} | "
+        f"{'eigh/nat':>{w}} | {'chol/nat':>{w}}"
+    )
+    print("  " + "-" * (5 * w + 17))
+
+    for n in ns:
+        # Tall matrix (2n x n) — typical TN reshape shape
+        a = torch.randn(B_qr, 2 * n, n, device=device, dtype=dtype)
+
+        t_native = time_op(torch.linalg.qr, a)
+        t_eigh = time_op(qr_via_eigh, a)
+        t_chol = time_op(qr_via_cholesky, a)
+
+        native_times.append(t_native)
+        eigh_times.append(t_eigh)
+        chol_times.append(t_chol)
+
+        r_eigh = t_eigh / t_native if t_native > 0 else float("nan")
+        r_chol = t_chol / t_native if t_native > 0 else float("nan")
+
+        marker = ""
+        if n == 32:
+            marker = "  <-- Jacobi threshold"
+
+        print(
+            f"  {n:4d} | {t_native:{w}.3f} | "
+            f"{t_eigh:{w}.3f} | {t_chol:{w}.3f} | "
+            f"{r_eigh:{w}.2f}x | {r_chol:{w}.2f}x{marker}"
+        )
+
+    # Summary
+    print(f"\n  --- Summary ({dtype_name}) ---")
+    for label, times in [("QR-eigh", eigh_times),
+                         ("QR-chol", chol_times)]:
+        ratios = [t / tn for t, tn in zip(times, native_times)]
+        best_i = min(range(len(ratios)), key=lambda i: ratios[i])
+        worst_i = max(range(len(ratios)), key=lambda i: ratios[i])
+        print(
+            f"  {label:>8}: best {ratios[best_i]:.2f}x "
+            f"(n={ns[best_i]}), "
+            f"worst {ratios[worst_i]:.2f}x "
+            f"(n={ns[worst_i]}), "
+            f"avg {np.mean(ratios):.2f}x vs native"
+        )
+
+    return {
+        "n_list": ns,
+        "native_ms": native_times,
+        "eigh_ms": eigh_times,
+        "chol_ms": chol_times,
+    }
+
+
+# Run for both dtypes
+res_f32 = run_qr_benchmark(torch.float32, B_qr=B)
+res_f64 = run_qr_benchmark(torch.float64, B_qr=B)
+
+# Save
+qr_data = {"float32": res_f32, "float64": res_f64, "B": B}
+npy_path = os.path.join(DATA_DIR, f"qr_method_timing_B={B}.npy")
+np.save(npy_path, qr_data)
+print(f"\nQR timing data saved to {npy_path}")

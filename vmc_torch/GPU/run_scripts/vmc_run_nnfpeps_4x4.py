@@ -87,7 +87,7 @@ class VMCConfig:
 
 
 def main():
-    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=True)
+    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=False, cholesky_qr=True, cholesky_qr_adaptive_jitter=False)
     torch.set_default_dtype(dtype)
 
     try:
@@ -102,8 +102,8 @@ def main():
         U = 8.0
         N_f = N_sites - 2  # 2 holes -> 14 fermions
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4   # PEPS bond dimension
-        chi = -1  # exact contraction
+        D = 8   # PEPS bond dimension
+        chi = 8  # exact contraction
 
         # NN backflow hyperparameters
         nn_eta = 1.0

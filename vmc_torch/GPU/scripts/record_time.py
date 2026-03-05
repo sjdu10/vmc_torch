@@ -31,7 +31,7 @@ from vmc_torch.GPU.models import (
     fPEPS_Model_GPU,
 )
 from vmc_torch.GPU.torch_utils import (
-    robust_svd_err_catcher_wrapper,
+    qr_via_cholesky,
     size_aware_qr,
     size_aware_svd,
 )
@@ -42,11 +42,11 @@ from vmc_torch.GPU.torch_utils import (
 dtype = torch.float64
 torch.set_default_dtype(dtype)
 
-Lx, Ly = 4, 4
+Lx, Ly = 8, 8
 N_f = Lx * Ly
 nsites = Lx * Ly
-D = 8
-chi = 8
+D = 10
+chi = 10
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 has_gpu = device.type == "cuda"
@@ -293,9 +293,10 @@ ar.register_function(
 )
 
 ar.register_function("torch", "linalg.qr", lambda x: size_aware_qr(x, via_eigh=qr_via_eigh, jitter=0.0))
+# ar.register_function("torch", "linalg.qr", lambda x: qr_via_cholesky(x, jitter=0, adaptive_jitter=False))
 
 model_gpu_c, model_cpu_c = build_models()
-results_c = run_benchmark(model_gpu_c, model_cpu_c, "size_aware+syevBatched_eigh", record_gpu=True, record_cpu=True)
+results_c = run_benchmark(model_gpu_c, model_cpu_c, "size_aware+syevBatched_eigh", record_gpu=True, record_cpu=False)
 # ==========================================
 # Print Mode C results
 # ==========================================
@@ -316,16 +317,16 @@ for i, bs in enumerate(batch_sizes):
     cpu_str = f"{ct:.4f}" if ct > 0 else "N/A"
     print(f"{bs:>4}  {gpu_str:>10}  {cpu_str:>10}")
 
-# Save Mode C results
-out_file = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "data",
-    f"{Lx}x{Ly}_D={D}_chi={chi}_syevBatched_eigh{'_qr_eigh' if qr_via_eigh else ''}_{str(dtype).split('.')[-1]}.npy",
-)
-os.makedirs(os.path.dirname(out_file), exist_ok=True)
-np.save(out_file, {"size_aware+syevBatched_eigh"+f'{'_qr_eigh' if qr_via_eigh else ''}': results_c})
-print(f"\nSaved to {out_file}")
+# # Save Mode C results
+# out_file = os.path.join(
+#     os.path.dirname(__file__),
+#     "..",
+#     "data",
+#     f"{Lx}x{Ly}_D={D}_chi={chi}_syevBatched_eigh{'_qr_eigh' if qr_via_eigh else ''}_{str(dtype).split('.')[-1]}.npy",
+# )
+# os.makedirs(os.path.dirname(out_file), exist_ok=True)
+# np.save(out_file, {"size_aware+syevBatched_eigh"+f'{'_qr_eigh' if qr_via_eigh else ''}': results_c})
+# print(f"\nSaved to {out_file}")
 
 
 
