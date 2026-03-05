@@ -305,7 +305,108 @@ def distributed_minres_solver_gpu(
     world_size = dist.get_world_size()
     device = torch.device('cuda')
 
-    # --- Ensure inputs are GPU tensors ---
+    # --- Check if O_loc is already on CPU ---
+    oloc_on_cpu = (
+        isinstance(local_O, torch.Tensor)
+        and local_O.device.type == 'cpu'
+    ) or isinstance(local_O, np.ndarray)
+
+    if use_scipy and oloc_on_cpu:
+        # --- Fast path: O_loc already on CPU ---
+        # Compute stats on CPU, only briefly use GPU for
+        # all_reduce of (Np,) vectors.
+        if isinstance(local_O, torch.Tensor):
+            local_O_np = local_O.numpy()
+        else:
+            local_O_np = np.asarray(
+                local_O, dtype=np.float64,
+            )
+
+        if isinstance(local_energies, torch.Tensor):
+            local_E_np = local_energies.cpu().numpy()
+        else:
+            local_E_np = np.asarray(
+                local_energies, dtype=np.float64,
+            )
+        n_local = local_E_np.shape[0]
+
+        if n_local > 0:
+            local_sum_O_np = local_O_np.sum(axis=0)
+            local_sum_EO_np = local_E_np @ local_O_np
+        else:
+            local_sum_O_np = np.zeros(
+                n_params, dtype=np.float64,
+            )
+            local_sum_EO_np = np.zeros(
+                n_params, dtype=np.float64,
+            )
+
+        # all_reduce requires GPU tensors (NCCL)
+        if world_size > 1:
+            sum_O_gpu = torch.tensor(
+                local_sum_O_np, device=device,
+            )
+            sum_EO_gpu = torch.tensor(
+                local_sum_EO_np, device=device,
+            )
+            dist.all_reduce(
+                sum_O_gpu, op=dist.ReduceOp.SUM,
+            )
+            dist.all_reduce(
+                sum_EO_gpu, op=dist.ReduceOp.SUM,
+            )
+            local_sum_O_np = sum_O_gpu.cpu().numpy()
+            local_sum_EO_np = sum_EO_gpu.cpu().numpy()
+            del sum_O_gpu, sum_EO_gpu
+
+        mean_O_np = local_sum_O_np / total_samples
+        mean_EO_np = local_sum_EO_np / total_samples
+        energy_grad_np = (
+            mean_EO_np - energy_mean * mean_O_np
+        )
+
+        if not run_SR:
+            t1 = time.time()
+            return energy_grad_np, t1 - t0, None
+
+        # scipy MINRES on CPU (O_loc stays on CPU)
+        if world_size == 1:
+            def matvec(x):
+                inner = local_O_np.dot(x)
+                Sx = local_O_np.T.dot(inner)
+                Sx /= total_samples
+                Sx -= np.dot(mean_O_np, x) * mean_O_np
+                return Sx + diag_shift * x
+        else:
+            def matvec(x):
+                if n_local > 0:
+                    inner = local_O_np.dot(x)
+                    local_Sx = local_O_np.T.dot(inner)
+                else:
+                    local_Sx = np.zeros_like(x)
+                Sx_t = torch.tensor(
+                    local_Sx, device=device,
+                )
+                dist.all_reduce(
+                    Sx_t, op=dist.ReduceOp.SUM,
+                )
+                Sx = Sx_t.cpu().numpy()
+                Sx /= total_samples
+                Sx -= np.dot(mean_O_np, x) * mean_O_np
+                return Sx + diag_shift * x
+
+        A = spla.LinearOperator(
+            (n_params, n_params), matvec=matvec,
+            dtype=np.float64,
+        )
+        dp, info = spla.minres(
+            A, energy_grad_np,
+            rtol=rtol, maxiter=maxiter,
+        )
+        t1 = time.time()
+        return dp, t1 - t0, info
+
+    # --- Standard path: ensure inputs are GPU tensors ---
     if not isinstance(local_O, torch.Tensor):
         local_O = torch.tensor(
             local_O, device=device, dtype=torch.float64,
@@ -348,43 +449,43 @@ def distributed_minres_solver_gpu(
         t1 = time.time()
         return energy_grad, t1 - t0, None
 
-    # --- MINRES solve ---
-    if use_scipy:
-        # Fallback: move to CPU numpy, use scipy MINRES
-        local_O_np = local_O.cpu().numpy()
-        mean_O_np = mean_O.cpu().numpy()
-        energy_grad_np = energy_grad.cpu().numpy()
+    # # --- MINRES solve ---
+    # if use_scipy:
+    #     # Fallback: move to CPU numpy, use scipy MINRES
+    #     local_O_np = local_O.cpu().numpy()
+    #     mean_O_np = mean_O.cpu().numpy()
+    #     energy_grad_np = energy_grad.cpu().numpy()
 
-        if world_size == 1:
-            def matvec(x):
-                inner = local_O_np.dot(x)
-                Sx = local_O_np.T.dot(inner)
-                Sx /= total_samples
-                Sx -= np.dot(mean_O_np, x) * mean_O_np
-                return Sx + diag_shift * x
-        else:
-            def matvec(x):
-                if n_local > 0:
-                    inner = local_O_np.dot(x)
-                    local_Sx = local_O_np.T.dot(inner)
-                else:
-                    local_Sx = np.zeros_like(x)
-                Sx_t = torch.tensor(local_Sx, device=device)
-                dist.all_reduce(Sx_t, op=dist.ReduceOp.SUM)
-                Sx = Sx_t.cpu().numpy()
-                Sx /= total_samples
-                Sx -= np.dot(mean_O_np, x) * mean_O_np
-                return Sx + diag_shift * x
+    #     if world_size == 1:
+    #         def matvec(x):
+    #             inner = local_O_np.dot(x)
+    #             Sx = local_O_np.T.dot(inner)
+    #             Sx /= total_samples
+    #             Sx -= np.dot(mean_O_np, x) * mean_O_np
+    #             return Sx + diag_shift * x
+    #     else:
+    #         def matvec(x):
+    #             if n_local > 0:
+    #                 inner = local_O_np.dot(x)
+    #                 local_Sx = local_O_np.T.dot(inner)
+    #             else:
+    #                 local_Sx = np.zeros_like(x)
+    #             Sx_t = torch.tensor(local_Sx, device=device)
+    #             dist.all_reduce(Sx_t, op=dist.ReduceOp.SUM)
+    #             Sx = Sx_t.cpu().numpy()
+    #             Sx /= total_samples
+    #             Sx -= np.dot(mean_O_np, x) * mean_O_np
+    #             return Sx + diag_shift * x
 
-        A = spla.LinearOperator(
-            (n_params, n_params), matvec=matvec,
-            dtype=np.float64,
-        )
-        dp, info = spla.minres(
-            A, energy_grad_np, rtol=rtol, maxiter=maxiter,
-        )
-        t1 = time.time()
-        return dp, t1 - t0, info
+    #     A = spla.LinearOperator(
+    #         (n_params, n_params), matvec=matvec,
+    #         dtype=np.float64,
+    #     )
+    #     dp, info = spla.minres(
+    #         A, energy_grad_np, rtol=rtol, maxiter=maxiter,
+    #     )
+    #     t1 = time.time()
+    #     return dp, t1 - t0, info
 
     # --- Pure-GPU MINRES via torch_minres ---
     if world_size == 1:
@@ -561,4 +662,233 @@ def minSR_solver_gpu(
 
         t1 = time.time()
         return energy_grad, t1 - t0, None
+
+
+# ===========================================================================
+# Distributed MinSR Solver (chunked Gram matrix, no full gather)
+# ===========================================================================
+def distributed_minSR_solver_gpu(
+    local_O,
+    local_energies,
+    energy_mean,
+    total_samples,
+    n_params,
+    diag_shift=1e-4,
+    param_chunk_size=1024,
+    device=None,
+    do_SR=True,
+):
+    """Distributed minSR solver with incremental Gram matrix.
+
+    Builds G = O_sk @ O_sk.T by iterating over parameter chunks
+    of size C.  Supports both GPU-resident and CPU-resident
+    local_O:
+
+    - GPU path: slices local_O[:, c:c+C] directly on GPU.
+    - CPU path (offload_oloc): local_O lives on CPU.  Each
+      param chunk is uploaded to GPU on the fly, used for
+      G-build and dp-reconstruction, then discarded.  Peak
+      GPU memory is O(Ns_total^2 + Ns_total * C) — the
+      (Ns_per_rank, Np) matrix never touches GPU.
+
+    Args:
+        local_O: (Ns_per_rank, Np) tensor — GPU or CPU.
+        local_energies: (Ns_per_rank,) tensor — GPU or CPU.
+        energy_mean: global mean energy (float).
+        total_samples: total samples across all ranks (Ns_total).
+        n_params: number of parameters (Np).
+        diag_shift: regularization for (G + lambda*I).
+        param_chunk_size: number of params to gather at once (C).
+        device: torch device for GPU compute.
+        do_SR: if False, return only the energy gradient.
+
+    Returns:
+        dp: (Np,) GPU tensor, parameter update direction.
+        sr_time: wall-clock time (float).
+        info: 0 if success, 1 if lstsq fallback.
+    """
+    t0 = time.time()
+    if device is None:
+        device = torch.device('cuda')
+
+    world_size = dist.get_world_size()
+    C = param_chunk_size
+
+    # --- Detect whether local_O lives on CPU ---
+    if isinstance(local_O, torch.Tensor):
+        oloc_on_cpu = local_O.device.type == 'cpu'
+    else:
+        oloc_on_cpu = True  # numpy
+
+    # --- Normalize inputs ---
+    if not isinstance(local_O, torch.Tensor):
+        local_O = torch.as_tensor(
+            local_O, dtype=torch.float64,
+        ).contiguous()
+    else:
+        local_O = local_O.to(dtype=torch.float64).contiguous()
+
+    if not isinstance(local_energies, torch.Tensor):
+        local_energies = torch.tensor(
+            local_energies, device=device, dtype=torch.float64,
+        )
+    else:
+        local_energies = local_energies.to(
+            device=device, dtype=torch.float64,
+        )
+
+    n_local = local_energies.shape[0]  # Ns_per_rank
+
+    # --- Compute global statistics via all_reduce on (Np,) ---
+    # When local_O is on CPU, chunk the sum/dot to avoid
+    # uploading the full matrix.
+    if n_local > 0:
+        if oloc_on_cpu:
+            local_sum_O = torch.zeros(
+                n_params, device=device, dtype=torch.float64,
+            )
+            local_sum_EO = torch.zeros(
+                n_params, device=device, dtype=torch.float64,
+            )
+            E_cpu = local_energies.cpu()
+            for start in range(0, n_params, C):
+                end = min(start + C, n_params)
+                chunk_gpu = local_O[:, start:end].to(device)
+                local_sum_O[start:end] = chunk_gpu.sum(dim=0)
+                local_sum_EO[start:end] = E_cpu @ local_O[:, start:end]
+                # sum_EO chunk: (Ns,)@(Ns,c) on CPU is fine,
+                # result is small (c,)
+            local_sum_EO = local_sum_EO.to(device)
+            del E_cpu
+        else:
+            # local_O already on GPU
+            if local_O.device != device:
+                local_O = local_O.to(device)
+            local_sum_O = local_O.sum(dim=0)
+            local_sum_EO = local_energies @ local_O
+    else:
+        local_sum_O = torch.zeros(
+            n_params, device=device, dtype=torch.float64,
+        )
+        local_sum_EO = torch.zeros(
+            n_params, device=device, dtype=torch.float64,
+        )
+
+    if world_size > 1:
+        dist.all_reduce(local_sum_O, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
+
+    mean_O = local_sum_O / total_samples            # (Np,) GPU
+    mean_EO = local_sum_EO / total_samples          # (Np,) GPU
+    energy_grad = mean_EO - energy_mean * mean_O    # (Np,) GPU
+
+    if not do_SR:
+        t1 = time.time()
+        return energy_grad, t1 - t0, None
+
+    # --- Center and scale local_O in-place ---
+    # O_sk = (O - mean_O) / sqrt(Ns)
+    # Safe: caller doesn't reuse local_O after solver returns.
+    if oloc_on_cpu:
+        mean_O_cpu = mean_O.cpu()
+        local_O -= mean_O_cpu.unsqueeze(0)
+        local_O /= math.sqrt(total_samples)
+        del mean_O_cpu
+    else:
+        local_O -= mean_O.unsqueeze(0)
+        local_O /= math.sqrt(total_samples)
+
+    # --- Gather energies (cheap: Ns_total floats) ---
+    local_E_scaled = (
+        (local_energies - energy_mean) / math.sqrt(total_samples)
+    )  # (Ns_per_rank,) GPU
+
+    if world_size > 1:
+        total_E = torch.zeros(
+            total_samples, device=device, dtype=torch.float64,
+        )
+        dist.all_gather_into_tensor(total_E, local_E_scaled)
+    else:
+        total_E = local_E_scaled
+
+    # --- Build Gram matrix G = O_sk @ O_sk^T via param chunks ---
+    G = torch.zeros(
+        (total_samples, total_samples),
+        device=device, dtype=torch.float64,
+    )
+
+    if world_size > 1:
+        gather_buf = torch.zeros(
+            (total_samples, C),
+            device=device, dtype=torch.float64,
+        )
+
+        for start in range(0, n_params, C):
+            end = min(start + C, n_params)
+            chunk_size = end - start
+            # Stream from CPU if needed
+            local_chunk = local_O[:, start:end].to(
+                device=device,
+            ).contiguous()
+
+            if chunk_size < C:
+                gather_buf_cur = torch.zeros(
+                    (total_samples, chunk_size),
+                    device=device, dtype=torch.float64,
+                )
+                dist.all_gather_into_tensor(
+                    gather_buf_cur, local_chunk,
+                )
+            else:
+                dist.all_gather_into_tensor(
+                    gather_buf, local_chunk,
+                )
+                gather_buf_cur = gather_buf
+
+            G.addmm_(gather_buf_cur, gather_buf_cur.T)
+            del local_chunk
+
+        del gather_buf
+    else:
+        for start in range(0, n_params, C):
+            end = min(start + C, n_params)
+            chunk = local_O[:, start:end].to(device)
+            G.addmm_(chunk, chunk.T)
+            del chunk
+
+    # --- Solve (G + lambda*I) alpha = E_s ---
+    G.diagonal().add_(diag_shift)
+    info = 0
+    try:
+        alpha = torch.linalg.solve(G, total_E)
+    except RuntimeError:
+        alpha = torch.linalg.lstsq(G, total_E).solution
+        info = 1
+    del G
+
+    # --- Reconstruct dp = O_sk^T @ alpha_local ---
+    if world_size > 1:
+        rank = dist.get_rank()
+        alpha_local = alpha[
+            rank * n_local:(rank + 1) * n_local
+        ]  # (Ns_per_rank,) GPU
+    else:
+        alpha_local = alpha
+
+    # Chunk the dp reconstruction along params to avoid
+    # uploading full (Ns_per_rank, Np) to GPU.
+    dp = torch.zeros(
+        n_params, device=device, dtype=torch.float64,
+    )
+    for start in range(0, n_params, C):
+        end = min(start + C, n_params)
+        chunk = local_O[:, start:end].to(device)
+        dp[start:end] = chunk.T @ alpha_local
+        del chunk
+
+    if world_size > 1:
+        dist.all_reduce(dp, op=dist.ReduceOp.SUM)
+
+    t1 = time.time()
+    return dp, t1 - t0, info
 

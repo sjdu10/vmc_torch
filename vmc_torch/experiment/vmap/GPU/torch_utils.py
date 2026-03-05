@@ -1,5 +1,6 @@
 import torch
 import contextlib
+import math
 
 # === Global control ===
 _ENABLE_JITTER = False
@@ -522,6 +523,106 @@ def size_aware_svd(x, jitter=1e-12, driver=None, backend='cuSOLVER'):
     
     return robust_svd_err_catcher_wrapper(x, jitter=jitter, driver=driver)
 
+
+# ===========================================================================
+# Pure-PyTorch MINRES (Paige & Saunders 1975)
+# ===========================================================================
+def torch_minres(matvec, b, rtol=1e-5, maxiter=100):
+    """MINRES solver in pure PyTorch — runs entirely on GPU.
+
+    Solves A x = b where A is symmetric (accessed via matvec).
+    Implements Paige & Saunders (1975), mirroring scipy's
+    implementation exactly.
+
+    One matvec call per iteration; all other ops are O(Np) vector
+    arithmetic.  Scalar extractions (.item()) are negligible
+    versus the matvec cost.
+
+    Args:
+        matvec: callable, x -> A @ x (GPU tensor in/out).
+        b: (Np,) right-hand-side GPU tensor.
+        rtol: relative tolerance |r| / |b| < rtol.
+        maxiter: maximum Lanczos iterations.
+
+    Returns:
+        x: (Np,) solution GPU tensor.
+        info: 0 if converged, else maxiter.
+    """
+    b_norm = torch.linalg.norm(b).item()
+    if b_norm == 0:
+        return torch.zeros_like(b), 0
+
+    # Lanczos init: r1 = b, beta1 = ||b||
+    n = b.shape[0]
+    x = torch.zeros_like(b)
+    r1 = b.clone()
+    r2 = b.clone()
+    beta1 = b_norm
+    beta = beta1
+
+    # Givens rotation state
+    cs = -1.0
+    sn = 0.0
+    oldb = 0.0
+    dbar = 0.0
+    epsln = 0.0
+    phibar = beta1
+
+    # w vectors for solution update
+    w = torch.zeros_like(b)
+    w2 = torch.zeros_like(b)
+
+    info = maxiter
+    for itn in range(1, maxiter + 1):
+        # Lanczos step
+        s = 1.0 / beta
+        v = s * r2                          # v_k
+
+        y = matvec(v)
+
+        if itn >= 2:
+            y = y - (beta / oldb) * r1
+
+        alfa = torch.dot(v, y).item()
+        y = y - (alfa / beta) * r2
+
+        r1 = r2
+        r2 = y
+        oldb = beta
+        beta = torch.linalg.norm(r2).item()
+
+        # Apply previous rotation Q_{k-1}
+        oldeps = epsln
+        delta = cs * dbar + sn * alfa
+        gbar = sn * dbar - cs * alfa
+        epsln = sn * beta
+        dbar = -cs * beta
+
+        # Compute new rotation Q_k
+        gamma = math.sqrt(gbar ** 2 + beta ** 2)
+        gamma = max(gamma, 1e-300)
+        cs = gbar / gamma
+        sn = beta / gamma
+        phi = cs * phibar
+        phibar = sn * phibar
+
+        # Update x
+        denom = 1.0 / gamma
+        w1 = w2
+        w2 = w
+        w = (v - oldeps * w1 - delta * w2) * denom
+        x = x + phi * w
+
+        # Convergence: |r| / |b|
+        if abs(phibar) < rtol * b_norm:
+            info = 0
+            break
+
+        if beta == 0.0:
+            info = 0
+            break
+
+    return x, info
 
 # ========================================== Benchmarking Suite ==========================================
 

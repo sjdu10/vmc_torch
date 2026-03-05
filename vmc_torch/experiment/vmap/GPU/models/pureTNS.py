@@ -165,6 +165,13 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         self.bMPS_params_x_in_dims = None
         self.bMPS_params_y_in_dims = None
 
+        # Keys whose bMPS is a raw single row/col (D bonds,
+        # not chi bonds). For these, skip boundary contraction
+        # inside amplitude_reuse to avoid slow small-tensor
+        # SVDs under torch.vmap.
+        self._raw_bMPS_x_keys = set()
+        self._raw_bMPS_y_keys = set()
+
         # Flatten pytree into a single list for torch
         params_flat, params_pytree = qu.utils.tree_flatten(
             params, get_ref=True
@@ -279,14 +286,28 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             )
             if self.chi > 0:
                 if len(amp_reuse.tensors) > 2 * self.Ly:
-                    amp_reuse.contract_boundary_from_xmin_(
-                        max_bond=self.chi, cutoff=0.0,
-                        xrange=[
-                            bMPS_keys[0][1],
-                            min(bMPS_keys[0][1] + 1, self.Lx - 1),
-                        ],
-                        **self.contract_boundary_opts,
+                    # Skip boundary contraction when either
+                    # env is a raw row (D bonds). The small
+                    # SVDs are very slow under torch.vmap.
+                    # Let cotengra contract all tensors
+                    # directly instead.
+                    has_raw = (
+                        bMPS_keys[0] in self._raw_bMPS_x_keys
+                        or bMPS_keys[1]
+                        in self._raw_bMPS_x_keys
                     )
+                    if not has_raw:
+                        amp_reuse.contract_boundary_from_xmin_(
+                            max_bond=self.chi, cutoff=0.0,
+                            xrange=[
+                                bMPS_keys[0][1],
+                                min(
+                                    bMPS_keys[0][1] + 1,
+                                    self.Lx - 1,
+                                ),
+                            ],
+                            **self.contract_boundary_opts,
+                        )
             return amp_reuse.contract()
 
         # y-environment reuse
@@ -317,14 +338,23 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             )
             if self.chi > 0:
                 if len(amp_reuse.tensors) > 2 * self.Lx:
-                    amp_reuse.contract_boundary_from_ymin_(
-                        max_bond=self.chi, cutoff=0.0,
-                        yrange=[
-                            bMPS_keys[0][1],
-                            min(bMPS_keys[0][1] + 1, self.Ly - 1),
-                        ],
-                        **self.contract_boundary_opts,
+                    has_raw = (
+                        bMPS_keys[0] in self._raw_bMPS_y_keys
+                        or bMPS_keys[1]
+                        in self._raw_bMPS_y_keys
                     )
+                    if not has_raw:
+                        amp_reuse.contract_boundary_from_ymin_(
+                            max_bond=self.chi, cutoff=0.0,
+                            yrange=[
+                                bMPS_keys[0][1],
+                                min(
+                                    bMPS_keys[0][1] + 1,
+                                    self.Ly - 1,
+                                ),
+                            ],
+                            **self.contract_boundary_opts,
+                        )
             return amp_reuse.contract()
 
         # Full contraction fallback
@@ -898,6 +928,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             lambda _: 0, bMPS_params_dict
         )
 
+        # Detect raw (single-row, D-bonded) x-envs:
+        # ('xmin', 1) = row 0 only, ('xmax', Lx-2) = last row
+        # only. These have D bonds, not chi bonds. Skip boundary
+        # contraction for them to avoid slow small SVDs under vmap.
+        self._raw_bMPS_x_keys = set()
+        if self.Lx >= 3:
+            self._raw_bMPS_x_keys.add(('xmin', 1))
+            self._raw_bMPS_x_keys.add(('xmax', self.Lx - 2))
+
         # y-direction environments
         env_y = amp.compute_y_environments(
             max_bond=self.chi, cutoff=0.0,
@@ -911,6 +950,11 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         self.bMPS_params_y_in_dims = qu.utils.tree_map(
             lambda _: 0, bMPS_params_dict
         )
+
+        self._raw_bMPS_y_keys = set()
+        if self.Ly >= 3:
+            self._raw_bMPS_y_keys.add(('ymin', 1))
+            self._raw_bMPS_y_keys.add(('ymax', self.Ly - 2))
 
     def cache_bMPS_params_vmap(self, x):
         """Compute batched bMPS params for all x and y environments.

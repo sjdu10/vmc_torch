@@ -432,7 +432,8 @@ def evaluate_energy_reuse(
 
     Args:
         fxs: (B, N_sites) int64 configurations.
-        model: fPEPS_Model_reuse_GPU with cache_bMPS_skeleton called.
+        model: PEPS_Model_reuse_GPU with cache_bMPS_skeleton
+            called.
         H: Hamiltonian with get_conn or get_conn_batch_gpu.
         current_amps: (B,) amplitudes at fxs.
         verbose: Print timing breakdown.
@@ -458,19 +459,34 @@ def evaluate_energy_reuse(
         print(f"  cache bMPS: {t1 - t0:.4f}s")
 
     # 2. Get connected configurations
-    if verbose:
-        t0 = time.time()
-
+    # --- GPU-batched path: zero CPU round-trips ---
     if hasattr(H, '_hop_list'):
+        if verbose:
+            t0 = time.time()
         conn_etas, conn_eta_coeffs, batch_ids = (
             H.get_conn_batch_gpu(fxs)
         )
-        conn_eta_num = torch.bincount(batch_ids, minlength=B)
-    else:
-        fxs_cpu = fxs.cpu()
-        all_etas_np, all_coeffs_np, conn_eta_num_list = (
-            [], [], [],
+        conn_eta_num = torch.bincount(
+            batch_ids, minlength=B,
         )
+        if verbose:
+            t1 = time.time()
+            print(
+                f"  GPU get_conn_batch: {t1 - t0:.4f}s"
+                f" ({conn_etas.shape[0]} connected)"
+            )
+
+    # --- Fallback: CPU get_conn ---
+    else:
+        if verbose:
+            t0 = time.time()
+            print(
+                "  Warning: falling back to CPU "
+                "get_conn (no _hop_list)"
+            )
+        fxs_cpu = fxs.cpu()
+        all_etas_np, all_coeffs_np = [], []
+        conn_eta_num_list = []
         for fx in fxs_cpu:
             eta, coeffs = H.get_conn(fx)
             conn_eta_num_list.append(len(eta))
@@ -489,10 +505,12 @@ def evaluate_energy_reuse(
         batch_ids = torch.repeat_interleave(
             torch.arange(B, device=device), conn_eta_num,
         )
-
-    if verbose:
-        t1 = time.time()
-        print(f"  get_conn: {t1 - t0:.4f}s")
+        if verbose:
+            t1 = time.time()
+            print(
+                f"  CPU get_conn: {t1 - t0:.4f}s"
+                f" ({conn_etas.shape[0]} connected)"
+            )
 
     # 3. Classify connected configs by change type
     # Note: batch_ids may NOT be contiguous (GPU get_conn_batch
@@ -529,12 +547,18 @@ def evaluate_energy_reuse(
         if is_row:
             pos = list(range(
                 max(0, min(pos) - model.radius),
-                min(model.Lx, max(pos) + model.radius + 1),
+                min(
+                    model.Lx,
+                    max(pos) + model.radius + 1,
+                ),
             ))
         else:
             pos = list(range(
                 max(0, min(pos) - model.radius),
-                min(model.Ly, max(pos) + model.radius + 1),
+                min(
+                    model.Ly,
+                    max(pos) + model.radius + 1,
+                ),
             ))
 
         mode = 'row' if is_row else 'col'
@@ -547,12 +571,15 @@ def evaluate_energy_reuse(
         tasks_map[group_key]['global_idxs'].append(k)
         tasks_map[group_key]['parent_idxs'].append(b)
 
+    n_diag = int(diagonal_mask.sum())
+    n_groups = len(tasks_map)
+    n_offdiag = total_conn - n_diag
     if verbose:
         t1 = time.time()
         print(
             f"  classify: {t1 - t0:.4f}s "
-            f"({len(tasks_map)} groups, "
-            f"{int(diagonal_mask.sum())} diagonal)"
+            f"({n_groups} groups, {n_diag} diagonal, "
+            f"{n_offdiag} off-diagonal)"
         )
 
     # 4. Evaluate connected amplitudes
@@ -560,25 +587,37 @@ def evaluate_energy_reuse(
         t0 = time.time()
 
     conn_amps = torch.zeros(
-        total_conn, dtype=current_amps.dtype, device=device,
+        total_conn, dtype=current_amps.dtype,
+        device=device,
     )
 
-    # A. Diagonal terms — direct copy
+    # A. Diagonal terms — direct copy (no forward pass)
     if diagonal_parent_indices:
-        diag_locs = torch.nonzero(diagonal_mask).squeeze(-1)
+        diag_locs = torch.nonzero(
+            diagonal_mask,
+        ).squeeze(-1)
         parents = torch.tensor(
             diagonal_parent_indices, device=device,
         )
         conn_amps[diag_locs] = current_amps[parents]
 
-    # B. Non-diagonal terms — grouped reuse contraction
+    # B. Non-diagonal terms — grouped reuse contraction.
     # Pad each chunk to fixed size B to avoid torch.compile
     # recompilation on varying batch sizes.
+    chunk_counter = 0
+    total_chunks = sum(
+        (len(d['global_idxs']) + B - 1) // B
+        for d in tasks_map.values()
+    )
+
     for (mode, indices), data in tasks_map.items():
         global_idxs = data['global_idxs']
         parent_idxs = data['parent_idxs']
 
         for start in range(0, len(global_idxs), B):
+            if verbose:
+                t00 = time.time()
+            chunk_counter += 1
             end = min(start + B, len(global_idxs))
             batch_global = global_idxs[start:end]
             batch_parents = parent_idxs[start:end]
@@ -627,9 +666,21 @@ def evaluate_energy_reuse(
             )
             conn_amps[locs] = amps_chunk[:actual]
 
+            if verbose:
+                print(
+                    f"  Reuse chunk {chunk_counter}"
+                    f" / {total_chunks}"
+                    f" ({mode} {list(indices)}):"
+                    f" {actual} configs,"
+                    f" delta t: {time.time() - t00:.4f}s,"
+                    f" total t: {time.time() - t0:.4f}s"
+                )
+
     if verbose:
         t1 = time.time()
-        print(f"  reuse forward: {t1 - t0:.4f}s")
+        print(
+            f"  reuse forward total: {t1 - t0:.4f}s"
+        )
 
     # 5. Compute local energies via vectorized index_add_
     current_amps_expanded = current_amps[batch_ids]
@@ -656,9 +707,16 @@ def flatten_params(parameters):
         vec.append(param.reshape(-1))
     return torch.cat(vec)
 
-def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=False, vmap_grad=False, **kwargs):
+def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=False, vmap_grad=False, offload_to_cpu=False, **kwargs):
     """
     Vectorized gradient computation optimized for GPU with memory chunking and vmap/jacrev support.
+
+    Args:
+        offload_to_cpu: if True, each (B_grad, Np) gradient chunk
+            is flattened and moved to CPU immediately after GPU
+            computation.  The final returned tensors live on CPU.
+            This keeps GPU peak memory at O(B_grad * Np) instead
+            of O(B * Np).
     """
     if vectorize:
         # 1. Prepare parameters PyTree structure
@@ -691,46 +749,66 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                 in_dims=(0, None)
             )
 
-            grads_pytree_chunks = []
             amps_chunks = []
-            
+
             t0 = time.time()
-            # Chunking loop
-            for b_start in range(0, B, B_grad):
-                b_end = min(b_start + B_grad, B)
-                fxs_chunk = fxs[b_start:b_end]
-                
-                # Compute gradients and amplitudes for the chunk
-                grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
-                
-                # Detach to free compute graph
-                amps_c = amps_c.detach()
-                grads_chunk = tree_map(lambda x: x.detach(), grads_chunk)
 
-                grads_pytree_chunks.append(grads_chunk)
-                amps_chunks.append(amps_c)
+            if offload_to_cpu:
+                # Eager CPU offload: flatten each chunk to (B_grad, Np)
+                # on GPU, then .cpu() immediately. Peak GPU mem = O(B_grad * Np).
+                flat_vec_chunks = []
+                for b_start in range(0, B, B_grad):
+                    b_end = min(b_start + B_grad, B)
+                    fxs_chunk = fxs[b_start:b_end]
 
-            # Aggregate results
-            amps = torch.cat(amps_chunks, dim=0)
-            # if amps.dim() == 1: amps = amps.unsqueeze(-1)
-            
-            # Helper to concatenate leaves of the gradient PyTree
-            def concat_leaves(*leaves):
-                return torch.cat(leaves, dim=0)
-            
-            # Combine chunks into full batch PyTree
-            full_grads_pytree = tree_map(concat_leaves, *grads_pytree_chunks)
+                    grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
 
-            # Flatten to vector (B, Np)
-            leaves, _ = tree_flatten(full_grads_pytree)
-            # Each leaf is (B, Param_Shape), flatten to (B, Param_Size)
-            flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
-            batched_grads_vec = torch.cat(flat_leaves, dim=1)
-            
+                    amps_c = amps_c.detach()
+                    grads_chunk = tree_map(lambda x: x.detach(), grads_chunk)
+
+                    # Flatten to (B_grad, Np) on GPU, then offload
+                    leaves_c, _ = tree_flatten(grads_chunk)
+                    flat_c = torch.cat(
+                        [l.flatten(start_dim=1) for l in leaves_c], dim=1,
+                    )
+                    flat_vec_chunks.append(flat_c.cpu())
+                    amps_chunks.append(amps_c.cpu())
+                    del grads_chunk, leaves_c, flat_c
+
+                # Concatenate on CPU
+                batched_grads_vec = torch.cat(flat_vec_chunks, dim=0)
+                amps = torch.cat(amps_chunks, dim=0)
+                del flat_vec_chunks
+            else:
+                # Standard path: accumulate pytree chunks on GPU
+                grads_pytree_chunks = []
+                for b_start in range(0, B, B_grad):
+                    b_end = min(b_start + B_grad, B)
+                    fxs_chunk = fxs[b_start:b_end]
+
+                    grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
+
+                    amps_c = amps_c.detach()
+                    grads_chunk = tree_map(lambda x: x.detach(), grads_chunk)
+
+                    grads_pytree_chunks.append(grads_chunk)
+                    amps_chunks.append(amps_c)
+
+                amps = torch.cat(amps_chunks, dim=0)
+
+                def concat_leaves(*leaves):
+                    return torch.cat(leaves, dim=0)
+
+                full_grads_pytree = tree_map(concat_leaves, *grads_pytree_chunks)
+
+                leaves, _ = tree_flatten(full_grads_pytree)
+                flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
+                batched_grads_vec = torch.cat(flat_leaves, dim=1)
+
             # Final cleanup
             batched_grads_vec = batched_grads_vec.detach()
             fpeps_model.zero_grad()
-            
+
             t1 = time.time()
             if verbose:
                 print(f"GPU Batched vmap(grad) time: {t1 - t0:.4f}s")

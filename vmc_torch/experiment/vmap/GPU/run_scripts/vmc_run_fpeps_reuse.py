@@ -128,7 +128,7 @@ def main():
             dtype=dtype,
             contract_boundary_opts={
                 'mode': 'mps',
-                'equalize_norms': 1.0,
+                # 'equalize_norms': 1.0,
                 'canonize': True,
             },
         )

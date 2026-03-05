@@ -17,12 +17,15 @@ DEFAULT_DATA_ROOT = (
 )
 
 
-def setup_linalg_hooks(jitter=1e-16, driver=None, qr_via_eigh=True):
-    ar.register_function(
-        'torch',
-        'linalg.svd',
-        lambda x: size_aware_svd(x, jitter=jitter, driver=driver),
-    )
+def setup_linalg_hooks(jitter=1e-16, driver=None, qr_via_eigh=True, randomize_svd=False):
+    if not randomize_svd:
+        ar.register_function(
+            'torch',
+            'linalg.svd',
+            lambda x: size_aware_svd(x, jitter=jitter, driver=driver),
+        )
+    else:
+        ...
     ar.register_function(
         'torch',
         'linalg.qr',
@@ -123,9 +126,69 @@ def ensure_output_dir(
     return output_dir
 
 
+def generate_random_spin_peps(
+    Lx, Ly, D, seed=42, dtype=torch.float64,
+):
+    """Generate a random PEPS for spin-1/2 systems.
+
+    Creates a quimb PEPS with physical dimension 2 (spin
+    states {0, 1}) and bond dimension D.
+
+    Args:
+        Lx, Ly: lattice dimensions.
+        D: bond dimension.
+        seed: random seed.
+        dtype: torch dtype.
+
+    Returns:
+        quimb PEPS tensor network.
+    """
+    dtype_str = str(dtype).split('.')[-1]
+    peps = qtn.PEPS.rand(
+        Lx, Ly,
+        bond_dim=D,
+        phys_dim=2,
+        dtype=dtype_str,
+        seed=seed,
+    )
+    return peps
+
+
+def random_spin_config_sz0(N_sites, seed=None):
+    """Generate a random spin-1/2 config with Sz=0.
+
+    Returns a 1D int64 CPU tensor with exactly N_sites//2
+    up-spins (1) and N_sites//2 down-spins (0).
+
+    Args:
+        N_sites: number of sites (must be even).
+        seed: optional random seed.
+
+    Returns:
+        (N_sites,) int64 tensor (CPU).
+    """
+    if seed is not None:
+        gen = torch.Generator(device='cpu').manual_seed(seed)
+    else:
+        gen = None
+    n_up = N_sites // 2
+    config = torch.cat([
+        torch.ones(n_up, dtype=torch.int64, device='cpu'),
+        torch.zeros(
+            N_sites - n_up, dtype=torch.int64, device='cpu',
+        ),
+    ])
+    perm = torch.randperm(
+        N_sites, generator=gen, device='cpu',
+    )
+    return config[perm]
+
+
 __all__ = [
     'setup_linalg_hooks',
     'load_or_generate_peps',
     'initialize_walkers',
     'ensure_output_dir',
+    'generate_random_spin_peps',
+    'random_spin_config_sz0',
 ]

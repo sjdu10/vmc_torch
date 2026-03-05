@@ -13,10 +13,10 @@ from vmc_torch.experiment.vmap.GPU.optimizer import (
     PreconditionerGPU,
 )
 from vmc_torch.experiment.vmap.GPU.sampler import SamplerGPU
-from vmc_torch.experiment.vmap.GPU.vmc_modules import (
-    distributed_minres_solver_gpu,
-    minSR_solver_gpu,
-)
+# from vmc_torch.experiment.vmap.GPU.vmc_modules import (
+#     distributed_minres_solver_gpu,
+#     minSR_solver_gpu,
+# )
 from vmc_torch.experiment.vmap.GPU.vmc_utils import (
     compute_grads_gpu,
     evaluate_energy,
@@ -77,7 +77,6 @@ class VMCLoopConfig:
     diag_shift: float = 1e-4
     burn_in_steps: int = 0
     run_sr: bool = True
-    use_min_sr: bool = False
     use_export_compile: bool = False
     show_progress: bool = True
     step_offset: int = 0  # global step = local step + step_offset
@@ -89,6 +88,28 @@ class VMCLoopConfig:
     # Optional LR scheduler: callable(step) -> float.
     # If set, overrides learning_rate each step.
     lr_scheduler: object = None
+
+    @classmethod
+    def from_vmc_config(cls, cfg, *, n_params, nsites):
+        """Build from a run-script VMCConfig dataclass.
+
+        Copies all fields whose names match between cfg and
+        VMCLoopConfig.  The two extra fields (n_params, nsites)
+        are model/system-dependent so must be passed explicitly.
+        ``resume_step`` in cfg maps to ``step_offset`` here.
+        """
+        import dataclasses as _dc
+        loop_fields = {f.name for f in _dc.fields(cls)}
+        kwargs = {}
+        for f in _dc.fields(cfg):
+            if f.name in loop_fields:
+                kwargs[f.name] = getattr(cfg, f.name)
+        # Map resume_step -> step_offset
+        if hasattr(cfg, 'resume_step'):
+            kwargs['step_offset'] = cfg.resume_step
+        kwargs['n_params'] = n_params
+        kwargs['nsites'] = nsites
+        return cls(**kwargs)
 
 
 class VMC_GPU:
@@ -131,6 +152,7 @@ class VMC_GPU:
         use_export_compile=False,
         debug=False,
         outlier_clip_factor=0.0,
+        offload_oloc=False,
     ):
         """Run MCMC sampling, energy eval, and gradient
         computation for one VMC step.
@@ -139,9 +161,15 @@ class VMC_GPU:
         method calls evaluate_energy_fn and
         compute_grads_fn directly.
 
+        Args:
+            offload_oloc: if True, move O_loc chunks to CPU
+                immediately after GPU computation. Reduces
+                GPU memory when SR solve runs on CPU anyway.
+
         Returns:
-            (local_energies, local_O): GPU tensors,
-                shapes (Ns,) and (Ns, Np).
+            (local_energies, local_O): tensors of shapes
+                (Ns,) and (Ns, Np). local_O is on CPU when
+                offload_oloc=True, GPU otherwise.
             fxs: (B, N_sites) updated walker configs.
             phase_times: dict with t_samp, t_locE, t_grad.
         """
@@ -191,8 +219,12 @@ class VMC_GPU:
                     vectorize=True,
                     batch_size=grad_batch_size,
                     vmap_grad=True,
+                    offload_to_cpu=offload_oloc,
                 )
             # O_loc = grads / amps
+            # When offload_oloc=True, grads and amps2 are
+            # already on CPU (eager offload inside
+            # compute_grads_fn). Division works on CPU.
             _rank = dist.get_rank() if dist.is_initialized() else 0
             if debug and _rank == 0:
                 abs_a = amps2.abs()
@@ -224,11 +256,12 @@ class VMC_GPU:
             local_energies_list.append(
                 local_E[:needed].detach(),
             )
-            local_O_list.append(
-                grads[:needed].detach(),
-            )
+            # When offload_oloc=True, grads are already on CPU
+            # (eager offload inside compute_grads_fn).
+            o_chunk = grads[:needed].detach()
+            local_O_list.append(o_chunk)
             current_count += needed
-            del grads, amps2, local_E
+            del grads, amps2, local_E, o_chunk
 
         local_energies = torch.cat(local_energies_list)
         local_O = torch.cat(local_O_list)
@@ -300,6 +333,13 @@ class VMC_GPU:
         rank,
         config: VMCWarmupConfig,
     ):
+        # Offload gradients to CPU when MINRES SR solver can work with
+        # CPU-resident data (scipy MINRES).
+        offload_grad_cpu = (
+            hasattr(self.preconditioner, 'use_scipy')
+            and self.preconditioner.use_scipy
+        )
+        
         self._sync_params(model)
 
         if rank == 0 and config.verbose:
@@ -338,6 +378,7 @@ class VMC_GPU:
                 vectorize=True,
                 batch_size=config.grad_batch_size,
                 vmap_grad=True,
+                offload_to_cpu=offload_grad_cpu,
             )
         if rank == 0 and config.verbose:
             print(
@@ -510,6 +551,13 @@ class VMC_GPU:
         device = next(model.parameters()).device
         self._sync_params(model)
 
+        # Offload O_loc to CPU when MINRES SR solver can work with
+        # CPU-resident data (scipy MINRES).
+        offload_oloc = (
+            hasattr(self.preconditioner, 'use_scipy')
+            and self.preconditioner.use_scipy
+        )
+
         if rank == 0 and config.show_progress:
             print(f"\n--- VMC ({config.vmc_steps} steps) ---")
             vmc_pbar = tqdm(
@@ -535,6 +583,7 @@ class VMC_GPU:
                     use_export_compile=config.use_export_compile,
                     debug=config.debug,
                     outlier_clip_factor=config.outlier_clip_factor,
+                    offload_oloc=offload_oloc,
                 )
             )
 

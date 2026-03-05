@@ -1,8 +1,8 @@
-"""GPU VMC with Conv2D-Geometric NN-fPEPS backflow model.
+"""GPU VMC with Conv2D-Geometric NN-fPEPS backflow model — 4x4 system.
 
 Run:
-    torchrun --nproc_per_node=<N> run_scripts/vmc_run_nnfpeps.py
-    torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps.py
+    torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps_4x4.py
+    torchrun --nproc_per_node=2 run_scripts/vmc_run_nnfpeps_4x4.py
 """
 import json
 import os
@@ -26,6 +26,7 @@ from vmc_torch.experiment.vmap.GPU.models import (
 )
 from vmc_torch.experiment.vmap.GPU.optimizer import (
     DecayScheduler,
+    DistributedMinSRGPU,
     DistributedSRMinresGPU,
     MinSRGPU,
     SGDGPU,
@@ -41,10 +42,17 @@ from vmc_torch.experiment.vmap.GPU.vmc_setup import (
 from vmc_torch.experiment.vmap.GPU.vmc_utils import random_initial_config
 
 dtype = torch.float64
-USE_EXPORT_COMPILE = True
+USE_EXPORT_COMPILE = False
+
+# Data paths
 DEFAULT_DATA_ROOT = (
     '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
     '/experiment/vmap/GPU/data'
+)
+# SU-initialized PEPS from CPU vmap pipeline
+CPU_DATA_ROOT = (
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
+    '/experiment/vmap/data'
 )
 
 
@@ -54,15 +62,17 @@ class VMCConfig:
 
     batch_size: int = 4096
     ns_per_rank: int = 4096
-    grad_batch_size: int = 1024
+    grad_batch_size: int = 16
     vmc_steps: int = 100
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
     burn_in_steps: int = 0
     use_min_sr: bool = False
+    use_distributed_min_sr: bool = False
+    param_chunk_size: int = 1024
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
-    save_every: int = 10
+    save_every: int = 50
     resume_step: int = 0
     debug: bool = False
     outlier_clip_factor: float = 100.0 # drop O_loc outliers > factor * median
@@ -71,7 +81,7 @@ class VMCConfig:
 
 
 def main():
-    setup_linalg_hooks(jitter=1e-12)
+    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=True)
     torch.set_default_dtype(dtype)
 
     try:
@@ -80,14 +90,14 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 2
+        Lx, Ly = 6, 6
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 2  # 2 holes
+        N_f = N_sites - 2  # 2 holes -> 14 fermions
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4   # PEPS bond dimension
-        chi = -1  # exact contraction (no boundary approx)
+        D = 10   # PEPS bond dimension
+        chi = 10  # exact contraction
 
         # NN backflow hyperparameters
         nn_eta = 1.0
@@ -114,7 +124,7 @@ def main():
 
         # ========== Variational state (NN-fPEPS model) ==========
         fpeps_base = (
-            f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
+            f"{CPU_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
             f"/N={N_f}/Z2/D={D}/"
         )
         peps = load_or_generate_peps(
@@ -133,6 +143,7 @@ def main():
             layers=cnn_layers,
             init_scale=init_scale,
             dtype=dtype,
+            backbone_dtype=torch.float64,
             contract_boundary_opts={
                 'mode': 'mps',
                 'equalize_norms': 1.0,
@@ -198,6 +209,9 @@ def main():
                 f"kernel={kernel_size}, layers={cnn_layers}"
             )
             print(
+                f"backbone_dtype=float32"
+            )
+            print(
                 f"{world_size} GPUs | {device}"
             )
 
@@ -233,7 +247,7 @@ def main():
                 f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
                 f'N_f={N_f}, D={D}, chi={chi}, '
                 f'nn_eta={nn_eta}, embed={embed_dim}, '
-                f'hidden={hidden_dim}'
+                f'hidden={hidden_dim}, backbone_dtype=float32'
             ),
             'Np': N_params,
             'sample size': total_ns,
@@ -243,14 +257,17 @@ def main():
         }
 
         # ========== VMC driver ==========
-        preconditioner = (
-            MinSRGPU()
-            if vmc_cfg.use_min_sr
-            else DistributedSRMinresGPU(
+        if vmc_cfg.use_distributed_min_sr:
+            preconditioner = DistributedMinSRGPU(
+                param_chunk_size=vmc_cfg.param_chunk_size,
+            )
+        elif vmc_cfg.use_min_sr:
+            preconditioner = MinSRGPU()
+        else:
+            preconditioner = DistributedSRMinresGPU(
                 rtol=vmc_cfg.sr_rtol,
                 maxiter=vmc_cfg.sr_maxiter,
             )
-        )
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
             preconditioner=preconditioner,
@@ -325,7 +342,7 @@ def main():
             )
             print(
                 f"NN-fPEPS: nn_eta={nn_eta}, embed={embed_dim}, "
-                f"hidden={hidden_dim}"
+                f"hidden={hidden_dim}, backbone_dtype=float32"
             )
             print(f"{'=' * 50}")
             print(f"First E/site: {energy_history[0]:.6f}")

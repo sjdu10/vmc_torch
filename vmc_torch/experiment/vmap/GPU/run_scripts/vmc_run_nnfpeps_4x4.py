@@ -26,6 +26,7 @@ from vmc_torch.experiment.vmap.GPU.models import (
 )
 from vmc_torch.experiment.vmap.GPU.optimizer import (
     DecayScheduler,
+    DistributedMinSRGPU,
     DistributedSRMinresGPU,
     MinSRGPU,
     SGDGPU,
@@ -41,6 +42,7 @@ from vmc_torch.experiment.vmap.GPU.vmc_setup import (
 from vmc_torch.experiment.vmap.GPU.vmc_utils import random_initial_config
 
 dtype = torch.float64
+nnbackbone_dtype = torch.float32
 USE_EXPORT_COMPILE = False
 
 # Data paths
@@ -59,16 +61,23 @@ CPU_DATA_ROOT = (
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 4096*2
-    ns_per_rank: int = 4096*2
+    batch_size: int = 4096
+    ns_per_rank: int = 4096
     grad_batch_size: int = 1024
     vmc_steps: int = 100
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
     burn_in_steps: int = 0
+    use_export_compile: bool = USE_EXPORT_COMPILE
+    
     use_min_sr: bool = False
+    use_distributed_min_sr: bool = False
+    param_chunk_size: int = 1024
+    use_distributed_sr_minres: bool = True
+    minres_sr_use_scipy: bool = False
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
+    
     save_every: int = 50
     resume_step: int = 0
     debug: bool = False
@@ -140,7 +149,7 @@ def main():
             layers=cnn_layers,
             init_scale=init_scale,
             dtype=dtype,
-            backbone_dtype=torch.float32,
+            backbone_dtype=nnbackbone_dtype,
             contract_boundary_opts={
                 'mode': 'mps',
                 'equalize_norms': 1.0,
@@ -206,7 +215,7 @@ def main():
                 f"kernel={kernel_size}, layers={cnn_layers}"
             )
             print(
-                f"backbone_dtype=float32"
+                f"backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}, "
             )
             print(
                 f"{world_size} GPUs | {device}"
@@ -244,7 +253,7 @@ def main():
                 f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
                 f'N_f={N_f}, D={D}, chi={chi}, '
                 f'nn_eta={nn_eta}, embed={embed_dim}, '
-                f'hidden={hidden_dim}, backbone_dtype=float32'
+                f'hidden={hidden_dim}, backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}'
             ),
             'Np': N_params,
             'sample size': total_ns,
@@ -254,14 +263,21 @@ def main():
         }
 
         # ========== VMC driver ==========
-        preconditioner = (
-            MinSRGPU()
-            if vmc_cfg.use_min_sr
-            else DistributedSRMinresGPU(
+        if vmc_cfg.use_distributed_min_sr:
+            preconditioner = DistributedMinSRGPU(
+                param_chunk_size=vmc_cfg.param_chunk_size,
+            )
+        elif vmc_cfg.use_min_sr:
+            preconditioner = MinSRGPU()
+        elif vmc_cfg.use_distributed_sr_minres:
+            preconditioner = DistributedSRMinresGPU(
                 rtol=vmc_cfg.sr_rtol,
                 maxiter=vmc_cfg.sr_maxiter,
+                use_scipy=vmc_cfg.minres_sr_use_scipy,
             )
-        )
+        else:
+            preconditioner = None
+            
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
             preconditioner=preconditioner,
@@ -277,7 +293,7 @@ def main():
             hamiltonian=H,
             rank=rank,
             config=VMCWarmupConfig(
-                use_export_compile=USE_EXPORT_COMPILE,
+                use_export_compile=vmc_cfg.use_export_compile,
                 grad_batch_size=vmc_cfg.grad_batch_size,
             ),
         )
@@ -307,22 +323,10 @@ def main():
             graph=graph,
             rank=rank,
             world_size=world_size,
-            config=VMCLoopConfig(
-                vmc_steps=vmc_cfg.vmc_steps,
-                ns_per_rank=vmc_cfg.ns_per_rank,
-                grad_batch_size=vmc_cfg.grad_batch_size,
+            config=VMCLoopConfig.from_vmc_config(
+                vmc_cfg,
                 n_params=N_params,
                 nsites=N_sites,
-                learning_rate=vmc_cfg.learning_rate,
-                diag_shift=vmc_cfg.diag_shift,
-                burn_in_steps=vmc_cfg.burn_in_steps,
-                run_sr=vmc_cfg.run_sr,
-                use_min_sr=vmc_cfg.use_min_sr,
-                use_export_compile=USE_EXPORT_COMPILE,
-                step_offset=vmc_cfg.resume_step,
-                debug=vmc_cfg.debug,
-                outlier_clip_factor=vmc_cfg.outlier_clip_factor,
-                lr_scheduler=vmc_cfg.lr_scheduler,
             ),
             on_step_end=on_step_end,
         )

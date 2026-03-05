@@ -1,5 +1,67 @@
 # GPU VMC Pipeline — Research Notebook
 
+## 2026-03-04: Debug spin reuse warmup + wire up evaluate_energy_reuse
+
+**Problem:** `vmc_run_spin_reuse.py` on 8x8 Heisenberg (D=4, chi=16) shows:
+1. Zero acceptance on rows 2-5 and 7 during x-sweep — incorrect reuse amplitudes
+2. Row 6 ~13x slower than rows 2-5 — vmap retrace due to different skeleton structure
+3. Energy eval uses full contraction (~530s for 170 chunks) instead of reuse path
+
+**Root cause of issue 1:** `equalize_norms=1.0` in `contract_boundary_opts` rescales
+bMPS tensors in-place during boundary contraction. This corrupts the cached
+boundary environments — subsequent reuse contractions use wrong norm scales,
+producing garbage amplitudes. Fix: remove `equalize_norms` from contract_boundary_opts
+for the reuse model.
+
+**Changes:**
+- `vmc_run_spin_reuse.py`: Commented out `equalize_norms: 1.0`; wired `evaluate_energy_reuse`
+- `sampler.py`: Added `[DBG]` prints comparing reuse vs full contraction amps on 0-acceptance rows
+- `pureTNS_spin.py`: Added `_vamp_reuse_cache` dict to cache vmapped functions
+- `vmc_utils.py`: Updated `evaluate_energy_reuse` to use GPU-batched `get_conn_batch_gpu`
+  path and verbose per-chunk progress prints (matching `evaluate_energy` style)
+
+**Note:** `vmc_run_fpeps_reuse.py` still has `equalize_norms: 1.0` — same bug applies.
+
+## 2026-03-04: Fix row 6 / col 6 slowdown in bMPS reuse
+
+**Problem:** Row 6 (and col 6) are ~3x slower under vmap (0.13s vs 0.04s for rows 2-5),
+despite identical single-sample timing (~0.04s for all rows).
+
+**Root cause:** `('xmax', 6)` is raw row 7 with D=4 bonds (not chi=16 boundary MPS).
+The SVD operations inside `contract_boundary_from_xmin_` on these tiny D-bonded tensors
+have disproportionately high Python/dispatch overhead under `torch.vmap`.
+
+**Fix** (both `pureTNS_spin.py` and `pureTNS.py`):
+- Added `_raw_bMPS_x_keys` / `_raw_bMPS_y_keys` sets in `cache_bMPS_skeleton()`.
+  Raw keys: `('xmin', 1)`, `('xmax', Lx-2)`, `('ymin', 1)`, `('ymax', Ly-2)` — the
+  single-row/col environments with D bonds (not chi boundary MPS).
+- In `amplitude_reuse()`, skip `contract_boundary_from_xmin_/ymin_` when either
+  env is raw. Let cotengra's `contract()` handle all 3*Ly tensors directly.
+- Applied to both `PEPS_Model_reuse_GPU` (spin) and `fPEPS_Model_reuse_GPU` (fermionic).
+
+**Result** (8x8 Heisenberg, D=4, chi=16, B=16):
+Row 1: 0.048s → 0.007s (6.8x); Row 6: 0.130s → 0.008s (16x); Rows 2-5 unchanged.
+
+## 2026-03-03: Spin PEPS reuse model (`PEPS_Model_reuse_GPU`)
+
+Implemented bMPS environment reuse model for spin-1/2 PEPS on GPU.
+
+**Key difference from fermionic reuse**: Uses standard `quimb.tensor.pack/unpack` and `quimb.utils.tree_flatten/unflatten` for dense tensors, instead of `pack_ftn/unpack_ftn/get_params_ftn` which handle symmray block-sparse arrays with Z2/U1 symmetry.
+
+**New files:**
+- `models/pureTNS_spin.py` — `PEPS_Model_reuse_GPU` class + helpers (`pack_tn`, `unpack_tn`, `get_params_tn`)
+- `scripts/test_spin_reuse.py` — test script
+
+**Modified files:**
+- `models/__init__.py` — registered `PEPS_Model_reuse_GPU`
+- `sampler.py` — added `MetropolisExchangeSpinSamplerReuse_GPU` (mirrors fermionic reuse sampler but uses `propose_spin_exchange_vec`)
+
+**Test (4x2 Heisenberg, J=1, Sz=0, D=4, chi=4, 640 params):**
+- ED GS E/site = -0.5366
+- Energy: -0.066 -> -0.195 over 10 steps, monotonically decreasing
+- PASS: no NaN, energy decreases
+- Run: `torchrun --nproc_per_node=1 GPU/scripts/test_spin_reuse.py`
+
 ## 2026-03-02: Fix GPU memory not released between inference and grad phases
 
 **Problem:** In `run_warmup()`, after MCMC sampling + energy eval (under `torch.inference_mode()`), GPU memory from model forward passes was not released before gradient computation. PyTorch's CUDA caching allocator retains freed blocks for reuse rather than returning them to CUDA.
@@ -1219,3 +1281,37 @@ Added `outlier_clip_factor` to `VMCLoopConfig` (default=5.0). After forming O_lo
 - Threshold ~9×median, median |O_loc|~1.9
 
 Previously this setup produced NaN after 1 step. The outlier masking completely fixes it.
+
+### CPU offloading of O_loc via `use_scipy=True`
+
+O_loc `(Ns, Np)` float64 dominates GPU memory. When the SR solver runs on CPU anyway (`use_scipy=True` on `DistributedSRMinresGPU`), we now offload O_loc to CPU immediately after GPU gradient computation. No new config variables — `use_scipy=True` triggers both CPU MINRES and CPU O_loc storage.
+
+**Files changed:**
+- `VMC.py`:
+  - `_run_sampling_phase`: added `offload_oloc=False` param. When True, each O_loc chunk is moved to CPU via `.cpu()` before appending.
+  - `run_vmc_loop`: detects `preconditioner.use_scipy` and passes `offload_oloc` to `_run_sampling_phase`.
+- `vmc_modules.py`:
+  - `distributed_minres_solver_gpu`: added fast path when `use_scipy=True` and O_loc is already on CPU. Computes `sum_O`, `sum_EO` on CPU, briefly moves `(Np,)` vectors to GPU for `all_reduce`, runs scipy MINRES entirely on CPU. Avoids the old wasteful pattern of uploading `(Ns, Np)` to GPU then downloading back.
+
+**dp reload to GPU** is already handled: `optimizer.step()` calls `torch.as_tensor(direction, device=target_device)` which converts numpy dp → GPU tensor automatically.
+
+**Test result** (4x2, D=chi=10, random PEPS, Ns=2048, B=512, 1 GPU):
+- Energy: 0.961 → -0.420 over 10 steps, monotonically decreasing, no NaN
+- GPU memory after loop: 17.1 MB allocated (O_loc offloaded)
+- SR solve time: ~0.2-0.3s/step (scipy MINRES on CPU)
+- Test script: `GPU/scripts/test_cpu_offload.py`
+
+### Spin Heisenberg GPU VMC — implemented
+
+Added support for spin-1/2 Heisenberg model on the GPU VMC pipeline. Key finding: `fPEPS_Model_GPU` is already generic (works with regular quimb PEPS, not just fermionic). Only the reuse model (`fPEPS_Model_reuse_GPU`) is fermionic-specific due to `pack_ftn/unpack_ftn`.
+
+**Files added/modified:**
+- `GPU/sampler.py`: added `propose_spin_exchange_vec` and `MetropolisExchangeSpinSamplerGPU` — simple spin-exchange proposals (swap 0↔1 on neighboring sites when they differ), conserves Sz
+- `GPU/vmc_setup.py`: added `generate_random_spin_peps(Lx, Ly, D)` and `random_spin_config_sz0(N_sites)` helpers
+- `GPU/vmc_run_spin.py`: new run script for spin Heisenberg VMC
+
+**Test result** (4x2 Heisenberg, J=1.0, Sz=0, D=chi=4, random PEPS, Ns=2048, B=512, 1 GPU):
+- ED ground state: E/site = -0.53663
+- VMC: -0.074 → -0.244 over 10 steps, monotonically decreasing
+- ~3-4s per step (much faster than fermionic due to smaller D and simpler proposals)
+- No NaN, no issues
