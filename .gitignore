@@ -23,3 +23,6 @@ vmc_torch.egg-info/
 vmc_torch/experiment/vmap/data
 vmc_torch/experiment/vmap/GPU/data
 vmc_torch/experiment/vmap/debug
+vmc_torch/GPU/data
+CLAUDE.md
+notebook.md
