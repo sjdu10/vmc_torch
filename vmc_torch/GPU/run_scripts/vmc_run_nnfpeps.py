@@ -42,6 +42,7 @@ from vmc_torch.GPU.vmc_setup import (
 from vmc_torch.GPU.vmc_utils import random_initial_config
 
 dtype = torch.float64
+nnbackbone_dtype = torch.float32
 USE_EXPORT_COMPILE = False
 
 # Data paths
@@ -60,18 +61,23 @@ CPU_DATA_ROOT = (
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 4096
-    ns_per_rank: int = 4096
-    grad_batch_size: int = 16
+    batch_size: int = 2048
+    ns_per_rank: int = 2048
+    grad_batch_size: int = 256
     vmc_steps: int = 100
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
     burn_in_steps: int = 0
+    use_export_compile: bool = USE_EXPORT_COMPILE
+    
     use_min_sr: bool = False
     use_distributed_min_sr: bool = False
     param_chunk_size: int = 1024
+    use_distributed_sr_minres: bool = True
+    minres_sr_use_scipy: bool = False
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
+    
     save_every: int = 50
     resume_step: int = 0
     debug: bool = False
@@ -79,9 +85,16 @@ class VMCConfig:
     run_sr: bool = True
     lr_scheduler: object = None  # set after construction
 
+warmup_cfg = VMCWarmupConfig(
+    use_export_compile=VMCConfig.use_export_compile,
+    grad_batch_size=VMCConfig.grad_batch_size,
+    run_sampling=False,
+    run_locE=False,
+    run_grad=True,
+)
 
 def main():
-    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=True)
+    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=False, cholesky_qr=True, cholesky_qr_adaptive_jitter=False)
     torch.set_default_dtype(dtype)
 
     try:
@@ -90,19 +103,19 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 6, 6
+        Lx, Ly = 12, 4
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 2  # 2 holes -> 14 fermions
+        N_f = N_sites - 8  # 8 holes
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 10   # PEPS bond dimension
-        chi = 10  # exact contraction
+        D = 4   # PEPS bond dimension
+        chi = -1  # exact contraction
 
         # NN backflow hyperparameters
         nn_eta = 1.0
-        embed_dim = 8
-        hidden_dim = 16
+        embed_dim = 16
+        hidden_dim = N_sites
         kernel_size = 3
         cnn_layers = 1
         init_scale = 1e-5
@@ -143,7 +156,7 @@ def main():
             layers=cnn_layers,
             init_scale=init_scale,
             dtype=dtype,
-            backbone_dtype=torch.float64,
+            backbone_dtype=nnbackbone_dtype,
             contract_boundary_opts={
                 'mode': 'mps',
                 'equalize_norms': 1.0,
@@ -209,7 +222,7 @@ def main():
                 f"kernel={kernel_size}, layers={cnn_layers}"
             )
             print(
-                f"backbone_dtype=float32"
+                f"backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}, "
             )
             print(
                 f"{world_size} GPUs | {device}"
@@ -247,7 +260,7 @@ def main():
                 f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
                 f'N_f={N_f}, D={D}, chi={chi}, '
                 f'nn_eta={nn_eta}, embed={embed_dim}, '
-                f'hidden={hidden_dim}, backbone_dtype=float32'
+                f'hidden={hidden_dim}, backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}'
             ),
             'Np': N_params,
             'sample size': total_ns,
@@ -263,11 +276,15 @@ def main():
             )
         elif vmc_cfg.use_min_sr:
             preconditioner = MinSRGPU()
-        else:
+        elif vmc_cfg.use_distributed_sr_minres:
             preconditioner = DistributedSRMinresGPU(
                 rtol=vmc_cfg.sr_rtol,
                 maxiter=vmc_cfg.sr_maxiter,
+                use_scipy=vmc_cfg.minres_sr_use_scipy,
             )
+        else:
+            preconditioner = None
+            
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
             preconditioner=preconditioner,
@@ -282,10 +299,7 @@ def main():
             graph=graph,
             hamiltonian=H,
             rank=rank,
-            config=VMCWarmupConfig(
-                use_export_compile=USE_EXPORT_COMPILE,
-                grad_batch_size=vmc_cfg.grad_batch_size,
-            ),
+            config=warmup_cfg,
         )
 
         # ========== Data-saving callback ==========
@@ -313,22 +327,10 @@ def main():
             graph=graph,
             rank=rank,
             world_size=world_size,
-            config=VMCLoopConfig(
-                vmc_steps=vmc_cfg.vmc_steps,
-                ns_per_rank=vmc_cfg.ns_per_rank,
-                grad_batch_size=vmc_cfg.grad_batch_size,
+            config=VMCLoopConfig.from_vmc_config(
+                vmc_cfg,
                 n_params=N_params,
                 nsites=N_sites,
-                learning_rate=vmc_cfg.learning_rate,
-                diag_shift=vmc_cfg.diag_shift,
-                burn_in_steps=vmc_cfg.burn_in_steps,
-                run_sr=vmc_cfg.run_sr,
-                use_min_sr=vmc_cfg.use_min_sr,
-                use_export_compile=USE_EXPORT_COMPILE,
-                step_offset=vmc_cfg.resume_step,
-                debug=vmc_cfg.debug,
-                outlier_clip_factor=vmc_cfg.outlier_clip_factor,
-                lr_scheduler=vmc_cfg.lr_scheduler,
             ),
             on_step_end=on_step_end,
         )

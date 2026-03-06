@@ -707,6 +707,48 @@ def flatten_params(parameters):
         vec.append(param.reshape(-1))
     return torch.cat(vec)
 
+def _check_grads_amps(batched_grads_vec, amps, fpeps_model):
+    """Raise ValueError if amps or grads contain NaN/Inf."""
+    if torch.isnan(amps).any() or torch.isinf(amps).any():
+        nan_count = torch.isnan(amps).sum().item()
+        inf_count = torch.isinf(amps).sum().item()
+        raise ValueError(
+            f"NaN/Inf in amplitudes: {nan_count} NaN, "
+            f"{inf_count} Inf out of {amps.numel()} samples"
+        )
+    if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
+        nan_mask = torch.isnan(batched_grads_vec)
+        inf_mask = torch.isinf(batched_grads_vec)
+        bad_samples = (nan_mask | inf_mask).any(dim=1)
+        n_bad = bad_samples.sum().item()
+        bad_params = (nan_mask | inf_mask).any(dim=0)
+        bad_param_ids = bad_params.nonzero(as_tuple=True)[0]
+        # Map flat param index to (param_idx, offset) in ParameterList
+        param_ranges = []
+        offset = 0
+        for i, p in enumerate(fpeps_model.params):
+            size = p.numel()
+            param_ranges.append((i, offset, offset + size, p.shape))
+            offset += size
+        bad_param_info = []
+        for pid in bad_param_ids[:10].tolist():
+            for (idx, lo, hi, shape) in param_ranges:
+                if lo <= pid < hi:
+                    bad_param_info.append(
+                        f"  flat[{pid}] -> params[{idx}]"
+                        f"{list(shape)} offset {pid - lo}"
+                    )
+                    break
+        raise ValueError(
+            f"NaN/Inf in gradients: {n_bad}/{batched_grads_vec.shape[0]} "
+            f"samples affected, "
+            f"{bad_params.sum().item()}/{batched_grads_vec.shape[1]}"
+            f" params affected.\n"
+            f"First bad params:\n"
+            + "\n".join(bad_param_info)
+        )
+
+
 def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=False, vmap_grad=False, offload_to_cpu=False, **kwargs):
     """
     Vectorized gradient computation optimized for GPU with memory chunking and vmap/jacrev support.
@@ -758,6 +800,8 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                 # on GPU, then .cpu() immediately. Peak GPU mem = O(B_grad * Np).
                 flat_vec_chunks = []
                 for b_start in range(0, B, B_grad):
+                    if verbose:
+                        print(f"Processing grad chunk: {b_start} to {min(b_start + B_grad, B)} / {B}")
                     b_end = min(b_start + B_grad, B)
                     fxs_chunk = fxs[b_start:b_end]
 
@@ -780,9 +824,22 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                 amps = torch.cat(amps_chunks, dim=0)
                 del flat_vec_chunks
             else:
-                # Standard path: accumulate pytree chunks on GPU
-                grads_pytree_chunks = []
+                # Standard path: pre-allocate and fill in-place to
+                # avoid holding chunks + concatenated result together.
+                leaves_p, _ = tree_flatten(params_pytree)
+                Np = sum(p.numel() for p in leaves_p)
+                dtype = leaves_p[0].dtype
+                device = leaves_p[0].device
+                del leaves_p
+
+                batched_grads_vec = torch.empty(
+                    B, Np, dtype=dtype, device=device,
+                )
+                amps = torch.empty(B, dtype=dtype, device=device)
+
                 for b_start in range(0, B, B_grad):
+                    if verbose:
+                        print(f"Processing grad chunk: {b_start} to {min(b_start + B_grad, B)} / {B}")
                     b_end = min(b_start + B_grad, B)
                     fxs_chunk = fxs[b_start:b_end]
 
@@ -791,19 +848,15 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                     amps_c = amps_c.detach()
                     grads_chunk = tree_map(lambda x: x.detach(), grads_chunk)
 
-                    grads_pytree_chunks.append(grads_chunk)
-                    amps_chunks.append(amps_c)
-
-                amps = torch.cat(amps_chunks, dim=0)
-
-                def concat_leaves(*leaves):
-                    return torch.cat(leaves, dim=0)
-
-                full_grads_pytree = tree_map(concat_leaves, *grads_pytree_chunks)
-
-                leaves, _ = tree_flatten(full_grads_pytree)
-                flat_leaves = [leaf.flatten(start_dim=1) for leaf in leaves]
-                batched_grads_vec = torch.cat(flat_leaves, dim=1)
+                    # Flatten and write directly into pre-allocated buffer
+                    leaves_c, _ = tree_flatten(grads_chunk)
+                    flat_c = torch.cat(
+                        [leaf.flatten(start_dim=1) for leaf in leaves_c],
+                        dim=1,
+                    )
+                    batched_grads_vec[b_start:b_end] = flat_c
+                    amps[b_start:b_end] = amps_c
+                    del grads_chunk, leaves_c, flat_c, amps_c
 
             # Final cleanup
             batched_grads_vec = batched_grads_vec.detach()
@@ -812,6 +865,9 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
             t1 = time.time()
             if verbose:
                 print(f"GPU Batched vmap(grad) time: {t1 - t0:.4f}s")
+            
+            _check_grads_amps(batched_grads_vec, amps, fpeps_model)
+            return batched_grads_vec, amps
 
         # ------------------------------------------------------------------
         # Path B: jacrev - Standard Jacobian Reverse Mode
@@ -879,51 +935,8 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
             if 'jac_pytree' in locals(): del jac_pytree
             fpeps_model.zero_grad()
 
-        # ------------------------------------------------------------------
-        # Safety Checks
-        # ------------------------------------------------------------------
-        if torch.isnan(amps).any() or torch.isinf(amps).any():
-            nan_count = torch.isnan(amps).sum().item()
-            inf_count = torch.isinf(amps).sum().item()
-            raise ValueError(
-                f"NaN/Inf in amplitudes: {nan_count} NaN, "
-                f"{inf_count} Inf out of {amps.numel()} samples"
-            )
-        if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
-            nan_mask = torch.isnan(batched_grads_vec)
-            inf_mask = torch.isinf(batched_grads_vec)
-            # Which samples have bad grads?
-            bad_samples = (nan_mask | inf_mask).any(dim=1)
-            n_bad = bad_samples.sum().item()
-            # Which parameters have bad grads?
-            bad_params = (nan_mask | inf_mask).any(dim=0)
-            bad_param_ids = bad_params.nonzero(as_tuple=True)[0]
-            # Map flat param index to (param_idx, offset) in ParameterList
-            param_ranges = []
-            offset = 0
-            for i, p in enumerate(fpeps_model.params):
-                size = p.numel()
-                param_ranges.append((i, offset, offset + size, p.shape))
-                offset += size
-            bad_param_info = []
-            for pid in bad_param_ids[:10].tolist():
-                for (idx, lo, hi, shape) in param_ranges:
-                    if lo <= pid < hi:
-                        bad_param_info.append(
-                            f"  flat[{pid}] -> params[{idx}]"
-                            f"{list(shape)} offset {pid - lo}"
-                        )
-                        break
-            raise ValueError(
-                f"NaN/Inf in gradients: {n_bad}/{fxs.shape[0]} "
-                f"samples affected, "
-                f"{bad_params.sum().item()}/{batched_grads_vec.shape[1]}"
-                f" params affected.\n"
-                f"First bad params:\n"
-                + "\n".join(bad_param_info)
-            )
-                
-        return batched_grads_vec, amps
+            _check_grads_amps(batched_grads_vec, amps, fpeps_model)
+            return batched_grads_vec, amps
 
     else:
         # ------------------------------------------------------------------

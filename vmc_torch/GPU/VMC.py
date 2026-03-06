@@ -64,6 +64,9 @@ class VMCWarmupConfig:
     use_export_compile: bool = False
     grad_batch_size: int = 64
     verbose: bool = True
+    run_sampling: bool = True
+    run_locE: bool = True
+    run_grad: bool = True
 
 
 @dataclass
@@ -332,7 +335,12 @@ class VMC_GPU:
         hamiltonian,
         rank,
         config: VMCWarmupConfig,
+
     ):
+        run_sampling = config.run_sampling
+        run_locE = config.run_locE
+        run_grad = config.run_grad
+    
         # Offload gradients to CPU when MINRES SR solver can work with
         # CPU-resident data (scipy MINRES).
         offload_grad_cpu = (
@@ -347,30 +355,37 @@ class VMC_GPU:
         t_warm = time.time()
 
         with torch.inference_mode():
-            fxs, amps = self.sampler.step(
-                fxs, model, graph,
-                compile=config.use_export_compile,
-                verbose=config.verbose,
-            )
-            if rank == 0 and config.verbose:
-                print(
-                    f"  sample_next:     "
-                    f"{time.time() - t_warm:.2f}s"
+            if run_sampling:
+                fxs, amps = self.sampler.step(
+                    fxs, model, graph,
+                    compile=config.use_export_compile,
+                    verbose=config.verbose,
                 )
-            t1 = time.time()
-            _, evals = self.evaluate_energy_fn(
-                fxs, model, hamiltonian, amps,
-                verbose=config.verbose,
-            )
-            if rank == 0 and config.verbose:
-                print(
-                    f"  evaluate_energy: "
-                    f"{time.time() - t1:.2f}s"
+                if rank == 0 and config.verbose:
+                    print(
+                        f"  sample_next:     "
+                        f"{time.time() - t_warm:.2f}s"
+                    )
+                t1 = time.time()
+            if run_locE:
+                _, evals = self.evaluate_energy_fn(
+                    fxs, model, hamiltonian, amps,
+                    verbose=config.verbose,
                 )
+                if rank == 0 and config.verbose:
+                    print(
+                        f"  evaluate_energy: "
+                        f"{time.time() - t1:.2f}s"
+                    )
         # Free inference-phase tensors before grad computation
-        del amps, evals
-        torch.cuda.empty_cache()
-
+        try:
+            del amps, evals
+            torch.cuda.empty_cache()
+        except:
+            pass
+        
+        if not run_grad:
+            return fxs
         t2 = time.time()
         with torch.enable_grad():
             grads, amps2 = self.compute_grads_fn(
@@ -379,6 +394,7 @@ class VMC_GPU:
                 batch_size=config.grad_batch_size,
                 vmap_grad=True,
                 offload_to_cpu=offload_grad_cpu,
+                verbose=config.verbose,
             )
         if rank == 0 and config.verbose:
             print(
@@ -391,6 +407,7 @@ class VMC_GPU:
             )
 
         del grads, amps2
+        torch.cuda.empty_cache()
         return fxs
 
     # ----------------------------------------------------------

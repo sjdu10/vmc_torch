@@ -154,6 +154,9 @@ def main():
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
+                'compress_opts': {
+                    'method': 'rsvd',
+                },
             },
         )
         model.to(device)

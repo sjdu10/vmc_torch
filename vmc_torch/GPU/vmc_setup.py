@@ -39,6 +39,16 @@ def setup_linalg_hooks(jitter=1e-16, driver=None, qr_via_eigh=True, cholesky_qr=
     else:
         pass  # use default torch.linalg.qr without autoray hook
 
+    # Bridge quimb's do("linalg.rsvd", x, max_bond) to symmray's
+    # svd_rand_truncated. quimb's rsvd dispatches to "linalg.rsvd"
+    # but symmray only registers "svd_rand_truncated".
+    from symmray.linalg import svd_rand_truncated
+    ar.register_function(
+        'symmray',
+        'linalg.rsvd',
+        lambda x, max_bond: svd_rand_truncated(x, max_bond=max_bond),
+    )
+
 
 def load_or_generate_peps(
     Lx, Ly, t, U, N_f, D, seed=42, dtype=torch.float64, scale_factor=4,

@@ -26,6 +26,7 @@ from vmc_torch.GPU.hamiltonian import (
 from vmc_torch.GPU.models import fPEPS_Model_GPU
 from vmc_torch.GPU.optimizer import (
     DecayScheduler,
+    DistributedMinSRGPU,
     DistributedSRMinresGPU,
     MinSRGPU,
     SGDGPU,
@@ -34,7 +35,6 @@ from vmc_torch.GPU.sampler import (
     MetropolisExchangeSpinfulSamplerGPU,
 )
 from vmc_torch.GPU.vmc_setup import (
-    ensure_output_dir,
     initialize_walkers,
     load_or_generate_peps,
     setup_linalg_hooks,
@@ -42,35 +42,54 @@ from vmc_torch.GPU.vmc_setup import (
 from vmc_torch.GPU.vmc_utils import random_initial_config
 
 dtype = torch.float64
+USE_EXPORT_COMPILE = True
+
+# Data paths
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
+    '/GPU/data'
 )
+
 
 @dataclass
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 4096
-    ns_per_rank: int = 4096
-    grad_batch_size: int = 1024
+    batch_size: int = 256
+    ns_per_rank: int = 256
+    grad_batch_size: int = 256
     vmc_steps: int = 100
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
-    burn_in_steps: int = 4
-    use_export_compile: bool = False
+    burn_in_steps: int = 0
+    use_export_compile: bool = USE_EXPORT_COMPILE
+    
     use_min_sr: bool = False
+    use_distributed_min_sr: bool = False
+    param_chunk_size: int = 1024
+    use_distributed_sr_minres: bool = True
+    minres_sr_use_scipy: bool = False
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
-    save_every: int = 10
-    resume_step: int = 0  # checkpoint step to resume from, 0 = fresh
-    debug: bool = False  # print [dbg] diagnostics each step
-    outlier_clip_factor: float = 100.0  # drop O_loc outliers > factor * median
+    
+    save_every: int = 50
+    resume_step: int = 0
+    debug: bool = False
+    outlier_clip_factor: float = 100.0 # drop O_loc outliers > factor * median
     run_sr: bool = True
     lr_scheduler: object = None  # set after construction
 
 
+warmup_cfg = VMCWarmupConfig(
+    use_export_compile=VMCConfig.use_export_compile,
+    grad_batch_size=VMCConfig.grad_batch_size,
+    run_sampling=True,
+    run_locE=False,
+    run_grad=False,
+)
+
 def main():
-    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=True)
+    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=False, cholesky_qr=True, cholesky_qr_adaptive_jitter=False)
     torch.set_default_dtype(dtype)
 
     try:
@@ -79,11 +98,11 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 2
+        Lx, Ly = 12, 4
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 2  # 2 holes
+        N_f = N_sites - 8  # 8 holes
         n_fermions_per_spin = (N_f // 2, N_f // 2)
         D = 4  # PEPS bond dimension
         chi = -1  # boundary bond dim
@@ -109,7 +128,10 @@ def main():
             f"/N={N_f}/Z2/D={D}/"
         )
         peps = load_or_generate_peps(
-            Lx, Ly, t, U, N_f, D, seed=42, dtype=dtype, file_path=fpeps_base, scale_factor=4
+            Lx, Ly, t, U, N_f, D,
+            seed=42, dtype=dtype,
+            file_path=fpeps_base,
+            scale_factor=4,
         )
         model = fPEPS_Model_GPU(
             tn=peps,
@@ -123,7 +145,23 @@ def main():
         )
         model.to(device)
 
-        # ========== Load checkpoint (optional) ==========
+        # Export + compile (optional, ~10-40s one-time cost)
+        if USE_EXPORT_COMPILE:
+            example_x = random_initial_config(
+                N_f, N_sites, seed=0,
+            ).to(device)
+            if rank == 0:
+                print("Running torch.export + compile...")
+            import time as _time
+            _t0 = _time.time()
+            model.export_and_compile(example_x)
+            if rank == 0:
+                print(
+                    f"Export + compile done in "
+                    f"{_time.time() - _t0:.1f}s"
+                )
+
+        # ========== Config ==========
         vmc_cfg = VMCConfig()
         vmc_cfg.lr_scheduler = DecayScheduler(
             init_lr=vmc_cfg.learning_rate,
@@ -155,15 +193,6 @@ def main():
                 f"Model: {N_params} params | "
                 f"{world_size} GPUs | {device}"
             )
-
-        # Export + compile (optional, ~10-40s one-time cost)
-        if vmc_cfg.use_export_compile:
-            example_x = random_initial_config(
-                N_f, N_sites, seed=0,
-            ).to(device)
-            if rank == 0:
-                print("Running torch.export + compile...")
-            model.export_and_compile(example_x, mode='default')
 
         print_sampling_settings(
             rank,
@@ -203,14 +232,21 @@ def main():
         }
 
         # ========== VMC driver ==========
-        preconditioner = (
-            MinSRGPU()
-            if vmc_cfg.use_min_sr
-            else DistributedSRMinresGPU(
+        if vmc_cfg.use_distributed_min_sr:
+            preconditioner = DistributedMinSRGPU(
+                param_chunk_size=vmc_cfg.param_chunk_size,
+            )
+        elif vmc_cfg.use_min_sr:
+            preconditioner = MinSRGPU()
+        elif vmc_cfg.use_distributed_sr_minres:
+            preconditioner = DistributedSRMinresGPU(
                 rtol=vmc_cfg.sr_rtol,
                 maxiter=vmc_cfg.sr_maxiter,
+                use_scipy=vmc_cfg.minres_sr_use_scipy,
             )
-        )
+        else:
+            preconditioner = None
+            
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
             preconditioner=preconditioner,
@@ -225,10 +261,7 @@ def main():
             graph=graph,
             hamiltonian=H,
             rank=rank,
-            config=VMCWarmupConfig(
-                use_export_compile=vmc_cfg.use_export_compile,
-                grad_batch_size=vmc_cfg.grad_batch_size,
-            ),
+            config=warmup_cfg,
         )
 
         # ========== Data-saving callback ==========
@@ -241,7 +274,7 @@ def main():
             with open(stats_file, 'w') as f:
                 json.dump(stats, f, indent=4)
 
-            step = info['step']  # already global (offset applied)
+            step = info['step']
             if (step + 1) % vmc_cfg.save_every == 0:
                 ckpt_path = os.path.join(
                     output_dir,
@@ -256,22 +289,10 @@ def main():
             graph=graph,
             rank=rank,
             world_size=world_size,
-            config=VMCLoopConfig(
-                vmc_steps=vmc_cfg.vmc_steps,
-                ns_per_rank=vmc_cfg.ns_per_rank,
-                grad_batch_size=vmc_cfg.grad_batch_size,
+            config=VMCLoopConfig.from_vmc_config(
+                vmc_cfg,
                 n_params=N_params,
                 nsites=N_sites,
-                learning_rate=vmc_cfg.learning_rate,
-                diag_shift=vmc_cfg.diag_shift,
-                burn_in_steps=vmc_cfg.burn_in_steps,
-                run_sr=vmc_cfg.run_sr,
-                use_min_sr=vmc_cfg.use_min_sr,
-                use_export_compile=vmc_cfg.use_export_compile,
-                step_offset=vmc_cfg.resume_step,
-                debug=vmc_cfg.debug,
-                outlier_clip_factor=vmc_cfg.outlier_clip_factor,
-                lr_scheduler=vmc_cfg.lr_scheduler,
             ),
             on_step_end=on_step_end,
         )
