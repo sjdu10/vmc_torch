@@ -305,76 +305,117 @@ def qr_svd_wrapper_random(A, jitter=1e-12, driver=None):
 
 
 # ========================================== SVD via Eigen Decomposition ==========================================
-def svd_via_eigh(A, epsilon=1e-16):
-    """
-    通过 Eigh (A^T A 或 A A^T) 计算 SVD。
-    稳定性极高，用于替代总是报错的 torch.linalg.svd。
-    
+def svd_via_eigh(
+    A, epsilon=1e-16,
+    jitter=0.0, nonuniform_diag=False,
+):
+    """Compute SVD via eigh(A^T A) or eigh(A A^T).
+
     Args:
-        A: (Batch, M, N)
-        epsilon: 用于正则化 S 的倒数，防止除零
+        A: (..., M, N)
+        epsilon: threshold for reciprocal of S
+        jitter: regularization added to A^T A (not to A itself),
+            preserving eigenvector orthogonality from eigh
+        nonuniform_diag: if True, jitter * diag(1,2,...,K)/K
+            to lift degeneracies; else jitter * I
     Returns:
-        U, S, Vh (符合 torch.linalg.svd 的定义)
+        U, S, Vh
     """
     M, N = A.shape[-2:]
-    
+
     # --- Case 1: Tall Matrix (M >= N) ---
-    # 我们计算 P = A^T @ A (尺寸 N x N)
     if M >= N:
         P = A.mT @ A
-        
-        # 1. 对称特征分解 (eigh 使用 syevd，非常稳)
-        # L 是特征值 (升序), V 是特征向量 (列向量)
+
+        # Add jitter to P = A^T A, not to A
+        if jitter > 0:
+            K = N
+            if nonuniform_diag:
+                diag_vals = torch.arange(
+                    1, K + 1, device=A.device, dtype=A.dtype,
+                ) / K
+                P = P + jitter * torch.diag_embed(
+                    diag_vals.expand(P.shape[:-1]),
+                )
+            else:
+                P = P + jitter * torch.eye(
+                    K, device=A.device, dtype=A.dtype,
+                )
+
         L, V = torch.linalg.eigh(P)
-        
-        # 2. 处理特征值 (数值误差可能导致微小的负数，clamp 掉)
         L = torch.clamp(L, min=0.0)
         S = torch.sqrt(L)
-        
-        # 3. 排序: eigh 是升序，SVD 需要降序 -> Flip
+
+        # eigh returns ascending order; SVD needs descending
         S = torch.flip(S, dims=[-1])
         V = torch.flip(V, dims=[-1])
-        Vh = V.mT # V 是 P 的特征向量，也是 A 的右奇异向量
-        
-        # 4. 重构 U = A @ V @ S_inv
-        # 为了数值稳定，只对非零 S 做除法
-        # 创建对角矩阵的逆
-        S_safe = S + epsilon
-        inv_S = torch.diag_embed(1.0 / S_safe)
-        
-        U = A @ V @ inv_S
-        
+        Vh = V.mT
+
+        # U = A @ V @ diag(1/S), with 1/S clamped for stability
+        threshold = S.max(dim=-1, keepdim=True).values * epsilon
+        mask = S > threshold
+        S = torch.where(mask, S, torch.zeros_like(S))
+        inv_s = torch.where(
+            mask, 1.0 / S.clamp(min=epsilon),
+            torch.zeros_like(S),
+        )
+        U = A @ V @ torch.diag_embed(inv_s)
+
     # --- Case 2: Wide Matrix (M < N) ---
-    # 我们计算 P = A @ A^T (尺寸 M x M)
     else:
         P = A @ A.mT
-        
+
+        if jitter > 0:
+            K = M
+            if nonuniform_diag:
+                diag_vals = torch.arange(
+                    1, K + 1, device=A.device, dtype=A.dtype,
+                ) / K
+                P = P + jitter * torch.diag_embed(
+                    diag_vals.expand(P.shape[:-1]),
+                )
+            else:
+                P = P + jitter * torch.eye(
+                    K, device=A.device, dtype=A.dtype,
+                )
+
         L, U_eig = torch.linalg.eigh(P)
-        
         L = torch.clamp(L, min=0.0)
         S = torch.sqrt(L)
-        
-        # 排序
+
         S = torch.flip(S, dims=[-1])
-        U = torch.flip(U_eig, dims=[-1]) # U_eig 是 P 的特征向量，也是 A 的左奇异向量
-        
-        # 重构 Vh = S_inv @ U^T @ A
-        S_safe = S + epsilon
-        inv_S = torch.diag_embed(1.0 / S_safe)
-        
-        # V = A^T @ U @ S_inv -> Vh = V^T = S_inv @ U^T @ A
-        Vh = inv_S @ U.mT @ A
+        U = torch.flip(U_eig, dims=[-1])
+
+        # Vh = diag(1/S) @ U^T @ A
+        threshold = S.max(dim=-1, keepdim=True).values * epsilon
+        mask = S > threshold
+        S = torch.where(mask, S, torch.zeros_like(S))
+        inv_s = torch.where(
+            mask, 1.0 / S.clamp(min=epsilon),
+            torch.zeros_like(S),
+        )
+        Vh = torch.diag_embed(inv_s) @ U.mT @ A
 
     return U, S, Vh
 
 class RobustSVD_EIG(torch.autograd.Function):
+    """SVD via eigendecomposition with optional non-uniform diagonal jitter.
+
+    When nonuniform_diag=True, adds jitter * diag(1, 2, ..., K)/K
+    instead of jitter * I.  The non-uniform diagonal lifts degeneracies
+    in singular values so the backward's 1/(s_i - s_j) terms stay
+    finite, avoiding gradient explosion from degenerate eigenvalues.
+    Deterministic (no torch.randn), so it works under nested vmap.
+    """
     generate_vmap_rule = True
 
     @staticmethod
-    def forward(A, jitter, driver): 
-        M, N = A.shape[-2:]
-        A = A + jitter * torch.eye(M, N, device=A.device, dtype=A.dtype)
-        U, S, Vh = svd_via_eigh(A)
+    def forward(A, jitter, driver, nonuniform_diag=False):
+        # Jitter is added to A^T A (not A) inside svd_via_eigh,
+        # so eigenvectors from eigh stay orthogonal.
+        U, S, Vh = svd_via_eigh(
+            A, jitter=jitter, nonuniform_diag=nonuniform_diag,
+        )
         return U, S, Vh
 
     @staticmethod
@@ -385,144 +426,220 @@ class RobustSVD_EIG(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dU, dS, dVh):
         U, S, Vh = ctx.saved_tensors
-        
+
         M = U.size(-2)
         N = Vh.size(-1)
         K = S.size(-1)
         eye_K = torch.eye(K, dtype=U.dtype, device=U.device)
         epsilon = 1e-12
 
-        # Use safe_inverse_random
+        UdU = U.mT @ dU
+        VdV = Vh @ dVh.mT
+
+        # SVD backward formula (arXiv:1903.09650):
+        #   F[i,j] = 1/(s_i - s_j),  G[i,j] = 1/(s_i + s_j)
+        #   Su = (F+G) * skew(U^T dU) / 2
+        #   Sv = (F-G) * skew(V^T dV) / 2
+        # Use safe_inverse_random for numerical stability
         F = S.unsqueeze(-2) - S.unsqueeze(-1)
         F = safe_inverse_random(F, epsilon=epsilon)
-        F = F * (1 - eye_K) 
+        F = F * (1 - eye_K)
 
         G = S.unsqueeze(-2) + S.unsqueeze(-1)
         G = safe_inverse_random(G, epsilon=epsilon)
         G = G * (1 - eye_K)
 
-        UdU = U.mT @ dU
-        VdV = Vh @ dVh.mT
-
         Su = (F + G) * (UdU - UdU.mT) / 2
         Sv = (F - G) * (VdV - VdV.mT) / 2
-        
+
         # NaN Guard
         Su = torch.nan_to_num(Su, nan=0.0, posinf=0.0, neginf=0.0)
         Sv = torch.nan_to_num(Sv, nan=0.0, posinf=0.0, neginf=0.0)
 
         dA = U @ (Su + Sv + torch.diag_embed(dS)) @ Vh
-        
+
         # Handle non-square contributions
         S_inv = safe_inverse_random(S, epsilon=epsilon)
-        
+
+
         if M > K:
             term1 = (dU * S_inv.unsqueeze(-2)) @ Vh
             term2 = U @ (U.mT @ term1)
             delta = term1 - term2
             dA = dA + delta
-            
+
         if N > K:
             term1 = (U * S_inv.unsqueeze(-2)) @ dVh
             term2 = term1 @ (Vh.mT @ Vh)
             delta = term1 - term2
             dA = dA + delta
 
-        return dA, None, None
-    
-def robust_svd_eig_wrapper(A, jitter=1e-12, driver=None):
-    return RobustSVD_EIG.apply(A, jitter, driver)
+        return dA, None, None, None
 
-def robust_svd_err_catcher_wrapper(A, jitter=1e-12, driver=None):
-    """
-    Wrapper that tries standard Robust SVD first,
+def robust_svd_eig_wrapper(A, jitter=1e-12, driver=None, nonuniform_diag=False):
+    return RobustSVD_EIG.apply(A, jitter, driver, nonuniform_diag)
+
+def robust_svd_err_catcher_wrapper(
+    A, jitter=1e-12, driver=None, nonuniform_diag=False,
+):
+    """Wrapper that tries standard Robust SVD first,
     falls back to EIG-based SVD on failure.
+
+    Args:
+        nonuniform_diag: if True, use non-uniform diagonal jitter in the
+            EIG fallback to lift singular value degeneracies.
     """
     try:
         return RobustSVD.apply(A, jitter, driver)
-    except RuntimeError as e:
-        return RobustSVD_EIG.apply(A, jitter, driver)
+    except RuntimeError:
+        return RobustSVD_EIG.apply(A, jitter, driver, nonuniform_diag)
 
 # ========== Cholesky QR dispatch ================
 
-def qr_via_cholesky(x, jitter=1e-12, adaptive_jitter=False):
-    """QR via Cholesky decomposition of the Gram matrix.
+
+def _cholesky_qr_forward(A, jitter):
+    """Cholesky QR forward: fast but no autograd.
 
     Tall/square (M >= N):
-      1. G = A^T A + jitter * I   (N x N, SPD)
-      2. Cholesky: G = L L^T, R = L^T  (upper triangular)
-      3. Q = A R^{-1}  (via triangular solve)
-
+      G = A^T A + jitter*I, cholesky(G)=L, R=L^T, Q=A R^{-1}
     Wide (M < N):
-      1. Cholesky QR on A[:, :M]  (the leading M x M square block)
-         to obtain Q (M x M, orthogonal)
-      2. R = Q^T A  (M x N, upper trapezoidal)
+      Cholesky QR on A[:,:M] → Q, then R = Q^T A
+    """
+    M, N = A.shape[-2:]
+    if M >= N:
+        G = A.mT @ A
+        G = G + jitter * torch.eye(
+            N, device=G.device, dtype=G.dtype,
+        )
+        L = torch.linalg.cholesky(G)
+        R = L.mT
+        QT = torch.linalg.solve_triangular(
+            L, A.mT, upper=False,
+        )
+        Q = QT.mT
+    else:
+        A1 = A[..., :M]
+        G = A1.mT @ A1
+        G = G + jitter * torch.eye(
+            M, device=G.device, dtype=G.dtype,
+        )
+        L = torch.linalg.cholesky(G)
+        QT = torch.linalg.solve_triangular(
+            L, A1.mT, upper=False,
+        )
+        Q = QT.mT
+        R = Q.mT @ A
+    return Q, R
 
-    Faster than Householder QR but numerically stable only
-    when A is reasonably well-conditioned (kappa <~ 1e8).
-    All ops are torch-native and support autograd.
+
+def _solve_R_inv_T(R, rhs, null_thresh=0.0):
+    """Compute rhs @ R^{-T} via thresholded pseudoinverse.
+
+    Uses svd_via_eigh (fast eigh-based SVD) instead of
+    torch.linalg.svd to avoid the batched SVD performance cliff.
+    Singular values of R below null_thresh get 1/S → 0.
+
+    Args:
+        R: (..., K, K) upper triangular
+        rhs: (..., M, K)
+        null_thresh: absolute threshold for null-space truncation
+    Returns:
+        rhs @ R^{-T}: (..., M, K)
+    """
+    # R = U_R @ diag(S_R) @ Vh_R
+    # R^{-T} = U_R @ diag(1/S_R) @ Vh_R
+    U_R, S_R, Vh_R = svd_via_eigh(R)
+    S_inv = torch.where(
+        S_R > null_thresh, 1.0 / S_R, torch.zeros_like(S_R),
+    )
+    return (rhs @ U_R) * S_inv.unsqueeze(-2) @ Vh_R
+
+
+def _qr_backward_tall(Q, R, dQ, dR, null_thresh=0.0):
+    """Standard QR backward for tall/square (M >= N).
+
+    From Seeger et al. (2017) / Liao et al. (2019):
+      M = copyltu(R dR^T - dQ^T Q)
+      dA = (dQ + Q M) R^{-T}
+    """
+    M_mat = R @ dR.mT - dQ.mT @ Q
+    M_mat = M_mat.tril(0) + M_mat.tril(-1).mT
+    tmp = dQ + Q @ M_mat
+    return _solve_R_inv_T(R, tmp, null_thresh)
+
+
+def _qr_backward_wide(A, Q, R, dQ, dR, null_thresh=0.0):
+    """Standard QR backward for wide (M < N)."""
+    M, N = A.shape[-2:]
+    U, V = R.split((M, N - M), dim=-1)
+    dU, dV = dR.split((M, N - M), dim=-1)
+
+    tmp = dQ + A[..., M:] @ dV.mT
+    M_mat = U @ dU.mT - tmp.mT @ Q
+    M_mat = M_mat.tril(0) + M_mat.tril(-1).mT
+    tmp = tmp + Q @ M_mat
+    dX = _solve_R_inv_T(U, tmp, null_thresh)
+    return torch.cat((dX, Q @ dV), dim=-1)
+
+
+class CholeskyQR(torch.autograd.Function):
+    """Cholesky QR forward + standard QR backward.
+
+    Forward uses the fast Cholesky path (cholesky + solve_triangular).
+    Backward uses the standard QR gradient formula instead of
+    autograd through cholesky/solve, which is numerically unstable
+    for rank-deficient boundary MPS matrices.
+    """
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(A, jitter):
+        Q, R = _cholesky_qr_forward(A, jitter)
+        return Q, R
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        A, jitter = inputs
+        Q, R = output
+        M, N = A.shape[-2:]
+        if M < N:
+            ctx.save_for_backward(A, Q, R)
+        else:
+            ctx.save_for_backward(Q, R)
+        ctx.tall = (M >= N)
+        ctx.null_thresh = jitter ** 0.5 if jitter > 0 else 0.0
+
+    @staticmethod
+    def backward(ctx, dQ, dR):
+        nt = ctx.null_thresh
+        if ctx.tall:
+            Q, R = ctx.saved_tensors
+            dA = _qr_backward_tall(Q, R, dQ, dR, nt)
+        else:
+            A, Q, R = ctx.saved_tensors
+            dA = _qr_backward_wide(A, Q, R, dQ, dR, nt)
+        return dA, None
+
+
+def qr_via_cholesky(x, jitter=1e-12, adaptive_jitter=False, forward_only=False):
+    """QR via Cholesky forward + standard QR backward.
+
+    Uses CholeskyQR custom autograd.Function for stable gradients.
 
     Args:
         x: (..., M, N) tensor.
         jitter: scalar added to Gram diagonal for regularization.
-        adaptive_jitter: if True, scale jitter by ||A||_F^2 so that
-            the effective regularization is jitter * ||A||_F^2 * I.
-            Bounds the condition number of G to ~1/jitter regardless
-            of the matrix scale. Stabilizes backward for
-            ill-conditioned matrices.
-
-    Returns:
-        Q: (..., M, K) with orthonormal columns, K = min(M, N).
-        R: (..., K, N) upper triangular (tall/square) or
-           upper trapezoidal (wide).
+        adaptive_jitter: if True, scale jitter by ||A||_F^2.
+        forward_only: if True, only compute the forward pass (no backward).
     """
-    M, N = x.shape[-2:]
-
     if adaptive_jitter:
-        # ||A||_F^2 per batch element, kept as (..., 1, 1) for broadcasting
-        scale = (x * x).sum(dim=(-2, -1), keepdim=True)
-        jitter_val = jitter * scale.squeeze(-1).squeeze(-1)
+        scale = (x * x).sum(dim=(-2, -1))
+        jitter = jitter * scale.amax()  # scalar
+    if forward_only:
+        Q, R = _cholesky_qr_forward(x, jitter)
+        return Q, R
     else:
-        jitter_val = jitter
-
-    if M >= N:
-        # Tall/square: standard Cholesky QR on full A
-        G = x.mT @ x  # (..., N, N)
-        eye = torch.eye(N, device=G.device, dtype=G.dtype)
-        if adaptive_jitter:
-            G = G + jitter_val[..., None, None] * eye
-        else:
-            G = G + jitter_val * eye
-
-        L = torch.linalg.cholesky(G)  # (..., N, N) lower tri
-        R = L.mT                       # (..., N, N) upper tri
-
-        # Q = A R^{-1} via solving L Q^T = A^T
-        QT = torch.linalg.solve_triangular(
-            L, x.mT, upper=False
-        )  # (..., N, M)
-        Q = QT.mT  # (..., M, N)
-    else:
-        # Wide: Cholesky QR on leading M columns to get Q,
-        # then R = Q^T A
-        A1 = x[..., :M]  # (..., M, M)
-        G = A1.mT @ A1   # (..., M, M)
-        eye = torch.eye(M, device=G.device, dtype=G.dtype)
-        if adaptive_jitter:
-            G = G + jitter_val[..., None, None] * eye
-        else:
-            G = G + jitter_val * eye
-
-        L = torch.linalg.cholesky(G)  # (..., M, M) lower tri
-
-        # Q from A1: solve L Q^T = A1^T
-        QT = torch.linalg.solve_triangular(
-            L, A1.mT, upper=False
-        )  # (..., M, M)
-        Q = QT.mT   # (..., M, M) orthogonal
-        R = Q.mT @ x  # (..., M, N)
-
-    return Q, R
+        return CholeskyQR.apply(x, jitter)
 
 
 # ========== Size/device-aware dispatch ==========
@@ -537,7 +654,7 @@ def qr_via_svd(x):
     return U, R
 
 
-def qr_via_eigh(x, jitter=1e-12):
+def qr_via_eigh(x, jitter=1e-12, nonuniform_diag=False):
     """QR via eigh-based SVD. A = USVh -> Q=U, R=diag(S)@Vh.
 
     Uses RobustSVD_EIG which computes SVD through eigendecomposition
@@ -546,13 +663,17 @@ def qr_via_eigh(x, jitter=1e-12):
 
     Note: R is not upper triangular, but for TN canonicalization
     this doesn't matter.
+
+    Args:
+        nonuniform_diag: if True, use non-uniform diagonal jitter to lift
+            singular value degeneracies (stabilizes backward).
     """
-    U, S, Vh = RobustSVD_EIG.apply(x, jitter, None)
+    U, S, Vh = RobustSVD_EIG.apply(x, jitter, None, nonuniform_diag)
     R = S.unsqueeze(-1) * Vh
     return U, R
 
 
-def size_aware_qr(x, via_eigh=False, jitter=0.0):
+def size_aware_qr(x, via_eigh=False, jitter=0.0, nonuniform_diag=False):
     """Size/device-aware QR. Uses SVD-based QR on GPU for n<=32.
 
     cuSOLVER's batched Jacobi kernel (n<=32) makes SVD ~10-15x faster
@@ -561,16 +682,19 @@ def size_aware_qr(x, via_eigh=False, jitter=0.0):
     On CPU or for n>32, standard QR (Householder) is used.
     """
     if via_eigh:
-        return qr_via_eigh(x, jitter)
+        return qr_via_eigh(x, jitter, nonuniform_diag=nonuniform_diag)
     n = min(x.shape[-2], x.shape[-1])
     if x.is_cuda and n <= 32:
         return qr_via_svd(x)
     return torch.linalg.qr(x)
 
 
-def size_aware_svd(x, jitter=1e-12, driver=None, backend='cuSOLVER'):
+def size_aware_svd(
+    x, jitter=1e-12, driver=None, backend='cuSOLVER',
+    nonuniform_diag=False,
+):
     """Size/device-aware SVD. Uses EIG-based+MAGMA on GPU for n>32.
-    
+
     When backend=='cuSOLVER':
         For n<=32, cuSOLVER's fused Jacobi kernel is fast (~0.4ms).
         For n>32, use SVD-VIA-EIG with cuSOLVER eigh backend.
@@ -581,6 +705,10 @@ def size_aware_svd(x, jitter=1e-12, driver=None, backend='cuSOLVER'):
         MAGMA eigh avoids this cliff (~4ms for all n), so we route
         through RobustSVD_EIG with MAGMA backend for large GPU matrices.
         On CPU, always uses default RobustSVD.
+
+    Args:
+        nonuniform_diag: if True, use non-uniform diagonal jitter in EIG path
+            to lift singular value degeneracies (stabilizes backward).
     """
     n = min(x.shape[-2], x.shape[-1])
     if backend == 'auto':
@@ -588,16 +716,22 @@ def size_aware_svd(x, jitter=1e-12, driver=None, backend='cuSOLVER'):
             prev = torch.backends.cuda.preferred_linalg_library()
             torch.backends.cuda.preferred_linalg_library('magma')
             try:
-                return RobustSVD_EIG.apply(x, jitter, driver)
+                return RobustSVD_EIG.apply(
+                    x, jitter, driver, nonuniform_diag,
+                )
             finally:
                 torch.backends.cuda.preferred_linalg_library(prev)
     elif backend == 'cuSOLVER':
         if x.is_cuda and n > 32:
-            return RobustSVD_EIG.apply(x, jitter, driver)
+            return RobustSVD_EIG.apply(
+                x, jitter, driver, nonuniform_diag,
+            )
     else:
         raise ValueError(f"Unsupported backend: {backend}")
-    
-    return robust_svd_err_catcher_wrapper(x, jitter=jitter, driver=driver)
+
+    return robust_svd_err_catcher_wrapper(
+        x, jitter=jitter, driver=driver, nonuniform_diag=nonuniform_diag,
+    )
 
 
 # ===========================================================================

@@ -20,11 +20,23 @@ def setup_linalg_hooks(
     jitter=1e-16, driver=None,
     qr_via_eigh=True, cholesky_qr=False,
     cholesky_qr_adaptive_jitter=False,
+    nonuniform_diag=False,
 ):
+    """Register autoray hooks for SVD and QR dispatch.
+
+    Args:
+        nonuniform_diag: if True, use non-uniform diagonal jitter (instead of
+            identity) in EIG-based SVD/QR to lift singular value
+            degeneracies.  Stabilizes backward for matrices with
+            repeated or near-degenerate singular values.
+    """
     ar.register_function(
         'torch',
         'linalg.svd',
-        lambda x: size_aware_svd(x, jitter=jitter, driver=driver),
+        lambda x: size_aware_svd(
+            x, jitter=jitter, driver=driver,
+            nonuniform_diag=nonuniform_diag,
+        ),
     )
     if qr_via_eigh and cholesky_qr:
         raise ValueError(
@@ -44,9 +56,13 @@ def setup_linalg_hooks(
             'torch',
             'linalg.qr',
             lambda x: size_aware_qr(
-                x, via_eigh=qr_via_eigh, jitter=jitter,
+                x, via_eigh=True, jitter=jitter,
+                nonuniform_diag=nonuniform_diag,
             ),
         )
+    else: # both False: use default torch.linalg.qr
+        # Use default torch.linalg.qr
+        pass
 
 
 def load_or_generate_peps(
