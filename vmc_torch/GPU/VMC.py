@@ -101,6 +101,7 @@ class VMCLoopConfig:
     # Optional LR scheduler: callable(step) -> float.
     # If set, overrides learning_rate each step.
     lr_scheduler: object = None
+    verbose: bool = False
 
     @classmethod
     def from_vmc_config(cls, cfg, *, n_params, nsites):
@@ -167,6 +168,7 @@ class VMC_GPU:
         outlier_clip_factor=0.0,
         offload_oloc=False,
         use_log_amp=False,
+        verbose=False,
     ):
         """Run MCMC sampling, energy eval, and gradient
         computation for one VMC step.
@@ -213,6 +215,7 @@ class VMC_GPU:
                     fxs, model, graph,
                     compile=use_export_compile,
                     use_log_amp=use_log_amp,
+                    verbose=verbose,
                 )
                 t_samp += time.time() - t0
 
@@ -221,6 +224,7 @@ class VMC_GPU:
                 _, local_E = self.evaluate_energy_fn(
                     fxs, model, hamiltonian, amps_out,
                     use_log_amp=use_log_amp,
+                    verbose=verbose,
                 )
                 t_locE += time.time() - t0
 
@@ -238,6 +242,7 @@ class VMC_GPU:
                     vmap_grad=True,
                     offload_to_cpu=offload_oloc,
                     use_log_amp=use_log_amp,
+                    verbose=verbose,
                 )
             _rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -632,6 +637,7 @@ class VMC_GPU:
                     outlier_clip_factor=config.outlier_clip_factor,
                     offload_oloc=offload_oloc,
                     use_log_amp=config.use_log_amp,
+                    verbose=config.verbose,
                 )
             )
 

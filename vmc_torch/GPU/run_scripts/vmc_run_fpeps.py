@@ -79,6 +79,7 @@ class VMCConfig:
     run_sr: bool = True
     use_log_amp: bool = True
     lr_scheduler: object = None  # set after construction
+    verbose: bool = True
     
 vmc_cfg = VMCConfig()
 vmc_cfg.lr_scheduler = DecayScheduler(

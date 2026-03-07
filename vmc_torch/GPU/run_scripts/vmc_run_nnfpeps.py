@@ -85,7 +85,22 @@ class VMCConfig:
     run_sr: bool = True
     use_log_amp: bool = True
     lr_scheduler: object = None  # set after construction
+    verbose: bool = True
+    
+vmc_cfg = VMCConfig()
+vmc_cfg.lr_scheduler = DecayScheduler(
+    init_lr=vmc_cfg.learning_rate,
+    decay_rate=0.9, patience=50,
+)
 
+warmup_cfg = VMCWarmupConfig(
+    use_export_compile=VMCConfig.use_export_compile,
+    grad_batch_size=VMCConfig.grad_batch_size,
+    use_log_amp=vmc_cfg.use_log_amp,
+    run_sampling=False,
+    run_locE=False,
+    run_grad=False,
+)
 
 def main():
     setup_linalg_hooks(
@@ -179,11 +194,7 @@ def main():
                 )
 
         # ========== Config ==========
-        vmc_cfg = VMCConfig()
-        vmc_cfg.lr_scheduler = DecayScheduler(
-            init_lr=vmc_cfg.learning_rate,
-            decay_rate=0.9, patience=50,
-        )
+
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
             f"t={t}_U={U}/N={N_f}/Z2/D={D}/chi={chi}/"
@@ -296,11 +307,7 @@ def main():
             graph=graph,
             hamiltonian=H,
             rank=rank,
-            config=VMCWarmupConfig(
-                use_export_compile=vmc_cfg.use_export_compile,
-                grad_batch_size=vmc_cfg.grad_batch_size,
-                use_log_amp=vmc_cfg.use_log_amp,
-            ),
+            config=warmup_cfg,
         )
 
         # ========== Data-saving callback ==========
