@@ -57,9 +57,9 @@ DEFAULT_DATA_ROOT = (
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 1024
-    ns_per_rank: int = 1024
-    grad_batch_size: int = 128
+    batch_size: int = 256
+    ns_per_rank: int = 256
+    grad_batch_size: int = 1
     vmc_steps: int = 1000
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
@@ -90,13 +90,17 @@ warmup_cfg = VMCWarmupConfig(
     use_export_compile=VMCConfig.use_export_compile,
     grad_batch_size=VMCConfig.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    run_sampling=False,
+    run_sampling=True,
     run_locE=False,
-    run_grad=False,
+    run_grad=True,
 )
 
 def main():
-    setup_linalg_hooks(jitter=1e-12)
+    setup_linalg_hooks(
+        jitter=1e-8, qr_via_eigh=False,
+        cholesky_qr=True, cholesky_qr_adaptive_jitter=False,
+        nonuniform_diag=True,
+    )
     torch.set_default_dtype(dtype)
 
     try:
@@ -106,14 +110,14 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 2
+        Lx, Ly = 8, 8
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 2
+        N_f = N_sites - 8
         n_fermions_per_spin = (N_f // 2, N_f // 2)
         D = 4  # PEPS bond dimension (start small)
-        chi = 4  # boundary bond dim
+        chi = 16  # boundary bond dim
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
