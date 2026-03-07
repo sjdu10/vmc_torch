@@ -1599,6 +1599,125 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             ),
         )(x, params, col_id, bMPS_params_y_batched, from_which)
 
+    # ----- Cheap gradient via hole contraction -----
+
+    def cheap_grad_single(self, x, params, bMPS_params_x):
+        """Single-sample cheap gradient via per-row hole contraction.
+
+        For pure fTNS, psi(x) is linear in each row's tensors.
+        The bMPS environments are treated as constants (no grad
+        through SVDs). For each row, we differentiate the small
+        contraction (bMPS_below | row_tensors | bMPS_above) w.r.t.
+        the full params pytree. Only the current row's params get
+        non-zero gradients.
+
+        Requires chi >= 4*D for accurate boundary environments.
+
+        Args:
+            x: (N_sites,) int64 — one configuration
+            params: quimb pytree of TN params
+            bMPS_params_x: dict {('xmin', r): flat_params,
+                ('xmax', r): flat_params} for all rows r
+
+        Returns:
+            (grad_flat, amp): gradient (Np,) and scalar amplitude
+        """
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        # Compute amplitude from midpoint bMPS envs
+        mid = self.Lx // 2
+        bMPS_mid_below = unpack_ftn(
+            bMPS_params_x[('xmin', mid)],
+            self.bMPS_x_skeletons[('xmin', mid)],
+        )
+        bMPS_mid_above = unpack_ftn(
+            bMPS_params_x[('xmax', mid - 1)],
+            self.bMPS_x_skeletons[('xmax', mid - 1)],
+        )
+        amp_val = (bMPS_mid_below | bMPS_mid_above).contract()
+
+        # Accumulate gradients row by row.
+        # Use flatten/unflatten since qu.utils.tree_map
+        # only maps over a single tree.
+        accum_flat, accum_ref = qu.utils.tree_flatten(
+            qu.utils.tree_map(torch.zeros_like, params),
+            get_ref=True,
+        )
+
+        for row in range(self.Lx):
+            bk_below = ('xmin', row)
+            bk_above = ('xmax', row)
+            bp_below = bMPS_params_x[bk_below]
+            bp_above = bMPS_params_x[bk_above]
+            sk_below = self.bMPS_x_skeletons[bk_below]
+            sk_above = self.bMPS_x_skeletons[bk_above]
+
+            # Capture loop vars via defaults
+            def row_fn(
+                p,
+                _bp_below=bp_below,
+                _bp_above=bp_above,
+                _sk_below=sk_below,
+                _sk_above=sk_above,
+                _row=row,
+            ):
+                tns = qtn.unpack(p, self.skeleton)
+                amp = tns.isel({
+                    tns.site_ind(site): x[i]
+                    for i, site in enumerate(tns.sites)
+                })
+                b_below = unpack_ftn(
+                    _bp_below, _sk_below,
+                )
+                b_above = unpack_ftn(
+                    _bp_above, _sk_above,
+                )
+                row_ts = amp.select(
+                    tns.row_tag(_row), which='any',
+                )
+                amp_reuse = (
+                    b_below | row_ts | b_above
+                )
+                return amp_reuse.contract()
+
+            row_grad = torch.func.grad(row_fn)(params)
+            row_grad_flat = qu.utils.tree_flatten(
+                row_grad,
+            )
+            accum_flat = [
+                a + g
+                for a, g in zip(accum_flat, row_grad_flat)
+            ]
+
+        # Flatten to (Np,)
+        grad_flat = torch.cat(
+            [g.flatten() for g in accum_flat],
+        )
+        return grad_flat, amp_val
+
+    def compute_cheap_grads_vmap(
+        self, fxs, bMPS_params_x,
+    ):
+        """Batched cheap gradient via vmap over cheap_grad_single.
+
+        Args:
+            fxs: (B, N_sites) int64
+            bMPS_params_x: batched dict from cache_bMPS_params_vmap
+
+        Returns:
+            (grads, amps): (B, Np) and (B,)
+        """
+        import quimb as qu
+
+        params = self._vamp_params_preprocess(self.params)
+        return torch.vmap(
+            self.cheap_grad_single,
+            in_dims=(
+                0, None, self.bMPS_params_x_in_dims,
+            ),
+        )(fxs, params, bMPS_params_x)
+
     # ----- Debug helper -----
 
     def amp_tn(self, x):

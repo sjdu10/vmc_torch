@@ -29,6 +29,7 @@ from vmc_torch.GPU.models import (
 )
 from vmc_torch.GPU.optimizer import (
     DecayScheduler,
+    DistributedMinSRGPU,
     DistributedSRMinresGPU,
     MinSRGPU,
     SGDGPU,
@@ -42,14 +43,14 @@ from vmc_torch.GPU.vmc_setup import (
     setup_linalg_hooks,
 )
 from vmc_torch.GPU.vmc_utils import (
+    compute_grads_cheap_gpu,
     evaluate_energy_reuse,
     random_initial_config,
 )
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch'
-    '/vmc_torch/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
 )
 
 
@@ -57,25 +58,45 @@ DEFAULT_DATA_ROOT = (
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 4096
-    ns_per_rank: int = 4096
-    grad_batch_size: int = 1024
+    batch_size: int = 256
+    ns_per_rank: int = 256
+    grad_batch_size: int = 128
     vmc_steps: int = 100
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
     burn_in_steps: int = 4
     use_export_compile: bool = False  # full-contraction export
-    use_export_compile_reuse: bool = True  # reuse export
+    use_export_compile_reuse: bool = False  # reuse export
     use_min_sr: bool = False
+    use_distributed_min_sr: bool = False
+    use_distributed_sr_minres: bool = True
+    minres_sr_use_scipy: bool = False
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
+    param_chunk_size: int = 1024
     save_every: int = 10
     resume_step: int = 0
     debug: bool = False
-    outlier_clip_factor: float = 100.0 # drop log_psi_grad outliers > factor * median
+    outlier_clip_factor: float = 1e4
     run_sr: bool = True
     use_log_amp: bool = True
+    use_cheap_grad: bool = True
     lr_scheduler: object = None  # set after construction
+    verbose: bool = True
+
+vmc_cfg = VMCConfig()
+vmc_cfg.lr_scheduler = DecayScheduler(
+    init_lr=vmc_cfg.learning_rate,
+    decay_rate=0.9, patience=50,
+)
+warmup_cfg = VMCWarmupConfig(
+    use_export_compile=VMCConfig.use_export_compile,
+    grad_batch_size=VMCConfig.grad_batch_size,
+    use_log_amp=vmc_cfg.use_log_amp,
+    run_sampling=True,
+    run_locE=True,
+    run_grad=True,
+)
 
 
 def main():
@@ -88,13 +109,13 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 2
+        Lx, Ly = 8, 8
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 2  # 2 holes -> 14 fermions
+        N_f = N_sites - 2  # 2 holes
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4  # PEPS bond dimension (start small)
+        D = 4  # PEPS bond dimension
         chi = 16  # boundary bond dim
 
         # ========== Hamiltonian ==========
@@ -136,11 +157,6 @@ def main():
         model.to(device)
 
         # ========== Load checkpoint (optional) ==========
-        vmc_cfg = VMCConfig()
-        vmc_cfg.lr_scheduler = DecayScheduler(
-            init_lr=vmc_cfg.learning_rate,
-            decay_rate=0.9, patience=50,
-        )
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
             f"t={t}_U={U}/N={N_f}/Z2/D={D}/chi={chi}/"
@@ -239,14 +255,21 @@ def main():
         }
 
         # ========== VMC driver ==========
-        preconditioner = (
-            MinSRGPU()
-            if vmc_cfg.use_min_sr
-            else DistributedSRMinresGPU(
+        if vmc_cfg.use_distributed_min_sr:
+            preconditioner = DistributedMinSRGPU(
+                param_chunk_size=vmc_cfg.param_chunk_size,
+            )
+        elif vmc_cfg.use_min_sr:
+            preconditioner = MinSRGPU()
+        elif vmc_cfg.use_distributed_sr_minres:
+            preconditioner = DistributedSRMinresGPU(
                 rtol=vmc_cfg.sr_rtol,
                 maxiter=vmc_cfg.sr_maxiter,
+                use_scipy=vmc_cfg.minres_sr_use_scipy,
             )
-        )
+        else:
+            preconditioner = None
+
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerReuse_GPU(),
             preconditioner=preconditioner,
@@ -254,6 +277,11 @@ def main():
                 learning_rate=vmc_cfg.learning_rate,
             ),
             evaluate_energy_fn=evaluate_energy_reuse,
+            **(
+                {'compute_grads_fn': compute_grads_cheap_gpu}
+                if vmc_cfg.use_cheap_grad
+                else {}
+            ),
         )
 
         fxs = vmc.run_warmup(
@@ -262,11 +290,7 @@ def main():
             graph=graph,
             hamiltonian=H,
             rank=rank,
-            config=VMCWarmupConfig(
-                use_export_compile=vmc_cfg.use_export_compile,
-                grad_batch_size=vmc_cfg.grad_batch_size,
-                use_log_amp=vmc_cfg.use_log_amp,
-            ),
+            config=warmup_cfg,
         )
 
         # ========== Data-saving callback ==========
@@ -294,23 +318,10 @@ def main():
             graph=graph,
             rank=rank,
             world_size=world_size,
-            config=VMCLoopConfig(
-                vmc_steps=vmc_cfg.vmc_steps,
-                ns_per_rank=vmc_cfg.ns_per_rank,
-                grad_batch_size=vmc_cfg.grad_batch_size,
+            config=VMCLoopConfig.from_vmc_config(
+                vmc_cfg,
                 n_params=N_params,
                 nsites=N_sites,
-                learning_rate=vmc_cfg.learning_rate,
-                diag_shift=vmc_cfg.diag_shift,
-                burn_in_steps=vmc_cfg.burn_in_steps,
-                run_sr=vmc_cfg.run_sr,
-                use_min_sr=vmc_cfg.use_min_sr,
-                use_export_compile=vmc_cfg.use_export_compile,
-                step_offset=vmc_cfg.resume_step,
-                debug=vmc_cfg.debug,
-                outlier_clip_factor=vmc_cfg.outlier_clip_factor,
-                use_log_amp=vmc_cfg.use_log_amp,
-                lr_scheduler=vmc_cfg.lr_scheduler,
             ),
             on_step_end=on_step_end,
         )

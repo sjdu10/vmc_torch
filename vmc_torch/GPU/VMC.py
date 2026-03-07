@@ -221,11 +221,17 @@ class VMC_GPU:
 
                 # 2. Local energy
                 t0 = time.time()
-                _, local_E = self.evaluate_energy_fn(
+                energy_result = self.evaluate_energy_fn(
                     fxs, model, hamiltonian, amps_out,
                     use_log_amp=use_log_amp,
                     verbose=verbose,
+                    return_bMPS=True,
                 )
+                if len(energy_result) == 4:
+                    _, local_E, bMPS_x, bMPS_y = energy_result
+                else:
+                    _, local_E = energy_result
+                    bMPS_x = None
                 t_locE += time.time() - t0
 
             # Free sampling/energy tensors so allocator
@@ -243,6 +249,7 @@ class VMC_GPU:
                     offload_to_cpu=offload_oloc,
                     use_log_amp=use_log_amp,
                     verbose=verbose,
+                    bMPS_params_x=bMPS_x,
                 )
             _rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -439,6 +446,15 @@ class VMC_GPU:
             print(
                 f"  Warmup total:    "
                 f"{time.time() - t_warm:.2f}s"
+            )
+            # analyze grad stats
+            g_rms = (
+                torch.norm(grads).item()                / grads.numel() ** 0.5
+            )
+            print(
+                f"  [dbg] log_psi_grad: "
+                f"rms={g_rms:.4e}, "
+                f"max={grads.abs().max().item():.4e}"
             )
 
         del grads, grads_aux

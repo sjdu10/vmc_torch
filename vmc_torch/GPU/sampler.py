@@ -442,10 +442,23 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
         B = fxs.shape[0]
         device = fxs.device
 
+        # Collect all edges for progress tracking
+        all_edges = []
+        for edges in graph.row_edges.values():
+            all_edges.extend(edges)
+        for edges in graph.col_edges.values():
+            all_edges.extend(edges)
+        total_edges = len(all_edges)
+
+        n_updates = 0
         if verbose:
-            t0 = time.time()
+            t_total_start = time.time()
+            t_propose = 0.0
+            t_forward = 0.0
 
         # ---- Phase 1: x-direction (row edges) ----
+        if verbose:
+            t0 = time.time()
         bMPS_x, current_amps = (
             model.cache_bMPS_params_any_direction_vmap(
                 fxs, direction='x',
@@ -456,23 +469,41 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
             cur_log_abs = torch.log(
                 current_amps.abs().clamp(min=1e-45),
             )
+        if verbose:
+            print(
+                f" cache bMPS x: "
+                f"{time.time() - t0:.4f}s"
+            )
 
         for row, edges in graph.row_edges.items():
             for edge in edges:
+                n_updates += 1
                 i, j = edge
+
+                if verbose:
+                    t00 = time.time()
                 proposed_fxs, new_flags = (
                     propose_exchange_or_hopping_vec(
                         i, j, fxs, self.hopping_rate,
                     )
                 )
+                if verbose:
+                    t11 = time.time()
+                    t_propose += t11 - t00
+
                 if not new_flags.any():
                     continue
+
+                n_changed = new_flags.sum().item()
 
                 # Determine which rows to contract
                 selected_rows = list(range(
                     max(0, row - model.radius),
                     min(model.Lx, row + model.radius + 1),
                 ))
+
+                if verbose:
+                    t10 = time.time()
 
                 if use_log_amp:
                     prop_signs, prop_log_abs = (
@@ -494,6 +525,20 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
                     ratio = (
                         (proposed_amps.abs() ** 2)
                         / (current_amps.abs() ** 2)
+                    )
+
+                if verbose:
+                    t11 = time.time()
+                    t_forward += t11 - t10
+                    print(
+                        f" Edge ({i}, {j}): "
+                        f"{n_changed} / {B} "
+                        f"proposed, forward: "
+                        f"{t11-t10:.4f}s, "
+                        f"total forward: "
+                        f"{t_forward:.4f}s, "
+                        f"progress: "
+                        f"{n_updates}/{total_edges}"
                     )
 
                 probs = torch.rand(B, device=device)
@@ -521,16 +566,9 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
                     fxs, row, bMPS_x, from_which='xmin',
                 )
 
-        if verbose:
-            t1 = time.time()
-            print(
-                f"Phase 1 (x-dir row edges): {t1 - t0:.4f}s"
-            )
-
         # ---- Phase 2: y-direction (col edges) ----
         if verbose:
             t0 = time.time()
-
         bMPS_y, current_amps = (
             model.cache_bMPS_params_any_direction_vmap(
                 fxs, direction='y',
@@ -541,22 +579,40 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
             cur_log_abs = torch.log(
                 current_amps.abs().clamp(min=1e-45),
             )
+        if verbose:
+            print(
+                f" cache bMPS y: "
+                f"{time.time() - t0:.4f}s"
+            )
 
         for col, edges in graph.col_edges.items():
             for edge in edges:
+                n_updates += 1
                 i, j = edge
+
+                if verbose:
+                    t00 = time.time()
                 proposed_fxs, new_flags = (
                     propose_exchange_or_hopping_vec(
                         i, j, fxs, self.hopping_rate,
                     )
                 )
+                if verbose:
+                    t11 = time.time()
+                    t_propose += t11 - t00
+
                 if not new_flags.any():
                     continue
+
+                n_changed = new_flags.sum().item()
 
                 selected_cols = list(range(
                     max(0, col - model.radius),
                     min(model.Ly, col + model.radius + 1),
                 ))
+
+                if verbose:
+                    t10 = time.time()
 
                 if use_log_amp:
                     prop_signs, prop_log_abs = (
@@ -578,6 +634,20 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
                     ratio = (
                         (proposed_amps.abs() ** 2)
                         / (current_amps.abs() ** 2)
+                    )
+
+                if verbose:
+                    t11 = time.time()
+                    t_forward += t11 - t10
+                    print(
+                        f" Edge ({i}, {j}): "
+                        f"{n_changed} / {B} "
+                        f"proposed, forward: "
+                        f"{t11-t10:.4f}s, "
+                        f"total forward: "
+                        f"{t_forward:.4f}s, "
+                        f"progress: "
+                        f"{n_updates}/{total_edges}"
                     )
 
                 probs = torch.rand(B, device=device)
@@ -608,7 +678,22 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
         if verbose:
             t1 = time.time()
             print(
-                f"Phase 2 (y-dir col edges): {t1 - t0:.4f}s"
+                f"Sample next: "
+                f"{t1-t_total_start:.4f}s for "
+                f"{n_updates} edges "
+                f"(avg "
+                f"{(t1-t_total_start)/n_updates:.4f}"
+                f"s/edge, B={B})"
+            )
+            print(
+                f"  Propose: {t_propose:.4f}s "
+                f"(avg "
+                f"{t_propose/n_updates:.4f}s/edge)"
+            )
+            print(
+                f"  Forward: {t_forward:.4f}s "
+                f"(avg "
+                f"{t_forward/n_updates:.4f}s/edge)"
             )
 
         if use_log_amp:
