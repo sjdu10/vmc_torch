@@ -61,9 +61,9 @@ CPU_DATA_ROOT = (
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 2048
-    ns_per_rank: int = 2048
-    grad_batch_size: int = 256
+    batch_size: int = 4096
+    ns_per_rank: int = 4096
+    grad_batch_size: int = 1024
     vmc_steps: int = 100
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
@@ -81,20 +81,17 @@ class VMCConfig:
     save_every: int = 50
     resume_step: int = 0
     debug: bool = False
-    outlier_clip_factor: float = 100.0 # drop O_loc outliers > factor * median
+    outlier_clip_factor: float = 100.0 # drop log_psi_grad outliers > factor * median
     run_sr: bool = True
+    use_log_amp: bool = True
     lr_scheduler: object = None  # set after construction
 
-warmup_cfg = VMCWarmupConfig(
-    use_export_compile=VMCConfig.use_export_compile,
-    grad_batch_size=VMCConfig.grad_batch_size,
-    run_sampling=False,
-    run_locE=False,
-    run_grad=True,
-)
 
 def main():
-    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=False, cholesky_qr=True, cholesky_qr_adaptive_jitter=False)
+    setup_linalg_hooks(
+        jitter=1e-12, qr_via_eigh=False,
+        cholesky_qr=True, cholesky_qr_adaptive_jitter=False,
+    )
     torch.set_default_dtype(dtype)
 
     try:
@@ -103,11 +100,11 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 12, 4
+        Lx, Ly = 4, 2
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 8  # 8 holes
+        N_f = N_sites - 2  # 2 holes -> 14 fermions
         n_fermions_per_spin = (N_f // 2, N_f // 2)
         D = 4   # PEPS bond dimension
         chi = -1  # exact contraction
@@ -299,7 +296,11 @@ def main():
             graph=graph,
             hamiltonian=H,
             rank=rank,
-            config=warmup_cfg,
+            config=VMCWarmupConfig(
+                use_export_compile=vmc_cfg.use_export_compile,
+                grad_batch_size=vmc_cfg.grad_batch_size,
+                use_log_amp=vmc_cfg.use_log_amp,
+            ),
         )
 
         # ========== Data-saving callback ==========

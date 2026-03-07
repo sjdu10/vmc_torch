@@ -221,6 +221,7 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
         graph,
         compile: bool = False,
         verbose: bool = False,
+        use_log_amp: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """One Metropolis sweep over all lattice edges.
@@ -237,12 +238,18 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
             compile: If True, always evaluate all B configs
                 (no partial batching) for torch.compile.
             verbose: Print per-edge timing info.
+            use_log_amp: If True, work in log-space and
+                return (signs, log_abs) instead of amps.
 
         Returns:
             fxs: (B, N_sites) int64 updated configs.
-            current_amps: (B,) amplitudes at updated configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs)
+                tuple when use_log_amp=True.
         """
-        current_amps = model(fxs)
+        if use_log_amp:
+            cur_signs, cur_log_abs = model.forward_log(fxs)
+        else:
+            current_amps = model(fxs)
         B = fxs.shape[0]
         device = fxs.device
 
@@ -278,23 +285,49 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
             if not new_flags.any():
                 continue
 
-            # Evaluate amplitudes — pad to B for compile
-            proposed_amps = current_amps.clone()
             n_changed = new_flags.sum().item()
 
             if verbose:
                 t10 = time.time()
-            if compile:
-                new_proposed_amps = model(proposed_fxs)
-                proposed_amps = new_proposed_amps
+
+            if use_log_amp:
+                # Evaluate proposed log-amplitudes
+                prop_signs = cur_signs.clone()
+                prop_log_abs = cur_log_abs.clone()
+                if compile:
+                    ps, pla = model.forward_log(proposed_fxs)
+                    prop_signs = ps
+                    prop_log_abs = pla
+                else:
+                    if n_changed == B:
+                        ps, pla = model.forward_log(
+                            proposed_fxs,
+                        )
+                        prop_signs = ps
+                        prop_log_abs = pla
+                    else:
+                        changed_fxs = proposed_fxs[new_flags]
+                        ps, pla = model.forward_log(
+                            changed_fxs,
+                        )
+                        prop_signs[new_flags] = ps
+                        prop_log_abs[new_flags] = pla
             else:
-                if n_changed == B:
+                # Evaluate proposed amplitudes
+                proposed_amps = current_amps.clone()
+                if compile:
                     new_proposed_amps = model(proposed_fxs)
                     proposed_amps = new_proposed_amps
                 else:
-                    changed_fxs = proposed_fxs[new_flags]
-                    changed_amps = model(changed_fxs)
-                    proposed_amps[new_flags] = changed_amps
+                    if n_changed == B:
+                        new_proposed_amps = model(
+                            proposed_fxs,
+                        )
+                        proposed_amps = new_proposed_amps
+                    else:
+                        changed_fxs = proposed_fxs[new_flags]
+                        changed_amps = model(changed_fxs)
+                        proposed_amps[new_flags] = changed_amps
 
             if verbose:
                 t11 = time.time()
@@ -307,18 +340,31 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
                 )
 
             # Metropolis accept/reject
-            ratio = (
-                (proposed_amps.abs() ** 2)
-                / (current_amps.abs() ** 2 )
-            )
+            if use_log_amp:
+                ratio = torch.exp(
+                    2.0 * (prop_log_abs - cur_log_abs),
+                )
+            else:
+                ratio = (
+                    (proposed_amps.abs() ** 2)
+                    / (current_amps.abs() ** 2)
+                )
             probs = torch.rand(B, device=device)
             accept_mask = new_flags & (probs < ratio)
 
             if accept_mask.any():
                 fxs[accept_mask] = proposed_fxs[accept_mask]
-                current_amps[accept_mask] = (
-                    proposed_amps[accept_mask]
-                )
+                if use_log_amp:
+                    cur_signs[accept_mask] = (
+                        prop_signs[accept_mask]
+                    )
+                    cur_log_abs[accept_mask] = (
+                        prop_log_abs[accept_mask]
+                    )
+                else:
+                    current_amps[accept_mask] = (
+                        proposed_amps[accept_mask]
+                    )
 
         if verbose:
             t1 = time.time()
@@ -337,6 +383,8 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
                 f"(avg {t_forward/n_updates:.4f}s/edge)"
             )
 
+        if use_log_amp:
+            return fxs, (cur_signs, cur_log_abs)
         return fxs, current_amps
 
 
@@ -368,6 +416,7 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
         graph,
         compile: bool = False,
         verbose: bool = False,
+        use_log_amp: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """One MCMC sweep with bMPS environment reuse.
@@ -382,10 +431,13 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
             graph: Lattice graph with .row_edges, .col_edges.
             compile: Unused (kept for interface compat).
             verbose: Print per-phase timing info.
+            use_log_amp: If True, work in log-space and
+                return (signs, log_abs) instead of amps.
 
         Returns:
             fxs: (B, N_sites) int64 updated configs.
-            current_amps: (B,) amplitudes at updated configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs)
+                tuple when use_log_amp=True.
         """
         B = fxs.shape[0]
         device = fxs.device
@@ -399,6 +451,11 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
                 fxs, direction='x',
             )
         )
+        if use_log_amp:
+            cur_signs = torch.sign(current_amps)
+            cur_log_abs = torch.log(
+                current_amps.abs().clamp(min=1e-45),
+            )
 
         for row, edges in graph.row_edges.items():
             for edge in edges:
@@ -417,26 +474,46 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
                     min(model.Lx, row + model.radius + 1),
                 ))
 
-                # Evaluate all B configs (must match bMPS batch)
-                proposed_amps = model.forward_reuse(
-                    proposed_fxs,
-                    bMPS_params_x_batched=bMPS_x,
-                    selected_rows=selected_rows,
-                )
+                if use_log_amp:
+                    prop_signs, prop_log_abs = (
+                        model.forward_reuse_log(
+                            proposed_fxs,
+                            bMPS_params_x_batched=bMPS_x,
+                            selected_rows=selected_rows,
+                        )
+                    )
+                    ratio = torch.exp(
+                        2.0 * (prop_log_abs - cur_log_abs),
+                    )
+                else:
+                    proposed_amps = model.forward_reuse(
+                        proposed_fxs,
+                        bMPS_params_x_batched=bMPS_x,
+                        selected_rows=selected_rows,
+                    )
+                    ratio = (
+                        (proposed_amps.abs() ** 2)
+                        / (current_amps.abs() ** 2)
+                    )
 
-                # Vectorized Metropolis accept/reject
-                ratio = (
-                    (proposed_amps.abs() ** 2)
-                    / (current_amps.abs() ** 2 )
-                )
                 probs = torch.rand(B, device=device)
                 accept_mask = new_flags & (probs < ratio)
 
                 if accept_mask.any():
-                    fxs[accept_mask] = proposed_fxs[accept_mask]
-                    current_amps[accept_mask] = (
-                        proposed_amps[accept_mask]
+                    fxs[accept_mask] = (
+                        proposed_fxs[accept_mask]
                     )
+                    if use_log_amp:
+                        cur_signs[accept_mask] = (
+                            prop_signs[accept_mask]
+                        )
+                        cur_log_abs[accept_mask] = (
+                            prop_log_abs[accept_mask]
+                        )
+                    else:
+                        current_amps[accept_mask] = (
+                            proposed_amps[accept_mask]
+                        )
 
             # Update bMPS to next row
             if row < model.Lx - 1:
@@ -459,6 +536,11 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
                 fxs, direction='y',
             )
         )
+        if use_log_amp:
+            cur_signs = torch.sign(current_amps)
+            cur_log_abs = torch.log(
+                current_amps.abs().clamp(min=1e-45),
+            )
 
         for col, edges in graph.col_edges.items():
             for edge in edges:
@@ -476,24 +558,46 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
                     min(model.Ly, col + model.radius + 1),
                 ))
 
-                proposed_amps = model.forward_reuse(
-                    proposed_fxs,
-                    bMPS_params_y_batched=bMPS_y,
-                    selected_cols=selected_cols,
-                )
+                if use_log_amp:
+                    prop_signs, prop_log_abs = (
+                        model.forward_reuse_log(
+                            proposed_fxs,
+                            bMPS_params_y_batched=bMPS_y,
+                            selected_cols=selected_cols,
+                        )
+                    )
+                    ratio = torch.exp(
+                        2.0 * (prop_log_abs - cur_log_abs),
+                    )
+                else:
+                    proposed_amps = model.forward_reuse(
+                        proposed_fxs,
+                        bMPS_params_y_batched=bMPS_y,
+                        selected_cols=selected_cols,
+                    )
+                    ratio = (
+                        (proposed_amps.abs() ** 2)
+                        / (current_amps.abs() ** 2)
+                    )
 
-                ratio = (
-                    (proposed_amps.abs() ** 2)
-                    / (current_amps.abs() ** 2)
-                )
                 probs = torch.rand(B, device=device)
                 accept_mask = new_flags & (probs < ratio)
 
                 if accept_mask.any():
-                    fxs[accept_mask] = proposed_fxs[accept_mask]
-                    current_amps[accept_mask] = (
-                        proposed_amps[accept_mask]
+                    fxs[accept_mask] = (
+                        proposed_fxs[accept_mask]
                     )
+                    if use_log_amp:
+                        cur_signs[accept_mask] = (
+                            prop_signs[accept_mask]
+                        )
+                        cur_log_abs[accept_mask] = (
+                            prop_log_abs[accept_mask]
+                        )
+                    else:
+                        current_amps[accept_mask] = (
+                            proposed_amps[accept_mask]
+                        )
 
             # Update bMPS to next col
             if col < model.Ly - 1:
@@ -507,6 +611,8 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
                 f"Phase 2 (y-dir col edges): {t1 - t0:.4f}s"
             )
 
+        if use_log_amp:
+            return fxs, (cur_signs, cur_log_abs)
         return fxs, current_amps
 
 #=== Utility functions for Metropolis-Hastings sampling on spin systems ===#
@@ -548,6 +654,7 @@ class MetropolisExchangeSpinSamplerGPU(SamplerGPU):
         graph,
         compile: bool = False,
         verbose: bool = False,
+        use_log_amp: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """One Metropolis sweep over all lattice edges.
@@ -560,12 +667,18 @@ class MetropolisExchangeSpinSamplerGPU(SamplerGPU):
             compile: If True, evaluate all B configs per
                 edge (no partial batching).
             verbose: Print per-edge timing info.
+            use_log_amp: If True, work in log-space and
+                return (signs, log_abs) instead of amps.
 
         Returns:
             fxs: (B, N_sites) int64 updated configs.
-            current_amps: (B,) amplitudes at updated configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs)
+                tuple when use_log_amp=True.
         """
-        current_amps = model(fxs)
+        if use_log_amp:
+            cur_signs, cur_log_abs = model.forward_log(fxs)
+        else:
+            current_amps = model(fxs)
         B = fxs.shape[0]
         device = fxs.device
 
@@ -597,22 +710,47 @@ class MetropolisExchangeSpinSamplerGPU(SamplerGPU):
             if not new_flags.any():
                 continue
 
-            proposed_amps = current_amps.clone()
             n_changed = new_flags.sum().item()
 
             if verbose:
                 t10 = time.time()
-            if compile:
-                new_proposed_amps = model(proposed_fxs)
-                proposed_amps = new_proposed_amps
+
+            if use_log_amp:
+                prop_signs = cur_signs.clone()
+                prop_log_abs = cur_log_abs.clone()
+                if compile:
+                    ps, pla = model.forward_log(proposed_fxs)
+                    prop_signs = ps
+                    prop_log_abs = pla
+                else:
+                    if n_changed == B:
+                        ps, pla = model.forward_log(
+                            proposed_fxs,
+                        )
+                        prop_signs = ps
+                        prop_log_abs = pla
+                    else:
+                        changed_fxs = proposed_fxs[new_flags]
+                        ps, pla = model.forward_log(
+                            changed_fxs,
+                        )
+                        prop_signs[new_flags] = ps
+                        prop_log_abs[new_flags] = pla
             else:
-                if n_changed == B:
+                proposed_amps = current_amps.clone()
+                if compile:
                     new_proposed_amps = model(proposed_fxs)
                     proposed_amps = new_proposed_amps
                 else:
-                    changed_fxs = proposed_fxs[new_flags]
-                    changed_amps = model(changed_fxs)
-                    proposed_amps[new_flags] = changed_amps
+                    if n_changed == B:
+                        new_proposed_amps = model(
+                            proposed_fxs,
+                        )
+                        proposed_amps = new_proposed_amps
+                    else:
+                        changed_fxs = proposed_fxs[new_flags]
+                        changed_amps = model(changed_fxs)
+                        proposed_amps[new_flags] = changed_amps
 
             if verbose:
                 t11 = time.time()
@@ -624,18 +762,31 @@ class MetropolisExchangeSpinSamplerGPU(SamplerGPU):
                     f" progress: {n_updates}/{len(all_edges)}"
                 )
 
-            ratio = (
-                (proposed_amps.abs() ** 2)
-                / (current_amps.abs() ** 2)
-            )
+            if use_log_amp:
+                ratio = torch.exp(
+                    2.0 * (prop_log_abs - cur_log_abs),
+                )
+            else:
+                ratio = (
+                    (proposed_amps.abs() ** 2)
+                    / (current_amps.abs() ** 2)
+                )
             probs = torch.rand(B, device=device)
             accept_mask = new_flags & (probs < ratio)
 
             if accept_mask.any():
                 fxs[accept_mask] = proposed_fxs[accept_mask]
-                current_amps[accept_mask] = (
-                    proposed_amps[accept_mask]
-                )
+                if use_log_amp:
+                    cur_signs[accept_mask] = (
+                        prop_signs[accept_mask]
+                    )
+                    cur_log_abs[accept_mask] = (
+                        prop_log_abs[accept_mask]
+                    )
+                else:
+                    current_amps[accept_mask] = (
+                        proposed_amps[accept_mask]
+                    )
 
         if verbose:
             t1 = time.time()
@@ -654,6 +805,8 @@ class MetropolisExchangeSpinSamplerGPU(SamplerGPU):
                 f"(avg {t_forward/n_updates:.4f}s/edge)"
             )
 
+        if use_log_amp:
+            return fxs, (cur_signs, cur_log_abs)
         return fxs, current_amps
 
 
@@ -677,6 +830,7 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
         graph,
         compile: bool = False,
         verbose: bool = False,
+        use_log_amp: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """One MCMC sweep with bMPS environment reuse.
@@ -692,11 +846,13 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                 .col_edges.
             compile: Unused (kept for interface compat).
             verbose: Print per-phase timing info.
+            use_log_amp: If True, work in log-space and
+                return (signs, log_abs) instead of amps.
 
         Returns:
             fxs: (B, N_sites) int64 updated configs.
-            current_amps: (B,) amplitudes at updated
-                configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs)
+                tuple when use_log_amp=True.
         """
         B = fxs.shape[0]
         device = fxs.device
@@ -710,6 +866,11 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                 fxs, direction='x',
             )
         )
+        if use_log_amp:
+            cur_signs = torch.sign(current_amps)
+            cur_log_abs = torch.log(
+                current_amps.abs().clamp(min=1e-45),
+            )
 
         for row, edges in graph.row_edges.items():
             for edge in edges:
@@ -725,16 +886,29 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                     min(model.Lx, row + model.radius + 1),
                 ))
                 t00 = time.time()
-                proposed_amps = model.forward_reuse(
-                    proposed_fxs,
-                    bMPS_params_x_batched=bMPS_x,
-                    selected_rows=selected_rows,
-                )
 
-                ratio = (
-                    (proposed_amps.abs() ** 2)
-                    / (current_amps.abs() ** 2)
-                )
+                if use_log_amp:
+                    prop_signs, prop_log_abs = (
+                        model.forward_reuse_log(
+                            proposed_fxs,
+                            bMPS_params_x_batched=bMPS_x,
+                            selected_rows=selected_rows,
+                        )
+                    )
+                    ratio = torch.exp(
+                        2.0 * (prop_log_abs - cur_log_abs),
+                    )
+                else:
+                    proposed_amps = model.forward_reuse(
+                        proposed_fxs,
+                        bMPS_params_x_batched=bMPS_x,
+                        selected_rows=selected_rows,
+                    )
+                    ratio = (
+                        (proposed_amps.abs() ** 2)
+                        / (current_amps.abs() ** 2)
+                    )
+
                 probs = torch.rand(B, device=device)
                 accept_mask = new_flags & (probs < ratio)
 
@@ -742,9 +916,17 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                     fxs[accept_mask] = (
                         proposed_fxs[accept_mask]
                     )
-                    current_amps[accept_mask] = (
-                        proposed_amps[accept_mask]
-                    )
+                    if use_log_amp:
+                        cur_signs[accept_mask] = (
+                            prop_signs[accept_mask]
+                        )
+                        cur_log_abs[accept_mask] = (
+                            prop_log_abs[accept_mask]
+                        )
+                    else:
+                        current_amps[accept_mask] = (
+                            proposed_amps[accept_mask]
+                        )
                 if verbose:
                     n_acc = accept_mask.sum().item()
                     print(
@@ -753,25 +935,6 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                         f"proposed, accepted: {n_acc}"
                         f", forward time: {time.time() - t00:.4f}s"
                     )
-                    # Debug: compare reuse vs full contraction
-                    # on first edge of each row with 0 acceptance
-                    if n_acc == 0 and edge == edges[0]:
-                        n_dbg = min(5, B)
-                        full_amps = model.forward(
-                            proposed_fxs[:n_dbg],
-                        )
-                        print(
-                            f"   [DBG] reuse amps[:5]: "
-                            f"{proposed_amps[:n_dbg].tolist()}"
-                        )
-                        print(
-                            f"   [DBG] full  amps[:5]: "
-                            f"{full_amps.tolist()}"
-                        )
-                        print(
-                            f"   [DBG] curr  amps[:5]: "
-                            f"{current_amps[:n_dbg].tolist()}"
-                        )
 
             # Update bMPS to next row
             if row < model.Lx - 1:
@@ -798,6 +961,11 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                 fxs, direction='y',
             )
         )
+        if use_log_amp:
+            cur_signs = torch.sign(current_amps)
+            cur_log_abs = torch.log(
+                current_amps.abs().clamp(min=1e-45),
+            )
 
         for col, edges in graph.col_edges.items():
             for edge in edges:
@@ -813,16 +981,29 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                     min(model.Ly, col + model.radius + 1),
                 ))
                 t00 = time.time()
-                proposed_amps = model.forward_reuse(
-                    proposed_fxs,
-                    bMPS_params_y_batched=bMPS_y,
-                    selected_cols=selected_cols,
-                )
 
-                ratio = (
-                    (proposed_amps.abs() ** 2)
-                    / (current_amps.abs() ** 2)
-                )
+                if use_log_amp:
+                    prop_signs, prop_log_abs = (
+                        model.forward_reuse_log(
+                            proposed_fxs,
+                            bMPS_params_y_batched=bMPS_y,
+                            selected_cols=selected_cols,
+                        )
+                    )
+                    ratio = torch.exp(
+                        2.0 * (prop_log_abs - cur_log_abs),
+                    )
+                else:
+                    proposed_amps = model.forward_reuse(
+                        proposed_fxs,
+                        bMPS_params_y_batched=bMPS_y,
+                        selected_cols=selected_cols,
+                    )
+                    ratio = (
+                        (proposed_amps.abs() ** 2)
+                        / (current_amps.abs() ** 2)
+                    )
+
                 probs = torch.rand(B, device=device)
                 accept_mask = new_flags & (probs < ratio)
 
@@ -830,9 +1011,17 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                     fxs[accept_mask] = (
                         proposed_fxs[accept_mask]
                     )
-                    current_amps[accept_mask] = (
-                        proposed_amps[accept_mask]
-                    )
+                    if use_log_amp:
+                        cur_signs[accept_mask] = (
+                            prop_signs[accept_mask]
+                        )
+                        cur_log_abs[accept_mask] = (
+                            prop_log_abs[accept_mask]
+                        )
+                    else:
+                        current_amps[accept_mask] = (
+                            proposed_amps[accept_mask]
+                        )
                 if verbose:
                     n_acc = accept_mask.sum().item()
                     print(
@@ -841,24 +1030,6 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                         f"proposed, accepted: {n_acc}"
                         f", forward time: {time.time() - t00:.4f}s"
                     )
-                    # Debug: compare reuse vs full contraction
-                    if n_acc == 0 and edge == edges[0]:
-                        n_dbg = min(5, B)
-                        full_amps = model.forward(
-                            proposed_fxs[:n_dbg],
-                        )
-                        print(
-                            f"   [DBG] reuse amps[:5]: "
-                            f"{proposed_amps[:n_dbg].tolist()}"
-                        )
-                        print(
-                            f"   [DBG] full  amps[:5]: "
-                            f"{full_amps.tolist()}"
-                        )
-                        print(
-                            f"   [DBG] curr  amps[:5]: "
-                            f"{current_amps[:n_dbg].tolist()}"
-                        )
 
             # Update bMPS to next col
             if col < model.Ly - 1:
@@ -876,6 +1047,8 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
                 f"{t1 - t0:.4f}s"
             )
 
+        if use_log_amp:
+            return fxs, (cur_signs, cur_log_abs)
         return fxs, current_amps
 
 

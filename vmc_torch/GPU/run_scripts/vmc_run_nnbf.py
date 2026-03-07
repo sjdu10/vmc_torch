@@ -63,8 +63,9 @@ class VMCConfig:
     burn_in_steps: int = 4
     use_export_compile: bool = False
     use_min_sr: bool = False
-    outlier_clip_factor: float = 100.0 # drop O_loc outliers > factor * median
+    outlier_clip_factor: float = 100.0 # drop log_psi_grad outliers > factor * median
     run_sr: bool = True
+    use_log_amp: bool = True
     lr_scheduler: object = None  # set after construction
 
 
@@ -112,6 +113,7 @@ def run_one_model(
         config=VMCWarmupConfig(
             use_export_compile=cfg.use_export_compile,
             grad_batch_size=cfg.grad_batch_size,
+            use_log_amp=cfg.use_log_amp,
         ),
     )
 
@@ -142,6 +144,7 @@ def run_one_model(
             use_export_compile=cfg.use_export_compile,
             step_offset=0,
             outlier_clip_factor=cfg.outlier_clip_factor,
+            use_log_amp=cfg.use_log_amp,
             lr_scheduler=cfg.lr_scheduler,
         ),
         on_step_end=on_step_end,

@@ -1,16 +1,18 @@
-"""Conv2D-Geometric backflow + fPEPS model for GPU VMC.
-
-Ports Conv2D_Geometric_fPEPS_Model_Cluster from CPU vmap/models/ConvNNfTNS.py
-to the GPU WavefunctionModel_GPU framework.
+"""NN-fTNS models for GPU VMC.
 
 Architecture (two-level evaluation):
-    1. NN (batch mode): CNN runs on full batch (B, N_sites) via
+    1. NN (batch mode): NN module runs on full batch (B, N_sites) via
        functional_call -> (B, total_ftn_params) backflow corrections.
     2. TN (vmap per-sample): Each sample's corrected TN params are
-       unpacked into a quimb fPEPS, isel'd, boundary-contracted,
-       and contract()'d.  Vmapped over the batch dim.
+       unpacked into a quimb fPEPS, isel'd, contracted.
+       Vmapped over the batch dim.
 
-This mirrors the CPU BasefPEPSBackflowModel.vamp() exactly.
+Base class NNfTNS_Model_GPU handles all plumbing (param registration,
+functional_call, vmap wrappers, export+compile). Subclasses only need
+to provide:
+    - An NN module (nn.Module: (B, N_sites) -> (B, total_ftn_params))
+    - Optionally override _contract_tn / _contract_tn_log for custom
+      contraction schemes.
 """
 import torch
 import torch.nn as nn
@@ -248,54 +250,40 @@ class _CNN_Geometric_Backflow_GPU(nn.Module):
 
 
 # ================================================================
-#  Conv2D Geometric fPEPS Model (GPU)
+#  NNfTNS_Model_GPU base class
 # ================================================================
 
 
-class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
-    """NN-fPEPS with Conv2D-Geometric backflow for GPU VMC.
+class NNfTNS_Model_GPU(WavefunctionModel_GPU):
+    """Base class for NN-fTNS models on GPU.
 
-    Combines a CNN geometric backflow network with fPEPS tensor
-    network contraction.  The CNN produces per-sample additive
-    corrections to the TN parameters, which are then contracted
-    via quimb.
+    Handles all plumbing: TN param packing, NN param extraction,
+    functional_call, vmap wrappers, export+compile.
+
+    Subclasses provide:
+        - An nn_module (nn.Module: (B, N_sites) -> (B, total_ftn_params))
+        - Optionally override _contract_tn / _contract_tn_log
 
     Parameter layout in self.params (ParameterList):
         [0 .. n_ftn-1]   TN parameters (flattened quimb pytree)
-        [n_ftn .. end]    NN parameters (from CNN module)
-
-    The key method is vamp() which:
-        1. Splits params into TN and NN parts
-        2. Runs CNN in batch mode via functional_call
-        3. Vmaps TN contraction over the batch dim
+        [n_ftn .. end]    NN parameters (from NN module)
 
     Args:
-        tn: quimb fPEPS tensor network
+        tn: quimb tensor network
+        nn_module: nn.Module producing backflow corrections
         max_bond: boundary contraction bond dimension (chi)
         nn_eta: scale factor for NN backflow correction
-        embed_dim: CNN embedding dimension
-        hidden_dim: CNN hidden channels
-        kernel_size: CNN kernel size (default 3)
-        layers: number of CNN layers (default 2)
-        init_scale: initial scale for output heads (default 1e-5)
         dtype: parameter dtype (default float64)
-        backbone_dtype: dtype for CNN backbone (default None = same
-            as dtype). Set to torch.float32 for faster CNN forward.
         contract_boundary_opts: options for boundary contraction
     """
 
     def __init__(
         self,
         tn,
+        nn_module,
         max_bond,
         nn_eta,
-        embed_dim,
-        hidden_dim,
-        kernel_size=3,
-        layers=2,
-        init_scale=1e-5,
         dtype=torch.float64,
-        backbone_dtype=None,
         contract_boundary_opts=None,
     ):
         import quimb as qu
@@ -332,21 +320,7 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
         ]
         self.ftn_params_length = sum(self.ftn_params_sizes)
 
-        # --- 2. NN backflow setup ---
-        nn_module = _CNN_Geometric_Backflow_GPU(
-            tn=tn,
-            embed_dim=embed_dim,
-            hidden_dim=hidden_dim,
-            kernel_size=kernel_size,
-            layers=layers,
-            dtype=dtype,
-            backbone_dtype=backbone_dtype,
-        )
-
-        # Small-init output heads
-        nn_module.initialize_output_scale(init_scale)
-
-        # Extract named parameters for functional_call
+        # --- 2. NN param extraction ---
         nn_param_names = []
         nn_param_dtypes = []
         nn_param_tensors = []
@@ -371,11 +345,16 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
             in_dims=(0, None, 0),
             randomness='different',
         )
+        self._vmapped_tn_contraction_log = torch.vmap(
+            self._tn_contraction_log,
+            in_dims=(0, None, 0),
+            randomness='different',
+        )
 
-    def _tn_contraction(self, x, ftn_params_list, nn_output):
-        """Single-sample TN contraction with additive backflow.
+    # ----- Backflow application (shared) -----
 
-        This is the function that gets vmapped in vamp().
+    def _apply_backflow(self, x, ftn_params_list, nn_output):
+        """Apply additive backflow to TN params and return isel'd TN.
 
         Args:
             x:              (N_sites,) int64 — one configuration
@@ -384,7 +363,7 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
                             backflow correction vector
 
         Returns:
-            scalar amplitude
+            isel'd quimb TN (ready for contraction)
         """
         import quimb as qu
         import quimb.tensor as qtn
@@ -408,34 +387,143 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
             )
             pointer += size
 
-        # 4. Reconstruct quimb TN and contract
+        # 4. Reconstruct quimb TN and isel
         params_pytree = qu.utils.tree_unflatten(
             corrected_params, self.ftn_params_pytree,
         )
         tn = qtn.unpack(params_pytree, self.skeleton)
 
-        amp = tn.isel({
+        amp_tn = tn.isel({
             tn.site_ind(site): x[i]
             for i, site in enumerate(tn.sites)
         })
 
+        return amp_tn
+
+    # ----- Contraction (overridable) -----
+
+    def _contract_tn(self, amp_tn):
+        """Contract an isel'd TN to a scalar amplitude.
+
+        Default: boundary contraction from xmin/xmax + contract().
+        Override for custom contraction schemes.
+
+        Args:
+            amp_tn: isel'd quimb TN
+
+        Returns:
+            scalar amplitude
+        """
         if self.chi > 0:
-            amp.contract_boundary_from_xmin_(
+            amp_tn.contract_boundary_from_xmin_(
                 max_bond=self.chi, cutoff=0.0,
-                xrange=[0, amp.Lx // 2 - 1],
+                xrange=[0, amp_tn.Lx // 2 - 1],
                 **self.contract_boundary_opts,
             )
-            amp.contract_boundary_from_xmax_(
+            amp_tn.contract_boundary_from_xmax_(
                 max_bond=self.chi, cutoff=0.0,
-                xrange=[amp.Lx // 2, amp.Lx - 1],
+                xrange=[amp_tn.Lx // 2, amp_tn.Lx - 1],
                 **self.contract_boundary_opts,
             )
-        return amp.contract()
+        return amp_tn.contract()
+
+    def _contract_tn_log(self, amp_tn):
+        """Contract an isel'd TN to (sign, log_abs) scalars.
+
+        Default: boundary contraction from xmin/xmax +
+        contract(strip_exponent=True).
+        Override for custom contraction schemes.
+
+        Args:
+            amp_tn: isel'd quimb TN
+
+        Returns:
+            (sign, log_abs) scalars
+        """
+        if self.chi > 0:
+            amp_tn.contract_boundary_from_xmin_(
+                max_bond=self.chi, cutoff=0.0,
+                xrange=[0, amp_tn.Lx // 2 - 1],
+                **self.contract_boundary_opts,
+            )
+            amp_tn.contract_boundary_from_xmax_(
+                max_bond=self.chi, cutoff=0.0,
+                xrange=[amp_tn.Lx // 2, amp_tn.Lx - 1],
+                **self.contract_boundary_opts,
+            )
+        sign, exponent_10 = amp_tn.contract(strip_exponent=True)
+        log_abs = exponent_10 * torch.log(torch.tensor(10.0))
+        return sign, log_abs
+
+    # ----- TN contraction entry points (compose backflow + contract) ---
+
+    def _tn_contraction(self, x, ftn_params_list, nn_output):
+        """Single-sample TN contraction with additive backflow.
+
+        This is the function that gets vmapped in vamp().
+
+        Args:
+            x:              (N_sites,) int64 — one configuration
+            ftn_params_list: list of TN parameter tensors
+            nn_output:      (total_ftn_params,) — single-sample
+                            backflow correction vector
+
+        Returns:
+            scalar amplitude
+        """
+        amp_tn = self._apply_backflow(x, ftn_params_list, nn_output)
+        return self._contract_tn(amp_tn)
+
+    def _tn_contraction_log(self, x, ftn_params_list, nn_output):
+        """Single-sample log TN contraction with additive backflow.
+
+        Returns:
+            (sign, log_abs) scalars
+        """
+        amp_tn = self._apply_backflow(x, ftn_params_list, nn_output)
+        return self._contract_tn_log(amp_tn)
+
+    # ----- NN helpers -----
+
+    def _make_nn_params_dict(self, nn_params):
+        """Build parameter dict for functional_call, casting to the
+        NN module's expected dtypes (handles mixed-precision backbone).
+        No-op when backbone_dtype == dtype.
+        """
+        return {
+            name: p.to(dt) if p.dtype != dt else p
+            for name, p, dt in zip(
+                self._nn_param_names,
+                nn_params,
+                self._nn_param_dtypes,
+            )
+        }
+
+    def _run_nn_batch(self, x, params):
+        """Split params, run NN in batch mode, return (ftn_params, nn_outputs).
+
+        Shared helper for vamp() and vamp_log().
+        """
+        if isinstance(params, nn.ParameterList):
+            params = list(params)
+
+        ftn_params = params[:self.n_ftn]
+        nn_params = params[self.n_ftn:]
+
+        nn_params_dict = self._make_nn_params_dict(nn_params)
+        nn_module = self._nn_container[0]
+        batch_nn_outputs = torch.func.functional_call(
+            nn_module, nn_params_dict, (x,),
+        )  # (B, total_ftn_params)
+
+        return ftn_params, batch_nn_outputs
+
+    # ----- Public interface -----
 
     def amplitude(self, x, params_list):
         """Single-sample amplitude (for export_and_compile compat).
 
-        Runs CNN on a single sample (unsqueeze/squeeze), then
+        Runs NN on a single sample (unsqueeze/squeeze), then
         does TN contraction with backflow.
 
         Args:
@@ -449,7 +537,7 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
         ftn_params = params_list[:self.n_ftn]
         nn_params = params_list[self.n_ftn:]
 
-        # Run CNN on single sample via functional_call
+        # Run NN on single sample via functional_call
         nn_params_dict = self._make_nn_params_dict(nn_params)
         nn_module = self._nn_container[0]
         x_batch = x.unsqueeze(0)  # (1, N_sites)
@@ -460,50 +548,43 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
 
         return self._tn_contraction(x, ftn_params, nn_output)
 
-    def _make_nn_params_dict(self, nn_params):
-        """Build parameter dict for functional_call, casting to the
-        CNN module's expected dtypes (handles mixed-precision backbone).
-        No-op when backbone_dtype == dtype.
+    def log_amplitude(self, x, params_list):
+        """Single-sample log-amplitude with backflow.
+
+        Same structure as amplitude() but uses _tn_contraction_log.
         """
-        return {
-            name: p.to(dt) if p.dtype != dt else p
-            for name, p, dt in zip(
-                self._nn_param_names,
-                nn_params,
-                self._nn_param_dtypes,
-            )
-        }
+        ftn_params = params_list[:self.n_ftn]
+        nn_params = params_list[self.n_ftn:]
 
-    def vamp(self, x, params):
-        """Batched amplitude: CNN in batch mode + vmap TN contraction.
-
-        Override of base class vamp().  The two-level evaluation:
-        1. functional_call runs CNN on full batch -> (B, total_ftn_params)
-        2. vmap runs TN contraction per sample with additive backflow
-
-        Args:
-            x:      (B, N_sites) int64
-            params: ParameterList or list of parameter tensors
-
-        Returns:
-            (B,) amplitudes
-        """
-        if isinstance(params, nn.ParameterList):
-            params = list(params)
-
-        # Split into TN and NN parts
-        ftn_params = params[:self.n_ftn]
-        nn_params = params[self.n_ftn:]
-
-        # 1. CNN forward in batch mode via functional_call
         nn_params_dict = self._make_nn_params_dict(nn_params)
         nn_module = self._nn_container[0]
-        batch_nn_outputs = torch.func.functional_call(
-            nn_module, nn_params_dict, (x,),
-        )  # (B, total_ftn_params)
+        x_batch = x.unsqueeze(0)
+        nn_output_batch = torch.func.functional_call(
+            nn_module, nn_params_dict, (x_batch,),
+        )
+        nn_output = nn_output_batch.squeeze(0)
 
-        # 2. vmap TN contraction over batch
+        return self._tn_contraction_log(x, ftn_params, nn_output)
+
+    def vamp(self, x, params):
+        """Batched amplitude: NN in batch mode + vmap TN contraction.
+
+        Two-level evaluation:
+        1. functional_call runs NN on full batch -> (B, total_ftn_params)
+        2. vmap runs TN contraction per sample with additive backflow
+        """
+        ftn_params, batch_nn_outputs = self._run_nn_batch(x, params)
         return self._vmapped_tn_contraction(
+            x, ftn_params, batch_nn_outputs,
+        )
+
+    def vamp_log(self, x, params):
+        """Batched log-amplitude: NN in batch mode + vmap log TN contraction.
+
+        Same two-level pattern as vamp() but uses _tn_contraction_log.
+        """
+        ftn_params, batch_nn_outputs = self._run_nn_batch(x, params)
+        return self._vmapped_tn_contraction_log(
             x, ftn_params, batch_nn_outputs,
         )
 
@@ -524,10 +605,10 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
         1. Export only the TN contraction (quimb/symmray ops) via
            torch.export -> pure aten-ops FX graph.
         2. Vmap the exported TN over the batch dim.
-        3. Build a combined forward: CNN (batch) + exported TN (vmap).
+        3. Build a combined forward: NN (batch) + exported TN (vmap).
         4. torch.compile the combined function.
 
-        The CNN uses standard PyTorch ops that dynamo traces natively,
+        The NN uses standard PyTorch ops that dynamo traces natively,
         so it does NOT need export.
 
         Call AFTER .to(device).
@@ -586,7 +667,7 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
             ftn_ps = all_params[:n_ftn]
             nn_ps = all_params[n_ftn:]
 
-            # CNN in batch mode (standard PyTorch)
+            # NN in batch mode (standard PyTorch)
             nn_params_dict = {
                 name: p.to(dt) if p.dtype != dt else p
                 for name, p, dt in zip(
@@ -717,3 +798,70 @@ class Conv2D_Geometric_fPEPS_GPU(WavefunctionModel_GPU):
             else:
                 return self._vmapped_exported_fn(x, *params_list)
         return self.vamp(x, self.params)
+
+
+# ================================================================
+#  Conv2D Geometric fPEPS Model (GPU) — thin subclass
+# ================================================================
+
+
+class Conv2D_Geometric_fPEPS_GPU(NNfTNS_Model_GPU):
+    """NN-fPEPS with Conv2D-Geometric backflow for GPU VMC.
+
+    Combines a CNN geometric backflow network with fPEPS tensor
+    network contraction.  The CNN produces per-sample additive
+    corrections to the TN parameters, which are then contracted
+    via quimb.
+
+    Args:
+        tn: quimb fPEPS tensor network
+        max_bond: boundary contraction bond dimension (chi)
+        nn_eta: scale factor for NN backflow correction
+        embed_dim: CNN embedding dimension
+        hidden_dim: CNN hidden channels
+        kernel_size: CNN kernel size (default 3)
+        layers: number of CNN layers (default 2)
+        init_scale: initial scale for output heads (default 1e-5)
+        dtype: parameter dtype (default float64)
+        backbone_dtype: dtype for CNN backbone (default None = same
+            as dtype). Set to torch.float32 for faster CNN forward.
+        contract_boundary_opts: options for boundary contraction
+    """
+
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        embed_dim,
+        hidden_dim,
+        kernel_size=3,
+        layers=2,
+        init_scale=1e-5,
+        dtype=torch.float64,
+        backbone_dtype=None,
+        contract_boundary_opts=None,
+    ):
+        # 1. Create CNN backflow module
+        nn_module = _CNN_Geometric_Backflow_GPU(
+            tn=tn,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            kernel_size=kernel_size,
+            layers=layers,
+            dtype=dtype,
+            backbone_dtype=backbone_dtype,
+        )
+
+        # 2. Small-init output heads
+        nn_module.initialize_output_scale(init_scale)
+
+        # 3. Delegate to base class
+        super().__init__(
+            tn=tn,
+            nn_module=nn_module,
+            max_bond=max_bond,
+            nn_eta=nn_eta,
+            dtype=dtype,
+            contract_boundary_opts=contract_boundary_opts,
+        )

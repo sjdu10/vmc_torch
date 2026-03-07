@@ -60,6 +60,7 @@ class VMCConfig:
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
     use_scipy: bool = False
+    use_log_amp: bool = True
 
 
 def main():
@@ -182,6 +183,7 @@ def main():
             config=VMCWarmupConfig(
                 use_export_compile=vmc_cfg.use_export_compile,
                 grad_batch_size=vmc_cfg.grad_batch_size,
+                use_log_amp=vmc_cfg.use_log_amp,
             ),
         )
 
@@ -203,6 +205,7 @@ def main():
                 burn_in_steps=vmc_cfg.burn_in_steps,
                 run_sr=True,
                 use_export_compile=vmc_cfg.use_export_compile,
+                use_log_amp=vmc_cfg.use_log_amp,
             ),
         )
 

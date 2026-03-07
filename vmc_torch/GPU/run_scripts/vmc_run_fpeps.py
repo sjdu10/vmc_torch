@@ -1,10 +1,11 @@
-"""GPU VMC for spinful Fermi-Hubbard on a square lattice (with data saving).
+"""GPU VMC for spinful Fermi-Hubbard with bMPS reuse.
 
-Same as vmc_run.py but saves energy stats to JSON and model checkpoints.
+Uses fPEPS_Model_reuse_GPU with cached boundary MPS environments
+for incremental updates during sampling and energy evaluation.
 
 Run:
-    torchrun --nproc_per_node=<N> vmc_run_fpeps.py
-    torchrun --nproc_per_node=1 vmc_run_fpeps.py   # single GPU
+    torchrun --nproc_per_node=<N> vmc_run_fpeps_reuse.py
+    torchrun --nproc_per_node=1 vmc_run_fpeps_reuse.py
 """
 import json
 import os
@@ -23,11 +24,13 @@ from vmc_torch.GPU.VMC import (
 from vmc_torch.GPU.hamiltonian import (
     spinful_Fermi_Hubbard_square_lattice_torch,
 )
-from vmc_torch.GPU.models import fPEPS_Model_GPU
+from vmc_torch.GPU.models import (
+    fPEPS_Model_GPU,
+)
 from vmc_torch.GPU.optimizer import (
     DecayScheduler,
-    DistributedMinSRGPU,
     DistributedSRMinresGPU,
+    DistributedMinSRGPU,
     MinSRGPU,
     SGDGPU,
 )
@@ -39,15 +42,14 @@ from vmc_torch.GPU.vmc_setup import (
     load_or_generate_peps,
     setup_linalg_hooks,
 )
-from vmc_torch.GPU.vmc_utils import random_initial_config
+from vmc_torch.GPU.vmc_utils import (
+    evaluate_energy,
+    random_initial_config,
+)
 
 dtype = torch.float64
-USE_EXPORT_COMPILE = True
-
-# Data paths
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
-    '/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
 )
 
 
@@ -55,57 +57,62 @@ DEFAULT_DATA_ROOT = (
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 256
-    ns_per_rank: int = 256
-    grad_batch_size: int = 256
-    vmc_steps: int = 100
+    batch_size: int = 1024
+    ns_per_rank: int = 1024
+    grad_batch_size: int = 128
+    vmc_steps: int = 1000
     learning_rate: float = 0.1
     diag_shift: float = 1e-4
-    burn_in_steps: int = 0
-    use_export_compile: bool = USE_EXPORT_COMPILE
-    
+    burn_in_steps: int = 1
+    use_export_compile: bool = False  # full-contraction export
+    use_export_compile_reuse: bool = False  # reuse export + compile patterns
     use_min_sr: bool = False
     use_distributed_min_sr: bool = False
-    param_chunk_size: int = 1024
     use_distributed_sr_minres: bool = True
     minres_sr_use_scipy: bool = False
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
-    
     save_every: int = 50
     resume_step: int = 0
     debug: bool = False
-    outlier_clip_factor: float = 100.0 # drop O_loc outliers > factor * median
+    outlier_clip_factor: float = 1e4 # drop O_loc outliers > factor * median
     run_sr: bool = True
+    use_log_amp: bool = True
     lr_scheduler: object = None  # set after construction
-
-
+    
+vmc_cfg = VMCConfig()
+vmc_cfg.lr_scheduler = DecayScheduler(
+    init_lr=vmc_cfg.learning_rate,
+    decay_rate=0.9, patience=50,
+)
 warmup_cfg = VMCWarmupConfig(
     use_export_compile=VMCConfig.use_export_compile,
     grad_batch_size=VMCConfig.grad_batch_size,
-    run_sampling=True,
+    use_log_amp=vmc_cfg.use_log_amp,
+    run_sampling=False,
     run_locE=False,
     run_grad=False,
 )
 
 def main():
-    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=False, cholesky_qr=True, cholesky_qr_adaptive_jitter=False)
+    setup_linalg_hooks(jitter=1e-12)
     torch.set_default_dtype(dtype)
 
     try:
         rank, world_size, device = setup_distributed()
+        # device = torch.device(f"cuda:1")
         torch.set_default_device(device)
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 12, 4
+        Lx, Ly = 4, 2
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 8  # 8 holes
+        N_f = N_sites - 2
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4  # PEPS bond dimension
-        chi = -1  # boundary bond dim
+        D = 4  # PEPS bond dimension (start small)
+        chi = 4  # boundary bond dim
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -122,7 +129,7 @@ def main():
         H.precompute_hops_gpu(device)
         graph = H.graph
 
-        # ========== Variational state (fPEPS model) ==========
+        # ========== Variational state (fPEPS reuse model) ==========
         fpeps_base = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
             f"/N={N_f}/Z2/D={D}/"
@@ -145,28 +152,7 @@ def main():
         )
         model.to(device)
 
-        # Export + compile (optional, ~10-40s one-time cost)
-        if USE_EXPORT_COMPILE:
-            example_x = random_initial_config(
-                N_f, N_sites, seed=0,
-            ).to(device)
-            if rank == 0:
-                print("Running torch.export + compile...")
-            import time as _time
-            _t0 = _time.time()
-            model.export_and_compile(example_x)
-            if rank == 0:
-                print(
-                    f"Export + compile done in "
-                    f"{_time.time() - _t0:.1f}s"
-                )
-
-        # ========== Config ==========
-        vmc_cfg = VMCConfig()
-        vmc_cfg.lr_scheduler = DecayScheduler(
-            init_lr=vmc_cfg.learning_rate,
-            decay_rate=0.9, patience=50,
-        )
+        # ========== Load checkpoint (optional) ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
             f"t={t}_U={U}/N={N_f}/Z2/D={D}/chi={chi}/"
@@ -176,7 +162,8 @@ def main():
         if vmc_cfg.resume_step > 0:
             ckpt_path = os.path.join(
                 output_dir,
-                f'checkpoint_{model_name}_{vmc_cfg.resume_step}.pt',
+                f'checkpoint_{model_name}'
+                f'_{vmc_cfg.resume_step}.pt',
             )
             ckpt = torch.load(
                 ckpt_path,
@@ -192,6 +179,35 @@ def main():
             print(
                 f"Model: {N_params} params | "
                 f"{world_size} GPUs | {device}"
+            )
+            print(
+                f"System: {Lx}x{Ly} Fermi-Hubbard, "
+                f"t={t}, U={U}, N_f={N_f}, D={D}, chi={chi}"
+            )
+
+        # ========== bMPS skeleton init (one-time) ==========
+        example_x = random_initial_config(
+            N_f, N_sites, seed=0,
+        ).to(device)
+
+        if rank == 0:
+            print("Initializing bMPS skeleton...")
+
+        # ========== Export + compile reuse (optional) ==========
+        if vmc_cfg.use_export_compile_reuse:
+            if rank == 0:
+                print("Exporting reuse patterns...")
+            model.export_and_compile_reuse(
+                example_x, mode='default',
+                verbose=(rank == 0),
+            )
+
+        # ========== Export + compile full contraction ==========
+        if vmc_cfg.use_export_compile:
+            if rank == 0:
+                print("Running torch.export + compile...")
+            model.export_and_compile(
+                example_x, mode='default',
             )
 
         print_sampling_settings(
@@ -218,12 +234,14 @@ def main():
         )
         stats_file = os.path.join(
             output_dir,
-            f'stats_{model_name}{step_tag}.json',
+            f'stats_{model_name}_reuse{step_tag}.json',
         )
         total_ns = vmc_cfg.ns_per_rank * world_size
         stats = {
-            'system': f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
-                      f'N_f={N_f}, D={D}, chi={chi}',
+            'system': (
+                f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
+                f'N_f={N_f}, D={D}, chi={chi}'
+            ),
             'Np': N_params,
             'sample size': total_ns,
             'mean': [],
@@ -253,6 +271,7 @@ def main():
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),
+            evaluate_energy_fn=evaluate_energy,
         )
 
         fxs = vmc.run_warmup(
@@ -301,8 +320,8 @@ def main():
         if rank == 0 and energy_history:
             print(f"\n{'=' * 50}")
             print(
-                f"Result: {Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, "
-                f"N_f={N_f}, D={D}, chi={chi}"
+                f"Result: {Lx}x{Ly} Fermi-Hubbard, "
+                f"t={t}, U={U}, N_f={N_f}, D={D}, chi={chi}"
             )
             print(f"{'=' * 50}")
             print(f"First E/site: {energy_history[0]:.6f}")

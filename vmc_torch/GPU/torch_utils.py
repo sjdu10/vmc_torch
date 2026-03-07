@@ -372,17 +372,9 @@ class RobustSVD_EIG(torch.autograd.Function):
 
     @staticmethod
     def forward(A, jitter, driver): 
-        # 1. Normalization (依然推荐保留)
-        scale = torch.amax(torch.abs(A), dim=(-2, -1), keepdim=True)
-        scale = torch.where(scale < 1e-16, torch.ones_like(scale), scale)
-        A_norm = A / scale
-
-        # 2. 使用 EIG 替代 SVD
-        U, S_norm, Vh = svd_via_eigh(A_norm)
-        
-        # 3. 还原 S
-        S = S_norm * scale.squeeze(-1)
-        
+        M, N = A.shape[-2:]
+        A = A + jitter * torch.eye(M, N, device=A.device, dtype=A.dtype)
+        U, S, Vh = svd_via_eigh(A)
         return U, S, Vh
 
     @staticmethod
@@ -625,7 +617,8 @@ def torch_minres(matvec, b, rtol=1e-5, maxiter=100):
     Args:
         matvec: callable, x -> A @ x (GPU tensor in/out).
         b: (Np,) right-hand-side GPU tensor.
-        rtol: relative tolerance |r| / |b| < rtol.
+        rtol: relative tolerance. Converges when
+              ||r|| < rtol * ||A|| * ||x|| (matching scipy).
         maxiter: maximum Lanczos iterations.
 
     Returns:
@@ -651,6 +644,10 @@ def torch_minres(matvec, b, rtol=1e-5, maxiter=100):
     dbar = 0.0
     epsln = 0.0
     phibar = beta1
+
+    # Estimates of ||A|| and ||x|| (following scipy MINRES)
+    Anorm2 = 0.0
+    ynorm2 = 0.0
 
     # w vectors for solution update
     w = torch.zeros_like(b)
@@ -697,8 +694,16 @@ def torch_minres(matvec, b, rtol=1e-5, maxiter=100):
         w = (v - oldeps * w1 - delta * w2) * denom
         x = x + phi * w
 
-        # Convergence: |r| / |b|
-        if abs(phibar) < rtol * b_norm:
+        # Update ||A|| estimate from Lanczos coefficients
+        Anorm2 += alfa ** 2 + oldb ** 2 + beta ** 2
+        Anorm = math.sqrt(Anorm2)
+
+        # Update ||x|| estimate
+        ynorm = torch.linalg.norm(x).item()
+
+        # Convergence: ||r|| < rtol * ||A|| * ||x|| (scipy criterion)
+        rnorm = abs(phibar)
+        if rnorm < rtol * Anorm * ynorm:
             info = 0
             break
 

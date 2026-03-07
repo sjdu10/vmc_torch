@@ -75,19 +75,23 @@ class VMCConfig:
     param_chunk_size: int = 1024
     use_distributed_sr_minres: bool = True
     minres_sr_use_scipy: bool = False
-    sr_rtol: float = 1e-4
+    sr_rtol: float = 1e-3
     sr_maxiter: int = 100
     
     save_every: int = 50
     resume_step: int = 0
     debug: bool = False
-    outlier_clip_factor: float = 100.0 # drop O_loc outliers > factor * median
+    outlier_clip_factor: float = 100.0 # drop log_psi_grad outliers > factor * median
     run_sr: bool = True
+    use_log_amp: bool = True
     lr_scheduler: object = None  # set after construction
 
 
 def main():
-    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=False, cholesky_qr=True, cholesky_qr_adaptive_jitter=False)
+    setup_linalg_hooks(
+        jitter=1e-12, qr_via_eigh=False,
+        cholesky_qr=True, cholesky_qr_adaptive_jitter=False,
+    )
     torch.set_default_dtype(dtype)
 
     try:
@@ -154,9 +158,6 @@ def main():
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
-                'compress_opts': {
-                    'method': 'rsvd',
-                },
             },
         )
         model.to(device)
@@ -298,6 +299,7 @@ def main():
             config=VMCWarmupConfig(
                 use_export_compile=vmc_cfg.use_export_compile,
                 grad_batch_size=vmc_cfg.grad_batch_size,
+                use_log_amp=vmc_cfg.use_log_amp,
             ),
         )
 

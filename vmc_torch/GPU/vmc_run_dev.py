@@ -285,7 +285,7 @@ for step in range(vmc_steps):
     t_sr_start = time.time()
     if use_minSR:
         dp, t_sr, info = minSR_solver_gpu(
-            local_O=local_O,
+            local_lpg=local_O,
             local_energies=local_energies,
             energy_mean=energy_mean,
             total_samples=Total_Ns,
@@ -296,7 +296,7 @@ for step in range(vmc_steps):
         )
     else:
         dp, t_sr, info = distributed_minres_solver_gpu(
-            local_O=local_O,
+            local_lpg=local_O,
             local_energies=local_energies,
             energy_mean=energy_mean,
             total_samples=Total_Ns,

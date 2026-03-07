@@ -23,13 +23,21 @@ from vmc_torch.GPU.vmc_utils import (
 )
 
 
+def _find_free_port():
+    """Find a free TCP port on localhost."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
 def setup_distributed():
     if "RANK" not in os.environ:
         print("Warning: Not using torchrun. Single device.")
         os.environ["RANK"] = "0"
         os.environ["WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
+        os.environ["MASTER_PORT"] = str(_find_free_port())
         os.environ["LOCAL_RANK"] = "0"
 
     dist.init_process_group(
@@ -67,6 +75,7 @@ class VMCWarmupConfig:
     run_sampling: bool = True
     run_locE: bool = True
     run_grad: bool = True
+    use_log_amp: bool = False
 
 
 @dataclass
@@ -84,8 +93,9 @@ class VMCLoopConfig:
     show_progress: bool = True
     step_offset: int = 0  # global step = local step + step_offset
     debug: bool = False  # print [dbg] diagnostics each step
-    # O_loc outlier clipping: drop samples whose per-sample
-    # |O_loc| norm exceeds clip_factor * median(|O_loc| norms).
+    use_log_amp: bool = False  # log-amplitude mode
+    # log_psi_grad outlier clipping: drop samples whose per-sample
+    # |log_psi_grad| norm exceeds clip_factor * median norms.
     # Set to 0 to disable.  Typical value: 5-10.
     outlier_clip_factor: float = 100.0
     # Optional LR scheduler: callable(step) -> float.
@@ -156,6 +166,7 @@ class VMC_GPU:
         debug=False,
         outlier_clip_factor=0.0,
         offload_oloc=False,
+        use_log_amp=False,
     ):
         """Run MCMC sampling, energy eval, and gradient
         computation for one VMC step.
@@ -165,14 +176,14 @@ class VMC_GPU:
         compute_grads_fn directly.
 
         Args:
-            offload_oloc: if True, move O_loc chunks to CPU
-                immediately after GPU computation. Reduces
-                GPU memory when SR solve runs on CPU anyway.
+            offload_oloc: if True, move log_psi_grad chunks
+                to CPU immediately after GPU computation.
+            use_log_amp: if True, work in log-amplitude
+                space throughout (sampler, energy, grads).
 
         Returns:
-            (local_energies, local_O): tensors of shapes
-                (Ns,) and (Ns, Np). local_O is on CPU when
-                offload_oloc=True, GPU otherwise.
+            (local_energies, local_log_psi_grad): tensors
+                of shapes (Ns,) and (Ns, Np).
             fxs: (B, N_sites) updated walker configs.
             phase_times: dict with t_samp, t_locE, t_grad.
         """
@@ -185,11 +196,12 @@ class VMC_GPU:
             fxs = self.sampler.burn_in(
                 fxs, model, graph, burn_in_steps,
                 compile=use_export_compile,
+                use_log_amp=use_log_amp,
             )
             t_samp += time.time() - t0
 
         local_energies_list = []
-        local_O_list = []
+        local_lpg_list = []
         current_count = 0
 
         while current_count < ns_per_rank:
@@ -197,87 +209,101 @@ class VMC_GPU:
             with torch.inference_mode():
                 # 1. MCMC sweep
                 t0 = time.time()
-                fxs, amps = self.sampler.step(
+                fxs, amps_out = self.sampler.step(
                     fxs, model, graph,
                     compile=use_export_compile,
+                    use_log_amp=use_log_amp,
                 )
                 t_samp += time.time() - t0
 
                 # 2. Local energy
                 t0 = time.time()
                 _, local_E = self.evaluate_energy_fn(
-                    fxs, model, hamiltonian, amps,
+                    fxs, model, hamiltonian, amps_out,
+                    use_log_amp=use_log_amp,
                 )
                 t_locE += time.time() - t0
 
             # Free sampling/energy tensors so allocator
             # can reuse their blocks for grad computation
-            del amps
+            del amps_out
 
-            # 3. Gradients -> O_loc
+            # 3. Gradients -> log_psi_grad
             t0 = time.time()
             with torch.enable_grad():
-                grads, amps2 = self.compute_grads_fn(
+                grads, grads_aux = self.compute_grads_fn(
                     fxs, model,
                     vectorize=True,
                     batch_size=grad_batch_size,
                     vmap_grad=True,
                     offload_to_cpu=offload_oloc,
+                    use_log_amp=use_log_amp,
                 )
-            # O_loc = grads / amps
-            # When offload_oloc=True, grads and amps2 are
-            # already on CPU (eager offload inside
-            # compute_grads_fn). Division works on CPU.
             _rank = dist.get_rank() if dist.is_initialized() else 0
-            if debug and _rank == 0:
-                abs_a = amps2.abs()
-                print(
-                    f"  [dbg] amps: "
-                    f"min={abs_a.min().item():.4e}"
-                    f", median={abs_a.median().item():.4e}"
-                    f", mean={abs_a.mean().item():.4e}"
-                    f", max={abs_a.max().item():.4e}"
-                )
-                g_rms = (
-                    torch.norm(grads).item()
-                    / grads.numel() ** 0.5
-                )
-                print(
-                    f"  [dbg] raw grads: "
-                    f"rms={g_rms:.4e}, "
-                    f"max={grads.abs().max().item():.4e}"
-                )
-            grads /= amps2.unsqueeze(1)
-            if debug and _rank == 0:
-                print(
-                    f"  [dbg] O_loc: rms="
-                    f"{torch.norm(grads).item() / grads.numel()**0.5:.4e}"
-                    f", max={grads.abs().max().item():.4e}"
-                )
+
+            if use_log_amp:
+                # grads is already d(log|psi|)/d(params)
+                # No division needed.
+                if debug and _rank == 0:
+                    g_rms = (
+                        torch.norm(grads).item()
+                        / grads.numel() ** 0.5
+                    )
+                    print(
+                        f"  [dbg] log_psi_grad: "
+                        f"rms={g_rms:.4e}, "
+                        f"max={grads.abs().max().item():.4e}"
+                    )
+            else:
+                # grads_aux is raw amps — divide to get
+                # O_loc = d(psi)/d(params) / psi
+                amps2 = grads_aux
+                if debug and _rank == 0:
+                    abs_a = amps2.abs()
+                    print(
+                        f"  [dbg] amps: "
+                        f"min={abs_a.min().item():.4e}"
+                        f", median={abs_a.median().item():.4e}"
+                        f", mean={abs_a.mean().item():.4e}"
+                        f", max={abs_a.max().item():.4e}"
+                    )
+                    g_rms = (
+                        torch.norm(grads).item()
+                        / grads.numel() ** 0.5
+                    )
+                    print(
+                        f"  [dbg] raw grads: "
+                        f"rms={g_rms:.4e}, "
+                        f"max={grads.abs().max().item():.4e}"
+                    )
+                grads /= amps2.unsqueeze(1)
+                if debug and _rank == 0:
+                    print(
+                        f"  [dbg] log_psi_grad: rms="
+                        f"{torch.norm(grads).item() / grads.numel()**0.5:.4e}"
+                        f", max={grads.abs().max().item():.4e}"
+                    )
             t_grad += time.time() - t0
 
             local_energies_list.append(
                 local_E[:needed].detach(),
             )
-            # When offload_oloc=True, grads are already on CPU
-            # (eager offload inside compute_grads_fn).
-            o_chunk = grads[:needed].detach()
-            local_O_list.append(o_chunk)
+            lpg_chunk = grads[:needed].detach()
+            local_lpg_list.append(lpg_chunk)
             current_count += needed
-            del grads, amps2, local_E, o_chunk
+            del grads, grads_aux, local_E, lpg_chunk
 
         local_energies = torch.cat(local_energies_list)
-        local_O = torch.cat(local_O_list)
+        local_log_psi_grad = torch.cat(local_lpg_list)
 
         # --- Outlier masking ---
-        # Drop samples whose per-sample O_loc norm exceeds
-        # clip_factor * median.  Zeroed samples don't
-        # contribute to SR gradient or energy mean.
+        # Drop samples whose per-sample log_psi_grad norm
+        # exceeds clip_factor * median.
         if outlier_clip_factor > 0:
-            o_norms = local_O.norm(dim=1)  # (Ns,)
-            median_norm = o_norms.median()
+            lpg_norms = local_log_psi_grad.norm(dim=1)
+            median_norm = lpg_norms.median()
             threshold = outlier_clip_factor * median_norm
-            mask = o_norms <= threshold  # True = keep
+            mask = lpg_norms <= threshold  # True = keep
             n_dropped = int((~mask).sum().item())
             if n_dropped > 0:
                 _rank = (
@@ -287,11 +313,12 @@ class VMC_GPU:
                 if _rank == 0:
                     print(
                         f"  [outlier] dropped {n_dropped}"
-                        f"/{local_O.shape[0]} samples "
-                        f"(|O_loc| > {threshold.item():.2e},"
+                        f"/{local_log_psi_grad.shape[0]} "
+                        f"samples "
+                        f"(|lpg| > {threshold.item():.2e},"
                         f" median={median_norm.item():.2e})"
                     )
-                local_O[~mask] = 0.0
+                local_log_psi_grad[~mask] = 0.0
                 local_energies[~mask] = local_energies[
                     mask
                 ].mean()
@@ -303,7 +330,7 @@ class VMC_GPU:
         }
         sample_time = t_samp + t_locE + t_grad
         return (
-            (local_energies, local_O),
+            (local_energies, local_log_psi_grad),
             fxs,
             sample_time,
             phase_times,
@@ -335,19 +362,19 @@ class VMC_GPU:
         hamiltonian,
         rank,
         config: VMCWarmupConfig,
-
     ):
         run_sampling = config.run_sampling
         run_locE = config.run_locE
         run_grad = config.run_grad
-    
+        use_log_amp = config.use_log_amp
+
         # Offload gradients to CPU when MINRES SR solver can work with
         # CPU-resident data (scipy MINRES).
         offload_grad_cpu = (
             hasattr(self.preconditioner, 'use_scipy')
             and self.preconditioner.use_scipy
         )
-        
+
         self._sync_params(model)
 
         if rank == 0 and config.verbose:
@@ -356,10 +383,11 @@ class VMC_GPU:
 
         with torch.inference_mode():
             if run_sampling:
-                fxs, amps = self.sampler.step(
+                fxs, amps_out = self.sampler.step(
                     fxs, model, graph,
                     compile=config.use_export_compile,
                     verbose=config.verbose,
+                    use_log_amp=use_log_amp,
                 )
                 if rank == 0 and config.verbose:
                     print(
@@ -369,8 +397,9 @@ class VMC_GPU:
                 t1 = time.time()
             if run_locE:
                 _, evals = self.evaluate_energy_fn(
-                    fxs, model, hamiltonian, amps,
+                    fxs, model, hamiltonian, amps_out,
                     verbose=config.verbose,
+                    use_log_amp=use_log_amp,
                 )
                 if rank == 0 and config.verbose:
                     print(
@@ -379,22 +408,23 @@ class VMC_GPU:
                     )
         # Free inference-phase tensors before grad computation
         try:
-            del amps, evals
+            del amps_out, evals
             torch.cuda.empty_cache()
-        except:
+        except Exception:
             pass
-        
+
         if not run_grad:
             return fxs
         t2 = time.time()
         with torch.enable_grad():
-            grads, amps2 = self.compute_grads_fn(
+            grads, grads_aux = self.compute_grads_fn(
                 fxs, model,
                 vectorize=True,
                 batch_size=config.grad_batch_size,
                 vmap_grad=True,
                 offload_to_cpu=offload_grad_cpu,
                 verbose=config.verbose,
+                use_log_amp=use_log_amp,
             )
         if rank == 0 and config.verbose:
             print(
@@ -406,7 +436,7 @@ class VMC_GPU:
                 f"{time.time() - t_warm:.2f}s"
             )
 
-        del grads, amps2
+        del grads, grads_aux
         torch.cuda.empty_cache()
         return fxs
 
@@ -486,10 +516,10 @@ class VMC_GPU:
             )
 
             if n_local > 0:
-                local_sum_O = local_o.sum(dim=0)
+                local_sum_lpg = local_o.sum(dim=0)
                 local_sum_EO = local_energies @ local_o
             else:
-                local_sum_O = torch.zeros(
+                local_sum_lpg = torch.zeros(
                     n_params, device=device,
                     dtype=torch.float64,
                 )
@@ -500,7 +530,7 @@ class VMC_GPU:
 
             if world_size > 1:
                 dist.all_reduce(
-                    local_sum_O,
+                    local_sum_lpg,
                     op=dist.ReduceOp.SUM,
                 )
                 dist.all_reduce(
@@ -508,10 +538,10 @@ class VMC_GPU:
                     op=dist.ReduceOp.SUM,
                 )
 
-            mean_O = local_sum_O / total_samples
+            mean_lpg = local_sum_lpg / total_samples
             mean_EO = local_sum_EO / total_samples
             energy_grad = (
-                mean_EO - energy_mean * mean_O
+                mean_EO - energy_mean * mean_lpg
             )
             return energy_grad, time.time() - t0, None
 
@@ -587,7 +617,7 @@ class VMC_GPU:
         for step in range(config.vmc_steps):
             t0 = time.time()
 
-            (local_energies, local_o), fxs, sample_time, phase_times = (
+            (local_energies, local_lpg), fxs, sample_time, phase_times = (
                 self._run_sampling_phase(
                     fxs=fxs,
                     model=model,
@@ -601,6 +631,7 @@ class VMC_GPU:
                     debug=config.debug,
                     outlier_clip_factor=config.outlier_clip_factor,
                     offload_oloc=offload_oloc,
+                    use_log_amp=config.use_log_amp,
                 )
             )
 
@@ -615,17 +646,22 @@ class VMC_GPU:
                 n_nan_E = torch.isnan(
                     local_energies
                 ).sum().item()
-                n_nan_O = torch.isnan(local_o).sum().item()
-                n_inf_O = torch.isinf(local_o).sum().item()
-                if n_nan_E or n_nan_O or n_inf_O:
+                n_nan_lpg = torch.isnan(
+                    local_lpg
+                ).sum().item()
+                n_inf_lpg = torch.isinf(
+                    local_lpg
+                ).sum().item()
+                if n_nan_E or n_nan_lpg or n_inf_lpg:
                     print(
                         f"[WARNING] SR inputs: "
                         f"local_E has {n_nan_E} NaN, "
-                        f"local_O has {n_nan_O} NaN / "
-                        f"{n_inf_O} Inf"
+                        f"log_psi_grad has "
+                        f"{n_nan_lpg} NaN / "
+                        f"{n_inf_lpg} Inf"
                     )
                 if config.debug:
-                    Np = local_o.shape[1]
+                    Np = local_lpg.shape[1]
                     pv0 = torch.nn.utils.parameters_to_vector(
                         model.parameters(),
                     )
@@ -636,18 +672,14 @@ class VMC_GPU:
                         f"max={pv0.abs().max().item():.4e}"
                     )
                     print(
-                        f"  [dbg] O_loc: rms="
-                        f"{torch.norm(local_o).item()/(local_o.numel()**0.5):.4e}, "
-                        f"max={local_o.abs().max().item():.4e}"
-                    )
-                    print(
-                        f"  [dbg] local_E: "
-                        f"mean={local_energies.mean().item():.4e}, "
-                        f"std={local_energies.std().item():.4e}"
+                        f"  [dbg] log_psi_grad: rms="
+                        f"{torch.norm(local_lpg).item()/(local_lpg.numel()**0.5):.4e}, "
+                        f"max={local_lpg.abs().max().item():.4e}"
                     )
 
+            # SR solve
             dp, t_sr, info = self.solve_sr_step(
-                local_o=local_o,
+                local_o=local_lpg,
                 local_energies=local_energies,
                 energy_mean=energy_mean,
                 total_samples=total_ns,
@@ -656,9 +688,14 @@ class VMC_GPU:
                 device=device,
                 run_sr=config.run_sr,
             )
-
-            # --- NaN/Inf check on SR direction ---
+            
+            # --- NaN/Inf check on SR gradients ---
+            pv0 = torch.nn.utils.parameters_to_vector(
+                model.parameters(),
+            )
+            max_pv0 = pv0.abs().max().item()
             dp_t = torch.as_tensor(dp, device=device)
+            max_dp_t = dp_t.abs().max().item()
             dp_nan = torch.isnan(dp_t).sum().item()
             dp_inf = torch.isinf(dp_t).sum().item()
             if (dp_nan > 0 or dp_inf > 0) and rank == 0:
@@ -666,7 +703,8 @@ class VMC_GPU:
                     f"[WARNING] SR dp has {dp_nan} NaN, "
                     f"{dp_inf} Inf out of {dp_t.numel()}"
                 )
-
+            
+            # Apply parameter update
             if config.lr_scheduler is not None:
                 global_step = step + config.step_offset
                 config.learning_rate = config.lr_scheduler(
@@ -677,33 +715,7 @@ class VMC_GPU:
                 model, dp, config.learning_rate, device,
             )
 
-            # --- NaN/Inf check on updated params ---
-            with torch.no_grad():
-                pv = torch.nn.utils.parameters_to_vector(
-                    model.parameters(),
-                )
-                pv_nan = torch.isnan(pv).sum().item()
-                pv_inf = torch.isinf(pv).sum().item()
-                if (pv_nan > 0 or pv_inf > 0) and rank == 0:
-                    print(
-                        f"[WARNING] After update: params "
-                        f"have {pv_nan} NaN, {pv_inf} Inf "
-                        f"out of {pv.numel()}"
-                    )
-                elif config.debug and rank == 0:
-                    Np = pv.numel()
-                    dp_rms = (
-                        torch.norm(dp_t).item() / Np ** 0.5
-                    )
-                    pv_rms = (
-                        torch.norm(pv).item() / Np ** 0.5
-                    )
-                    print(
-                        f"  [dbg] dp rms={dp_rms:.4e}, "
-                        f"params rms={pv_rms:.4e}, "
-                        f"lr*dp_rms="
-                        f"{config.learning_rate * dp_rms:.4e}"
-                    )
+            # End of step diagnostics and logging
             step_time = time.time() - t0
 
             e_per_site = energy_mean / config.nsites
@@ -728,7 +740,9 @@ class VMC_GPU:
                     f"+/- {err:.6f} | N={total_ns}{lr_str} | "
                     f"T_samp={t_s:.1f}s T_locE={t_e:.1f}s "
                     f"T_grad={t_g:.1f}s T_SR={t_sr:.2f}s "
-                    f"T_total={step_time:.1f}s"
+                    f"T_total={step_time:.1f}s | "
+                    f"SR_info={info} "
+                    f"max_p={max_pv0:.4e} max_dp={max_dp_t:.4e}"
                 )
                 vmc_pbar.update(1)
 

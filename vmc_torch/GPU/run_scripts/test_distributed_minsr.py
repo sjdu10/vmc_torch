@@ -156,7 +156,7 @@ def main():
 
         # ========== Reference: old minSR (GPU gather) ==========
         dp_ref, t_ref, info_ref = minSR_solver_gpu(
-            local_O=local_O.clone(),
+            local_lpg=local_O.clone(),
             local_energies=local_energies.clone(),
             energy_mean=energy_mean,
             total_samples=total_ns,
@@ -173,7 +173,7 @@ def main():
         for chunk_size in [32, 128, 1024]:
             dp_new, t_new, info_new = (
                 distributed_minSR_solver_gpu(
-                    local_O=local_O.clone(),
+                    local_lpg=local_O.clone(),
                     local_energies=local_energies.clone(),
                     energy_mean=energy_mean,
                     total_samples=total_ns,
@@ -204,7 +204,7 @@ def main():
         for chunk_size in [32, 128, 1024]:
             dp_cpu, t_cpu, info_cpu = (
                 distributed_minSR_solver_gpu(
-                    local_O=local_O_cpu.clone(),
+                    local_lpg=local_O_cpu.clone(),
                     local_energies=local_E_cpu.clone(),
                     energy_mean=energy_mean,
                     total_samples=total_ns,
@@ -230,7 +230,7 @@ def main():
             print("\n=== Test 3: gradient-only, CPU vs GPU ===")
 
         dp_grad_gpu, _, _ = distributed_minSR_solver_gpu(
-            local_O=local_O.clone(),
+            local_lpg=local_O.clone(),
             local_energies=local_energies.clone(),
             energy_mean=energy_mean,
             total_samples=total_ns,
@@ -239,7 +239,7 @@ def main():
             do_SR=False,
         )
         dp_grad_cpu, _, _ = distributed_minSR_solver_gpu(
-            local_O=local_O_cpu.clone(),
+            local_lpg=local_O_cpu.clone(),
             local_energies=local_E_cpu.clone(),
             energy_mean=energy_mean,
             total_samples=total_ns,

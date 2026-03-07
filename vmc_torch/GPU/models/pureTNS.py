@@ -95,19 +95,47 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
                 **self.contract_boundary_opts,
             )
         return amp.contract()
+    
+    def log_amplitude(self, x, params):
+        """Single-sample log-amplitude via quimb TN contraction.
 
-    def vamp(self, x, params):
-        """Batched amplitude with quimb pytree unflatten.
+        Args:
+            x:      (N_sites,) int64 — one configuration
+            params: quimb pytree of parameter tensors
 
-        Override: unflatten ParameterList -> quimb pytree, then
-        call _vmapped_amplitude (vmap over single-sample TN contraction).
+        Returns:
+            scalar log-amplitude (mantissa, exponent)
         """
+        import quimb.tensor as qtn
+
+        tn = qtn.unpack(params, self.skeleton)
+        amp = tn.isel({
+            tn.site_ind(site): x[i]
+            for i, site in enumerate(tn.sites)
+        })
+        if self.chi > 0:
+            amp.contract_boundary_from_xmin_(
+                max_bond=self.chi, cutoff=0.0,
+                xrange=[0, amp.Lx // 2 - 1],
+                **self.contract_boundary_opts,
+            )
+            amp.contract_boundary_from_xmax_(
+                max_bond=self.chi, cutoff=0.0,
+                xrange=[amp.Lx // 2, amp.Lx - 1],
+                **self.contract_boundary_opts,
+            )
+        sign, exponent_10 = amp.contract(strip_exponent=True)
+        exp = exponent_10*torch.log(torch.tensor(10.0))
+        return sign, exp
+
+    def _vamp_params_preprocess(self, params):
+        """Preprocess params for vamp.  Default: unflatten ParameterList -> quimb pytree."""
         import quimb as qu
 
         if isinstance(params, nn.ParameterList):
             params = list(params)
         params = qu.utils.tree_unflatten(params, self.params_pytree)
-        return self._vmapped_amplitude(x, params)
+        return params
 
     def _amplitude_for_export(self, x, *flat_params):
         """Wrapper for torch.export: unflatten then TN contraction."""
@@ -186,6 +214,17 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
         super().__init__(params_list=params_tensors)
 
+    # ----- Param preprocessing -----
+
+    def _vamp_params_preprocess(self, params):
+        """Unflatten ParameterList -> quimb pytree."""
+        import quimb as qu
+
+        if isinstance(params, nn.ParameterList):
+            params = list(params)
+        params = qu.utils.tree_unflatten(params, self.params_pytree)
+        return params
+
     # ----- Single-sample amplitude (full contraction) -----
 
     def amplitude(self, x, params):
@@ -217,6 +256,38 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 **self.contract_boundary_opts,
             )
         return amp.contract()
+
+    def log_amplitude(self, x, params):
+        """Single-sample log-amplitude via strip_exponent.
+
+        Args:
+            x:      (N_sites,) int64 — one configuration
+            params: quimb pytree of parameter tensors
+
+        Returns:
+            (sign, log_abs) scalars
+        """
+        import quimb.tensor as qtn
+
+        tn = qtn.unpack(params, self.skeleton)
+        amp = tn.isel({
+            tn.site_ind(site): x[i]
+            for i, site in enumerate(tn.sites)
+        })
+        if self.chi > 0:
+            amp.contract_boundary_from_xmin_(
+                max_bond=self.chi, cutoff=0.0,
+                xrange=[0, amp.Lx // 2 - 1],
+                **self.contract_boundary_opts,
+            )
+            amp.contract_boundary_from_xmax_(
+                max_bond=self.chi, cutoff=0.0,
+                xrange=[amp.Lx // 2, amp.Lx - 1],
+                **self.contract_boundary_opts,
+            )
+        sign, exponent_10 = amp.contract(strip_exponent=True)
+        log_abs = exponent_10 * torch.log(torch.tensor(10.0))
+        return sign, log_abs
 
     # ----- Single-sample amplitude with reuse -----
 
@@ -371,15 +442,157 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             )
         return amp.contract()
 
+    def amplitude_reuse_log(
+        self,
+        x,
+        params,
+        bMPS_keys=None,
+        bMPS_params_xmin=None,
+        bMPS_params_xmax=None,
+        bMPS_params_ymin=None,
+        bMPS_params_ymax=None,
+        selected_rows=None,
+        selected_cols=None,
+    ):
+        """Single-sample log-amplitude with cached bMPS environments.
+
+        Same as amplitude_reuse but uses strip_exponent for
+        numerically stable log-amplitude.
+
+        Returns:
+            (sign, log_abs) scalars
+        """
+        import quimb.tensor as qtn
+
+        tns = qtn.unpack(params, self.skeleton)
+        amp = tns.isel({
+            tns.site_ind(site): x[i]
+            for i, site in enumerate(tns.sites)
+        })
+
+        # x-environment reuse
+        if (bMPS_params_xmin is not None
+                and bMPS_params_xmax is not None
+                and bMPS_keys is not None):
+            bMPS_min = unpack_ftn(
+                bMPS_params_xmin,
+                self.bMPS_x_skeletons[bMPS_keys[0]],
+            )
+            bMPS_max = unpack_ftn(
+                bMPS_params_xmax,
+                self.bMPS_x_skeletons[bMPS_keys[1]],
+            )
+            rows = amp.select(
+                [tns.row_tag(row) for row in selected_rows],
+                which='any',
+            )
+            amp_reuse = (bMPS_min | rows | bMPS_max)
+            amp_reuse.view_as_(
+                qtn.PEPS,
+                site_tag_id=tns._site_tag_id,
+                x_tag_id=tns._x_tag_id,
+                y_tag_id=tns._y_tag_id,
+                Lx=tns._Lx,
+                Ly=tns._Ly,
+                site_ind_id=tns._site_ind_id,
+            )
+            if self.chi > 0:
+                if len(amp_reuse.tensors) > 2 * self.Ly:
+                    has_raw = (
+                        bMPS_keys[0] in self._raw_bMPS_x_keys
+                        or bMPS_keys[1]
+                        in self._raw_bMPS_x_keys
+                    )
+                    if not has_raw:
+                        amp_reuse.contract_boundary_from_xmin_(
+                            max_bond=self.chi, cutoff=0.0,
+                            xrange=[
+                                bMPS_keys[0][1],
+                                min(
+                                    bMPS_keys[0][1] + 1,
+                                    self.Lx - 1,
+                                ),
+                            ],
+                            **self.contract_boundary_opts,
+                        )
+            sign, exp10 = amp_reuse.contract(
+                strip_exponent=True,
+            )
+            log_abs = exp10 * torch.log(torch.tensor(10.0))
+            return sign, log_abs
+
+        # y-environment reuse
+        if (bMPS_params_ymin is not None
+                and bMPS_params_ymax is not None
+                and bMPS_keys is not None):
+            bMPS_min = unpack_ftn(
+                bMPS_params_ymin,
+                self.bMPS_y_skeletons[bMPS_keys[0]],
+            )
+            bMPS_max = unpack_ftn(
+                bMPS_params_ymax,
+                self.bMPS_y_skeletons[bMPS_keys[1]],
+            )
+            cols = amp.select(
+                [tns.col_tag(col) for col in selected_cols],
+                which='any',
+            )
+            amp_reuse = (bMPS_min | cols | bMPS_max)
+            amp_reuse.view_as_(
+                qtn.PEPS,
+                site_tag_id=tns._site_tag_id,
+                x_tag_id=tns._x_tag_id,
+                y_tag_id=tns._y_tag_id,
+                Lx=tns._Lx,
+                Ly=tns._Ly,
+                site_ind_id=tns._site_ind_id,
+            )
+            if self.chi > 0:
+                if len(amp_reuse.tensors) > 2 * self.Lx:
+                    has_raw = (
+                        bMPS_keys[0] in self._raw_bMPS_y_keys
+                        or bMPS_keys[1]
+                        in self._raw_bMPS_y_keys
+                    )
+                    if not has_raw:
+                        amp_reuse.contract_boundary_from_ymin_(
+                            max_bond=self.chi, cutoff=0.0,
+                            yrange=[
+                                bMPS_keys[0][1],
+                                min(
+                                    bMPS_keys[0][1] + 1,
+                                    self.Ly - 1,
+                                ),
+                            ],
+                            **self.contract_boundary_opts,
+                        )
+            sign, exp10 = amp_reuse.contract(
+                strip_exponent=True,
+            )
+            log_abs = exp10 * torch.log(torch.tensor(10.0))
+            return sign, log_abs
+
+        # Full contraction fallback
+        if self.chi > 0:
+            amp.contract_boundary_from_xmin_(
+                max_bond=self.chi, cutoff=0.0,
+                xrange=[0, amp.Lx // 2 - 1],
+                **self.contract_boundary_opts,
+            )
+            amp.contract_boundary_from_xmax_(
+                max_bond=self.chi, cutoff=0.0,
+                xrange=[amp.Lx // 2, amp.Lx - 1],
+                **self.contract_boundary_opts,
+            )
+        sign, exp10 = amp.contract(strip_exponent=True)
+        log_abs = exp10 * torch.log(torch.tensor(10.0))
+        return sign, log_abs
+
     # ----- vamp overrides -----
 
     def vamp(self, x, params):
         """Batched full-contraction amplitude with pytree unflatten."""
-        import quimb as qu
-
-        if isinstance(params, nn.ParameterList):
-            params = list(params)
-        params = qu.utils.tree_unflatten(params, self.params_pytree)
+        params = self._vamp_params_preprocess(params)
         return self._vmapped_amplitude(x, params)
 
     def vamp_reuse(
@@ -399,11 +612,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         Uses torch.vmap over amplitude_reuse with appropriate in_dims
         for the batched bMPS parameter pytrees.
         """
-        import quimb as qu
-
-        if isinstance(params, nn.ParameterList):
-            params = list(params)
-        params = qu.utils.tree_unflatten(params, self.params_pytree)
+        params = self._vamp_params_preprocess(params)
 
         if (bMPS_params_xmin is not None
                 and bMPS_params_xmax is not None):
@@ -452,6 +661,85 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         # No reuse — full contraction via vmap
         return torch.vmap(
             self.amplitude_reuse,
+            in_dims=(
+                0, None, None, None, None, None, None, None, None,
+            ),
+        )(
+            x, params, bMPS_keys,
+            bMPS_params_xmin, bMPS_params_xmax,
+            bMPS_params_ymin, bMPS_params_ymax,
+            selected_rows, selected_cols,
+        )
+
+    def vamp_reuse_log(
+        self,
+        x,
+        params,
+        bMPS_keys=None,
+        bMPS_params_xmin=None,
+        bMPS_params_xmax=None,
+        bMPS_params_ymin=None,
+        bMPS_params_ymax=None,
+        selected_rows=None,
+        selected_cols=None,
+    ):
+        """Batched log-amplitude with bMPS environment reuse.
+
+        Uses torch.vmap over amplitude_reuse_log with appropriate
+        in_dims for the batched bMPS parameter pytrees.
+
+        Returns:
+            (signs, log_abs): each (B,)
+        """
+        params = self._vamp_params_preprocess(params)
+
+        if (bMPS_params_xmin is not None
+                and bMPS_params_xmax is not None):
+            return torch.vmap(
+                self.amplitude_reuse_log,
+                in_dims=(
+                    0,
+                    None,
+                    None,
+                    self.bMPS_params_x_in_dims[bMPS_keys[0]],
+                    self.bMPS_params_x_in_dims[bMPS_keys[1]],
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )(
+                x, params, bMPS_keys,
+                bMPS_params_xmin, bMPS_params_xmax,
+                bMPS_params_ymin, bMPS_params_ymax,
+                selected_rows, selected_cols,
+            )
+
+        if (bMPS_params_ymin is not None
+                and bMPS_params_ymax is not None):
+            return torch.vmap(
+                self.amplitude_reuse_log,
+                in_dims=(
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.bMPS_params_y_in_dims[bMPS_keys[0]],
+                    self.bMPS_params_y_in_dims[bMPS_keys[1]],
+                    None,
+                    None,
+                ),
+            )(
+                x, params, bMPS_keys,
+                bMPS_params_xmin, bMPS_params_xmax,
+                bMPS_params_ymin, bMPS_params_ymax,
+                selected_rows, selected_cols,
+            )
+
+        # No reuse — full contraction via vmap
+        return torch.vmap(
+            self.amplitude_reuse_log,
             in_dims=(
                 0, None, None, None, None, None, None, None, None,
             ),
@@ -880,6 +1168,62 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             ]
 
         return self.vamp_reuse(
+            x, self.params,
+            bMPS_keys=bMPS_keys,
+            bMPS_params_xmin=bMPS_params_xmin,
+            bMPS_params_xmax=bMPS_params_xmax,
+            bMPS_params_ymin=bMPS_params_ymin,
+            bMPS_params_ymax=bMPS_params_ymax,
+            selected_rows=selected_rows,
+            selected_cols=selected_cols,
+        )
+
+    def forward_reuse_log(
+        self,
+        x,
+        bMPS_params_x_batched=None,
+        bMPS_params_y_batched=None,
+        selected_rows=None,
+        selected_cols=None,
+    ):
+        """Log-amplitude variant of forward_reuse.
+
+        Uses native strip_exponent via vamp_reuse_log for
+        numerically stable log-amplitude.
+
+        Returns:
+            (signs, log_abs): each (B,) float64.
+        """
+        bMPS_params_xmin = None
+        bMPS_params_xmax = None
+        bMPS_params_ymin = None
+        bMPS_params_ymax = None
+        bMPS_keys = None
+
+        if selected_rows is not None:
+            bMPS_keys = [
+                ('xmin', min(selected_rows)),
+                ('xmax', max(selected_rows)),
+            ]
+            bMPS_params_xmin = bMPS_params_x_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_xmax = bMPS_params_x_batched[
+                bMPS_keys[1]
+            ]
+        if selected_cols is not None:
+            bMPS_keys = [
+                ('ymin', min(selected_cols)),
+                ('ymax', max(selected_cols)),
+            ]
+            bMPS_params_ymin = bMPS_params_y_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_ymax = bMPS_params_y_batched[
+                bMPS_keys[1]
+            ]
+
+        return self.vamp_reuse_log(
             x, self.params,
             bMPS_keys=bMPS_keys,
             bMPS_params_xmin=bMPS_params_xmin,

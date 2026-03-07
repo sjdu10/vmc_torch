@@ -52,6 +52,13 @@ class WavefunctionModel_GPU(nn.Module):
             randomness='different',
         )
 
+        # Pre-vmap the single-sample log-amplitude function
+        self._vmapped_log_amplitude = torch.vmap(
+            self.log_amplitude,
+            in_dims=(0, None),
+            randomness='different',
+        )
+
     # ----- Must implement -----
 
     def amplitude(self, x, params_list):
@@ -67,6 +74,15 @@ class WavefunctionModel_GPU(nn.Module):
         raise NotImplementedError
 
     # ----- Optionally override -----
+    
+    def _vamp_params_preprocess(self, params):
+        """Preprocess params for vamp.  Default: normalize ParameterList -> list.
+        
+        Override if vamp needs different param handling than forward.
+        """
+        if isinstance(params, nn.ParameterList):
+            return list(params)
+        return params
 
     def vamp(self, x, params):
         """Batched amplitude compatible with torch.vmap / torch.func.grad.
@@ -76,9 +92,36 @@ class WavefunctionModel_GPU(nn.Module):
 
         Override for model-specific param handling.
         """
-        if isinstance(params, nn.ParameterList):
-            params = list(params)
+        params = self._vamp_params_preprocess(params)
         return self._vmapped_amplitude(x, params)
+
+    # ----- Log-amplitude interface -----
+
+    def log_amplitude(self, x, params_list):
+        """Single-sample: returns (sign, log_abs) scalars.
+
+        Default wraps amplitude(). Override for native log-space.
+        """
+        amp = self.amplitude(x, params_list)
+        sign = torch.sign(amp)
+        log_abs = torch.log(amp.abs().clamp(min=1e-45))
+        return sign, log_abs
+    
+    def vamp_log(self, x, params):
+        """Batched log-amplitude: returns (signs, log_abs) each (B,).
+
+        Default: vmap over log_amplitude(). If a subclass overrides
+        log_amplitude (e.g. for native log-space TN contraction),
+        this automatically picks it up.
+        
+        Override for model-specific param handling.
+        """
+        params = self._vamp_params_preprocess(params)
+        return self._vmapped_log_amplitude(x, params)
+
+    def forward_log(self, x):
+        """Batched log-amplitude dispatch: returns (signs, log_abs) each (B,)."""
+        return self.vamp_log(x, self.params)
 
     # ----- Provided for free -----
 
