@@ -82,7 +82,7 @@ class VMCConfig:
     use_log_amp: bool = True
     use_cheap_grad: bool = True
     lr_scheduler: object = None  # set after construction
-    verbose: bool = True
+    verbose: bool = False
 
 vmc_cfg = VMCConfig()
 vmc_cfg.lr_scheduler = DecayScheduler(
@@ -109,7 +109,7 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 8, 8
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0

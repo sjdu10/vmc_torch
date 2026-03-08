@@ -57,9 +57,9 @@ DEFAULT_DATA_ROOT = (
 class VMCConfig:
     """VMC numerical / training settings."""
 
-    batch_size: int = 1
-    ns_per_rank: int = 1
-    grad_batch_size: int = 1
+    batch_size: int = 8
+    ns_per_rank: int = 8
+    grad_batch_size: int = 8
     vmc_steps: int = 1000
     learning_rate: float = 0.1
     diag_shift: float = 1e-4

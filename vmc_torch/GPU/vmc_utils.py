@@ -1219,16 +1219,17 @@ def compute_grads_cheap_gpu(
     B_grad = batch_size if batch_size is not None else B
 
     # Compute bMPS environments if not provided
-    if bMPS_params_x is None:
-        if verbose:
-            t0 = time.time()
-        bMPS_x, _ = fpeps_model.cache_bMPS_params_vmap(fxs)
-        bMPS_params_x = bMPS_x
-        if verbose:
-            print(
-                f"  cheap_grad: cache bMPS: "
-                f"{time.time() - t0:.4f}s"
-            )
+    with torch.no_grad():
+        if bMPS_params_x is None:
+            if verbose:
+                t0 = time.time()
+            bMPS_x, _ = fpeps_model.cache_bMPS_params_vmap(fxs)
+            bMPS_params_x = bMPS_x
+            if verbose:
+                print(
+                    f"  cheap_grad: cache bMPS: "
+                    f"{time.time() - t0:.4f}s"
+                )
 
     t0 = time.time()
 

@@ -200,7 +200,7 @@ class VMC_GPU:
                 compile=use_export_compile,
                 use_log_amp=use_log_amp,
             )
-            t_samp += time.time() - t0
+            print(f'Burn-in: {burn_in_steps} steps, T_b = {time.time()-t0}')
 
         local_energies_list = []
         local_lpg_list = []
