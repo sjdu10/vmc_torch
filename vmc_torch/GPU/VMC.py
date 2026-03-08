@@ -1,6 +1,6 @@
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
@@ -76,6 +76,11 @@ class VMCWarmupConfig:
     run_locE: bool = True
     run_grad: bool = True
     use_log_amp: bool = False
+    def __init__(self, **kwargs):
+          for f in fields(self):
+              setattr(self, f.name, kwargs.pop(f.name, f.default))
+          for k, v in kwargs.items():
+              setattr(self, k, v)
 
 
 @dataclass
@@ -102,6 +107,12 @@ class VMCLoopConfig:
     # If set, overrides learning_rate each step.
     lr_scheduler: object = None
     verbose: bool = False
+    
+    def __init__(self, **kwargs):
+          for f in fields(self):
+              setattr(self, f.name, kwargs.pop(f.name, f.default))
+          for k, v in kwargs.items():
+              setattr(self, k, v)
 
     @classmethod
     def from_vmc_config(cls, cfg, *, n_params, nsites):
@@ -114,10 +125,14 @@ class VMCLoopConfig:
         """
         import dataclasses as _dc
         loop_fields = {f.name for f in _dc.fields(cls)}
+        cfg_fields = {f.name for f in _dc.fields(cfg)}
         kwargs = {}
         for f in _dc.fields(cfg):
-            if f.name in loop_fields:
-                kwargs[f.name] = getattr(cfg, f.name)
+            kwargs[f.name] = getattr(cfg, f.name)
+        # Pass through extra (non-dataclass-field) attributes
+        for k, v in vars(cfg).items():
+            if k not in cfg_fields and k not in kwargs:
+                kwargs[k] = v
         # Map resume_step -> step_offset
         if hasattr(cfg, 'resume_step'):
             kwargs['step_offset'] = cfg.resume_step
@@ -166,7 +181,7 @@ class VMC_GPU:
         use_export_compile=False,
         debug=False,
         outlier_clip_factor=0.0,
-        offload_oloc=False,
+        offload_lpg_loc_cpu=False,
         use_log_amp=False,
         verbose=False,
     ):
@@ -178,7 +193,7 @@ class VMC_GPU:
         compute_grads_fn directly.
 
         Args:
-            offload_oloc: if True, move log_psi_grad chunks
+            offload_lpg_loc_cpu: if True, move log_psi_grad chunks
                 to CPU immediately after GPU computation.
             use_log_amp: if True, work in log-amplitude
                 space throughout (sampler, energy, grads).
@@ -246,7 +261,7 @@ class VMC_GPU:
                     vectorize=True,
                     batch_size=grad_batch_size,
                     vmap_grad=True,
-                    offload_to_cpu=offload_oloc,
+                    offload_to_cpu=offload_lpg_loc_cpu,
                     use_log_amp=use_log_amp,
                     verbose=verbose,
                     bMPS_params_x=bMPS_x,
@@ -268,7 +283,7 @@ class VMC_GPU:
                     )
             else:
                 # grads_aux is raw amps — divide to get
-                # O_loc = d(psi)/d(params) / psi
+                # lpg_loc = d(psi)/d(params) / psi
                 amps2 = grads_aux
                 if debug and _rank == 0:
                     abs_a = amps2.abs()
@@ -382,10 +397,10 @@ class VMC_GPU:
 
         # Offload gradients to CPU when MINRES SR solver can work with
         # CPU-resident data (scipy MINRES).
-        offload_grad_cpu = (
-            hasattr(self.preconditioner, 'use_scipy')
+        offload_grad_cpu = (                                                                                                                                                                                                                                    
+            hasattr(self.preconditioner, 'use_scipy')                                                                                                                                                                                                         
             and self.preconditioner.use_scipy
-        )
+        ) or getattr(config, 'offload_grad_to_cpu', False)
 
         self._sync_params(model)
 
@@ -619,12 +634,12 @@ class VMC_GPU:
         device = next(model.parameters()).device
         self._sync_params(model)
 
-        # Offload O_loc to CPU when MINRES SR solver can work with
+        # Offload lpg_loc to CPU when MINRES SR solver can work with
         # CPU-resident data (scipy MINRES).
-        offload_oloc = (
+        offload_lpg_loc_cpu = (
             hasattr(self.preconditioner, 'use_scipy')
             and self.preconditioner.use_scipy
-        )
+        ) or getattr(config, 'offload_grad_to_cpu', False)
 
         if rank == 0 and config.show_progress:
             print(f"\n--- VMC ({config.vmc_steps} steps) ---")
@@ -651,7 +666,7 @@ class VMC_GPU:
                     use_export_compile=config.use_export_compile,
                     debug=config.debug,
                     outlier_clip_factor=config.outlier_clip_factor,
-                    offload_oloc=offload_oloc,
+                    offload_lpg_loc_cpu=offload_lpg_loc_cpu,
                     use_log_amp=config.use_log_amp,
                     verbose=config.verbose,
                 )
