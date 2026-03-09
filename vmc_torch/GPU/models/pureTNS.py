@@ -137,15 +137,6 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
         params = qu.utils.tree_unflatten(params, self.params_pytree)
         return params
 
-    def _amplitude_for_export(self, x, *flat_params):
-        """Wrapper for torch.export: unflatten then TN contraction."""
-        import quimb as qu
-
-        p = qu.utils.tree_unflatten(
-            list(flat_params), self.params_pytree
-        )
-        return self.amplitude(x, p)
-
 
 # =================================================================
 #  fPEPS with bMPS environment reuse
@@ -750,21 +741,11 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             selected_rows, selected_cols,
         )
 
-    # ----- Export override for pytree unflatten -----
-
-    def _amplitude_for_export(self, x, *flat_params):
-        """Wrapper for torch.export: unflatten then TN contraction."""
-        import quimb as qu
-
-        p = qu.utils.tree_unflatten(
-            list(flat_params), self.params_pytree
-        )
-        return self.amplitude(x, p)
-
     # ----- Export + compile for reuse patterns -----
 
     def export_and_compile_reuse(
         self, example_x, mode='default', verbose=True,
+        use_log_amp=False,
     ):
         """Pre-export amplitude_reuse for all reuse patterns.
 
@@ -786,11 +767,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             example_x: (N_sites,) int64 on the target device.
             mode: torch.compile mode.
             verbose: Print progress.
+            use_log_amp: if True, export amplitude_reuse_log instead
+                of amplitude_reuse. forward_reuse_log() will dispatch
+                to compiled path; forward_reuse() to eager.
         """
         import quimb as qu
         from torch.export import export
 
         self._compiled_reuse = {}
+        self._compiled_reuse_log_amp = use_log_amp
         device = example_x.device
 
         # Compute example bMPS params for slicing
@@ -877,8 +862,13 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             def make_wrapper(
                 _bMPS_keys, _bMPS_min_pytree, _bMPS_max_pytree,
                 _n_tn, _n_min, _selected_rows, _selected_cols,
-                _direction,
+                _direction, _use_log_amp,
             ):
+                if _use_log_amp:
+                    reuse_fn = self.amplitude_reuse_log
+                else:
+                    reuse_fn = self.amplitude_reuse
+
                 def wrapper(x, *flat_args):
                     tn_params = list(flat_args[:_n_tn])
                     min_params = list(
@@ -894,7 +884,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                         max_params, _bMPS_max_pytree,
                     )
                     if _direction == 'x':
-                        return self.amplitude_reuse(
+                        return reuse_fn(
                             x,
                             qu.utils.tree_unflatten(
                                 tn_params, self.params_pytree,
@@ -905,7 +895,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                             selected_rows=_selected_rows,
                         )
                     else:
-                        return self.amplitude_reuse(
+                        return reuse_fn(
                             x,
                             qu.utils.tree_unflatten(
                                 tn_params, self.params_pytree,
@@ -922,6 +912,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 bMPS_max_pytree,
                 n_tn_params, n_min,
                 selected_rows, selected_cols, direction,
+                use_log_amp,
             )
 
             # Export
@@ -1054,7 +1045,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
     def forward(self, x):
         """Compiled full-contraction forward (no reuse)."""
-        if self._exported:
+        if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
                 return self._vmapped_compiled(x, *params_list)
@@ -1106,11 +1097,12 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         else:
             key = None
 
-        # Try compiled path
+        # Try compiled path (only when exported for amplitude, not log)
         if (
             key is not None
             and hasattr(self, '_compiled_reuse')
             and key in self._compiled_reuse
+            and not getattr(self, '_compiled_reuse_log_amp', False)
         ):
             entry = self._compiled_reuse[key]
             params_list = list(self.params)
@@ -1189,11 +1181,76 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         """Log-amplitude variant of forward_reuse.
 
         Uses native strip_exponent via vamp_reuse_log for
-        numerically stable log-amplitude.
+        numerically stable log-amplitude.  Dispatches to
+        compiled path when export_and_compile_reuse was called
+        with use_log_amp=True.
 
         Returns:
             (signs, log_abs): each (B,) float64.
         """
+        import quimb as qu
+
+        # Determine the reuse key
+        if selected_rows is not None:
+            key = ('x', tuple(selected_rows))
+            bMPS_keys = [
+                ('xmin', min(selected_rows)),
+                ('xmax', max(selected_rows)),
+            ]
+            bMPS_params_xmin = bMPS_params_x_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_xmax = bMPS_params_x_batched[
+                bMPS_keys[1]
+            ]
+        elif selected_cols is not None:
+            key = ('y', tuple(selected_cols))
+            bMPS_keys = [
+                ('ymin', min(selected_cols)),
+                ('ymax', max(selected_cols)),
+            ]
+            bMPS_params_ymin = bMPS_params_y_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_ymax = bMPS_params_y_batched[
+                bMPS_keys[1]
+            ]
+        else:
+            key = None
+
+        # Try compiled path (only when exported for log-amp)
+        if (
+            key is not None
+            and hasattr(self, '_compiled_reuse')
+            and key in self._compiled_reuse
+            and getattr(self, '_compiled_reuse_log_amp', False)
+        ):
+            entry = self._compiled_reuse[key]
+            params_list = list(self.params)
+
+            if selected_rows is not None:
+                bMPS_min_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_xmin, get_ref=True,
+                )
+                bMPS_max_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_xmax, get_ref=True,
+                )
+            else:
+                bMPS_min_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_ymin, get_ref=True,
+                )
+                bMPS_max_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_ymax, get_ref=True,
+                )
+
+            return entry['fn'](
+                x,
+                *params_list,
+                *bMPS_min_flat,
+                *bMPS_max_flat,
+            )
+
+        # Fallback to eager
         bMPS_params_xmin = None
         bMPS_params_xmax = None
         bMPS_params_ymin = None

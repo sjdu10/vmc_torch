@@ -596,8 +596,20 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
         """
         return self._tn_contraction(x, list(ftn_params), nn_output)
 
+    def _tn_contraction_log_for_export(
+        self, x, nn_output, *ftn_params,
+    ):
+        """Wrapper for torch.export: log TN contraction.
+
+        Single-sample: returns (sign, log_abs) scalars.
+        """
+        return self._tn_contraction_log(
+            x, list(ftn_params), nn_output,
+        )
+
     def export_and_compile(
-        self, example_x, mode='default', **compile_kwargs,
+        self, example_x, mode='default',
+        use_log_amp=False, **compile_kwargs,
     ):
         """Export TN contraction + compile combined NN+TN forward.
 
@@ -616,11 +628,17 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
         Args:
             example_x: single-sample config (N_sites,) on device.
             mode: torch.compile mode.
+            use_log_amp: if True, export log TN contraction.
         """
         from torch.export import export
 
         device = example_x.device
         ftn_params = [p.data for p in self.params[:self.n_ftn]]
+
+        if use_log_amp:
+            tn_export_fn = self._tn_contraction_log_for_export
+        else:
+            tn_export_fn = self._tn_contraction_for_export
 
         # --- 1. Generate example nn_output ---
         nn_module = self._nn_container[0]
@@ -640,7 +658,7 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
 
         with torch.no_grad():
             exported = export(
-                _TNModule(self._tn_contraction_for_export),
+                _TNModule(tn_export_fn),
                 (example_x, example_nn_output, *ftn_params),
             )
         exported_tn_module = exported.module()
@@ -691,13 +709,19 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
 
         self._exported = True
         self._compiled = True
+        self._exported_log_amp = use_log_amp
 
-    def export_only(self, example_x):
+    def export_only(self, example_x, use_log_amp=False):
         """Export + vmap without compile. Useful for debugging."""
         from torch.export import export
 
         device = example_x.device
         ftn_params = [p.data for p in self.params[:self.n_ftn]]
+
+        if use_log_amp:
+            tn_export_fn = self._tn_contraction_log_for_export
+        else:
+            tn_export_fn = self._tn_contraction_for_export
 
         nn_module = self._nn_container[0]
         with torch.no_grad():
@@ -715,7 +739,7 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
 
         with torch.no_grad():
             exported = export(
-                _TNModule(self._tn_contraction_for_export),
+                _TNModule(tn_export_fn),
                 (example_x, example_nn_output, *ftn_params),
             )
         exported_tn_module = exported.module()
@@ -751,6 +775,7 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
 
         self._vmapped_exported_fn = _exported_forward
         self._exported = True
+        self._exported_log_amp = use_log_amp
 
     def _move_exported_tn_constants_to_device(self, device):
         """Move CPU constants in the exported TN graph to GPU.
@@ -791,13 +816,22 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
 
     def forward(self, x):
         """Batched forward: compiled -> exported -> eager."""
-        if self._exported:
+        if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
                 return self._vmapped_compiled(x, *params_list)
             else:
                 return self._vmapped_exported_fn(x, *params_list)
         return self.vamp(x, self.params)
+
+    def forward_log(self, x):
+        """Batched log-amplitude: compiled -> exported -> eager."""
+        if self._exported and self._exported_log_amp:
+            params_list = list(self.params)
+            if self._compiled:
+                return self._vmapped_compiled(x, *params_list)
+            return self._vmapped_exported_fn(x, *params_list)
+        return self.vamp_log(x, self.params)
 
 
 # ================================================================

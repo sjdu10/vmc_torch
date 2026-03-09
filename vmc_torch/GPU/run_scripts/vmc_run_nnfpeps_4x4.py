@@ -6,7 +6,6 @@ Run:
 """
 import json
 import os
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -40,10 +39,10 @@ from vmc_torch.GPU.vmc_setup import (
     setup_linalg_hooks,
 )
 from vmc_torch.GPU.vmc_utils import random_initial_config
+from vmcconfig import VMCConfig
 
 dtype = torch.float64
-nnbackbone_dtype = torch.float32
-USE_EXPORT_COMPILE = False
+nnbackbone_dtype = torch.float64
 
 # Data paths
 DEFAULT_DATA_ROOT = (
@@ -56,35 +55,32 @@ CPU_DATA_ROOT = (
     '/experiment/vmap/data'
 )
 
-
-@dataclass
-class VMCConfig:
-    """VMC numerical / training settings."""
-
-    batch_size: int = 4096
-    ns_per_rank: int = 4096
-    grad_batch_size: int = 1024
-    vmc_steps: int = 100
-    learning_rate: float = 0.1
-    diag_shift: float = 1e-4
-    burn_in_steps: int = 0
-    use_export_compile: bool = USE_EXPORT_COMPILE
-    
-    use_min_sr: bool = False
-    use_distributed_min_sr: bool = False
-    param_chunk_size: int = 1024
-    use_distributed_sr_minres: bool = True
-    minres_sr_use_scipy: bool = False
-    sr_rtol: float = 1e-3
-    sr_maxiter: int = 100
-    
-    save_every: int = 50
-    resume_step: int = 0
-    debug: bool = False
-    outlier_clip_factor: float = 100.0 # drop log_psi_grad outliers > factor * median
-    run_sr: bool = True
-    use_log_amp: bool = True
-    lr_scheduler: object = None  # set after construction
+vmc_cfg = VMCConfig(
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=1024,
+    vmc_steps=1000,
+    burn_in_steps=1,
+    learning_rate=0.1,
+    sr_diag_shift=5e-4,
+    use_distributed_sr_minres=True,
+    sr_rtol=1e-4,
+    offload_grad_to_cpu=True,
+    use_log_amp=True,
+    use_export_compile=True,
+    save_every=10,
+    resume_step=0,
+    verbose=False,
+)
+vmc_cfg.lr_scheduler = DecayScheduler(
+    init_lr=vmc_cfg.learning_rate,
+    decay_rate=0.9, patience=50,
+)
+warmup_cfg = VMCWarmupConfig(
+    use_export_compile=vmc_cfg.use_export_compile,
+    grad_batch_size=vmc_cfg.grad_batch_size,
+    use_log_amp=vmc_cfg.use_log_amp,
+)
 
 
 def main():
@@ -106,8 +102,8 @@ def main():
         U = 8.0
         N_f = N_sites - 2  # 2 holes -> 14 fermions
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 8   # PEPS bond dimension
-        chi = 8  # exact contraction
+        D = 4   # PEPS bond dimension
+        chi = -1  # exact contraction
 
         # NN backflow hyperparameters
         nn_eta = 1.0
@@ -163,7 +159,7 @@ def main():
         model.to(device)
 
         # Export + compile (optional, ~10-40s one-time cost)
-        if USE_EXPORT_COMPILE:
+        if vmc_cfg.use_export_compile:
             example_x = random_initial_config(
                 N_f, N_sites, seed=0,
             ).to(device)
@@ -171,7 +167,10 @@ def main():
                 print("Running torch.export + compile...")
             import time as _time
             _t0 = _time.time()
-            model.export_and_compile(example_x)
+            model.export_and_compile(
+                example_x,
+                use_log_amp=vmc_cfg.use_log_amp,
+            )
             if rank == 0:
                 print(
                     f"Export + compile done in "
@@ -179,11 +178,6 @@ def main():
                 )
 
         # ========== Config ==========
-        vmc_cfg = VMCConfig()
-        vmc_cfg.lr_scheduler = DecayScheduler(
-            init_lr=vmc_cfg.learning_rate,
-            decay_rate=0.9, patience=50,
-        )
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
             f"t={t}_U={U}/N={N_f}/Z2/D={D}/chi={chi}/"
@@ -296,11 +290,7 @@ def main():
             graph=graph,
             hamiltonian=H,
             rank=rank,
-            config=VMCWarmupConfig(
-                use_export_compile=vmc_cfg.use_export_compile,
-                grad_batch_size=vmc_cfg.grad_batch_size,
-                use_log_amp=vmc_cfg.use_log_amp,
-            ),
+            config=warmup_cfg,
         )
 
         # ========== Data-saving callback ==========

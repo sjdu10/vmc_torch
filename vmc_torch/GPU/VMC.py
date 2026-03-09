@@ -31,14 +31,17 @@ def _find_free_port():
         return s.getsockname()[1]
 
 
-def setup_distributed():
+def setup_distributed(cuda_rank: Optional[int] = None):
     if "RANK" not in os.environ:
         print("Warning: Not using torchrun. Single device.")
         os.environ["RANK"] = "0"
         os.environ["WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(_find_free_port())
-        os.environ["LOCAL_RANK"] = "0"
+        if cuda_rank is None:
+            os.environ["LOCAL_RANK"] = "0"
+        else:
+            os.environ["LOCAL_RANK"] = str(cuda_rank)
 
     dist.init_process_group(
         backend="nccl", init_method="env://",
@@ -122,6 +125,7 @@ class VMCLoopConfig:
         VMCLoopConfig.  The two extra fields (n_params, nsites)
         are model/system-dependent so must be passed explicitly.
         ``resume_step`` in cfg maps to ``step_offset`` here.
+        ``sr_diag_shift`` in cfg maps to ``diag_shift`` here.
         """
         import dataclasses as _dc
         loop_fields = {f.name for f in _dc.fields(cls)}
@@ -136,6 +140,9 @@ class VMCLoopConfig:
         # Map resume_step -> step_offset
         if hasattr(cfg, 'resume_step'):
             kwargs['step_offset'] = cfg.resume_step
+        # Map sr_diag_shift -> diag_shift
+        if 'sr_diag_shift' in kwargs:
+            kwargs['diag_shift'] = kwargs.pop('sr_diag_shift')
         kwargs['n_params'] = n_params
         kwargs['nsites'] = nsites
         return cls(**kwargs)

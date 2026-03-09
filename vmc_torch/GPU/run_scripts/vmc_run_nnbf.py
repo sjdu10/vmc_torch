@@ -1,17 +1,13 @@
-"""GPU VMC comparison: MLP backflow vs Attention backflow (depth sweep).
+"""GPU VMC with neural network backflow (MLP or Attention).
 
-Runs NNBF_GPU (MLP, 2 layers) as baseline, then AttentionNNBF_GPU with
-n_layers = 1, 2, 3, 4 on 4x2 spinful Fermi-Hubbard for 50 VMC steps.
-Prints a side-by-side energy comparison table at the end.
-
-System: 4x2 Fermi-Hubbard, t=1, U=8, N_f=6 (2 holes), OBC.
+System: spinful Fermi-Hubbard on a square lattice.
 
 Run:
     torchrun --nproc_per_node=1 run_scripts/vmc_run_nnbf.py
+    torchrun --nproc_per_node=<N> run_scripts/vmc_run_nnbf.py
 """
 import json
 import os
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -28,13 +24,18 @@ from vmc_torch.GPU.hamiltonian import (
 )
 from vmc_torch.GPU.models import NNBF_GPU, AttentionNNBF_GPU
 from vmc_torch.GPU.optimizer import (
-    DecayScheduler, MinSRGPU, SGDGPU,
+    DecayScheduler,
+    DistributedMinSRGPU,
+    DistributedSRMinresGPU,
+    MinSRGPU,
+    SGDGPU,
 )
 from vmc_torch.GPU.sampler import (
     MetropolisExchangeSpinfulSamplerGPU,
 )
 from vmc_torch.GPU.vmc_setup import initialize_walkers
 from vmc_torch.GPU.vmc_utils import random_initial_config
+from vmcconfig import VMCConfig
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
@@ -42,114 +43,21 @@ DEFAULT_DATA_ROOT = (
     '/GPU/data'
 )
 
-# ========== System parameters ==========
-Lx, Ly = 4, 2
-N_sites = Lx * Ly
-t = 1.0
-U = 8.0
-N_f = N_sites - 2  # 2 holes
-n_fermions_per_spin = (N_f // 2, N_f // 2)
-
-
-@dataclass
-class VMCConfig:
-    """VMC numerical / training settings."""
-    batch_size: int = 1024
-    ns_per_rank: int = 1024
-    grad_batch_size: int = 1024
-    vmc_steps: int = 200
-    learning_rate: float = 0.1
-    diag_shift: float = 1e-3
-    burn_in_steps: int = 4
-    use_export_compile: bool = False
-    use_min_sr: bool = False
-    outlier_clip_factor: float = 100.0 # drop log_psi_grad outliers > factor * median
-    run_sr: bool = True
-    use_log_amp: bool = True
-    lr_scheduler: object = None  # set after construction
-
-
-def run_one_model(
-    model, model_label, H, graph, device, rank, world_size,
-):
-    """Run VMC for one model and return energy history + stats."""
-    cfg = VMCConfig()
-    cfg.lr_scheduler = DecayScheduler(
-        init_lr=cfg.learning_rate,
-        decay_rate=0.9, patience=50,
-    )
-    N_params = sum(p.numel() for p in model.parameters())
-
-    if rank == 0:
-        print(f"\n{'=' * 55}")
-        print(f"  {model_label}: {N_params} parameters")
-        print(f"{'=' * 55}")
-
-    print_sampling_settings(
-        rank, world_size,
-        cfg.batch_size, cfg.ns_per_rank, cfg.grad_batch_size,
-    )
-
-    # Initialize walkers (fresh for each model, same seed)
-    fxs = initialize_walkers(
-        init_fn=lambda seed: random_initial_config(
-            N_f, N_sites, seed=seed,
-        ),
-        batch_size=cfg.batch_size,
-        seed=42, rank=rank, device=device,
-    )
-
-    # VMC driver
-    vmc = VMC_GPU(
-        sampler=MetropolisExchangeSpinfulSamplerGPU(),
-        preconditioner=MinSRGPU(),
-        optimizer=SGDGPU(learning_rate=cfg.learning_rate),
-    )
-
-    # Warmup
-    fxs = vmc.run_warmup(
-        fxs=fxs, model=model, graph=graph,
-        hamiltonian=H, rank=rank,
-        config=VMCWarmupConfig(
-            use_export_compile=cfg.use_export_compile,
-            grad_batch_size=cfg.grad_batch_size,
-            use_log_amp=cfg.use_log_amp,
-        ),
-    )
-
-    # Collect per-step stats
-    stats = {'mean': [], 'error': [], 'variance': []}
-
-    def on_step_end(info):
-        if rank != 0:
-            return
-        stats['mean'].append(info['energy_per_site'])
-        stats['error'].append(info['error_per_site'])
-        stats['variance'].append(info['energy_var'])
-
-    energy_history, fxs = vmc.run_vmc_loop(
-        fxs=fxs, model=model, hamiltonian=H,
-        graph=graph, rank=rank, world_size=world_size,
-        config=VMCLoopConfig(
-            vmc_steps=cfg.vmc_steps,
-            ns_per_rank=cfg.ns_per_rank,
-            grad_batch_size=cfg.grad_batch_size,
-            n_params=N_params,
-            nsites=N_sites,
-            learning_rate=cfg.learning_rate,
-            diag_shift=cfg.diag_shift,
-            burn_in_steps=cfg.burn_in_steps,
-            run_sr=cfg.run_sr,
-            use_min_sr=cfg.use_min_sr,
-            use_export_compile=cfg.use_export_compile,
-            step_offset=0,
-            outlier_clip_factor=cfg.outlier_clip_factor,
-            use_log_amp=cfg.use_log_amp,
-            lr_scheduler=cfg.lr_scheduler,
-        ),
-        on_step_end=on_step_end,
-    )
-    return energy_history, stats
+vmc_cfg = VMCConfig(
+    vmc_steps=200,
+    burn_in_steps=4,
+    sr_diag_shift=1e-3,
+    outlier_clip_factor=100.0,
+)
+vmc_cfg.lr_scheduler = DecayScheduler(
+    init_lr=vmc_cfg.learning_rate,
+    decay_rate=0.9, patience=50,
+)
+warmup_cfg = VMCWarmupConfig(
+    use_export_compile=vmc_cfg.use_export_compile,
+    grad_batch_size=vmc_cfg.grad_batch_size,
+    use_log_amp=vmc_cfg.use_log_amp,
+)
 
 
 def main():
@@ -158,14 +66,17 @@ def main():
     try:
         rank, world_size, device = setup_distributed()
         torch.set_default_device(device)
+        torch.manual_seed(42 + rank)
 
-        if rank == 0:
-            print(
-                f"System: {Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, "
-                f"N_f={N_f}, {world_size} GPU(s)"
-            )
+        # ========== System parameters ==========
+        Lx, Ly = 4, 2
+        N_sites = Lx * Ly
+        t = 1.0
+        U = 8.0
+        N_f = N_sites - 2  # 2 holes
+        n_fermions_per_spin = (N_f // 2, N_f // 2)
 
-        # ========== Hamiltonian (shared) ==========
+        # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
             Lx, Ly, t, U, N_f,
             pbc=False,
@@ -176,113 +87,189 @@ def main():
         H.precompute_hops_gpu(device)
         graph = H.graph
 
-        # ========== Models to compare ==========
-        # (label, model_builder)
-        attn_depths = [1, 2, 3, 4]
-        models_to_run = [
-            (
-                "MLP (h=32, L=2)",
-                lambda: NNBF_GPU(
-                    n_sites=N_sites, n_fermions=N_f,
-                    hidden_dim=32, n_layers=2,
-                    activation='tanh', bf_scale=0.01, dtype=dtype,
-                ),
-            ),
-        ]
-        for L in attn_depths:
-            models_to_run.append((
-                f"Attn (d=32, L={L})",
-                lambda L=L: AttentionNNBF_GPU(
-                    n_sites=N_sites, n_fermions=N_f,
-                    d_model=32, n_heads=4, n_layers=L,
-                    bf_scale=0.01, dtype=dtype,
-                ),
-            ))
+        # ========== Model ==========
+        # Option A: MLP backflow
+        model = NNBF_GPU(
+            n_sites=N_sites, n_fermions=N_f,
+            hidden_dim=32, n_layers=2,
+            activation='tanh', bf_scale=0.01,
+            dtype=dtype,
+        )
+        # Option B: Attention backflow (uncomment):
+        # model = AttentionNNBF_GPU(
+        #     n_sites=N_sites, n_fermions=N_f,
+        #     d_model=32, n_heads=4, n_layers=2,
+        #     bf_scale=0.01, dtype=dtype,
+        # )
+        model.to(device)
 
-        # ========== Run all models ==========
-        results = {}  # label -> {Np, hist, stats}
-        for label, builder in models_to_run:
-            torch.manual_seed(42 + rank)
-            model = builder()
-            model.to(device)
-            Np = sum(p.numel() for p in model.parameters())
-            torch.manual_seed(42 + rank)
-            hist, stats = run_one_model(
-                model, label, H, graph, device, rank, world_size,
+        # ========== Config ==========
+        output_dir = (
+            f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
+            f"t={t}_U={U}/N={N_f}/nnbf/"
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        model_name = model._get_name()
+        if vmc_cfg.resume_step > 0:
+            ckpt_path = os.path.join(
+                output_dir,
+                f'checkpoint_{model_name}'
+                f'_{vmc_cfg.resume_step}.pt',
             )
-            results[label] = {
-                'Np': Np, 'hist': hist, 'stats': stats,
-            }
+            ckpt = torch.load(
+                ckpt_path,
+                map_location=device,
+                weights_only=True,
+            )
+            model.load_state_dict(ckpt)
+            if rank == 0:
+                print(f"Loaded checkpoint: {ckpt_path}")
 
-        # ========== Summary table ==========
+        N_params = sum(p.numel() for p in model.parameters())
         if rank == 0:
-            print(f"\n{'=' * 72}")
             print(
-                f"  Depth sweep: {Lx}x{Ly} Fermi-Hubbard, "
-                f"t={t}, U={U}, N_f={N_f}, 50 VMC steps"
+                f"Model: {model_name} | {N_params} params | "
+                f"{world_size} GPUs | {device}"
             )
-            print(f"{'=' * 72}")
-
-            # Summary row per model
             print(
-                f"\n{'Model':<22} {'Np':>6}  "
-                f"{'E/site(1)':>10}  {'E/site(50)':>10}  "
-                f"{'min E/site':>10}"
+                f"System: {Lx}x{Ly} Fermi-Hubbard, "
+                f"t={t}, U={U}, N_f={N_f}"
             )
-            print("-" * 68)
-            for label, r in results.items():
-                h = r['hist']
-                if h:
-                    print(
-                        f"{label:<22} {r['Np']:>6}  "
-                        f"{h[0]:>10.6f}  {h[-1]:>10.6f}  "
-                        f"{min(h):>10.6f}"
-                    )
 
-            # Step-by-step table
-            labels = list(results.keys())
-            hists = [results[l]['hist'] for l in labels]
-            n_steps = min(len(h) for h in hists) if hists else 0
-
-            header_parts = [f"{'Step':>5}"]
-            for l in labels:
-                header_parts.append(f"{l:>22}")
-            header = "  ".join(header_parts)
-            print(f"\n{header}")
-            print("-" * len(header))
-
-            steps_to_show = list(range(0, n_steps, 20))
-            if n_steps > 0 and (n_steps - 1) not in steps_to_show:
-                steps_to_show.append(n_steps - 1)
-            for i in steps_to_show:
-                row = [f"{i + 1:>5}"]
-                for h in hists:
-                    row.append(f"{h[i]:>22.6f}")
-                print("  ".join(row))
-
-            # Save results
-            output_dir = (
-                f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/nnbf_depth_sweep/"
+        # ========== Export + compile (optional) ==========
+        if vmc_cfg.use_export_compile:
+            example_x = random_initial_config(
+                N_f, N_sites, seed=0,
+            ).to(device)
+            if rank == 0:
+                print("Running torch.export + compile...")
+            model.export_and_compile(
+                example_x,
+                use_log_amp=vmc_cfg.use_log_amp,
             )
-            os.makedirs(output_dir, exist_ok=True)
-            save_data = {
-                'system': (
-                    f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
-                    f'N_f={N_f}'
-                ),
-            }
-            for label, r in results.items():
-                save_data[label] = {
-                    'Np': r['Np'],
-                    **r['stats'],
-                }
-            stats_file = os.path.join(
-                output_dir, 'depth_sweep.json',
+
+        print_sampling_settings(
+            rank,
+            world_size,
+            vmc_cfg.batch_size,
+            vmc_cfg.ns_per_rank,
+            vmc_cfg.grad_batch_size,
+        )
+
+        # ========== Initialize walkers ==========
+        fxs = initialize_walkers(
+            init_fn=lambda seed: random_initial_config(
+                N_f, N_sites, seed=seed,
+            ),
+            batch_size=vmc_cfg.batch_size,
+            seed=42, rank=rank, device=device,
+        )
+
+        # ========== Stats tracking ==========
+        step_tag = (
+            f'_from{vmc_cfg.resume_step}'
+            if vmc_cfg.resume_step > 0 else ''
+        )
+        stats_file = os.path.join(
+            output_dir,
+            f'stats_{model_name}{step_tag}.json',
+        )
+        total_ns = vmc_cfg.ns_per_rank * world_size
+        stats = {
+            'system': (
+                f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
+                f'N_f={N_f}'
+            ),
+            'Np': N_params,
+            'sample size': total_ns,
+            'mean': [],
+            'error': [],
+            'variance': [],
+        }
+
+        # ========== VMC driver ==========
+        if vmc_cfg.use_distributed_min_sr:
+            preconditioner = DistributedMinSRGPU(
+                param_chunk_size=vmc_cfg.param_chunk_size,
             )
+        elif vmc_cfg.use_min_sr:
+            preconditioner = MinSRGPU()
+        elif vmc_cfg.use_distributed_sr_minres:
+            preconditioner = DistributedSRMinresGPU(
+                rtol=vmc_cfg.sr_rtol,
+                maxiter=vmc_cfg.sr_maxiter,
+                use_scipy=vmc_cfg.minres_sr_use_scipy,
+            )
+        else:
+            preconditioner = None
+
+        vmc = VMC_GPU(
+            sampler=MetropolisExchangeSpinfulSamplerGPU(),
+            preconditioner=preconditioner,
+            optimizer=SGDGPU(
+                learning_rate=vmc_cfg.learning_rate,
+            ),
+        )
+
+        fxs = vmc.run_warmup(
+            fxs=fxs,
+            model=model,
+            graph=graph,
+            hamiltonian=H,
+            rank=rank,
+            config=warmup_cfg,
+        )
+
+        # ========== Data-saving callback ==========
+        def on_step_end(info):
+            if rank != 0:
+                return
+            stats['mean'].append(info['energy_per_site'])
+            stats['error'].append(info['error_per_site'])
+            stats['variance'].append(info['energy_var'])
             with open(stats_file, 'w') as f:
-                json.dump(save_data, f, indent=4)
-            print(f"\n  Results saved to: {stats_file}")
+                json.dump(stats, f, indent=4)
 
+            step = info['step']
+            if (step + 1) % vmc_cfg.save_every == 0:
+                ckpt_path = os.path.join(
+                    output_dir,
+                    f'checkpoint_{model_name}_{step + 1}.pt',
+                )
+                torch.save(model.state_dict(), ckpt_path)
+
+        energy_history, _ = vmc.run_vmc_loop(
+            fxs=fxs,
+            model=model,
+            hamiltonian=H,
+            graph=graph,
+            rank=rank,
+            world_size=world_size,
+            config=VMCLoopConfig.from_vmc_config(
+                vmc_cfg,
+                n_params=N_params,
+                nsites=N_sites,
+            ),
+            on_step_end=on_step_end,
+        )
+
+        # ========== Summary ==========
+        if rank == 0 and energy_history:
+            print(f"\n{'=' * 50}")
+            print(
+                f"Result: {Lx}x{Ly} Fermi-Hubbard, "
+                f"t={t}, U={U}, N_f={N_f}"
+            )
+            print(f"Model: {model_name}")
+            print(f"{'=' * 50}")
+            print(f"First E/site: {energy_history[0]:.6f}")
+            print(f"Last  E/site: {energy_history[-1]:.6f}")
+            print(f"Min   E/site: {min(energy_history):.6f}")
+            print(f"Stats saved to: {stats_file}")
+            if energy_history[-1] < energy_history[0]:
+                print("\nEnergy decreased.")
+            else:
+                print("\nWARNING: Energy did NOT decrease.")
     finally:
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()

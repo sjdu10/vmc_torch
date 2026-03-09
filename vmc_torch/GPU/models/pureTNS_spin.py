@@ -671,22 +671,314 @@ class PEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             selected_rows, selected_cols,
         )
 
-    # ----- Export override for pytree unflatten -----
+    # ----- Export + compile for reuse patterns -----
 
-    def _amplitude_for_export(self, x, *flat_params):
-        """Wrapper for torch.export."""
+    def export_and_compile_reuse(
+        self, example_x, mode='default', verbose=True,
+        use_log_amp=False,
+    ):
+        """Pre-export amplitude_reuse for all reuse patterns.
+
+        For a nearest-neighbor Hamiltonian on Lx x Ly lattice,
+        the possible reuse patterns are:
+          - x-dir, single row r: selected_rows=[r]   (Lx)
+          - x-dir, two rows r,r+1: selected_rows=[r,r+1] (Lx-1)
+          - y-dir, single col c: selected_cols=[c]   (Ly)
+          - y-dir, two cols c,c+1: selected_cols=[c,c+1] (Ly-1)
+        Total: 2*(Lx + Ly) - 2 patterns.
+
+        Args:
+            example_x: (N_sites,) int64 on the target device.
+            mode: torch.compile mode.
+            verbose: Print progress.
+            use_log_amp: if True, export amplitude_reuse_log.
+        """
         import quimb as qu
+        from torch.export import export
 
-        p = qu.utils.tree_unflatten(
-            list(flat_params), self.params_pytree,
-        )
-        return self.amplitude(x, p)
+        self._compiled_reuse = {}
+        self._compiled_reuse_log_amp = use_log_amp
+        device = example_x.device
+
+        # Compute example bMPS params for slicing
+        x_batch = example_x.unsqueeze(0)  # (1, N_sites)
+        bMPS_x, bMPS_y = self.cache_bMPS_params_vmap(x_batch)
+
+        params_list = list(self.params)
+        n_tn_params = len(params_list)
+
+        patterns = []
+        for direction in ('x', 'y'):
+            L = self.Lx if direction == 'x' else self.Ly
+            for width in (1, 2):
+                for start in range(L - width + 1):
+                    indices = tuple(
+                        range(start, start + width)
+                    )
+                    patterns.append((direction, indices))
+
+        if verbose:
+            print(
+                f"Exporting {len(patterns)} reuse patterns "
+                f"for {self.Lx}x{self.Ly} lattice..."
+            )
+
+        for pat_idx, (direction, indices) in enumerate(
+            patterns
+        ):
+            if direction == 'x':
+                bMPS_keys = [
+                    ('xmin', min(indices)),
+                    ('xmax', max(indices)),
+                ]
+                bMPS_min_batched = bMPS_x[bMPS_keys[0]]
+                bMPS_max_batched = bMPS_x[bMPS_keys[1]]
+                in_dims_min = (
+                    self.bMPS_params_x_in_dims[bMPS_keys[0]]
+                )
+                in_dims_max = (
+                    self.bMPS_params_x_in_dims[bMPS_keys[1]]
+                )
+            else:
+                bMPS_keys = [
+                    ('ymin', min(indices)),
+                    ('ymax', max(indices)),
+                ]
+                bMPS_min_batched = bMPS_y[bMPS_keys[0]]
+                bMPS_max_batched = bMPS_y[bMPS_keys[1]]
+                in_dims_min = (
+                    self.bMPS_params_y_in_dims[bMPS_keys[0]]
+                )
+                in_dims_max = (
+                    self.bMPS_params_y_in_dims[bMPS_keys[1]]
+                )
+
+            # Extract single-sample bMPS params for export
+            bMPS_min_single = qu.utils.tree_map(
+                lambda t: t[0], bMPS_min_batched,
+            )
+            bMPS_max_single = qu.utils.tree_map(
+                lambda t: t[0], bMPS_max_batched,
+            )
+
+            # Flatten bMPS params for export
+            bMPS_min_flat, bMPS_min_pytree = (
+                qu.utils.tree_flatten(
+                    bMPS_min_single, get_ref=True,
+                )
+            )
+            bMPS_max_flat, bMPS_max_pytree = (
+                qu.utils.tree_flatten(
+                    bMPS_max_single, get_ref=True,
+                )
+            )
+
+            n_min = len(bMPS_min_flat)
+            n_max = len(bMPS_max_flat)
+
+            selected_rows = (
+                list(indices) if direction == 'x' else None
+            )
+            selected_cols = (
+                list(indices) if direction == 'y' else None
+            )
+            bMPS_keys_frozen = list(bMPS_keys)
+
+            def make_wrapper(
+                _bMPS_keys, _bMPS_min_pytree,
+                _bMPS_max_pytree,
+                _n_tn, _n_min, _selected_rows,
+                _selected_cols, _direction, _use_log_amp,
+            ):
+                if _use_log_amp:
+                    reuse_fn = self.amplitude_reuse_log
+                else:
+                    reuse_fn = self.amplitude_reuse
+
+                def wrapper(x, *flat_args):
+                    tn_params = list(flat_args[:_n_tn])
+                    min_params = list(
+                        flat_args[_n_tn:_n_tn + _n_min]
+                    )
+                    max_params = list(
+                        flat_args[_n_tn + _n_min:]
+                    )
+                    bMPS_min = qu.utils.tree_unflatten(
+                        min_params, _bMPS_min_pytree,
+                    )
+                    bMPS_max = qu.utils.tree_unflatten(
+                        max_params, _bMPS_max_pytree,
+                    )
+                    if _direction == 'x':
+                        return reuse_fn(
+                            x,
+                            qu.utils.tree_unflatten(
+                                tn_params,
+                                self.params_pytree,
+                            ),
+                            bMPS_keys=_bMPS_keys,
+                            bMPS_params_xmin=bMPS_min,
+                            bMPS_params_xmax=bMPS_max,
+                            selected_rows=_selected_rows,
+                        )
+                    else:
+                        return reuse_fn(
+                            x,
+                            qu.utils.tree_unflatten(
+                                tn_params,
+                                self.params_pytree,
+                            ),
+                            bMPS_keys=_bMPS_keys,
+                            bMPS_params_ymin=bMPS_min,
+                            bMPS_params_ymax=bMPS_max,
+                            selected_cols=_selected_cols,
+                        )
+                return wrapper
+
+            wrapper_fn = make_wrapper(
+                bMPS_keys_frozen, bMPS_min_pytree,
+                bMPS_max_pytree,
+                n_tn_params, n_min,
+                selected_rows, selected_cols, direction,
+                use_log_amp,
+            )
+
+            # Export
+            import torch.nn as nn_mod
+
+            class _ReuseModule(nn_mod.Module):
+                def __init__(self_, fn):
+                    super().__init__()
+                    self_._fn = fn
+
+                def forward(self_, x, *flat_args):
+                    return self_._fn(x, *flat_args)
+
+            all_flat_args = (
+                params_list + bMPS_min_flat + bMPS_max_flat
+            )
+
+            try:
+                with torch.no_grad():
+                    exported = export(
+                        _ReuseModule(wrapper_fn),
+                        (example_x, *all_flat_args),
+                    )
+                exported_module = exported.module()
+
+                # Move CPU constants to GPU
+                self._move_exported_constants_to_device(
+                    device,
+                    exported_module=exported_module,
+                )
+
+                # Flatten in_dims for bMPS params
+                in_dims_min_flat, _ = (
+                    qu.utils.tree_flatten(
+                        in_dims_min, get_ref=True,
+                    )
+                )
+                in_dims_max_flat, _ = (
+                    qu.utils.tree_flatten(
+                        in_dims_max, get_ref=True,
+                    )
+                )
+
+                in_dims_tuple = (
+                    (0,)  # x batched
+                    + tuple([None] * n_tn_params)
+                    + tuple(in_dims_min_flat)
+                    + tuple(in_dims_max_flat)
+                )
+
+                vmapped = torch.vmap(
+                    exported_module,
+                    in_dims=in_dims_tuple,
+                )
+                compiled = torch.compile(
+                    vmapped, mode=mode,
+                )
+
+                key = (direction, indices)
+                self._compiled_reuse[key] = {
+                    'fn': compiled,
+                    'bMPS_min_pytree': bMPS_min_pytree,
+                    'bMPS_max_pytree': bMPS_max_pytree,
+                    'n_tn': n_tn_params,
+                    'n_min': n_min,
+                    'bMPS_keys': bMPS_keys_frozen,
+                }
+
+                if verbose:
+                    print(
+                        f"  [{pat_idx+1}/{len(patterns)}] "
+                        f"({direction}, {indices}) OK"
+                    )
+            except Exception as e:
+                if verbose:
+                    print(
+                        f"  [{pat_idx+1}/{len(patterns)}] "
+                        f"({direction}, {indices}) FAILED: "
+                        f"{e}"
+                    )
+
+        if verbose:
+            print(
+                f"Exported {len(self._compiled_reuse)}"
+                f"/{len(patterns)} patterns"
+            )
+
+    def _move_exported_constants_to_device(
+        self, device, exported_module=None,
+    ):
+        """Move CPU constants in exported graph to GPU.
+
+        Extended to accept an external exported_module for
+        reuse patterns.
+        """
+        if exported_module is None:
+            super()._move_exported_constants_to_device(
+                device
+            )
+            return
+
+        gm = exported_module
+        graph = gm.graph
+        for node in graph.nodes:
+            if node.op != 'get_attr':
+                continue
+            parts = node.target.split('.')
+            parent = gm
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            leaf = parts[-1]
+            tensor = getattr(parent, leaf)
+            if (
+                isinstance(tensor, torch.Tensor)
+                and tensor.device.type == 'cpu'
+            ):
+                setattr(parent, leaf, tensor.to(device))
+
+        for node in graph.nodes:
+            if node.op != 'call_function':
+                continue
+            if '_assert_tensor_metadata' not in str(
+                node.target
+            ):
+                continue
+            kw = dict(node.kwargs)
+            if kw.get('device') == torch.device('cpu'):
+                kw['device'] = device
+                node.kwargs = kw
+
+        graph.lint()
+        gm.recompile()
 
     # ----- forward -----
 
     def forward(self, x):
         """Compiled full-contraction forward (no reuse)."""
-        if self._exported:
+        if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
                 return self._vmapped_compiled(
@@ -706,7 +998,72 @@ class PEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         selected_rows=None,
         selected_cols=None,
     ):
-        """Reuse forward path (eager vmap)."""
+        """Reuse forward — compiled if available, else eager."""
+        import quimb as qu
+
+        # Determine the reuse key
+        if selected_rows is not None:
+            key = ('x', tuple(selected_rows))
+            bMPS_keys = [
+                ('xmin', min(selected_rows)),
+                ('xmax', max(selected_rows)),
+            ]
+            bMPS_params_xmin = bMPS_params_x_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_xmax = bMPS_params_x_batched[
+                bMPS_keys[1]
+            ]
+        elif selected_cols is not None:
+            key = ('y', tuple(selected_cols))
+            bMPS_keys = [
+                ('ymin', min(selected_cols)),
+                ('ymax', max(selected_cols)),
+            ]
+            bMPS_params_ymin = bMPS_params_y_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_ymax = bMPS_params_y_batched[
+                bMPS_keys[1]
+            ]
+        else:
+            key = None
+
+        # Try compiled path (only for amplitude, not log)
+        if (
+            key is not None
+            and hasattr(self, '_compiled_reuse')
+            and key in self._compiled_reuse
+            and not getattr(
+                self, '_compiled_reuse_log_amp', False
+            )
+        ):
+            entry = self._compiled_reuse[key]
+            params_list = list(self.params)
+
+            if selected_rows is not None:
+                bMPS_min_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_xmin, get_ref=True,
+                )
+                bMPS_max_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_xmax, get_ref=True,
+                )
+            else:
+                bMPS_min_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_ymin, get_ref=True,
+                )
+                bMPS_max_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_ymax, get_ref=True,
+                )
+
+            return entry['fn'](
+                x,
+                *params_list,
+                *bMPS_min_flat,
+                *bMPS_max_flat,
+            )
+
+        # Fallback to eager
         bMPS_params_xmin = None
         bMPS_params_xmax = None
         bMPS_params_ymin = None
@@ -755,14 +1112,72 @@ class PEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         selected_rows=None,
         selected_cols=None,
     ):
-        """Log-amplitude variant of forward_reuse.
+        """Log-amplitude reuse — compiled if available."""
+        import quimb as qu
 
-        Uses native strip_exponent via vamp_reuse_log for
-        numerically stable log-amplitude.
+        # Determine the reuse key
+        if selected_rows is not None:
+            key = ('x', tuple(selected_rows))
+            bMPS_keys = [
+                ('xmin', min(selected_rows)),
+                ('xmax', max(selected_rows)),
+            ]
+            bMPS_params_xmin = bMPS_params_x_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_xmax = bMPS_params_x_batched[
+                bMPS_keys[1]
+            ]
+        elif selected_cols is not None:
+            key = ('y', tuple(selected_cols))
+            bMPS_keys = [
+                ('ymin', min(selected_cols)),
+                ('ymax', max(selected_cols)),
+            ]
+            bMPS_params_ymin = bMPS_params_y_batched[
+                bMPS_keys[0]
+            ]
+            bMPS_params_ymax = bMPS_params_y_batched[
+                bMPS_keys[1]
+            ]
+        else:
+            key = None
 
-        Returns:
-            (signs, log_abs): each (B,) float64.
-        """
+        # Try compiled path (only for log-amp)
+        if (
+            key is not None
+            and hasattr(self, '_compiled_reuse')
+            and key in self._compiled_reuse
+            and getattr(
+                self, '_compiled_reuse_log_amp', False
+            )
+        ):
+            entry = self._compiled_reuse[key]
+            params_list = list(self.params)
+
+            if selected_rows is not None:
+                bMPS_min_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_xmin, get_ref=True,
+                )
+                bMPS_max_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_xmax, get_ref=True,
+                )
+            else:
+                bMPS_min_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_ymin, get_ref=True,
+                )
+                bMPS_max_flat, _ = qu.utils.tree_flatten(
+                    bMPS_params_ymax, get_ref=True,
+                )
+
+            return entry['fn'](
+                x,
+                *params_list,
+                *bMPS_min_flat,
+                *bMPS_max_flat,
+            )
+
+        # Fallback to eager
         bMPS_params_xmin = None
         bMPS_params_xmax = None
         bMPS_params_ymin = None
@@ -1168,3 +1583,120 @@ class PEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             x, params, col_id,
             bMPS_params_y_batched, from_which,
         )
+
+    # ----- Cheap gradient via hole contraction -----
+
+    def cheap_grad_single(self, x, params, bMPS_params_x):
+        """Single-sample cheap gradient via per-row hole contraction.
+
+        For pure TNS, psi(x) is linear in each row's tensors.
+        The bMPS environments are treated as constants (no grad
+        through SVDs). For each row, we differentiate the small
+        contraction (bMPS_below | row_tensors | bMPS_above) w.r.t.
+        the full params pytree. Only the current row's params get
+        non-zero gradients.
+
+        Requires chi >= 4*D for accurate boundary environments.
+
+        Args:
+            x: (N_sites,) int64 — one configuration
+            params: quimb pytree of TN params
+            bMPS_params_x: dict {('xmin', r): flat_params,
+                ('xmax', r): flat_params} for all rows r
+
+        Returns:
+            (grad_flat, amp): gradient (Np,) and scalar amplitude
+        """
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        # Compute amplitude from midpoint bMPS envs
+        mid = self.Lx // 2
+        bMPS_mid_below = unpack_tn(
+            bMPS_params_x[('xmin', mid)],
+            self.bMPS_x_skeletons[('xmin', mid)],
+        )
+        bMPS_mid_above = unpack_tn(
+            bMPS_params_x[('xmax', mid - 1)],
+            self.bMPS_x_skeletons[('xmax', mid - 1)],
+        )
+        amp_val = (bMPS_mid_below | bMPS_mid_above).contract()
+
+        # Accumulate gradients row by row.
+        # Use flatten/unflatten since qu.utils.tree_map
+        # only maps over a single tree.
+        accum_flat, accum_ref = qu.utils.tree_flatten(
+            qu.utils.tree_map(torch.zeros_like, params),
+            get_ref=True,
+        )
+
+        for row in range(self.Lx):
+            bk_below = ('xmin', row)
+            bk_above = ('xmax', row)
+            bp_below = bMPS_params_x[bk_below]
+            bp_above = bMPS_params_x[bk_above]
+            sk_below = self.bMPS_x_skeletons[bk_below]
+            sk_above = self.bMPS_x_skeletons[bk_above]
+
+            # Capture loop vars via defaults
+            def row_fn(
+                p,
+                _bp_below=bp_below,
+                _bp_above=bp_above,
+                _sk_below=sk_below,
+                _sk_above=sk_above,
+                _row=row,
+            ):
+                tns = qtn.unpack(p, self.skeleton)
+                amp = tns.isel({
+                    tns.site_ind(site): x[i]
+                    for i, site in enumerate(tns.sites)
+                })
+                b_below = unpack_tn(
+                    _bp_below, _sk_below,
+                )
+                b_above = unpack_tn(
+                    _bp_above, _sk_above,
+                )
+                row_ts = amp.select(
+                    tns.row_tag(_row), which='any',
+                )
+                amp_reuse = (
+                    b_below | row_ts | b_above
+                )
+                return amp_reuse.contract()
+
+            row_grad = torch.func.grad(row_fn)(params)
+            row_grad_flat = qu.utils.tree_flatten(
+                row_grad,
+            )
+            accum_flat = [
+                a + g
+                for a, g in zip(accum_flat, row_grad_flat)
+            ]
+
+        # Flatten to (Np,)
+        grad_flat = torch.cat(
+            [g.flatten() for g in accum_flat],
+        )
+        return grad_flat, amp_val
+
+    def compute_cheap_grads_vmap(
+        self, fxs, bMPS_params_x,
+    ):
+        """Batched cheap gradient via vmap over cheap_grad_single.
+
+        Args:
+            fxs: (B, N_sites) int64
+            bMPS_params_x: batched dict from cache_bMPS_params_vmap
+
+        Returns:
+            (grads, amps): (B, Np) and (B,)
+        """
+        params = self._vamp_params_preprocess(self.params)
+        return torch.vmap(
+            self.cheap_grad_single,
+            in_dims=(
+                0, None, self.bMPS_params_x_in_dims,
+            ),
+        )(fxs, params, bMPS_params_x)

@@ -4,8 +4,6 @@ Run:
     torchrun --nproc_per_node=<N> vmc_run_spin.py
     torchrun --nproc_per_node=1 vmc_run_spin.py   # single GPU
 """
-from dataclasses import dataclass
-
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -34,26 +32,27 @@ from vmc_torch.GPU.vmc_setup import (
     random_spin_config_sz0,
     setup_linalg_hooks,
 )
+from vmcconfig import VMCConfig
 
 dtype = torch.float64
 
-
-@dataclass
-class VMCConfig:
-    """VMC numerical / training settings."""
-
-    batch_size: int = 128
-    ns_per_rank: int = 128
-    grad_batch_size: int = 64
-    vmc_steps: int = 50
-    learning_rate: float = 0.1
-    diag_shift: float = 1e-4
-    burn_in_steps: int = 0
-    use_export_compile: bool = False
-    sr_rtol: float = 1e-4
-    sr_maxiter: int = 100
-    use_scipy: bool = False
-    use_log_amp: bool = True
+vmc_cfg = vmc_cfg = VMCConfig(
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=1024,
+    vmc_steps=1000,
+    burn_in_steps=1,
+    learning_rate=0.1,
+    sr_diag_shift=5e-4,
+    use_distributed_sr_minres=True,
+    sr_tol=1e-4,
+    offload_grad_to_cpu=True,
+    use_log_amp=True,
+    use_export_compile=True,
+    save_every=10,
+    resume_step=0,
+    verbose=False,
+)
 
 
 def main():
@@ -118,9 +117,6 @@ def main():
                 f"{world_size} GPUs | {device}"
             )
 
-        # ========== VMC settings ==========
-        vmc_cfg = VMCConfig()
-
         # Export + compile (optional)
         if vmc_cfg.use_export_compile:
             example_x = random_spin_config_sz0(
@@ -130,6 +126,7 @@ def main():
                 print("Running torch.export + compile...")
             model.export_and_compile(
                 example_x, mode='default',
+                use_log_amp=vmc_cfg.use_log_amp,
             )
 
         print_sampling_settings(
@@ -155,7 +152,7 @@ def main():
             preconditioner=DistributedSRMinresGPU(
                 rtol=vmc_cfg.sr_rtol,
                 maxiter=vmc_cfg.sr_maxiter,
-                use_scipy=vmc_cfg.use_scipy,
+                use_scipy=vmc_cfg.minres_sr_use_scipy,
             ),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
@@ -182,18 +179,10 @@ def main():
             graph=graph,
             rank=rank,
             world_size=world_size,
-            config=VMCLoopConfig(
-                vmc_steps=vmc_cfg.vmc_steps,
-                ns_per_rank=vmc_cfg.ns_per_rank,
-                grad_batch_size=vmc_cfg.grad_batch_size,
+            config=VMCLoopConfig.from_vmc_config(
+                vmc_cfg,
                 n_params=N_params,
                 nsites=N_sites,
-                learning_rate=vmc_cfg.learning_rate,
-                diag_shift=vmc_cfg.diag_shift,
-                burn_in_steps=vmc_cfg.burn_in_steps,
-                run_sr=True,
-                use_export_compile=vmc_cfg.use_export_compile,
-                use_log_amp=vmc_cfg.use_log_amp,
             ),
         )
 

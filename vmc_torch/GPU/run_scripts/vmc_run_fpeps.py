@@ -9,7 +9,6 @@ Run:
 """
 import json
 import os
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -46,53 +45,41 @@ from vmc_torch.GPU.vmc_utils import (
     evaluate_energy,
     random_initial_config,
 )
+from vmcconfig import VMCConfig
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
     '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
 )
 
-
-@dataclass
-class VMCConfig:
-    """VMC numerical / training settings."""
-
-    batch_size: int = 256
-    ns_per_rank: int = 256
-    grad_batch_size: int = 1
-    vmc_steps: int = 1000
-    learning_rate: float = 0.1
-    diag_shift: float = 1e-4
-    burn_in_steps: int = 1
-    use_export_compile: bool = False  # full-contraction export
-    use_export_compile_reuse: bool = False  # reuse export + compile patterns
-    use_min_sr: bool = False
-    use_distributed_min_sr: bool = False
-    use_distributed_sr_minres: bool = True
-    minres_sr_use_scipy: bool = False
-    sr_rtol: float = 1e-4
-    sr_maxiter: int = 100
-    save_every: int = 50
-    resume_step: int = 0
-    debug: bool = False
-    outlier_clip_factor: float = 1e4 # drop O_loc outliers > factor * median
-    run_sr: bool = True
-    use_log_amp: bool = True
-    lr_scheduler: object = None  # set after construction
-    verbose: bool = True
-    
-vmc_cfg = VMCConfig()
+vmc_cfg = VMCConfig(
+    batch_size=4096,
+    ns_per_rank=4096,
+    grad_batch_size=1024,
+    vmc_steps=1000,
+    burn_in_steps=5,
+    learning_rate=0.1,
+    sr_diag_shift=5e-4,
+    use_distributed_sr_minres=True,
+    sr_rtol=1e-4,
+    offload_grad_to_cpu=True,
+    use_log_amp=True,
+    use_export_compile=True,
+    save_every=10,
+    resume_step=0,
+    verbose=False,
+)
 vmc_cfg.lr_scheduler = DecayScheduler(
     init_lr=vmc_cfg.learning_rate,
     decay_rate=0.9, patience=50,
 )
 warmup_cfg = VMCWarmupConfig(
-    use_export_compile=VMCConfig.use_export_compile,
-    grad_batch_size=VMCConfig.grad_batch_size,
+    use_export_compile=vmc_cfg.use_export_compile,
+    grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    run_sampling=True,
+    run_sampling=False,
     run_locE=False,
-    run_grad=True,
+    run_grad=False,
 )
 
 def main():
@@ -110,14 +97,14 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 8, 8
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 8
+        N_f = N_sites - 2
         n_fermions_per_spin = (N_f // 2, N_f // 2)
         D = 4  # PEPS bond dimension (start small)
-        chi = 16  # boundary bond dim
+        chi = -1  # boundary bond dim
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -198,22 +185,24 @@ def main():
         if rank == 0:
             print("Initializing bMPS skeleton...")
 
-        # ========== Export + compile reuse (optional) ==========
-        if vmc_cfg.use_export_compile_reuse:
-            if rank == 0:
-                print("Exporting reuse patterns...")
-            model.export_and_compile_reuse(
-                example_x, mode='default',
-                verbose=(rank == 0),
-            )
-
         # ========== Export + compile full contraction ==========
         if vmc_cfg.use_export_compile:
+            example_x = random_initial_config(
+                N_f, N_sites, seed=0,
+            ).to(device)
             if rank == 0:
                 print("Running torch.export + compile...")
+            import time as _time
+            _t0 = _time.time()
             model.export_and_compile(
-                example_x, mode='default',
+                example_x,
+                use_log_amp=vmc_cfg.use_log_amp,
             )
+            if rank == 0:
+                print(
+                    f"Export + compile done in "
+                    f"{_time.time() - _t0:.1f}s"
+                )
 
         print_sampling_settings(
             rank,
@@ -253,6 +242,24 @@ def main():
             'error': [],
             'variance': [],
         }
+        
+        # ========== Data-saving callback ==========
+        def on_step_end(info):
+            if rank != 0:
+                return
+            stats['mean'].append(info['energy_per_site'])
+            stats['error'].append(info['error_per_site'])
+            stats['variance'].append(info['energy_var'])
+            with open(stats_file, 'w') as f:
+                json.dump(stats, f, indent=4)
+
+            step = info['step']
+            if (step + 1) % vmc_cfg.save_every == 0:
+                ckpt_path = os.path.join(
+                    output_dir,
+                    f'checkpoint_{model_name}_{step + 1}.pt',
+                )
+                torch.save(model.state_dict(), ckpt_path)
 
         # ========== VMC driver ==========
         if vmc_cfg.use_distributed_min_sr:
@@ -287,24 +294,6 @@ def main():
             rank=rank,
             config=warmup_cfg,
         )
-
-        # ========== Data-saving callback ==========
-        def on_step_end(info):
-            if rank != 0:
-                return
-            stats['mean'].append(info['energy_per_site'])
-            stats['error'].append(info['error_per_site'])
-            stats['variance'].append(info['energy_var'])
-            with open(stats_file, 'w') as f:
-                json.dump(stats, f, indent=4)
-
-            step = info['step']
-            if (step + 1) % vmc_cfg.save_every == 0:
-                ckpt_path = os.path.join(
-                    output_dir,
-                    f'checkpoint_{model_name}_{step + 1}.pt',
-                )
-                torch.save(model.state_dict(), ckpt_path)
 
         energy_history, _ = vmc.run_vmc_loop(
             fxs=fxs,

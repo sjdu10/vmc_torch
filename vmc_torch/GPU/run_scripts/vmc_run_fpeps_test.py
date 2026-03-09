@@ -9,7 +9,6 @@ Run:
 """
 import json
 import os
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -46,49 +45,37 @@ from vmc_torch.GPU.vmc_utils import (
     evaluate_energy,
     random_initial_config,
 )
+from vmcconfig import VMCConfig
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
     '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
 )
 
-
-@dataclass
-class VMCConfig:
-    """VMC numerical / training settings."""
-
-    batch_size: int = 8
-    ns_per_rank: int = 8
-    grad_batch_size: int = 8
-    vmc_steps: int = 1000
-    learning_rate: float = 0.1
-    diag_shift: float = 1e-4
-    burn_in_steps: int = 1
-    use_export_compile: bool = False  # full-contraction export
-    use_export_compile_reuse: bool = False  # reuse export + compile patterns
-    use_min_sr: bool = False
-    use_distributed_min_sr: bool = False
-    use_distributed_sr_minres: bool = True
-    minres_sr_use_scipy: bool = False
-    sr_rtol: float = 1e-4
-    sr_maxiter: int = 100
-    save_every: int = 50
-    resume_step: int = 0
-    debug: bool = False
-    outlier_clip_factor: float = 1e4 # drop O_loc outliers > factor * median
-    run_sr: bool = True
-    use_log_amp: bool = True
-    lr_scheduler: object = None  # set after construction
-    verbose: bool = True
-    
-vmc_cfg = VMCConfig()
+vmc_cfg = VMCConfig(
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=1024,
+    vmc_steps=1000,
+    burn_in_steps=1,
+    learning_rate=0.1,
+    sr_diag_shift=5e-4,
+    use_distributed_sr_minres=True,
+    sr_rtol=1e-4,
+    offload_grad_to_cpu=True,
+    use_log_amp=True,
+    use_export_compile=True,
+    save_every=10,
+    resume_step=0,
+    verbose=False,
+)
 vmc_cfg.lr_scheduler = DecayScheduler(
     init_lr=vmc_cfg.learning_rate,
     decay_rate=0.9, patience=50,
 )
 warmup_cfg = VMCWarmupConfig(
-    use_export_compile=VMCConfig.use_export_compile,
-    grad_batch_size=VMCConfig.grad_batch_size,
+    use_export_compile=vmc_cfg.use_export_compile,
+    grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
     run_sampling=False,
     run_locE=False,
@@ -205,6 +192,7 @@ def main():
             model.export_and_compile_reuse(
                 example_x, mode='default',
                 verbose=(rank == 0),
+                use_log_amp=vmc_cfg.use_log_amp,
             )
 
         # ========== Export + compile full contraction ==========
@@ -213,6 +201,7 @@ def main():
                 print("Running torch.export + compile...")
             model.export_and_compile(
                 example_x, mode='default',
+                use_log_amp=vmc_cfg.use_log_amp,
             )
 
         print_sampling_settings(

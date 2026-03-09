@@ -9,7 +9,6 @@ Run:
 """
 import json
 import os
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -37,6 +36,7 @@ from vmc_torch.GPU.vmc_setup import (
     initialize_walkers,
 )
 from vmc_torch.GPU.vmc_utils import random_initial_config
+from vmcconfig import VMCConfig
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
@@ -44,28 +44,27 @@ DEFAULT_DATA_ROOT = (
     '/GPU/data'
 )
 
-
-@dataclass
-class VMCConfig:
-    """VMC numerical / training settings."""
-
-    batch_size: int = 4096
-    ns_per_rank: int = 4096
-    grad_batch_size: int = 4096
-    vmc_steps: int = 100
-    learning_rate: float = 0.1
-    diag_shift: float = 1e-4
-    burn_in_steps: int = 4
-    use_export_compile: bool = True
-    use_min_sr: bool = False  # MinSR if Ns<Np, I prefer minres over MinSR
-    sr_rtol: float = 1e-4
-    sr_maxiter: int = 100
-    save_every: int = 10
-    debug: bool = False
-    outlier_clip_factor: float = 100.0 # drop log_psi_grad outliers > factor * median
-    run_sr: bool = True
-    use_log_amp: bool = True
-    lr_scheduler: object = None  # set after construction
+vmc_cfg = VMCConfig(
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=1024,
+    vmc_steps=1000,
+    burn_in_steps=1,
+    learning_rate=0.1,
+    sr_diag_shift=5e-4,
+    use_distributed_sr_minres=True,
+    sr_rtol=1e-4,
+    offload_grad_to_cpu=True,
+    use_log_amp=True,
+    use_export_compile=True,
+    save_every=10,
+    resume_step=0,
+    verbose=False,
+)
+vmc_cfg.lr_scheduler = DecayScheduler(
+    init_lr=vmc_cfg.learning_rate,
+    decay_rate=0.9, patience=50,
+)
 
 
 def main():
@@ -119,12 +118,6 @@ def main():
                 f"{world_size} GPUs | {device}"
             )
 
-        vmc_cfg = VMCConfig()
-        vmc_cfg.lr_scheduler = DecayScheduler(
-            init_lr=vmc_cfg.learning_rate,
-            decay_rate=0.9, patience=50,
-        )
-
         # ========== Output directory ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
@@ -140,7 +133,10 @@ def main():
             ).to(device)
             if rank == 0:
                 print("Running torch.export + compile...")
-            model.export_and_compile(example_x, mode='default')
+            model.export_and_compile(
+                example_x, mode='default',
+                use_log_amp=vmc_cfg.use_log_amp,
+            )
 
         print_sampling_settings(
             rank,
@@ -229,23 +225,10 @@ def main():
             graph=graph,
             rank=rank,
             world_size=world_size,
-            config=VMCLoopConfig(
-                vmc_steps=vmc_cfg.vmc_steps,
-                ns_per_rank=vmc_cfg.ns_per_rank,
-                grad_batch_size=vmc_cfg.grad_batch_size,
+            config=VMCLoopConfig.from_vmc_config(
+                vmc_cfg,
                 n_params=N_params,
                 nsites=N_sites,
-                learning_rate=vmc_cfg.learning_rate,
-                diag_shift=vmc_cfg.diag_shift,
-                burn_in_steps=vmc_cfg.burn_in_steps,
-                run_sr=vmc_cfg.run_sr,
-                use_min_sr=vmc_cfg.use_min_sr,
-                use_export_compile=vmc_cfg.use_export_compile,
-                step_offset=0,
-                debug=vmc_cfg.debug,
-                outlier_clip_factor=vmc_cfg.outlier_clip_factor,
-                use_log_amp=vmc_cfg.use_log_amp,
-                lr_scheduler=vmc_cfg.lr_scheduler,
             ),
             on_step_end=on_step_end,
         )

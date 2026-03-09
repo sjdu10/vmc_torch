@@ -44,6 +44,7 @@ class WavefunctionModel_GPU(nn.Module):
         ])
         self._compiled = False
         self._exported = False
+        self._exported_log_amp = False
 
         # Pre-vmap the single-sample amplitude function
         self._vmapped_amplitude = torch.vmap(
@@ -120,14 +121,19 @@ class WavefunctionModel_GPU(nn.Module):
         return self._vmapped_log_amplitude(x, params)
 
     def forward_log(self, x):
-        """Batched log-amplitude dispatch: returns (signs, log_abs) each (B,)."""
+        """Dispatch: compiled -> exported -> eager for log-amplitude."""
+        if self._exported and self._exported_log_amp:
+            params_list = list(self.params)
+            if self._compiled:
+                return self._vmapped_compiled(x, *params_list)
+            return self._vmapped_exported(x, *params_list)
         return self.vamp_log(x, self.params)
 
     # ----- Provided for free -----
 
     def forward(self, x):
         """Dispatch: compiled -> exported -> eager."""
-        if self._exported:
+        if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
                 return self._vmapped_compiled(x, *params_list)
@@ -140,7 +146,16 @@ class WavefunctionModel_GPU(nn.Module):
 
         Single-sample: x is (N_sites,), returns scalar.
         """
-        return self.amplitude(x, list(flat_params))
+        p = self._vamp_params_preprocess(list(flat_params))
+        return self.amplitude(x, p)
+
+    def _log_amplitude_for_export(self, x, *flat_params):
+        """Wrapper for torch.export: log_amplitude with flat *args.
+
+        Single-sample: x is (N_sites,), returns (sign, log_abs).
+        """
+        p = self._vamp_params_preprocess(list(flat_params))
+        return self.log_amplitude(x, p)
 
     def _move_exported_constants_to_device(self, device):
         """Move CPU constants in the exported graph to GPU.
@@ -184,7 +199,8 @@ class WavefunctionModel_GPU(nn.Module):
         gm.recompile()
 
     def export_and_compile(
-        self, example_x, mode='default', **compile_kwargs,
+        self, example_x, mode='default',
+        use_log_amp=False, **compile_kwargs,
     ):
         """Export + compile the amplitude function for GPU speedup.
 
@@ -200,10 +216,18 @@ class WavefunctionModel_GPU(nn.Module):
                 on the target device.
             mode: torch.compile mode ('default', 'reduce-overhead',
                 'max-autotune').
+            use_log_amp: if True, export log_amplitude instead of
+                amplitude. forward_log() will dispatch to compiled
+                path; forward() will fall back to eager.
         """
         from torch.export import export
 
         params_list = list(self.params)
+
+        if use_log_amp:
+            export_fn = self._log_amplitude_for_export
+        else:
+            export_fn = self._amplitude_for_export
 
         class _AmpModule(nn.Module):
             def __init__(self_, amp_fn):
@@ -215,7 +239,7 @@ class WavefunctionModel_GPU(nn.Module):
 
         with torch.no_grad():
             exported = export(
-                _AmpModule(self._amplitude_for_export),
+                _AmpModule(export_fn),
                 (example_x, *params_list),
             )
         self._exported_module = exported.module()
@@ -235,12 +259,18 @@ class WavefunctionModel_GPU(nn.Module):
 
         self._exported = True
         self._compiled = True
+        self._exported_log_amp = use_log_amp
 
-    def export_only(self, example_x):
+    def export_only(self, example_x, use_log_amp=False):
         """Export + vmap without compile.  Useful for debugging."""
         from torch.export import export
 
         params_list = list(self.params)
+
+        if use_log_amp:
+            export_fn = self._log_amplitude_for_export
+        else:
+            export_fn = self._amplitude_for_export
 
         class _AmpModule(nn.Module):
             def __init__(self_, amp_fn):
@@ -252,7 +282,7 @@ class WavefunctionModel_GPU(nn.Module):
 
         with torch.no_grad():
             exported = export(
-                _AmpModule(self._amplitude_for_export),
+                _AmpModule(export_fn),
                 (example_x, *params_list),
             )
         self._exported_module = exported.module()
@@ -264,6 +294,7 @@ class WavefunctionModel_GPU(nn.Module):
             in_dims=(0, *([None] * n_params)),
         )
         self._exported = True
+        self._exported_log_amp = use_log_amp
 
     def compile_model(self, mode='reduce-overhead', **kwargs):
         """Wrap vmap(eager) with torch.compile (no export step)."""
