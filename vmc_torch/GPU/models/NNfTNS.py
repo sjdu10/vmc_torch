@@ -292,6 +292,17 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
         if contract_boundary_opts is None:
             contract_boundary_opts = {}
 
+        if tn.tensors[0].data.indices[-1]._linearmap is not None:
+            for ts in tn.tensors:
+                ts_data = ts.data
+                ts_data.indices[-1]._linearmap = None
+                ts.modify(data=ts_data)
+            self._loc_basis_perm = torch.tensor(
+                [0, 2, 3, 1], dtype=torch.long
+            )
+        else:
+            self._loc_basis_perm = None
+
         self.dtype = dtype
         self.chi = max_bond
         self.nn_eta = nn_eta
@@ -393,6 +404,8 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
         )
         tn = qtn.unpack(params_pytree, self.skeleton)
 
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp_tn = tn.isel({
             tn.site_ind(site): x[i]
             for i, site in enumerate(tn.sites)

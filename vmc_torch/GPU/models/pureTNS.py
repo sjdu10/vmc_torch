@@ -47,6 +47,18 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
 
         if contract_boundary_opts is None:
             contract_boundary_opts = {}
+        
+        if tn.tensors[0].data.indices[-1]._linearmap is not None:
+            for ts in tn.tensors:
+                ts_data = ts.data
+                ts_data.indices[-1]._linearmap = None
+                ts.modify(data=ts_data)
+            # config value k -> physical index perm[k]
+            self._loc_basis_perm = torch.tensor(
+                [0, 2, 3, 1], dtype=torch.long
+            )
+        else:
+            self._loc_basis_perm = None
 
         params, skeleton = qtn.pack(tn)
         self.dtype = dtype
@@ -79,6 +91,9 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
         import quimb.tensor as qtn
 
         tn = qtn.unpack(params, self.skeleton)
+        # apply local basis permutation (no-op if _loc_basis_perm is None)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp = tn.isel({
             tn.site_ind(site): x[i]
             for i, site in enumerate(tn.sites)
@@ -95,7 +110,7 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
                 **self.contract_boundary_opts,
             )
         return amp.contract()
-    
+
     def log_amplitude(self, x, params):
         """Single-sample log-amplitude via quimb TN contraction.
 
@@ -109,6 +124,8 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
         import quimb.tensor as qtn
 
         tn = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp = tn.isel({
             tn.site_ind(site): x[i]
             for i, site in enumerate(tn.sites)
@@ -168,6 +185,17 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
         if contract_boundary_opts is None:
             contract_boundary_opts = {}
+
+        if tn.tensors[0].data.indices[-1]._linearmap is not None:
+            for ts in tn.tensors:
+                ts_data = ts.data
+                ts_data.indices[-1]._linearmap = None
+                ts.modify(data=ts_data)
+            self._loc_basis_perm = torch.tensor(
+                [0, 2, 3, 1], dtype=torch.long
+            )
+        else:
+            self._loc_basis_perm = None
 
         params, skeleton = qtn.pack(tn)
         self.dtype = dtype
@@ -231,6 +259,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         import quimb.tensor as qtn
 
         tn = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp = tn.isel({
             tn.site_ind(site): x[i]
             for i, site in enumerate(tn.sites)
@@ -261,6 +291,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         import quimb.tensor as qtn
 
         tn = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp = tn.isel({
             tn.site_ind(site): x[i]
             for i, site in enumerate(tn.sites)
@@ -315,6 +347,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         import quimb.tensor as qtn
 
         tns = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp = tns.isel({
             tns.site_ind(site): x[i]
             for i, site in enumerate(tns.sites)
@@ -456,6 +490,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         import quimb.tensor as qtn
 
         tns = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp = tns.isel({
             tns.site_ind(site): x[i]
             for i, site in enumerate(tns.sites)
@@ -1309,6 +1345,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             self.params, self.params_pytree
         )
         tns = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp = tns.isel({
             tns.site_ind(site): x[i]
             for i, site in enumerate(tns.sites)
@@ -1375,6 +1413,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
         def cache_bMPS_params_single(x_single, params):
             tns = qtn.unpack(params, self.skeleton)
+            if self._loc_basis_perm is not None:
+                x_single = self._loc_basis_perm[x_single]
             amp = tns.isel({
                 tns.site_ind(site): x_single[i]
                 for i, site in enumerate(tns.sites)
@@ -1419,6 +1459,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
         def cache_bMPS_params_x_single(x_single, params):
             tns = qtn.unpack(params, self.skeleton)
+            if self._loc_basis_perm is not None:
+                x_single = self._loc_basis_perm[x_single]
             amp = tns.isel({
                 tns.site_ind(site): x_single[i]
                 for i, site in enumerate(tns.sites)
@@ -1437,6 +1479,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
         def cache_bMPS_params_y_single(x_single, params):
             tns = qtn.unpack(params, self.skeleton)
+            if self._loc_basis_perm is not None:
+                x_single = self._loc_basis_perm[x_single]
             amp = tns.isel({
                 tns.site_ind(site): x_single[i]
                 for i, site in enumerate(tns.sites)
@@ -1492,6 +1536,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             x_single, params, row_id, bMPS_params_x, from_which,
         ):
             tns = qtn.unpack(params, self.skeleton)
+            if self._loc_basis_perm is not None:
+                x_single = self._loc_basis_perm[x_single]
             amp = tns.isel({
                 tns.site_ind(site): x_single[i]
                 for i, site in enumerate(tns.sites)
@@ -1587,6 +1633,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             x_single, params, col_id, bMPS_params_y, from_which,
         ):
             tns = qtn.unpack(params, self.skeleton)
+            if self._loc_basis_perm is not None:
+                x_single = self._loc_basis_perm[x_single]
             amp = tns.isel({
                 tns.site_ind(site): x_single[i]
                 for i, site in enumerate(tns.sites)
@@ -1681,6 +1729,9 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         """
         import quimb as qu
         import quimb.tensor as qtn
+
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
 
         # Compute amplitude from midpoint bMPS envs
         mid = self.Lx // 2
@@ -1786,6 +1837,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             self.params, self.params_pytree
         )
         tns = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
         amp = tns.isel({
             tns.site_ind(site): x[i]
             for i, site in enumerate(tns.sites)

@@ -63,9 +63,9 @@ class ReuseCfg(VMCConfig):
     use_cheap_grad: bool = True
 
 vmc_cfg = ReuseCfg(
-    batch_size=2048,
-    ns_per_rank=2048,
-    grad_batch_size=1024,
+    batch_size=512,
+    ns_per_rank=512,
+    grad_batch_size=512,
     vmc_steps=1000,
     burn_in_steps=1,
     learning_rate=0.1,
@@ -73,7 +73,7 @@ vmc_cfg = ReuseCfg(
     use_distributed_sr_minres=True,
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
-    use_log_amp=True,
+    use_log_amp=False,
     use_export_compile=False,
     save_every=10,
     resume_step=0,
@@ -182,8 +182,10 @@ def main():
         example_x = random_spin_config_sz0(
             N_sites, seed=0,
         ).to(device)
+        import time
+        t0 = time.time()
         model.cache_bMPS_skeleton(example_x)
-
+        print(f'Cached skeleton time={time.time()-t0}')
         # ========== Export + compile reuse (optional) =====
         if vmc_cfg.use_export_compile_reuse:
             if rank == 0:

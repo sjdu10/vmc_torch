@@ -1,5 +1,5 @@
 import os
-from vmc_torch.fermion_utils import generate_random_fpeps, u1peps_to_z2peps, generate_random_fpeps_symmray
+from vmc_torch.fermion_utils import generate_random_fpeps_symmray
 import quimb.tensor as qtn
 import symmray as sr
 import pickle
@@ -9,6 +9,64 @@ from symmray.fermionic_local_operators import (
     get_spinful_charge_indexmap,
 )
 from vmc_torch.fermion_utils import format_fpeps_keys
+
+
+# ------Symmray function utils------
+try:
+    parse_edges_to_site_info = sr.utils.parse_edges_to_site_info
+except Exception:
+    parse_edges_to_site_info = sr.parse_edges_to_site_info
+
+def farr_sector_format(farray):
+    new_blocks = {}
+    for charge_blk, data in farray.blocks.items():
+        new_charge_blk = tuple(map(int, charge_blk))
+        new_blocks[new_charge_blk] = data
+    farray.modify(blocks=new_blocks)
+    return farray
+
+def format_fpeps_keys(peps):
+    peps = peps.copy()
+    for ts in peps.tensors:
+        ts.modify(data=farr_sector_format(ts.data))
+    return peps.copy()
+
+def u1arr_to_z2arr(u1array):
+    """
+    Convert a FermionicArray with U1 symmetry to a FermionicArray with Z2 symmetry
+    """
+    def u1ind_to_z2indmap(u1indices):
+        """Mapping from ndim U1 charge block to Z2 charge block. The mapping is determined by the charge map of each U1 index block."""
+        index_maps = []
+        for blockind in u1indices:
+            index_map = {}
+            indicator = 0 #max value=blocind.size_total-1
+            for c, dim in blockind.chargemap.items():
+                for i in range(indicator, indicator+dim):
+                    index_map[i]=int(c%2)
+                indicator+=dim
+            index_maps.append(index_map)
+        print(u1indices[-1])
+        return index_maps
+    
+    u1indices = u1array.indices
+    u1charge = u1array.charge
+    u1dummy_modes = u1array.dummy_modes
+    u1duals = u1array.duals
+    index_maps = u1ind_to_z2indmap(u1indices)
+    print(index_maps[-1])
+    z2array=sr.Z2FermionicArray.from_dense(u1array.to_dense(), index_maps=index_maps, duals=u1duals, charge=u1charge%2, dummy_modes=u1dummy_modes)
+    return z2array
+
+def u1peps_to_z2peps(peps):
+    """
+    Convert a PEPS with U1 symmetry to a PEPS with Z2 symmetry
+    """
+    pepsu1 = peps.copy()
+    for ts in pepsu1.tensors:
+        ts.modify(data=u1arr_to_z2arr(ts.data))
+    return pepsu1.copy()
+
 
 def fermi_hubbard_local_array_w_spf(
     symmetry,
@@ -299,7 +357,6 @@ def run_u1SU(
         # Define the lattice shape
         spinless = False
         # SU in quimb
-        # peps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)[0]
         peps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless, subsizes='equal')
     
     edges = qtn.edges_2d_square(Lx, Ly)
@@ -414,7 +471,7 @@ def run_z2SU(
         # Define the lattice shape
         spinless = False
         # SU in quimb
-        peps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='Z2', Nf=N_f, spinless=spinless)[0]
+        peps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='Z2', Nf=N_f, spinless=spinless)[0]
 
     edges = qtn.edges_2d_square(Lx, Ly)
     site_info = sr.parse_edges_to_site_info(

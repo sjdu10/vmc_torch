@@ -52,10 +52,18 @@ DEFAULT_DATA_ROOT = (
     '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
 )
 
+# import autoray as ar
+# from symmray.linalg import (
+#     svd_rand_truncated,
+#     svd_truncated
+# )
+# # ar.register_function("symmray", "svd_truncated", svd_truncated)
+# ar.register_function("symmray", "svd_truncated", svd_rand_truncated)
+
 vmc_cfg = VMCConfig(
-    batch_size=4096,
-    ns_per_rank=4096,
-    grad_batch_size=1024,
+    batch_size=512,
+    ns_per_rank=512,
+    grad_batch_size=128,
     vmc_steps=1000,
     burn_in_steps=5,
     learning_rate=0.1,
@@ -64,7 +72,7 @@ vmc_cfg = VMCConfig(
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=True,
+    use_export_compile=False,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -97,7 +105,7 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 4
+        Lx, Ly = 3, 2
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
@@ -140,6 +148,9 @@ def main():
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
+                'compress_opts': {
+                    'seed': 42
+                }
             },
         )
         model.to(device)
