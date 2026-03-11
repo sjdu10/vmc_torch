@@ -54,6 +54,7 @@ class VMCConfig:
     sr_maxiter: int = 100
     save_every: int = 10
     resume_step: int = 0  # checkpoint step to resume from, 0 = fresh
+    use_log_amp: bool = True
 
 
 def main():
@@ -169,6 +170,7 @@ def main():
             config=VMCWarmupConfig(
                 use_export_compile=vmc_cfg.use_export_compile,
                 grad_batch_size=vmc_cfg.grad_batch_size,
+                use_log_amp=vmc_cfg.use_log_amp,
             ),
         )
 
@@ -192,6 +194,7 @@ def main():
                 use_min_sr=vmc_cfg.use_min_sr,
                 use_export_compile=vmc_cfg.use_export_compile,
                 step_offset=vmc_cfg.resume_step,
+                use_log_amp=vmc_cfg.use_log_amp,
             ),
         )
 

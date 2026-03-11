@@ -245,7 +245,10 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, compi
     return fxs, current_amps
 
 @torch.inference_mode()
-def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False,**kwargs):
+def evaluate_energy(
+    fxs, fpeps_model, H, current_amps,
+    verbose=False, use_log_amp=False, **kwargs,
+):
     """Compute local energies for a batch of configurations.
 
     For each config fxs[b], obtains connected configs and matrix
@@ -261,8 +264,12 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False,**kwargs):
         fxs: Configurations, (B, N_sites) int64.
         fpeps_model: Batched wavefunction model, (B, N_sites) -> (B,).
         H: Hamiltonian with get_conn (or get_conn_batch_gpu) method.
-        current_amps: Amplitudes at fxs, (B,).
+        current_amps: Amplitudes at fxs, (B,). When
+            use_log_amp=True, this is (signs, log_abs).
         verbose: Print timing breakdown.
+        use_log_amp: If True, current_amps is a
+            (signs, log_abs) tuple and connected amps
+            are evaluated in log-space.
 
     Returns:
         energy: Mean local energy, scalar.
@@ -303,13 +310,23 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False,**kwargs):
             torch.arange(B, device=device), conn_eta_num
         )
 
+    # Unpack log-amp current state if needed
+    if use_log_amp:
+        cur_signs, cur_log_abs = current_amps
+
     # Batch compute connected amplitudes — pad last chunk to
     # fixed size B to avoid torch.compile recompilation
     if verbose:
         t0 = time.time()
     chunk_size = B
     total_conn = conn_etas.shape[0]
-    conn_amps_list = []
+
+    if use_log_amp:
+        conn_signs_list = []
+        conn_log_abs_list = []
+    else:
+        conn_amps_list = []
+
     for i in range(0, total_conn, chunk_size):
         if verbose:
             t00 = time.time()
@@ -322,27 +339,60 @@ def evaluate_energy(fxs, fpeps_model, H, current_amps, verbose=False,**kwargs):
                 chunk,
                 chunk[:1].expand(pad, -1),
             ], dim=0)
-            out = fpeps_model(chunk)
-            conn_amps_list.append(out[:actual])
+            if use_log_amp:
+                cs, cla = fpeps_model.forward_log(chunk)
+                conn_signs_list.append(cs[:actual])
+                conn_log_abs_list.append(cla[:actual])
+            else:
+                out = fpeps_model(chunk)
+                conn_amps_list.append(out[:actual])
         else:
-            conn_amps_list.append(fpeps_model(chunk))
+            if use_log_amp:
+                cs, cla = fpeps_model.forward_log(chunk)
+                conn_signs_list.append(cs)
+                conn_log_abs_list.append(cla)
+            else:
+                conn_amps_list.append(fpeps_model(chunk))
         if verbose:
-            print(f"  Evaluating connected amplitudes: chunk {i // chunk_size + 1} / {(total_conn + chunk_size - 1) // chunk_size}, "
-                  f"delta t_forward: {time.time() - t00:.4f}s, "
-                  f"total t_forward: {time.time() - t0:.4f}s")
-    conn_amps = torch.cat(conn_amps_list)
+            print(
+                f"  Evaluating connected amplitudes: "
+                f"chunk {i // chunk_size + 1} / "
+                f"{(total_conn + chunk_size - 1) // chunk_size}, "
+                f"delta t_forward: {time.time() - t00:.4f}s, "
+                f"total t_forward: {time.time() - t0:.4f}s"
+            )
+
     if verbose:
         t1 = time.time()
-        print(f"GPU forward for connected configs time: {t1 - t0:.4f}s")
+        print(
+            f"GPU forward for connected configs time: "
+            f"{t1 - t0:.4f}s"
+        )
 
     # Vectorized local energy calculation
-    current_amps_expanded = current_amps[batch_ids]
-    
-    # Compute each term: H_s's * (psi_s' / psi_s)
-    terms = conn_eta_coeffs * (conn_amps / current_amps_expanded)
-    
+    if use_log_amp:
+        conn_signs = torch.cat(conn_signs_list)
+        conn_log_abs = torch.cat(conn_log_abs_list)
+        # amp_ratio = sign' * sign * exp(log_abs' - log_abs)
+        amp_ratio = (
+            conn_signs
+            * cur_signs[batch_ids]
+            * torch.exp(
+                conn_log_abs - cur_log_abs[batch_ids],
+            )
+        )
+        terms = conn_eta_coeffs * amp_ratio
+    else:
+        conn_amps = torch.cat(conn_amps_list)
+        current_amps_expanded = current_amps[batch_ids]
+        terms = conn_eta_coeffs * (
+            conn_amps / current_amps_expanded
+        )
+
     # Aggregate results
-    local_energies = torch.zeros(B, device=device, dtype=terms.dtype)
+    local_energies = torch.zeros(
+        B, device=device, dtype=terms.dtype,
+    )
     local_energies.index_add_(0, batch_ids, terms)
 
     energy = torch.mean(local_energies)
@@ -421,7 +471,9 @@ def _slice_env_dict(env_dict, idxs):
 
 @torch.inference_mode()
 def evaluate_energy_reuse(
-    fxs, model, H, current_amps, verbose=False, **kwargs
+    fxs, model, H, current_amps,
+    verbose=False, use_log_amp=False,
+    return_bMPS=False, **kwargs,
 ):
     """Compute local energies using bMPS environment reuse.
 
@@ -435,8 +487,12 @@ def evaluate_energy_reuse(
         model: PEPS_Model_reuse_GPU with cache_bMPS_skeleton
             called.
         H: Hamiltonian with get_conn or get_conn_batch_gpu.
-        current_amps: (B,) amplitudes at fxs.
+        current_amps: (B,) amplitudes at fxs. When
+            use_log_amp=True, this is (signs, log_abs).
         verbose: Print timing breakdown.
+        use_log_amp: If True, current_amps is a
+            (signs, log_abs) tuple and connected amps
+            are evaluated in log-space.
 
     Returns:
         energy: Mean local energy, scalar.
@@ -447,6 +503,10 @@ def evaluate_energy_reuse(
     B = fxs.shape[0]
     device = fxs.device
     Ly = model.Ly
+
+    # Unpack log-amp current state if needed
+    if use_log_amp:
+        cur_signs, cur_log_abs = current_amps
 
     if verbose:
         t0 = time.time()
@@ -472,7 +532,8 @@ def evaluate_energy_reuse(
         if verbose:
             t1 = time.time()
             print(
-                f"  GPU get_conn_batch: {t1 - t0:.4f}s"
+                f"  GPU get_conn_batch time: "
+                f"{t1 - t0:.4f}s"
                 f" ({conn_etas.shape[0]} connected)"
             )
 
@@ -586,10 +647,22 @@ def evaluate_energy_reuse(
     if verbose:
         t0 = time.time()
 
-    conn_amps = torch.zeros(
-        total_conn, dtype=current_amps.dtype,
-        device=device,
+    _amp_dtype = (
+        cur_log_abs.dtype if use_log_amp
+        else current_amps.dtype
     )
+
+    if use_log_amp:
+        conn_signs = torch.zeros(
+            total_conn, dtype=_amp_dtype, device=device,
+        )
+        conn_log_abs = torch.zeros(
+            total_conn, dtype=_amp_dtype, device=device,
+        )
+    else:
+        conn_amps = torch.zeros(
+            total_conn, dtype=_amp_dtype, device=device,
+        )
 
     # A. Diagonal terms — direct copy (no forward pass)
     if diagonal_parent_indices:
@@ -599,7 +672,11 @@ def evaluate_energy_reuse(
         parents = torch.tensor(
             diagonal_parent_indices, device=device,
         )
-        conn_amps[diag_locs] = current_amps[parents]
+        if use_log_amp:
+            conn_signs[diag_locs] = cur_signs[parents]
+            conn_log_abs[diag_locs] = cur_log_abs[parents]
+        else:
+            conn_amps[diag_locs] = current_amps[parents]
 
     # B. Non-diagonal terms — grouped reuse contraction.
     # Pad each chunk to fixed size B to avoid torch.compile
@@ -647,46 +724,78 @@ def evaluate_energy_reuse(
                 bMPS_y, subset_parents,
             )
 
-            if mode == 'row':
-                amps_chunk = model.forward_reuse(
-                    target_configs,
-                    bMPS_params_x_batched=subset_env_x,
-                    selected_rows=list(indices),
+            if use_log_amp:
+                if mode == 'row':
+                    cs, cla = model.forward_reuse_log(
+                        target_configs,
+                        bMPS_params_x_batched=subset_env_x,
+                        selected_rows=list(indices),
+                    )
+                else:
+                    cs, cla = model.forward_reuse_log(
+                        target_configs,
+                        bMPS_params_y_batched=subset_env_y,
+                        selected_cols=list(indices),
+                    )
+                locs = torch.tensor(
+                    batch_global, device=device,
                 )
+                conn_signs[locs] = cs[:actual]
+                conn_log_abs[locs] = cla[:actual]
             else:
-                amps_chunk = model.forward_reuse(
-                    target_configs,
-                    bMPS_params_y_batched=subset_env_y,
-                    selected_cols=list(indices),
+                if mode == 'row':
+                    amps_chunk = model.forward_reuse(
+                        target_configs,
+                        bMPS_params_x_batched=subset_env_x,
+                        selected_rows=list(indices),
+                    )
+                else:
+                    amps_chunk = model.forward_reuse(
+                        target_configs,
+                        bMPS_params_y_batched=subset_env_y,
+                        selected_cols=list(indices),
+                    )
+                locs = torch.tensor(
+                    batch_global, device=device,
                 )
-
-            # Only keep the actual (non-padded) results
-            locs = torch.tensor(
-                batch_global, device=device,
-            )
-            conn_amps[locs] = amps_chunk[:actual]
+                conn_amps[locs] = amps_chunk[:actual]
 
             if verbose:
                 print(
-                    f"  Reuse chunk {chunk_counter}"
-                    f" / {total_chunks}"
-                    f" ({mode} {list(indices)}):"
-                    f" {actual} configs,"
-                    f" delta t: {time.time() - t00:.4f}s,"
-                    f" total t: {time.time() - t0:.4f}s"
+                    f"  Evaluating connected amplitudes: "
+                    f"chunk {chunk_counter} / "
+                    f"{total_chunks} "
+                    f"({mode} {list(indices)}, "
+                    f"{actual} configs), "
+                    f"delta t_forward: "
+                    f"{time.time() - t00:.4f}s, "
+                    f"total t_forward: "
+                    f"{time.time() - t0:.4f}s"
                 )
 
     if verbose:
         t1 = time.time()
         print(
-            f"  reuse forward total: {t1 - t0:.4f}s"
+            f"  GPU forward for connected configs "
+            f"time: {t1 - t0:.4f}s"
         )
 
     # 5. Compute local energies via vectorized index_add_
-    current_amps_expanded = current_amps[batch_ids]
-    terms = conn_eta_coeffs * (
-        conn_amps / current_amps_expanded
-    )
+    if use_log_amp:
+        amp_ratio = (
+            conn_signs
+            * cur_signs[batch_ids]
+            * torch.exp(
+                conn_log_abs - cur_log_abs[batch_ids],
+            )
+        )
+        terms = conn_eta_coeffs * amp_ratio
+    else:
+        current_amps_expanded = current_amps[batch_ids]
+        terms = conn_eta_coeffs * (
+            conn_amps / current_amps_expanded
+        )
+
     local_energies = torch.zeros(
         B, device=device, dtype=terms.dtype,
     )
@@ -697,6 +806,8 @@ def evaluate_energy_reuse(
     if verbose:
         print(f"  E_loc mean: {energy.item():.6f}")
 
+    if return_bMPS:
+        return energy, local_energies, bMPS_x, bMPS_y
     return energy, local_energies
 
 
@@ -707,11 +818,22 @@ def flatten_params(parameters):
         vec.append(param.reshape(-1))
     return torch.cat(vec)
 
-def _check_grads_amps(batched_grads_vec, amps, fpeps_model):
+def _check_grads_amps(batched_grads_vec, amps, fpeps_model, configs=None):
     """Raise ValueError if amps or grads contain NaN/Inf."""
     if torch.isnan(amps).any() or torch.isinf(amps).any():
         nan_count = torch.isnan(amps).sum().item()
         inf_count = torch.isinf(amps).sum().item()
+        # Print ill configs for amplitudes
+        if configs is not None:
+            bad_mask = torch.isnan(amps) | torch.isinf(amps)
+            # Handle both 1D amps (B,) and 2D amps (B, 1)
+            if bad_mask.dim() > 1:
+                bad_mask = bad_mask.any(dim=1)
+            bad_indices = bad_mask.nonzero(as_tuple=True)[0]
+            torch.set_printoptions(threshold=10_000_000)
+            for idx in bad_indices[:20].tolist():
+                print(f"  amp NaN/Inf sample[{idx}]: {configs[idx].tolist()}")
+            torch.set_printoptions(profile="default")
         raise ValueError(
             f"NaN/Inf in amplitudes: {nan_count} NaN, "
             f"{inf_count} Inf out of {amps.numel()} samples"
@@ -723,6 +845,12 @@ def _check_grads_amps(batched_grads_vec, amps, fpeps_model):
         n_bad = bad_samples.sum().item()
         bad_params = (nan_mask | inf_mask).any(dim=0)
         bad_param_ids = bad_params.nonzero(as_tuple=True)[0]
+        # Print ill configs that produce NaN/Inf gradients
+        if configs is not None:
+            bad_indices = bad_samples.nonzero(as_tuple=True)[0]
+            print(f"Ill configs with NaN/Inf grads ({n_bad} total):")
+            for idx in bad_indices[:20].tolist():
+                print(f"  sample[{idx}]: {configs[idx].tolist()}")
         # Map flat param index to (param_idx, offset) in ParameterList
         param_ranges = []
         offset = 0
@@ -749,9 +877,12 @@ def _check_grads_amps(batched_grads_vec, amps, fpeps_model):
         )
 
 
-def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose=False, vmap_grad=False, offload_to_cpu=False, **kwargs):
-    """
-    Vectorized gradient computation optimized for GPU with memory chunking and vmap/jacrev support.
+def compute_grads_gpu(
+    fxs, fpeps_model, vectorize=True, batch_size=None,
+    verbose=False, vmap_grad=False, offload_to_cpu=False,
+    use_log_amp=False, **kwargs,
+):
+    """Vectorized gradient computation optimized for GPU.
 
     Args:
         offload_to_cpu: if True, each (B_grad, Np) gradient chunk
@@ -759,6 +890,10 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
             computation.  The final returned tensors live on CPU.
             This keeps GPU peak memory at O(B_grad * Np) instead
             of O(B * Np).
+        use_log_amp: if True, compute d(log|psi|)/d(params)
+            directly. Returns (log_psi_grad, (signs, log_abs))
+            instead of (grads, amps). log_psi_grad is already the
+            log-derivative — no division by amps needed.
     """
     if vectorize:
         # 1. Prepare parameters PyTree structure
@@ -778,26 +913,51 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
             B = fxs.shape[0]
             # Determine chunk size to avoid OOM
             B_grad = batch_size if batch_size is not None else B
-            
-            # Define logic for a single sample: (x_i, params) -> (amp_i, amp_i)
-            def single_sample_amp_func(x_i, p):
-                amp = fpeps_model.vamp(x_i.unsqueeze(0), p).squeeze(0)
-                return amp, amp  # (Loss target for grad, Aux data for cache)
 
-            # Define vmap-ed gradient function
-            # in_dims=(0, None): batch over x, broadcast over params
-            grad_vmap_fn = torch.vmap(
-                torch.func.grad(single_sample_amp_func, argnums=1, has_aux=True),
-                in_dims=(0, None)
-            )
+            if use_log_amp:
+                # Differentiate log|psi| directly — grad is O(1)
+                def single_sample_log_amp_func(x_i, p):
+                    sign, log_abs = fpeps_model.vamp_log(
+                        x_i.unsqueeze(0), p,
+                    )
+                    sign = sign.squeeze(0)
+                    log_abs = log_abs.squeeze(0)
+                    return log_abs, (sign, log_abs)
 
-            amps_chunks = []
+                grad_vmap_fn = torch.vmap(
+                    torch.func.grad(
+                        single_sample_log_amp_func,
+                        argnums=1, has_aux=True,
+                    ),
+                    in_dims=(0, None),
+                )
+            else:
+                # Original: differentiate amp directly
+                def single_sample_amp_func(x_i, p):
+                    amp = fpeps_model.vamp(
+                        x_i.unsqueeze(0), p,
+                    ).squeeze(0)
+                    return amp, amp
+
+                grad_vmap_fn = torch.vmap(
+                    torch.func.grad(
+                        single_sample_amp_func,
+                        argnums=1, has_aux=True,
+                    ),
+                    in_dims=(0, None),
+                )
 
             t0 = time.time()
 
+            if use_log_amp:
+                signs_chunks = []
+                log_abs_chunks = []
+            else:
+                amps_chunks = []
+
             if offload_to_cpu:
                 # Eager CPU offload: flatten each chunk to (B_grad, Np)
-                # on GPU, then .cpu() immediately. Peak GPU mem = O(B_grad * Np).
+                # on GPU, then .cpu() immediately.
                 flat_vec_chunks = []
                 for b_start in range(0, B, B_grad):
                     if verbose:
@@ -805,27 +965,43 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                     b_end = min(b_start + B_grad, B)
                     fxs_chunk = fxs[b_start:b_end]
 
-                    grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
+                    grads_chunk, aux_c = grad_vmap_fn(
+                        fxs_chunk, params_pytree,
+                    )
 
-                    amps_c = amps_c.detach()
-                    grads_chunk = tree_map(lambda x: x.detach(), grads_chunk)
+                    grads_chunk = tree_map(
+                        lambda x: x.detach(), grads_chunk,
+                    )
 
                     # Flatten to (B_grad, Np) on GPU, then offload
                     leaves_c, _ = tree_flatten(grads_chunk)
                     flat_c = torch.cat(
-                        [l.flatten(start_dim=1) for l in leaves_c], dim=1,
+                        [l.flatten(start_dim=1) for l in leaves_c],
+                        dim=1,
                     )
                     flat_vec_chunks.append(flat_c.cpu())
-                    amps_chunks.append(amps_c.cpu())
+
+                    if use_log_amp:
+                        sc, lac = aux_c
+                        signs_chunks.append(sc.detach().cpu())
+                        log_abs_chunks.append(lac.detach().cpu())
+                    else:
+                        amps_chunks.append(aux_c.detach().cpu())
+
                     del grads_chunk, leaves_c, flat_c
 
                 # Concatenate on CPU
-                batched_grads_vec = torch.cat(flat_vec_chunks, dim=0)
-                amps = torch.cat(amps_chunks, dim=0)
+                batched_grads_vec = torch.cat(
+                    flat_vec_chunks, dim=0,
+                )
+                if use_log_amp:
+                    signs = torch.cat(signs_chunks, dim=0)
+                    log_abs = torch.cat(log_abs_chunks, dim=0)
+                else:
+                    amps = torch.cat(amps_chunks, dim=0)
                 del flat_vec_chunks
             else:
-                # Standard path: pre-allocate and fill in-place to
-                # avoid holding chunks + concatenated result together.
+                # Standard path: pre-allocate and fill in-place.
                 leaves_p, _ = tree_flatten(params_pytree)
                 Np = sum(p.numel() for p in leaves_p)
                 dtype = leaves_p[0].dtype
@@ -835,7 +1011,17 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                 batched_grads_vec = torch.empty(
                     B, Np, dtype=dtype, device=device,
                 )
-                amps = torch.empty(B, dtype=dtype, device=device)
+                if use_log_amp:
+                    signs = torch.empty(
+                        B, dtype=dtype, device=device,
+                    )
+                    log_abs = torch.empty(
+                        B, dtype=dtype, device=device,
+                    )
+                else:
+                    amps = torch.empty(
+                        B, dtype=dtype, device=device,
+                    )
 
                 for b_start in range(0, B, B_grad):
                     if verbose:
@@ -843,20 +1029,29 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
                     b_end = min(b_start + B_grad, B)
                     fxs_chunk = fxs[b_start:b_end]
 
-                    grads_chunk, amps_c = grad_vmap_fn(fxs_chunk, params_pytree)
+                    grads_chunk, aux_c = grad_vmap_fn(
+                        fxs_chunk, params_pytree,
+                    )
 
-                    amps_c = amps_c.detach()
-                    grads_chunk = tree_map(lambda x: x.detach(), grads_chunk)
+                    grads_chunk = tree_map(
+                        lambda x: x.detach(), grads_chunk,
+                    )
 
-                    # Flatten and write directly into pre-allocated buffer
+                    # Flatten and write directly into buffer
                     leaves_c, _ = tree_flatten(grads_chunk)
                     flat_c = torch.cat(
-                        [leaf.flatten(start_dim=1) for leaf in leaves_c],
+                        [leaf.flatten(start_dim=1)
+                         for leaf in leaves_c],
                         dim=1,
                     )
                     batched_grads_vec[b_start:b_end] = flat_c
-                    amps[b_start:b_end] = amps_c
-                    del grads_chunk, leaves_c, flat_c, amps_c
+                    if use_log_amp:
+                        sc, lac = aux_c
+                        signs[b_start:b_end] = sc.detach()
+                        log_abs[b_start:b_end] = lac.detach()
+                    else:
+                        amps[b_start:b_end] = aux_c.detach()
+                    del grads_chunk, leaves_c, flat_c
 
             # Final cleanup
             batched_grads_vec = batched_grads_vec.detach()
@@ -865,9 +1060,17 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
             t1 = time.time()
             if verbose:
                 print(f"GPU Batched vmap(grad) time: {t1 - t0:.4f}s")
-            
-            _check_grads_amps(batched_grads_vec, amps, fpeps_model)
-            return batched_grads_vec, amps
+
+            if use_log_amp:
+                _check_grads_amps(
+                    batched_grads_vec, log_abs, fpeps_model,
+                )
+                return batched_grads_vec, (signs, log_abs)
+            else:
+                _check_grads_amps(
+                    batched_grads_vec, amps, fpeps_model,
+                )
+                return batched_grads_vec, amps
 
         # ------------------------------------------------------------------
         # Path B: jacrev - Standard Jacobian Reverse Mode
@@ -980,6 +1183,157 @@ def compute_grads_gpu(fxs, fpeps_model, vectorize=True, batch_size=None, verbose
         batched_grads_vec = torch.stack(batched_grads_vec, dim=0)
         
         return batched_grads_vec, amps
+
+
+def compute_grads_cheap_gpu(
+    fxs, fpeps_model, batch_size=None,
+    offload_to_cpu=False, use_log_amp=False,
+    verbose=False, bMPS_params_x=None,
+    **kwargs,
+):
+    """Cheap gradient via per-row hole contraction for pure fTNS.
+
+    Avoids backprop through SVDs in boundary contraction by treating
+    cached bMPS environments as constants. Requires the model to be
+    an fPEPS_Model_reuse_GPU with bMPS skeletons initialized.
+
+    Interface matches compute_grads_gpu for drop-in replacement.
+
+    Args:
+        fxs: (B, N_sites) int64 configurations.
+        fpeps_model: fPEPS_Model_reuse_GPU with cache_bMPS_skeleton
+            called.
+        batch_size: gradient chunk size (like grad_batch_size).
+        offload_to_cpu: move grad chunks to CPU eagerly.
+        use_log_amp: if True, return log-amplitude gradients.
+        verbose: print timing info.
+        bMPS_params_x: pre-computed batched x-env params from
+            evaluate_energy_reuse. If None, recomputes them.
+
+    Returns:
+        use_log_amp=False: (grads (B, Np), amps (B,))
+        use_log_amp=True:  (grads (B, Np), (signs (B,), log_abs (B,)))
+    """
+    B = fxs.shape[0]
+    device = fxs.device
+    B_grad = batch_size if batch_size is not None else B
+
+    # Compute bMPS environments if not provided
+    with torch.no_grad():
+        if bMPS_params_x is None:
+            if verbose:
+                t0 = time.time()
+            bMPS_x, _ = fpeps_model.cache_bMPS_params_vmap(fxs)
+            bMPS_params_x = bMPS_x
+            if verbose:
+                print(
+                    f"  cheap_grad: cache bMPS: "
+                    f"{time.time() - t0:.4f}s"
+                )
+
+    t0 = time.time()
+
+    # Pre-allocate output buffers
+    leaves_p, _ = tree_flatten(
+        list(fpeps_model.params),
+    )
+    Np = sum(p.numel() for p in leaves_p)
+    dtype = leaves_p[0].dtype
+    del leaves_p
+
+    if offload_to_cpu:
+        flat_vec_chunks = []
+        if use_log_amp:
+            signs_chunks, log_abs_chunks = [], []
+        else:
+            amps_chunks = []
+    else:
+        batched_grads_vec = torch.empty(
+            B, Np, dtype=dtype, device=device,
+        )
+        if use_log_amp:
+            signs = torch.empty(B, dtype=dtype, device=device)
+            log_abs = torch.empty(
+                B, dtype=dtype, device=device,
+            )
+        else:
+            amps = torch.empty(B, dtype=dtype, device=device)
+
+    for b_start in range(0, B, B_grad):
+        b_end = min(b_start + B_grad, B)
+        if verbose:
+            print(
+                f"  cheap_grad chunk: "
+                f"{b_start} to {b_end} / {B}"
+            )
+
+        fxs_chunk = fxs[b_start:b_end]
+        bMPS_chunk = _slice_env_dict(
+            bMPS_params_x,
+            torch.arange(
+                b_start, b_end, device=device,
+            ),
+        )
+
+        grads_chunk, amps_chunk = (
+            fpeps_model.compute_cheap_grads_vmap(
+                fxs_chunk, bMPS_chunk,
+            )
+        )
+        grads_chunk = grads_chunk.detach()
+        amps_chunk = amps_chunk.detach()
+
+        if use_log_amp:
+            s_chunk = torch.sign(amps_chunk)
+            la_chunk = torch.log(
+                amps_chunk.abs().clamp(min=1e-45),
+            )
+            # Convert raw grad to log-amplitude grad:
+            # d(log|psi|)/dp = (1/psi) * dpsi/dp
+            grads_chunk = (
+                grads_chunk / amps_chunk.unsqueeze(1)
+            )
+
+        if offload_to_cpu:
+            flat_vec_chunks.append(grads_chunk.cpu())
+            if use_log_amp:
+                signs_chunks.append(s_chunk.cpu())
+                log_abs_chunks.append(la_chunk.cpu())
+            else:
+                amps_chunks.append(amps_chunk.cpu())
+        else:
+            batched_grads_vec[b_start:b_end] = grads_chunk
+            if use_log_amp:
+                signs[b_start:b_end] = s_chunk
+                log_abs[b_start:b_end] = la_chunk
+            else:
+                amps[b_start:b_end] = amps_chunk
+
+        del grads_chunk, amps_chunk
+
+    if offload_to_cpu:
+        batched_grads_vec = torch.cat(
+            flat_vec_chunks, dim=0,
+        )
+        if use_log_amp:
+            signs = torch.cat(signs_chunks, dim=0)
+            log_abs = torch.cat(log_abs_chunks, dim=0)
+        else:
+            amps = torch.cat(amps_chunks, dim=0)
+
+    t1 = time.time()
+    if verbose:
+        print(f"  cheap_grad total: {t1 - t0:.4f}s")
+
+    _check_grads_amps(
+        batched_grads_vec,
+        log_abs if use_log_amp else amps,
+        fpeps_model,
+    )
+
+    if use_log_amp:
+        return batched_grads_vec, (signs, log_abs)
+    return batched_grads_vec, amps
 
 
 def random_initial_config(N_f, N_sites, seed=None):

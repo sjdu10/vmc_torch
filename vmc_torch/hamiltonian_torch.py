@@ -429,6 +429,10 @@ class Hamiltonian(Operator):
         state_index_map = {tuple(state): idx for idx, state in enumerate(all_states)}
         
         for idx, sigma in enumerate(all_states):
+            if hasattr(self, 'gpu'):
+                if self.gpu:
+                    import torch
+                    sigma = torch.as_tensor(sigma, dtype=torch.int64)
             connected_configs, coeffs = self.get_conn(sigma)
             for eta, coeff in zip(connected_configs, coeffs):
                 eta_tuple = tuple(eta)

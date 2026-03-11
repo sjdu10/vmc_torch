@@ -16,38 +16,53 @@ DEFAULT_DATA_ROOT = (
 )
 
 
-def setup_linalg_hooks(jitter=1e-16, driver=None, qr_via_eigh=True, cholesky_qr=False, cholesky_qr_adaptive_jitter=False):
+def setup_linalg_hooks(
+    jitter=1e-16, driver=None,
+    qr_via_eigh=True, cholesky_qr=False,
+    cholesky_qr_adaptive_jitter=False,
+    nonuniform_diag=False,
+):
+    """Register autoray hooks for SVD and QR dispatch.
+
+    Args:
+        nonuniform_diag: if True, use non-uniform diagonal jitter (instead of
+            identity) in EIG-based SVD/QR to lift singular value
+            degeneracies.  Stabilizes backward for matrices with
+            repeated or near-degenerate singular values.
+    """
     ar.register_function(
         'torch',
         'linalg.svd',
-        lambda x: size_aware_svd(x, jitter=jitter, driver=driver),
+        lambda x: size_aware_svd(
+            x, jitter=jitter, driver=driver,
+            nonuniform_diag=nonuniform_diag,
+        ),
     )
     if qr_via_eigh and cholesky_qr:
-        raise ValueError("Cannot use both qr_via_eigh and cholesky_qr at the same time.")
+        raise ValueError(
+            "Cannot use both qr_via_eigh and cholesky_qr."
+        )
     if cholesky_qr:
         ar.register_function(
             "torch",
             "linalg.qr",
-            lambda x: qr_via_cholesky(x, jitter=jitter, adaptive_jitter=cholesky_qr_adaptive_jitter),
+            lambda x: qr_via_cholesky(
+                x, jitter=jitter,
+                adaptive_jitter=cholesky_qr_adaptive_jitter,
+            ),
         )
     elif qr_via_eigh:
         ar.register_function(
             'torch',
             'linalg.qr',
-            lambda x: size_aware_qr(x, via_eigh=qr_via_eigh, jitter=jitter),
+            lambda x: size_aware_qr(
+                x, via_eigh=True, jitter=jitter,
+                nonuniform_diag=nonuniform_diag,
+            ),
         )
-    else:
-        pass  # use default torch.linalg.qr without autoray hook
-
-    # Bridge quimb's do("linalg.rsvd", x, max_bond) to symmray's
-    # svd_rand_truncated. quimb's rsvd dispatches to "linalg.rsvd"
-    # but symmray only registers "svd_rand_truncated".
-    from symmray.linalg import svd_rand_truncated
-    ar.register_function(
-        'symmray',
-        'linalg.rsvd',
-        lambda x, max_bond: svd_rand_truncated(x, max_bond=max_bond),
-    )
+    else: # both False: use default torch.linalg.qr
+        # Use default torch.linalg.qr
+        pass
 
 
 def load_or_generate_peps(

@@ -11,7 +11,7 @@ from .pureTNS_spin import PEPS_Model_reuse_GPU
 from .pureNN import PureNN_GPU
 from .slater import SlaterDeterminant_GPU
 from .NNBF import NNBF_GPU, AttentionNNBF_GPU
-from .NNfTNS import Conv2D_Geometric_fPEPS_GPU
+from .NNfTNS import NNfTNS_Model_GPU, Conv2D_Geometric_fPEPS_GPU
 
 __all__ = [
     "WavefunctionModel_GPU",
@@ -21,6 +21,7 @@ __all__ = [
     "SlaterDeterminant_GPU",
     "NNBF_GPU",
     "AttentionNNBF_GPU",
+    "NNfTNS_Model_GPU",
     "Conv2D_Geometric_fPEPS_GPU",
     "PEPS_Model_reuse_GPU",
 ]

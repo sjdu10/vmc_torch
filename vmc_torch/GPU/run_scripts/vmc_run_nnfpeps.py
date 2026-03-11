@@ -1,13 +1,9 @@
-"""GPU VMC with Conv2D-Geometric NN-fPEPS backflow model — 4x4 system.
+"""GPU VMC with Conv2D-Geometric NN-fPEPS backflow model — 8x8 system.
 
 Run:
-    torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps_4x4.py
-    torchrun --nproc_per_node=2 run_scripts/vmc_run_nnfpeps_4x4.py
+    torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps.py
+    torchrun --nproc_per_node=2 run_scripts/vmc_run_nnfpeps.py
 """
-import json
-import os
-from dataclasses import dataclass
-
 import torch
 import torch.distributed as dist
 
@@ -24,13 +20,7 @@ from vmc_torch.GPU.hamiltonian import (
 from vmc_torch.GPU.models import (
     Conv2D_Geometric_fPEPS_GPU,
 )
-from vmc_torch.GPU.optimizer import (
-    DecayScheduler,
-    DistributedMinSRGPU,
-    DistributedSRMinresGPU,
-    MinSRGPU,
-    SGDGPU,
-)
+from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
     MetropolisExchangeSpinfulSamplerGPU,
 )
@@ -40,10 +30,18 @@ from vmc_torch.GPU.vmc_setup import (
     setup_linalg_hooks,
 )
 from vmc_torch.GPU.vmc_utils import random_initial_config
+from vmcconfig import (
+    VMCConfig,
+    load_checkpoint,
+    make_on_step_end,
+    make_preconditioner,
+    make_stats,
+    make_stats_file,
+    print_summary,
+)
 
 dtype = torch.float64
 nnbackbone_dtype = torch.float32
-USE_EXPORT_COMPILE = False
 
 # Data paths
 DEFAULT_DATA_ROOT = (
@@ -56,45 +54,43 @@ CPU_DATA_ROOT = (
     '/experiment/vmap/data'
 )
 
-
-@dataclass
-class VMCConfig:
-    """VMC numerical / training settings."""
-
-    batch_size: int = 2048
-    ns_per_rank: int = 2048
-    grad_batch_size: int = 256
-    vmc_steps: int = 100
-    learning_rate: float = 0.1
-    diag_shift: float = 1e-4
-    burn_in_steps: int = 0
-    use_export_compile: bool = USE_EXPORT_COMPILE
-    
-    use_min_sr: bool = False
-    use_distributed_min_sr: bool = False
-    param_chunk_size: int = 1024
-    use_distributed_sr_minres: bool = True
-    minres_sr_use_scipy: bool = False
-    sr_rtol: float = 1e-4
-    sr_maxiter: int = 100
-    
-    save_every: int = 50
-    resume_step: int = 0
-    debug: bool = False
-    outlier_clip_factor: float = 100.0 # drop O_loc outliers > factor * median
-    run_sr: bool = True
-    lr_scheduler: object = None  # set after construction
-
-warmup_cfg = VMCWarmupConfig(
-    use_export_compile=VMCConfig.use_export_compile,
-    grad_batch_size=VMCConfig.grad_batch_size,
-    run_sampling=False,
-    run_locE=False,
-    run_grad=True,
+vmc_cfg = VMCConfig(
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=1024,
+    vmc_steps=1000,
+    burn_in_steps=1,
+    learning_rate=0.1,
+    sr_diag_shift=5e-4,
+    use_distributed_sr_minres=True,
+    sr_rtol=1e-4,
+    offload_grad_to_cpu=True,
+    use_log_amp=True,
+    use_export_compile=True,
+    save_every=10,
+    resume_step=0,
+    verbose=False,
+)
+vmc_cfg.lr_scheduler = DecayScheduler(
+    init_lr=vmc_cfg.learning_rate,
+    decay_rate=0.9, patience=50,
 )
 
+warmup_cfg = VMCWarmupConfig(
+    use_export_compile=vmc_cfg.use_export_compile,
+    grad_batch_size=vmc_cfg.grad_batch_size,
+    use_log_amp=vmc_cfg.use_log_amp,
+    run_sampling=False,
+    run_locE=False,
+    run_grad=False,
+)
+
+
 def main():
-    setup_linalg_hooks(jitter=1e-12, qr_via_eigh=False, cholesky_qr=True, cholesky_qr_adaptive_jitter=False)
+    setup_linalg_hooks(
+        jitter=1e-12, qr_via_eigh=False,
+        cholesky_qr=True, cholesky_qr_adaptive_jitter=False,
+    )
     torch.set_default_dtype(dtype)
 
     try:
@@ -103,14 +99,14 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 12, 4
+        Lx, Ly = 8, 8
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 8  # 8 holes
+        N_f = N_sites - 8  # 2 holes -> 14 fermions
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4   # PEPS bond dimension
-        chi = -1  # exact contraction
+        D = 10   # PEPS bond dimension
+        chi = 10  # exact contraction
 
         # NN backflow hyperparameters
         nn_eta = 1.0
@@ -118,7 +114,6 @@ def main():
         hidden_dim = N_sites
         kernel_size = 3
         cnn_layers = 1
-        init_scale = 1e-5
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -146,6 +141,19 @@ def main():
             file_path=fpeps_base,
             scale_factor=4,
         )
+        # Set init_scale relative to fTN param magnitudes
+        import quimb.tensor as qtn
+        import quimb as qu
+        _params, _ = qtn.pack(peps)
+        _flat, _ = qu.utils.tree_flatten(_params, get_ref=True)
+        ftn_params_mean = torch.mean(torch.stack([
+            torch.as_tensor(p, dtype=dtype).abs().mean()
+            for p in _flat
+        ])).item()
+        init_scale = 1e-2 * ftn_params_mean
+        if rank == 0:
+            print(f"ftn_params_mean={ftn_params_mean:.6e}, "
+                  f"init_scale={init_scale:.6e}")
         model = Conv2D_Geometric_fPEPS_GPU(
             tn=peps,
             max_bond=chi,
@@ -164,9 +172,24 @@ def main():
             },
         )
         model.to(device)
+        n_params = sum(p.numel() for p in model.parameters())
+        # estimate the gpu mem needed for grad:
+        grad_mem_estimate = vmc_cfg.batch_size * n_params * 8 / 1024**3
+        if rank == 0:
+            print(
+                f"Model has {n_params} parameters, "
+                f"estimated grad memory per batch: {grad_mem_estimate:.2f} GB"
+            )
+            ftn_params = list(model.parameters())[:model.n_ftn]
+            ftn_params_mean = torch.mean(
+                torch.cat([p.detach().cpu().flatten().abs() for p in ftn_params])
+            )
+            print(
+                f"FTN params mean abs value: {ftn_params_mean:.3e}"
+            )
 
         # Export + compile (optional, ~10-40s one-time cost)
-        if USE_EXPORT_COMPILE:
+        if vmc_cfg.use_export_compile:
             example_x = random_initial_config(
                 N_f, N_sites, seed=0,
             ).to(device)
@@ -174,42 +197,31 @@ def main():
                 print("Running torch.export + compile...")
             import time as _time
             _t0 = _time.time()
-            model.export_and_compile(example_x)
+            model.export_and_compile(
+                example_x,
+                use_log_amp=vmc_cfg.use_log_amp,
+            )
             if rank == 0:
                 print(
                     f"Export + compile done in "
                     f"{_time.time() - _t0:.1f}s"
                 )
 
-        # ========== Config ==========
-        vmc_cfg = VMCConfig()
-        vmc_cfg.lr_scheduler = DecayScheduler(
-            init_lr=vmc_cfg.learning_rate,
-            decay_rate=0.9, patience=50,
-        )
+        # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"t={t}_U={U}/N={N_f}/Z2/D={D}/chi={chi}/"
-            f"nnfpeps_eta={nn_eta}_emb={embed_dim}"
-            f"_hid={hidden_dim}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/{model._get_name()}/chi={chi}/"
         )
+        import os
         os.makedirs(output_dir, exist_ok=True)
         model_name = model._get_name()
-        if vmc_cfg.resume_step > 0:
-            ckpt_path = os.path.join(
-                output_dir,
-                f'checkpoint_{model_name}_{vmc_cfg.resume_step}.pt',
-            )
-            ckpt = torch.load(
-                ckpt_path,
-                map_location=device,
-                weights_only=True,
-            )
-            model.load_state_dict(ckpt)
-            if rank == 0:
-                print(f"Loaded checkpoint: {ckpt_path}")
-
         N_params = sum(p.numel() for p in model.parameters())
+
+        load_checkpoint(
+            model, output_dir, model_name,
+            vmc_cfg.resume_step, device, rank,
+        )
+
         if rank == 0:
             print(
                 f"Model: {model_name} | {N_params} params | "
@@ -245,49 +257,30 @@ def main():
             seed=42, rank=rank, device=device,
         )
 
-        # ========== Stats tracking ==========
-        step_tag = (
-            f'_from{vmc_cfg.resume_step}'
-            if vmc_cfg.resume_step > 0 else ''
+        # ========== Stats + callback ==========
+        system_str = (
+            f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
+            f'N_f={N_f}, D={D}, chi={chi}, '
+            f'nn_eta={nn_eta}, embed={embed_dim}, '
+            f'hidden={hidden_dim}, backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}'
         )
-        stats_file = os.path.join(
-            output_dir,
-            f'stats_{model_name}{step_tag}.json',
+        stats_file = make_stats_file(
+            output_dir, model_name,
+            vmc_cfg.resume_step,
         )
-        total_ns = vmc_cfg.ns_per_rank * world_size
-        stats = {
-            'system': (
-                f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
-                f'N_f={N_f}, D={D}, chi={chi}, '
-                f'nn_eta={nn_eta}, embed={embed_dim}, '
-                f'hidden={hidden_dim}, backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}'
-            ),
-            'Np': N_params,
-            'sample size': total_ns,
-            'mean': [],
-            'error': [],
-            'variance': [],
-        }
+        stats = make_stats(
+            system_str, N_params,
+            vmc_cfg.ns_per_rank, world_size,
+        )
+        on_step_end = make_on_step_end(
+            rank, stats, stats_file, output_dir,
+            model_name, model, vmc_cfg.save_every,
+        )
 
         # ========== VMC driver ==========
-        if vmc_cfg.use_distributed_min_sr:
-            preconditioner = DistributedMinSRGPU(
-                param_chunk_size=vmc_cfg.param_chunk_size,
-            )
-        elif vmc_cfg.use_min_sr:
-            preconditioner = MinSRGPU()
-        elif vmc_cfg.use_distributed_sr_minres:
-            preconditioner = DistributedSRMinresGPU(
-                rtol=vmc_cfg.sr_rtol,
-                maxiter=vmc_cfg.sr_maxiter,
-                use_scipy=vmc_cfg.minres_sr_use_scipy,
-            )
-        else:
-            preconditioner = None
-            
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
-            preconditioner=preconditioner,
+            preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),
@@ -301,24 +294,6 @@ def main():
             rank=rank,
             config=warmup_cfg,
         )
-
-        # ========== Data-saving callback ==========
-        def on_step_end(info):
-            if rank != 0:
-                return
-            stats['mean'].append(info['energy_per_site'])
-            stats['error'].append(info['error_per_site'])
-            stats['variance'].append(info['energy_var'])
-            with open(stats_file, 'w') as f:
-                json.dump(stats, f, indent=4)
-
-            step = info['step']
-            if (step + 1) % vmc_cfg.save_every == 0:
-                ckpt_path = os.path.join(
-                    output_dir,
-                    f'checkpoint_{model_name}_{step + 1}.pt',
-                )
-                torch.save(model.state_dict(), ckpt_path)
 
         energy_history, _ = vmc.run_vmc_loop(
             fxs=fxs,
@@ -335,26 +310,10 @@ def main():
             on_step_end=on_step_end,
         )
 
-        # ========== Summary ==========
-        if rank == 0 and energy_history:
-            print(f"\n{'=' * 50}")
-            print(
-                f"Result: {Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, "
-                f"N_f={N_f}, D={D}, chi={chi}"
-            )
-            print(
-                f"NN-fPEPS: nn_eta={nn_eta}, embed={embed_dim}, "
-                f"hidden={hidden_dim}, backbone_dtype=float32"
-            )
-            print(f"{'=' * 50}")
-            print(f"First E/site: {energy_history[0]:.6f}")
-            print(f"Last  E/site: {energy_history[-1]:.6f}")
-            print(f"Min   E/site: {min(energy_history):.6f}")
-            print(f"Stats saved to: {stats_file}")
-            if energy_history[-1] < energy_history[0]:
-                print("\nEnergy decreased.")
-            else:
-                print("\nWARNING: Energy did NOT decrease.")
+        print_summary(
+            rank, energy_history,
+            system_str, stats_file,
+        )
     finally:
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
