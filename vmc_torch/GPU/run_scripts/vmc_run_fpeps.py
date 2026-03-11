@@ -1,15 +1,9 @@
-"""GPU VMC for spinful Fermi-Hubbard with bMPS reuse.
-
-Uses fPEPS_Model_reuse_GPU with cached boundary MPS environments
-for incremental updates during sampling and energy evaluation.
+"""GPU VMC for spinful Fermi-Hubbard with fPEPS.
 
 Run:
-    torchrun --nproc_per_node=<N> vmc_run_fpeps_reuse.py
-    torchrun --nproc_per_node=1 vmc_run_fpeps_reuse.py
+    torchrun --nproc_per_node=<N> vmc_run_fpeps.py
+    torchrun --nproc_per_node=1 vmc_run_fpeps.py
 """
-import json
-import os
-
 import torch
 import torch.distributed as dist
 
@@ -23,16 +17,8 @@ from vmc_torch.GPU.VMC import (
 from vmc_torch.GPU.hamiltonian import (
     spinful_Fermi_Hubbard_square_lattice_torch,
 )
-from vmc_torch.GPU.models import (
-    fPEPS_Model_GPU,
-)
-from vmc_torch.GPU.optimizer import (
-    DecayScheduler,
-    DistributedSRMinresGPU,
-    DistributedMinSRGPU,
-    MinSRGPU,
-    SGDGPU,
-)
+from vmc_torch.GPU.models import fPEPS_Model_GPU
+from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
     MetropolisExchangeSpinfulSamplerGPU,
 )
@@ -45,27 +31,28 @@ from vmc_torch.GPU.vmc_utils import (
     evaluate_energy,
     random_initial_config,
 )
-from vmcconfig import VMCConfig
+from vmcconfig import (
+    VMCConfig,
+    load_checkpoint,
+    make_on_step_end,
+    make_preconditioner,
+    make_stats,
+    make_stats_file,
+    print_summary,
+)
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch'
+    '/vmc_torch/GPU/data'
 )
 
-# import autoray as ar
-# from symmray.linalg import (
-#     svd_rand_truncated,
-#     svd_truncated
-# )
-# # ar.register_function("symmray", "svd_truncated", svd_truncated)
-# ar.register_function("symmray", "svd_truncated", svd_rand_truncated)
-
 vmc_cfg = VMCConfig(
-    batch_size=512,
-    ns_per_rank=512,
-    grad_batch_size=128,
+    batch_size=1024,
+    ns_per_rank=1024,
+    grad_batch_size=512,
     vmc_steps=1000,
-    burn_in_steps=5,
+    burn_in_steps=0,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
     use_distributed_sr_minres=True,
@@ -85,51 +72,46 @@ warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    run_sampling=False,
+    run_sampling=True,
     run_locE=False,
     run_grad=False,
 )
 
+
 def main():
     setup_linalg_hooks(
         jitter=1e-8, qr_via_eigh=False,
-        cholesky_qr=True, cholesky_qr_adaptive_jitter=False,
+        cholesky_qr=True,
+        cholesky_qr_adaptive_jitter=False,
         nonuniform_diag=True,
     )
     torch.set_default_dtype(dtype)
 
     try:
         rank, world_size, device = setup_distributed()
-        # device = torch.device(f"cuda:1")
         torch.set_default_device(device)
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 3, 2
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
-        t = 1.0
-        U = 8.0
+        t, U = 1.0, 8.0
         N_f = N_sites - 2
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4  # PEPS bond dimension (start small)
-        chi = -1  # boundary bond dim
+        D = 4
+        chi = 16
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
-            Lx,
-            Ly,
-            t,
-            U,
-            N_f,
+            Lx, Ly, t, U, N_f,
             pbc=False,
             n_fermions_per_spin=n_fermions_per_spin,
             no_u1_symmetry=False,
             gpu=True,
         )
         H.precompute_hops_gpu(device)
-        graph = H.graph
 
-        # ========== Variational state (fPEPS reuse model) ==========
+        # ========== Model ==========
         fpeps_base = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
             f"/N={N_f}/Z2/D={D}/"
@@ -148,59 +130,40 @@ def main():
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
-                'compress_opts': {
-                    'seed': 42
-                }
+                'compress_opts': {'seed': 42},
             },
         )
         model.to(device)
 
-        # ========== Load checkpoint (optional) ==========
+        # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"t={t}_U={U}/N={N_f}/Z2/D={D}/chi={chi}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/"
+            f"{model._get_name()}/chi={chi}/"
         )
+        import os
         os.makedirs(output_dir, exist_ok=True)
         model_name = model._get_name()
-        if vmc_cfg.resume_step > 0:
-            ckpt_path = os.path.join(
-                output_dir,
-                f'checkpoint_{model_name}'
-                f'_{vmc_cfg.resume_step}.pt',
-            )
-            ckpt = torch.load(
-                ckpt_path,
-                map_location=device,
-                weights_only=True,
-            )
-            model.load_state_dict(ckpt)
-            if rank == 0:
-                print(f"Loaded checkpoint: {ckpt_path}")
+        N_params = sum(
+            p.numel() for p in model.parameters()
+        )
 
-        N_params = sum(p.numel() for p in model.parameters())
+        load_checkpoint(
+            model, output_dir, model_name,
+            vmc_cfg.resume_step, device, rank,
+        )
+
         if rank == 0:
             print(
                 f"Model: {N_params} params | "
                 f"{world_size} GPUs | {device}"
             )
-            print(
-                f"System: {Lx}x{Ly} Fermi-Hubbard, "
-                f"t={t}, U={U}, N_f={N_f}, D={D}, chi={chi}"
-            )
 
-        # ========== bMPS skeleton init (one-time) ==========
+        # ========== Export + compile ==========
         example_x = random_initial_config(
             N_f, N_sites, seed=0,
         ).to(device)
-
-        if rank == 0:
-            print("Initializing bMPS skeleton...")
-
-        # ========== Export + compile full contraction ==========
         if vmc_cfg.use_export_compile:
-            example_x = random_initial_config(
-                N_f, N_sites, seed=0,
-            ).to(device)
             if rank == 0:
                 print("Running torch.export + compile...")
             import time as _time
@@ -216,11 +179,8 @@ def main():
                 )
 
         print_sampling_settings(
-            rank,
-            world_size,
-            vmc_cfg.batch_size,
-            vmc_cfg.ns_per_rank,
-            vmc_cfg.grad_batch_size,
+            rank, world_size, vmc_cfg.batch_size,
+            vmc_cfg.ns_per_rank, vmc_cfg.grad_batch_size,
         )
 
         # ========== Initialize walkers ==========
@@ -232,65 +192,28 @@ def main():
             seed=42, rank=rank, device=device,
         )
 
-        # ========== Stats tracking ==========
-        step_tag = (
-            f'_from{vmc_cfg.resume_step}'
-            if vmc_cfg.resume_step > 0 else ''
+        # ========== Stats + callback ==========
+        system_str = (
+            f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
+            f'N_f={N_f}, D={D}, chi={chi}'
         )
-        stats_file = os.path.join(
-            output_dir,
-            f'stats_{model_name}_reuse{step_tag}.json',
+        stats_file = make_stats_file(
+            output_dir, model_name,
+            vmc_cfg.resume_step,
         )
-        total_ns = vmc_cfg.ns_per_rank * world_size
-        stats = {
-            'system': (
-                f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
-                f'N_f={N_f}, D={D}, chi={chi}'
-            ),
-            'Np': N_params,
-            'sample size': total_ns,
-            'mean': [],
-            'error': [],
-            'variance': [],
-        }
-        
-        # ========== Data-saving callback ==========
-        def on_step_end(info):
-            if rank != 0:
-                return
-            stats['mean'].append(info['energy_per_site'])
-            stats['error'].append(info['error_per_site'])
-            stats['variance'].append(info['energy_var'])
-            with open(stats_file, 'w') as f:
-                json.dump(stats, f, indent=4)
-
-            step = info['step']
-            if (step + 1) % vmc_cfg.save_every == 0:
-                ckpt_path = os.path.join(
-                    output_dir,
-                    f'checkpoint_{model_name}_{step + 1}.pt',
-                )
-                torch.save(model.state_dict(), ckpt_path)
+        stats = make_stats(
+            system_str, N_params,
+            vmc_cfg.ns_per_rank, world_size,
+        )
+        on_step_end = make_on_step_end(
+            rank, stats, stats_file, output_dir,
+            model_name, model, vmc_cfg.save_every,
+        )
 
         # ========== VMC driver ==========
-        if vmc_cfg.use_distributed_min_sr:
-            preconditioner = DistributedMinSRGPU(
-                param_chunk_size=vmc_cfg.param_chunk_size,
-            )
-        elif vmc_cfg.use_min_sr:
-            preconditioner = MinSRGPU()
-        elif vmc_cfg.use_distributed_sr_minres:
-            preconditioner = DistributedSRMinresGPU(
-                rtol=vmc_cfg.sr_rtol,
-                maxiter=vmc_cfg.sr_maxiter,
-                use_scipy=vmc_cfg.minres_sr_use_scipy,
-            )
-        else:
-            preconditioner = None
-            
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
-            preconditioner=preconditioner,
+            preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),
@@ -298,20 +221,12 @@ def main():
         )
 
         fxs = vmc.run_warmup(
-            fxs=fxs,
-            model=model,
-            graph=graph,
-            hamiltonian=H,
-            rank=rank,
-            config=warmup_cfg,
+            fxs=fxs, model=model, graph=H.graph,
+            hamiltonian=H, rank=rank, config=warmup_cfg,
         )
-
         energy_history, _ = vmc.run_vmc_loop(
-            fxs=fxs,
-            model=model,
-            hamiltonian=H,
-            graph=graph,
-            rank=rank,
+            fxs=fxs, model=model, hamiltonian=H,
+            graph=H.graph, rank=rank,
             world_size=world_size,
             config=VMCLoopConfig.from_vmc_config(
                 vmc_cfg,
@@ -321,22 +236,10 @@ def main():
             on_step_end=on_step_end,
         )
 
-        # ========== Summary ==========
-        if rank == 0 and energy_history:
-            print(f"\n{'=' * 50}")
-            print(
-                f"Result: {Lx}x{Ly} Fermi-Hubbard, "
-                f"t={t}, U={U}, N_f={N_f}, D={D}, chi={chi}"
-            )
-            print(f"{'=' * 50}")
-            print(f"First E/site: {energy_history[0]:.6f}")
-            print(f"Last  E/site: {energy_history[-1]:.6f}")
-            print(f"Min   E/site: {min(energy_history):.6f}")
-            print(f"Stats saved to: {stats_file}")
-            if energy_history[-1] < energy_history[0]:
-                print("\nEnergy decreased.")
-            else:
-                print("\nWARNING: Energy did NOT decrease.")
+        print_summary(
+            rank, energy_history,
+            system_str, stats_file,
+        )
     finally:
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()

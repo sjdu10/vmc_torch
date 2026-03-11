@@ -178,6 +178,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         max_bond,
         dtype=torch.float64,
         contract_boundary_opts=None,
+        bold=True,
         **kwargs,
     ):
         import quimb as qu
@@ -205,6 +206,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         self.Ly = tn.Ly
         self.chi = max_bond
         self.debug = kwargs.get('debug', False)
+        self.bold = bold # whether to aggresively do exact contraction for 3-row TN - for GPU this is often faster than doing SVD with small bond dimension
 
         # bMPS skeleton/in_dims dicts — populated by cache_bMPS_skeleton
         self.bMPS_x_skeletons = {}
@@ -392,7 +394,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                         or bMPS_keys[1]
                         in self._raw_bMPS_x_keys
                     )
-                    if not has_raw:
+                    if not has_raw and not self.bold:
                         amp_reuse.contract_boundary_from_xmin_(
                             max_bond=self.chi, cutoff=0.0,
                             xrange=[
@@ -439,7 +441,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                         or bMPS_keys[1]
                         in self._raw_bMPS_y_keys
                     )
-                    if not has_raw:
+                    if not has_raw and not self.bold:
                         amp_reuse.contract_boundary_from_ymin_(
                             max_bond=self.chi, cutoff=0.0,
                             yrange=[
@@ -530,7 +532,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                         or bMPS_keys[1]
                         in self._raw_bMPS_x_keys
                     )
-                    if not has_raw:
+                    if not has_raw and not self.bold:
                         amp_reuse.contract_boundary_from_xmin_(
                             max_bond=self.chi, cutoff=0.0,
                             xrange=[
@@ -581,7 +583,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                         or bMPS_keys[1]
                         in self._raw_bMPS_y_keys
                     )
-                    if not has_raw:
+                    if not has_raw and not self.bold:
                         amp_reuse.contract_boundary_from_ymin_(
                             max_bond=self.chi, cutoff=0.0,
                             yrange=[
@@ -1421,12 +1423,14 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             })
             env_x = amp.compute_x_environments(
                 max_bond=self.chi, cutoff=0.0,
+                **self.contract_boundary_opts,
             )
             bMPS_params_x_dict = {}
             for key, btn in env_x.items():
                 bMPS_params_x_dict[key] = get_params_ftn(btn)
             env_y = amp.compute_y_environments(
                 max_bond=self.chi, cutoff=0.0,
+                **self.contract_boundary_opts,
             )
             bMPS_params_y_dict = {}
             for key, btn in env_y.items():
@@ -1467,6 +1471,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             })
             env_x = amp.compute_x_environments(
                 max_bond=self.chi, cutoff=0.0,
+                **self.contract_boundary_opts,
             )
             amp_val = (
                 env_x[('xmin', self.Lx // 2)]
@@ -1487,6 +1492,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             })
             env_y = amp.compute_y_environments(
                 max_bond=self.chi, cutoff=0.0,
+                **self.contract_boundary_opts,
             )
             amp_val = (
                 env_y[('ymin', self.Ly // 2)]

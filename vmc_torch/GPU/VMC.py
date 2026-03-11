@@ -790,6 +790,20 @@ class VMC_GPU:
                 )
                 vmc_pbar.update(1)
 
+            # Gather walker configs from all ranks
+            # for checkpoint saving (Ns, N_sites)
+            if world_size > 1:
+                _fxs_list = [
+                    torch.zeros_like(fxs)
+                    for _ in range(world_size)
+                ]
+                dist.all_gather(
+                    _fxs_list, fxs.contiguous(),
+                )
+                all_fxs = torch.cat(_fxs_list, dim=0)
+            else:
+                all_fxs = fxs
+
             if on_step_end is not None:
                 on_step_end(
                     {
@@ -804,6 +818,7 @@ class VMC_GPU:
                         "sr_time": t_sr,
                         "total_time": step_time,
                         "solver_info": info,
+                        "fxs": all_fxs,
                     }
                 )
 

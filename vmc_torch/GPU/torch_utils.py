@@ -607,7 +607,7 @@ class CholeskyQR(torch.autograd.Function):
         else:
             ctx.save_for_backward(Q, R)
         ctx.tall = (M >= N)
-        ctx.null_thresh = jitter ** 0.5 if jitter > 0 else 0.0
+        ctx.null_thresh = jitter ** 0.5
 
     @staticmethod
     def backward(ctx, dQ, dR):
@@ -634,6 +634,7 @@ def qr_via_cholesky(x, jitter=1e-12, adaptive_jitter=False, forward_only=False):
     """
     if adaptive_jitter:
         scale = (x * x).sum(dim=(-2, -1))
+        scale.detach()
         jitter = jitter * scale.amax()  # scalar
     if forward_only:
         Q, R = _cholesky_qr_forward(x, jitter)

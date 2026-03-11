@@ -26,3 +26,4 @@ vmc_torch/experiment/vmap/debug
 vmc_torch/GPU/data
 CLAUDE.md
 notebook.md
+test_scripts/

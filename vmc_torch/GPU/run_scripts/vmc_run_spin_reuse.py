@@ -7,8 +7,8 @@ Run:
     torchrun --nproc_per_node=<N> vmc_run_spin_reuse.py
     torchrun --nproc_per_node=1 vmc_run_spin_reuse.py
 """
-import json
 import os
+import time
 from dataclasses import dataclass
 
 import torch
@@ -28,16 +28,8 @@ from vmc_torch.GPU.vmc_utils import (
 from vmc_torch.hamiltonian_torch import (
     spin_Heisenberg_square_lattice_torch,
 )
-from vmc_torch.GPU.models import (
-    PEPS_Model_reuse_GPU,
-)
-from vmc_torch.GPU.optimizer import (
-    DecayScheduler,
-    DistributedMinSRGPU,
-    DistributedSRMinresGPU,
-    MinSRGPU,
-    SGDGPU,
-)
+from vmc_torch.GPU.models import PEPS_Model_reuse_GPU
+from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
     MetropolisExchangeSpinSamplerReuse_GPU,
 )
@@ -47,7 +39,15 @@ from vmc_torch.GPU.vmc_setup import (
     random_spin_config_sz0,
     setup_linalg_hooks,
 )
-from vmcconfig import VMCConfig
+from vmcconfig import (
+    VMCConfig,
+    load_checkpoint,
+    make_on_step_end,
+    make_preconditioner,
+    make_stats,
+    make_stats_file,
+    print_summary,
+)
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
@@ -61,6 +61,7 @@ class ReuseCfg(VMCConfig):
     """Reuse-model specific settings."""
     use_export_compile_reuse: bool = False
     use_cheap_grad: bool = True
+
 
 vmc_cfg = ReuseCfg(
     batch_size=512,
@@ -106,15 +107,14 @@ def main():
         Lx, Ly = 6, 6
         N_sites = Lx * Ly
         J = 1.0
-        D = 4  # PEPS bond dimension
-        chi = 16  # boundary bond dim
+        D = 4
+        chi = 16
 
         # ========== Hamiltonian ==========
         H = spin_Heisenberg_square_lattice_torch(
             Lx, Ly, J=J, total_sz=0,
         )
         H.precompute_hops_gpu(device)
-        graph = H.graph
 
         # ED reference for small systems
         if rank == 0 and N_sites <= 16:
@@ -128,7 +128,7 @@ def main():
                 f"{gs_e / N_sites:.8f}"
             )
 
-        # ========== Model (PEPS with reuse) ==========
+        # ========== Model ==========
         peps = generate_random_spin_peps(
             Lx, Ly, D, seed=42, dtype=dtype,
         )
@@ -138,55 +138,46 @@ def main():
             dtype=dtype,
             contract_boundary_opts={
                 'mode': 'mps',
-                # 'equalize_norms': 1.0,
                 'canonize': True,
             },
         )
         model.to(device)
 
-        # ========== Load checkpoint (optional) ==========
+        # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
             f"J={J}/D={D}/chi={chi}/"
         )
         os.makedirs(output_dir, exist_ok=True)
         model_name = model._get_name()
-        if vmc_cfg.resume_step > 0:
-            ckpt_path = os.path.join(
-                output_dir,
-                f'checkpoint_{model_name}'
-                f'_{vmc_cfg.resume_step}.pt',
-            )
-            ckpt = torch.load(
-                ckpt_path,
-                map_location=device,
-                weights_only=True,
-            )
-            model.load_state_dict(ckpt)
-            if rank == 0:
-                print(f"Loaded checkpoint: {ckpt_path}")
+        N_params = sum(
+            p.numel() for p in model.parameters()
+        )
 
-        N_params = sum(p.numel() for p in model.parameters())
+        load_checkpoint(
+            model, output_dir, model_name,
+            vmc_cfg.resume_step, device, rank,
+        )
+
         if rank == 0:
             print(
-                f"System: {Lx}x{Ly} Heisenberg, J={J}, "
-                f"Sz=0"
+                f"System: {Lx}x{Ly} Heisenberg, "
+                f"J={J}, Sz=0"
             )
             print(
-                f"Model: PEPS_Model_reuse_GPU D={D}, "
+                f"Model: {model_name} D={D}, "
                 f"chi={chi}, {N_params} params | "
                 f"{world_size} GPUs | {device}"
             )
 
-        # ========== bMPS skeleton init (one-time) ==========
+        # ========== bMPS skeleton + reuse compile ==========
         example_x = random_spin_config_sz0(
             N_sites, seed=0,
         ).to(device)
-        import time
         t0 = time.time()
         model.cache_bMPS_skeleton(example_x)
         print(f'Cached skeleton time={time.time()-t0}')
-        # ========== Export + compile reuse (optional) =====
+
         if vmc_cfg.use_export_compile_reuse:
             if rank == 0:
                 print("Exporting reuse patterns...")
@@ -195,8 +186,6 @@ def main():
                 verbose=(rank == 0),
                 use_log_amp=vmc_cfg.use_log_amp,
             )
-
-        # ========== Export + compile full contraction ======
         if vmc_cfg.use_export_compile:
             if rank == 0:
                 print("Running torch.export + compile...")
@@ -206,11 +195,8 @@ def main():
             )
 
         print_sampling_settings(
-            rank,
-            world_size,
-            vmc_cfg.batch_size,
-            vmc_cfg.ns_per_rank,
-            vmc_cfg.grad_batch_size,
+            rank, world_size, vmc_cfg.batch_size,
+            vmc_cfg.ns_per_rank, vmc_cfg.grad_batch_size,
         )
 
         # ========== Initialize walkers ==========
@@ -222,47 +208,28 @@ def main():
             seed=42, rank=rank, device=device,
         )
 
-        # ========== Stats tracking ==========
-        step_tag = (
-            f'_from{vmc_cfg.resume_step}'
-            if vmc_cfg.resume_step > 0 else ''
+        # ========== Stats + callback ==========
+        system_str = (
+            f'{Lx}x{Ly} Heisenberg, J={J}, '
+            f'D={D}, chi={chi}'
         )
-        stats_file = os.path.join(
-            output_dir,
-            f'stats_{model_name}_reuse{step_tag}.json',
+        stats_file = make_stats_file(
+            output_dir, model_name,
+            vmc_cfg.resume_step, suffix='_reuse',
         )
-        total_ns = vmc_cfg.ns_per_rank * world_size
-        stats = {
-            'system': (
-                f'{Lx}x{Ly} Heisenberg, J={J}, '
-                f'D={D}, chi={chi}'
-            ),
-            'Np': N_params,
-            'sample size': total_ns,
-            'mean': [],
-            'error': [],
-            'variance': [],
-        }
+        stats = make_stats(
+            system_str, N_params,
+            vmc_cfg.ns_per_rank, world_size,
+        )
+        on_step_end = make_on_step_end(
+            rank, stats, stats_file, output_dir,
+            model_name, model, vmc_cfg.save_every,
+        )
 
         # ========== VMC driver ==========
-        if vmc_cfg.use_distributed_min_sr:
-            preconditioner = DistributedMinSRGPU(
-                param_chunk_size=vmc_cfg.param_chunk_size,
-            )
-        elif vmc_cfg.use_min_sr:
-            preconditioner = MinSRGPU()
-        elif vmc_cfg.use_distributed_sr_minres:
-            preconditioner = DistributedSRMinresGPU(
-                rtol=vmc_cfg.sr_rtol,
-                maxiter=vmc_cfg.sr_maxiter,
-                use_scipy=vmc_cfg.minres_sr_use_scipy,
-            )
-        else:
-            preconditioner = None
-
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinSamplerReuse_GPU(),
-            preconditioner=preconditioner,
+            preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),
@@ -275,38 +242,12 @@ def main():
         )
 
         fxs = vmc.run_warmup(
-            fxs=fxs,
-            model=model,
-            graph=graph,
-            hamiltonian=H,
-            rank=rank,
-            config=warmup_cfg,
+            fxs=fxs, model=model, graph=H.graph,
+            hamiltonian=H, rank=rank, config=warmup_cfg,
         )
-
-        # ========== Data-saving callback ==========
-        def on_step_end(info):
-            if rank != 0:
-                return
-            stats['mean'].append(info['energy_per_site'])
-            stats['error'].append(info['error_per_site'])
-            stats['variance'].append(info['energy_var'])
-            with open(stats_file, 'w') as f:
-                json.dump(stats, f, indent=4)
-
-            step = info['step']
-            if (step + 1) % vmc_cfg.save_every == 0:
-                ckpt_path = os.path.join(
-                    output_dir,
-                    f'checkpoint_{model_name}_{step + 1}.pt',
-                )
-                torch.save(model.state_dict(), ckpt_path)
-
         energy_history, fxs = vmc.run_vmc_loop(
-            fxs=fxs,
-            model=model,
-            hamiltonian=H,
-            graph=graph,
-            rank=rank,
+            fxs=fxs, model=model, hamiltonian=H,
+            graph=H.graph, rank=rank,
             world_size=world_size,
             config=VMCLoopConfig.from_vmc_config(
                 vmc_cfg,
@@ -316,22 +257,10 @@ def main():
             on_step_end=on_step_end,
         )
 
-        # ========== Summary ==========
-        if rank == 0 and energy_history:
-            print(f"\n{'=' * 50}")
-            print(
-                f"Result: {Lx}x{Ly} Heisenberg, J={J}, "
-                f"D={D}, chi={chi} (reuse)"
-            )
-            print(f"{'=' * 50}")
-            print(f"First E/site: {energy_history[0]:.6f}")
-            print(f"Last  E/site: {energy_history[-1]:.6f}")
-            print(f"Min   E/site: {min(energy_history):.6f}")
-            print(f"Stats saved to: {stats_file}")
-            if energy_history[-1] < energy_history[0]:
-                print("\nEnergy decreased.")
-            else:
-                print("\nWARNING: Energy did NOT decrease.")
+        print_summary(
+            rank, energy_history,
+            system_str, stats_file,
+        )
     finally:
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
