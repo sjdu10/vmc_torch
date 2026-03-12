@@ -328,19 +328,18 @@ def svd_via_eigh(
         P = A.mT @ A
 
         # Add jitter to P = A^T A, not to A
-        if jitter > 0:
-            K = N
-            if nonuniform_diag:
-                diag_vals = torch.arange(
-                    1, K + 1, device=A.device, dtype=A.dtype,
-                ) / K
-                P = P + jitter * torch.diag_embed(
-                    diag_vals.expand(P.shape[:-1]),
-                )
-            else:
-                P = P + jitter * torch.eye(
-                    K, device=A.device, dtype=A.dtype,
-                )
+        K = N
+        if nonuniform_diag:
+            diag_vals = torch.arange(
+                1, K + 1, device=A.device, dtype=A.dtype,
+            ) / K
+            P = P + jitter * torch.diag_embed(
+                diag_vals.expand(P.shape[:-1]),
+            )
+        else:
+            P = P + jitter * torch.eye(
+                K, device=A.device, dtype=A.dtype,
+            )
 
         L, V = torch.linalg.eigh(P)
         L = torch.clamp(L, min=0.0)
@@ -365,19 +364,18 @@ def svd_via_eigh(
     else:
         P = A @ A.mT
 
-        if jitter > 0:
-            K = M
-            if nonuniform_diag:
-                diag_vals = torch.arange(
-                    1, K + 1, device=A.device, dtype=A.dtype,
-                ) / K
-                P = P + jitter * torch.diag_embed(
-                    diag_vals.expand(P.shape[:-1]),
-                )
-            else:
-                P = P + jitter * torch.eye(
-                    K, device=A.device, dtype=A.dtype,
-                )
+        K = M
+        if nonuniform_diag:
+            diag_vals = torch.arange(
+                1, K + 1, device=A.device, dtype=A.dtype,
+            ) / K
+            P = P + jitter * torch.diag_embed(
+                diag_vals.expand(P.shape[:-1]),
+            )
+        else:
+            P = P + jitter * torch.eye(
+                K, device=A.device, dtype=A.dtype,
+            )
 
         L, U_eig = torch.linalg.eigh(P)
         L = torch.clamp(L, min=0.0)
@@ -497,7 +495,7 @@ def robust_svd_err_catcher_wrapper(
 # ========== Cholesky QR dispatch ================
 
 
-def _cholesky_qr_forward(A, jitter):
+def _cholesky_qr_forward(A, rel_jitter):
     """Cholesky QR forward: fast but no autograd.
 
     Tall/square (M >= N):
@@ -505,6 +503,9 @@ def _cholesky_qr_forward(A, jitter):
     Wide (M < N):
       Cholesky QR on A[:,:M] → Q, then R = Q^T A
     """
+    scale = (A * A).sum(dim=(-2, -1))
+    scale.detach()
+    jitter = rel_jitter * scale.amax()  # scalar
     M, N = A.shape[-2:]
     if M >= N:
         G = A.mT @ A
@@ -532,30 +533,35 @@ def _cholesky_qr_forward(A, jitter):
     return Q, R
 
 
-def _solve_R_inv_T(R, rhs, null_thresh=0.0):
-    """Compute rhs @ R^{-T} via thresholded pseudoinverse.
+def _solve_R_inv_T(R, A, rel_jitter=0.0) -> torch.Tensor:
+    """Compute A @ R^{-T} via thresholded pseudoinverse.
 
     Uses svd_via_eigh (fast eigh-based SVD) instead of
     torch.linalg.svd to avoid the batched SVD performance cliff.
-    Singular values of R below null_thresh get 1/S → 0.
+    Singular values of R below rel_jitter get 1/S → 0.
+
+    The jitter passed to svd_via_eigh is scaled by tr(R) so
+    it stays meaningful relative to R's scale,
+    even when R is ill-conditioned.
 
     Args:
         R: (..., K, K) upper triangular
-        rhs: (..., M, K)
-        null_thresh: absolute threshold for null-space truncation
+        A: (..., M, K)
+        rel_jitter: used as relative jitter scale for svd_via_eigh.
     Returns:
-        rhs @ R^{-T}: (..., M, K)
+        A @ R^{-T}: (..., M, K)
     """
     # R = U_R @ diag(S_R) @ Vh_R
     # R^{-T} = U_R @ diag(1/S_R) @ Vh_R
-    U_R, S_R, Vh_R = svd_via_eigh(R)
-    S_inv = torch.where(
-        S_R > null_thresh, 1.0 / S_R, torch.zeros_like(S_R),
-    )
-    return (rhs @ U_R) * S_inv.unsqueeze(-2) @ Vh_R
+    # Scale jitter by tr(R) so it's meaningful relative to R's scale.
+    tr_R = torch.diagonal(R, dim1=-2, dim2=-1).sum(-1).max().detach()
+    adaptive_jitter = rel_jitter * tr_R
+    U_R, S_R, Vh_R = svd_via_eigh(R, jitter=adaptive_jitter)
+    S_inv = safe_inverse(S_R)
+    return (A @ U_R) * S_inv.unsqueeze(-2) @ Vh_R
 
 
-def _qr_backward_tall(Q, R, dQ, dR, null_thresh=0.0):
+def _qr_backward_tall(Q, R, dQ, dR, rel_jitter=0.0):
     """Standard QR backward for tall/square (M >= N).
 
     From Seeger et al. (2017) / Liao et al. (2019):
@@ -565,10 +571,10 @@ def _qr_backward_tall(Q, R, dQ, dR, null_thresh=0.0):
     M_mat = R @ dR.mT - dQ.mT @ Q
     M_mat = M_mat.tril(0) + M_mat.tril(-1).mT
     tmp = dQ + Q @ M_mat
-    return _solve_R_inv_T(R, tmp, null_thresh)
+    return _solve_R_inv_T(R, tmp, rel_jitter)
 
 
-def _qr_backward_wide(A, Q, R, dQ, dR, null_thresh=0.0):
+def _qr_backward_wide(A, Q, R, dQ, dR, rel_jitter=0.0):
     """Standard QR backward for wide (M < N)."""
     M, N = A.shape[-2:]
     U, V = R.split((M, N - M), dim=-1)
@@ -578,7 +584,7 @@ def _qr_backward_wide(A, Q, R, dQ, dR, null_thresh=0.0):
     M_mat = U @ dU.mT - tmp.mT @ Q
     M_mat = M_mat.tril(0) + M_mat.tril(-1).mT
     tmp = tmp + Q @ M_mat
-    dX = _solve_R_inv_T(U, tmp, null_thresh)
+    dX = _solve_R_inv_T(U, tmp, rel_jitter)
     return torch.cat((dX, Q @ dV), dim=-1)
 
 
@@ -593,13 +599,13 @@ class CholeskyQR(torch.autograd.Function):
     generate_vmap_rule = True
 
     @staticmethod
-    def forward(A, jitter):
-        Q, R = _cholesky_qr_forward(A, jitter)
+    def forward(A, rel_jitter):
+        Q, R = _cholesky_qr_forward(A, rel_jitter)
         return Q, R
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        A, jitter = inputs
+        A, rel_jitter = inputs
         Q, R = output
         M, N = A.shape[-2:]
         if M < N:
@@ -607,11 +613,11 @@ class CholeskyQR(torch.autograd.Function):
         else:
             ctx.save_for_backward(Q, R)
         ctx.tall = (M >= N)
-        ctx.null_thresh = jitter ** 0.5
+        ctx.rel_jitter = rel_jitter
 
     @staticmethod
     def backward(ctx, dQ, dR):
-        nt = ctx.null_thresh
+        nt = ctx.rel_jitter
         if ctx.tall:
             Q, R = ctx.saved_tensors
             dA = _qr_backward_tall(Q, R, dQ, dR, nt)
@@ -621,7 +627,7 @@ class CholeskyQR(torch.autograd.Function):
         return dA, None
 
 
-def qr_via_cholesky(x, jitter=1e-12, adaptive_jitter=False, forward_only=False):
+def qr_via_cholesky(x, jitter=1e-16, adaptive_jitter=False, forward_only=False):
     """QR via Cholesky forward + standard QR backward.
 
     Uses CholeskyQR custom autograd.Function for stable gradients.
@@ -655,7 +661,7 @@ def qr_via_svd(x):
     return U, R
 
 
-def qr_via_eigh(x, jitter=1e-12, nonuniform_diag=False):
+def qr_via_eigh(x, jitter=1e-16, nonuniform_diag=False):
     """QR via eigh-based SVD. A = USVh -> Q=U, R=diag(S)@Vh.
 
     Uses RobustSVD_EIG which computes SVD through eigendecomposition
@@ -691,7 +697,7 @@ def size_aware_qr(x, via_eigh=False, jitter=0.0, nonuniform_diag=False):
 
 
 def size_aware_svd(
-    x, jitter=1e-12, driver=None, backend='cuSOLVER',
+    x, jitter=1e-16, driver=None, backend='cuSOLVER',
     nonuniform_diag=False,
 ):
     """Size/device-aware SVD. Uses EIG-based+MAGMA on GPU for n>32.

@@ -64,9 +64,9 @@ class ReuseCfg(VMCConfig):
 
 
 vmc_cfg = ReuseCfg(
-    batch_size=512,
-    ns_per_rank=512,
-    grad_batch_size=512,
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=1024,
     vmc_steps=1000,
     burn_in_steps=1,
     learning_rate=0.1,
@@ -74,7 +74,7 @@ vmc_cfg = ReuseCfg(
     use_distributed_sr_minres=True,
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
-    use_log_amp=False,
+    use_log_amp=True,
     use_export_compile=False,
     save_every=10,
     resume_step=0,
@@ -88,9 +88,9 @@ warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    run_sampling=True,
-    run_locE=True,
-    run_grad=True,
+    # run_sampling=True,
+    # run_locE=True,
+    # run_grad=True,
 )
 
 
@@ -104,7 +104,7 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 6, 6
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         J = 1.0
         D = 4
@@ -139,14 +139,16 @@ def main():
             contract_boundary_opts={
                 'mode': 'mps',
                 'canonize': True,
+                'equalize_norms': 1.0,
             },
+            bold=True,
         )
         model.to(device)
 
         # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"J={J}/D={D}/chi={chi}/"
+            f"J={J}/D={D}/{model._get_name()}/chi={chi}/"
         )
         os.makedirs(output_dir, exist_ok=True)
         model_name = model._get_name()

@@ -361,13 +361,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 and bMPS_params_xmax is not None
                 and bMPS_keys is not None):
             bMPS_min = unpack_ftn(
-                bMPS_params_xmin,
+                bMPS_params_xmin[0],
                 self.bMPS_x_skeletons[bMPS_keys[0]],
             )
+            bMPS_min.exponent = bMPS_params_xmin[1]
             bMPS_max = unpack_ftn(
-                bMPS_params_xmax,
+                bMPS_params_xmax[0],
                 self.bMPS_x_skeletons[bMPS_keys[1]],
             )
+            bMPS_max.exponent = bMPS_params_xmax[1]
             rows = amp.select(
                 [tns.row_tag(row) for row in selected_rows],
                 which='any',
@@ -413,13 +415,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 and bMPS_params_ymax is not None
                 and bMPS_keys is not None):
             bMPS_min = unpack_ftn(
-                bMPS_params_ymin,
+                bMPS_params_ymin[0],
                 self.bMPS_y_skeletons[bMPS_keys[0]],
             )
+            bMPS_min.exponent = bMPS_params_ymin[1]
             bMPS_max = unpack_ftn(
-                bMPS_params_ymax,
+                bMPS_params_ymax[0],
                 self.bMPS_y_skeletons[bMPS_keys[1]],
             )
+            bMPS_max.exponent = bMPS_params_ymax[1]
             cols = amp.select(
                 [tns.col_tag(col) for col in selected_cols],
                 which='any',
@@ -504,13 +508,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 and bMPS_params_xmax is not None
                 and bMPS_keys is not None):
             bMPS_min = unpack_ftn(
-                bMPS_params_xmin,
+                bMPS_params_xmin[0],
                 self.bMPS_x_skeletons[bMPS_keys[0]],
             )
+            bMPS_min.exponent = bMPS_params_xmin[1]
             bMPS_max = unpack_ftn(
-                bMPS_params_xmax,
+                bMPS_params_xmax[0],
                 self.bMPS_x_skeletons[bMPS_keys[1]],
             )
+            bMPS_max.exponent = bMPS_params_xmax[1]
             rows = amp.select(
                 [tns.row_tag(row) for row in selected_rows],
                 which='any',
@@ -555,13 +561,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 and bMPS_params_ymax is not None
                 and bMPS_keys is not None):
             bMPS_min = unpack_ftn(
-                bMPS_params_ymin,
+                bMPS_params_ymin[0],
                 self.bMPS_y_skeletons[bMPS_keys[0]],
             )
+            bMPS_min.exponent = bMPS_params_ymin[1]
             bMPS_max = unpack_ftn(
-                bMPS_params_ymax,
+                bMPS_params_ymax[0],
                 self.bMPS_y_skeletons[bMPS_keys[1]],
             )
+            bMPS_max.exponent = bMPS_params_ymax[1]
             cols = amp.select(
                 [tns.col_tag(col) for col in selected_cols],
                 which='any',
@@ -1363,7 +1371,10 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         for key, tn in env_x.items():
             bMPS_params, skeleton = pack_ftn(tn)
             env_x[key] = skeleton
-            bMPS_params_dict[key] = bMPS_params
+            bMPS_params_dict[key] = (
+                bMPS_params,
+                torch.tensor(0.0, dtype=self.dtype),
+            )
         self.bMPS_x_skeletons = env_x
         self.bMPS_params_x_in_dims = qu.utils.tree_map(
             lambda _: 0, bMPS_params_dict
@@ -1386,7 +1397,10 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         for key, tn in env_y.items():
             bMPS_params, skeleton = pack_ftn(tn)
             env_y[key] = skeleton
-            bMPS_params_dict[key] = bMPS_params
+            bMPS_params_dict[key] = (
+                bMPS_params,
+                torch.tensor(0.0, dtype=self.dtype),
+            )
         self.bMPS_y_skeletons = env_y
         self.bMPS_params_y_in_dims = qu.utils.tree_map(
             lambda _: 0, bMPS_params_dict
@@ -1427,14 +1441,20 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             )
             bMPS_params_x_dict = {}
             for key, btn in env_x.items():
-                bMPS_params_x_dict[key] = get_params_ftn(btn)
+                bMPS_params_x_dict[key] = (
+                    get_params_ftn(btn),
+                    torch.as_tensor(btn.exponent),
+                )
             env_y = amp.compute_y_environments(
                 max_bond=self.chi, cutoff=0.0,
                 **self.contract_boundary_opts,
             )
             bMPS_params_y_dict = {}
             for key, btn in env_y.items():
-                bMPS_params_y_dict[key] = get_params_ftn(btn)
+                bMPS_params_y_dict[key] = (
+                    get_params_ftn(btn),
+                    torch.as_tensor(btn.exponent),
+                )
             return bMPS_params_x_dict, bMPS_params_y_dict
 
         return torch.vmap(
@@ -1479,7 +1499,10 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             ).contract()
             bMPS_params_x_dict = {}
             for key, btn in env_x.items():
-                bMPS_params_x_dict[key] = get_params_ftn(btn)
+                bMPS_params_x_dict[key] = (
+                    get_params_ftn(btn),
+                    torch.as_tensor(btn.exponent),
+                )
             return bMPS_params_x_dict, amp_val
 
         def cache_bMPS_params_y_single(x_single, params):
@@ -1500,7 +1523,10 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             ).contract()
             bMPS_params_y_dict = {}
             for key, btn in env_y.items():
-                bMPS_params_y_dict[key] = get_params_ftn(btn)
+                bMPS_params_y_dict[key] = (
+                    get_params_ftn(btn),
+                    torch.as_tensor(btn.exponent),
+                )
             return bMPS_params_y_dict, amp_val
 
         if direction == 'x':
@@ -1549,9 +1575,10 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 for i, site in enumerate(tns.sites)
             })
             bMPS_to_row = unpack_ftn(
-                bMPS_params_x[bMPS_key],
+                bMPS_params_x[bMPS_key][0],
                 self.bMPS_x_skeletons[bMPS_key],
             )
+            bMPS_to_row.exponent = bMPS_params_x[bMPS_key][1]
             row_tn = amp.select(
                 [tns.row_tag(row_id)], which='any',
             )
@@ -1571,14 +1598,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                     updated_bMPS_params, get_ref=True,
                 )
                 _, pytree = qu.utils.tree_flatten(
-                    bMPS_params_x[(from_which, row_id + 1)],
+                    bMPS_params_x[(from_which, row_id + 1)][0],
                     get_ref=True,
                 )
                 updated_bMPS_params = qu.utils.tree_unflatten(
                     pytree_params, pytree,
                 )
                 bMPS_params_x[(from_which, row_id + 1)] = (
-                    updated_bMPS_params
+                    updated_bMPS_params,
+                    torch.as_tensor(updated_bMPS.exponent),
                 )
             else:
                 if row_id == amp.Ly - 1:
@@ -1594,14 +1622,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                     updated_bMPS_params, get_ref=True,
                 )
                 _, pytree = qu.utils.tree_flatten(
-                    bMPS_params_x[(from_which, row_id - 1)],
+                    bMPS_params_x[(from_which, row_id - 1)][0],
                     get_ref=True,
                 )
                 updated_bMPS_params = qu.utils.tree_unflatten(
                     pytree_params, pytree,
                 )
                 bMPS_params_x[(from_which, row_id - 1)] = (
-                    updated_bMPS_params
+                    updated_bMPS_params,
+                    torch.as_tensor(updated_bMPS.exponent),
                 )
             return bMPS_params_x
 
@@ -1646,9 +1675,10 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 for i, site in enumerate(tns.sites)
             })
             bMPS_to_col = unpack_ftn(
-                bMPS_params_y[bMPS_key],
+                bMPS_params_y[bMPS_key][0],
                 self.bMPS_y_skeletons[bMPS_key],
             )
+            bMPS_to_col.exponent = bMPS_params_y[bMPS_key][1]
             col_tn = amp.select(
                 [tns.col_tag(col_id)], which='any',
             )
@@ -1668,14 +1698,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                     updated_bMPS_params, get_ref=True,
                 )
                 _, pytree = qu.utils.tree_flatten(
-                    bMPS_params_y[(from_which, col_id + 1)],
+                    bMPS_params_y[(from_which, col_id + 1)][0],
                     get_ref=True,
                 )
                 updated_bMPS_params = qu.utils.tree_unflatten(
                     pytree_params, pytree,
                 )
                 bMPS_params_y[(from_which, col_id + 1)] = (
-                    updated_bMPS_params
+                    updated_bMPS_params,
+                    torch.as_tensor(updated_bMPS.exponent),
                 )
             else:
                 if col_id == amp.Lx - 1:
@@ -1691,14 +1722,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                     updated_bMPS_params, get_ref=True,
                 )
                 _, pytree = qu.utils.tree_flatten(
-                    bMPS_params_y[(from_which, col_id - 1)],
+                    bMPS_params_y[(from_which, col_id - 1)][0],
                     get_ref=True,
                 )
                 updated_bMPS_params = qu.utils.tree_unflatten(
                     pytree_params, pytree,
                 )
                 bMPS_params_y[(from_which, col_id - 1)] = (
-                    updated_bMPS_params
+                    updated_bMPS_params,
+                    torch.as_tensor(updated_bMPS.exponent),
                 )
             return bMPS_params_y
 
@@ -1742,12 +1774,18 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         # Compute amplitude from midpoint bMPS envs
         mid = self.Lx // 2
         bMPS_mid_below = unpack_ftn(
-            bMPS_params_x[('xmin', mid)],
+            bMPS_params_x[('xmin', mid)][0],
             self.bMPS_x_skeletons[('xmin', mid)],
         )
+        bMPS_mid_below.exponent = (
+            bMPS_params_x[('xmin', mid)][1]
+        )
         bMPS_mid_above = unpack_ftn(
-            bMPS_params_x[('xmax', mid - 1)],
+            bMPS_params_x[('xmax', mid - 1)][0],
             self.bMPS_x_skeletons[('xmax', mid - 1)],
+        )
+        bMPS_mid_above.exponent = (
+            bMPS_params_x[('xmax', mid - 1)][1]
         )
         amp_val = (bMPS_mid_below | bMPS_mid_above).contract()
 
@@ -1782,11 +1820,13 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                     for i, site in enumerate(tns.sites)
                 })
                 b_below = unpack_ftn(
-                    _bp_below, _sk_below,
+                    _bp_below[0], _sk_below,
                 )
+                b_below.exponent = _bp_below[1]
                 b_above = unpack_ftn(
-                    _bp_above, _sk_above,
+                    _bp_above[0], _sk_above,
                 )
+                b_above.exponent = _bp_above[1]
                 row_ts = amp.select(
                     tns.row_tag(_row), which='any',
                 )

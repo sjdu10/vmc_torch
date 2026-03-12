@@ -48,9 +48,9 @@ DEFAULT_DATA_ROOT = (
 )
 
 vmc_cfg = VMCConfig(
-    batch_size=1024,
-    ns_per_rank=1024,
-    grad_batch_size=512,
+    batch_size=4,
+    ns_per_rank=4,
+    grad_batch_size=4,
     vmc_steps=1000,
     burn_in_steps=0,
     learning_rate=0.1,
@@ -72,16 +72,17 @@ warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    run_sampling=True,
+    offload_grad_to_cpu=vmc_cfg.offload_grad_to_cpu,
+    run_sampling=False,
     run_locE=False,
-    run_grad=False,
+    run_grad=True,
 )
 
 
 def main():
     setup_linalg_hooks(
-        jitter=1e-8, qr_via_eigh=False,
-        cholesky_qr=True,
+        jitter=1e-8, qr_via_eigh=True,
+        cholesky_qr=False,
         cholesky_qr_adaptive_jitter=False,
         nonuniform_diag=True,
     )
@@ -93,13 +94,13 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 4
+        Lx, Ly = 8, 8
         N_sites = Lx * Ly
         t, U = 1.0, 8.0
-        N_f = N_sites - 2
+        N_f = N_sites - 8
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4
-        chi = 16
+        D = 10
+        chi = 10
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(

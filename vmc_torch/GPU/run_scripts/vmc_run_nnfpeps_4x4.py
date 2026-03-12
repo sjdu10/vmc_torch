@@ -30,7 +30,7 @@ from vmc_torch.GPU.vmc_setup import (
     setup_linalg_hooks,
 )
 from vmc_torch.GPU.vmc_utils import random_initial_config
-from vmcconfig import (
+from vmc_torch.GPU.run_scripts.vmcconfig import (
     VMCConfig,
     load_checkpoint,
     make_on_step_end,
@@ -49,10 +49,7 @@ DEFAULT_DATA_ROOT = (
     '/GPU/data'
 )
 # SU-initialized PEPS from CPU vmap pipeline
-CPU_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
-    '/experiment/vmap/data'
-)
+CPU_DATA_ROOT = DEFAULT_DATA_ROOT
 
 vmc_cfg = VMCConfig(
     batch_size=2048,
@@ -79,13 +76,17 @@ warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
+    offload_grad_to_cpu=vmc_cfg.offload_grad_to_cpu,
+    run_sampling=False,
+    run_locE=False,
+    run_grad=True,
 )
 
 
 def main():
     setup_linalg_hooks(
-        jitter=1e-12, qr_via_eigh=False,
-        cholesky_qr=True, cholesky_qr_adaptive_jitter=False,
+        jitter=1e-12, qr_via_eigh=True,
+        cholesky_qr=False, cholesky_qr_adaptive_jitter=False,
     )
     torch.set_default_dtype(dtype)
 

@@ -74,7 +74,7 @@ vmc_cfg = ReuseCfg(
     offload_grad_to_cpu=True,
     use_log_amp=True,
     use_export_compile=False,
-    use_export_compile_reuse=True,
+    use_export_compile_reuse=False,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -144,7 +144,7 @@ def main():
             dtype=dtype,
             contract_boundary_opts={
                 'mode': 'mps',
-                # 'equalize_norms': 1.0,
+                'equalize_norms': 1.0,
                 'canonize': True,
             },
         )

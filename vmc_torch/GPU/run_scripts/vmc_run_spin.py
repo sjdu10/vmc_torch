@@ -19,8 +19,8 @@ from vmc_torch.GPU.VMC import (
 from vmc_torch.hamiltonian_torch import (
     spin_Heisenberg_square_lattice_torch,
 )
-from vmc_torch.GPU.models import fPEPS_Model_GPU
-from vmc_torch.GPU.optimizer import SGDGPU
+from vmc_torch.GPU.models import PEPS_Model_GPU
+from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
     MetropolisExchangeSpinSamplerGPU,
 )
@@ -49,7 +49,7 @@ vmc_cfg = VMCConfig(
     batch_size=2048,
     ns_per_rank=2048,
     grad_batch_size=1024,
-    vmc_steps=1000,
+    vmc_steps=1,
     burn_in_steps=1,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
@@ -57,15 +57,32 @@ vmc_cfg = VMCConfig(
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=True,
+    use_export_compile=False,
     save_every=10,
     resume_step=0,
     verbose=False,
 )
+vmc_cfg.lr_scheduler = DecayScheduler(
+    init_lr=vmc_cfg.learning_rate,
+    decay_rate=0.9, patience=50,
+)
+
+warmup_cfg = VMCWarmupConfig(
+    use_export_compile=vmc_cfg.use_export_compile,
+    grad_batch_size=vmc_cfg.grad_batch_size,
+    use_log_amp=vmc_cfg.use_log_amp,
+    offload_grad_to_cpu=vmc_cfg.offload_grad_to_cpu,
+    run_sampling=True,
+    run_locE=False,
+    run_grad=False,
+)
 
 
 def main():
-    setup_linalg_hooks(jitter=1e-16)
+    setup_linalg_hooks(
+        jitter=1e-8, qr_via_eigh=True,
+        cholesky_qr=False, cholesky_qr_adaptive_jitter=False,
+    )
     torch.set_default_dtype(dtype)
 
     try:
@@ -77,8 +94,8 @@ def main():
         Lx, Ly = 8, 8
         N_sites = Lx * Ly
         J = 1.0
-        D = 4
-        chi = 16
+        D = 6
+        chi = 10
 
         # ========== Hamiltonian ==========
         H = spin_Heisenberg_square_lattice_torch(
@@ -102,7 +119,7 @@ def main():
         peps = generate_random_spin_peps(
             Lx, Ly, D, seed=42, dtype=dtype,
         )
-        model = fPEPS_Model_GPU(
+        model = PEPS_Model_GPU(
             tn=peps,
             max_bond=chi,
             dtype=dtype,
@@ -110,6 +127,7 @@ def main():
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
+                # 'compress_opts': {'seed': 42},
             },
         )
         model.to(device)
