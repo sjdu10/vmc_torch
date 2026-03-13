@@ -397,9 +397,9 @@ def distributed_minres_solver_gpu(
     # --- Standard path: ensure inputs are GPU tensors ---
     assert isinstance(local_lpg, torch.Tensor), "local_lpg must be a torch.Tensor"
     assert isinstance(local_energies, torch.Tensor), "local_energies must be a torch.Tensor"
-    if lpgloc_on_cpu:                                                                                                                                                                                                                                       
-      t0 = time.time()                                                                                                                                                                                                                                    
-      local_lpg = local_lpg.to(device=device, dtype=torch.float64)                                                                                                                                                                                      
+    if lpgloc_on_cpu:
+      t0 = time.time()
+      local_lpg = local_lpg.to(device=device, dtype=torch.float64)
       if dist.get_rank() == 0:
           print(f'SR: reload lpg from cpu to gpu, time = {time.time() - t0:.2f}s')
 

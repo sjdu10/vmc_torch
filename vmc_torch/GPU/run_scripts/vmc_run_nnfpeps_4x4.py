@@ -62,8 +62,9 @@ vmc_cfg = VMCConfig(
     use_distributed_sr_minres=True,
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
+    # minres_sr_use_scipy=True,
     use_log_amp=True,
-    use_export_compile=True,
+    use_export_compile=False,
     save_every=1,
     resume_step=0,
     verbose=False,
@@ -168,6 +169,14 @@ def main():
             },
         )
         model.to(device)
+        n_params = sum(p.numel() for p in model.parameters())
+        # estimate the gpu mem needed for grad:
+        grad_mem_estimate = vmc_cfg.batch_size * n_params * 8 / 1024**3
+        if rank == 0:
+            print(
+                f"Model has {n_params} parameters, "
+                f"estimated grad memory per batch: {grad_mem_estimate:.2f} GB"
+            )
 
         # Export + compile (optional, ~10-40s one-time cost)
         if vmc_cfg.use_export_compile:

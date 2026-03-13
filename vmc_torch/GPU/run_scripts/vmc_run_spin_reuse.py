@@ -64,11 +64,11 @@ class ReuseCfg(VMCConfig):
 
 
 vmc_cfg = ReuseCfg(
-    batch_size=2048,
-    ns_per_rank=2048,
-    grad_batch_size=1024,
-    vmc_steps=1000,
-    burn_in_steps=1,
+    batch_size=1024,
+    ns_per_rank=1024,
+    grad_batch_size=256,
+    vmc_steps=10,
+    burn_in_steps=0,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
     use_distributed_sr_minres=True,
@@ -88,9 +88,9 @@ warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    # run_sampling=True,
-    # run_locE=True,
-    # run_grad=True,
+    run_sampling=False,
+    run_locE=False,
+    run_grad=False,
 )
 
 
@@ -104,11 +104,11 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 4
+        Lx, Ly = 8, 8
         N_sites = Lx * Ly
         J = 1.0
-        D = 4
-        chi = 16
+        D = 8
+        chi = 4*D
 
         # ========== Hamiltonian ==========
         H = spin_Heisenberg_square_lattice_torch(

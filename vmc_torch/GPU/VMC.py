@@ -720,7 +720,7 @@ class VMC_GPU:
                         f"{torch.norm(local_lpg).item()/(local_lpg.numel()**0.5):.4e}, "
                         f"max={local_lpg.abs().max().item():.4e}"
                     )
-
+            torch.cuda.empty_cache()
             # SR solve
             dp, t_sr, info = self.solve_sr_step(
                 local_o=local_lpg,
