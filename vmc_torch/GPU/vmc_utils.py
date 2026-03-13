@@ -4,6 +4,15 @@ import time
 import random
 # from mpi4py import MPI
 from torch.utils._pytree import tree_map, tree_flatten
+import os                                                                                                                                                                                                                                                   
+                                                                                                                                                                                                                                                
+def cpu_mem_gb():                                                                                                                                                                                                                                           
+    """Resident memory of this process in GB."""
+    with open(f'/proc/{os.getpid()}/status') as f:
+        for line in f:
+            if line.startswith('VmRSS:'):
+                return int(line.split()[1]) / 1024**2  # kB -> GB
+    return 0.0
 
 #=== Utility functions for Metropolis-Hastings sampling ===#
 
@@ -949,16 +958,29 @@ def compute_grads_gpu(
 
             t0 = time.time()
 
-            if use_log_amp:
-                signs_chunks = []
-                log_abs_chunks = []
-            else:
-                amps_chunks = []
-
             if offload_to_cpu:
-                # Eager CPU offload: flatten each chunk to (B_grad, Np)
-                # on GPU, then .cpu() immediately.
-                flat_vec_chunks = []
+                # Pre-allocate CPU buffer and write chunks
+                # directly to avoid torch.cat peak doubling.
+                leaves_p, _ = tree_flatten(params_pytree)
+                Np = sum(p.numel() for p in leaves_p)
+                p_dtype = leaves_p[0].dtype
+                del leaves_p
+
+                batched_grads_vec = torch.empty(
+                    B, Np, dtype=p_dtype, device='cpu',
+                )
+                if use_log_amp:
+                    signs = torch.empty(
+                        B, dtype=p_dtype, device='cpu',
+                    )
+                    log_abs = torch.empty(
+                        B, dtype=p_dtype, device='cpu',
+                    )
+                else:
+                    amps = torch.empty(
+                        B, dtype=p_dtype, device='cpu',
+                    )
+
                 for b_start in range(0, B, B_grad):
                     if verbose:
                         print(f"Processing grad chunk: {b_start} to {min(b_start + B_grad, B)} / {B}")
@@ -979,27 +1001,16 @@ def compute_grads_gpu(
                         [l.flatten(start_dim=1) for l in leaves_c],
                         dim=1,
                     )
-                    flat_vec_chunks.append(flat_c.cpu())
+                    batched_grads_vec[b_start:b_end] = flat_c.cpu()
 
                     if use_log_amp:
                         sc, lac = aux_c
-                        signs_chunks.append(sc.detach().cpu())
-                        log_abs_chunks.append(lac.detach().cpu())
+                        signs[b_start:b_end] = sc.detach().cpu()
+                        log_abs[b_start:b_end] = lac.detach().cpu()
                     else:
-                        amps_chunks.append(aux_c.detach().cpu())
+                        amps[b_start:b_end] = aux_c.detach().cpu()
 
                     del grads_chunk, leaves_c, flat_c
-
-                # Concatenate on CPU
-                batched_grads_vec = torch.cat(
-                    flat_vec_chunks, dim=0,
-                )
-                if use_log_amp:
-                    signs = torch.cat(signs_chunks, dim=0)
-                    log_abs = torch.cat(log_abs_chunks, dim=0)
-                else:
-                    amps = torch.cat(amps_chunks, dim=0)
-                del flat_vec_chunks
             else:
                 # Standard path: pre-allocate and fill in-place.
                 leaves_p, _ = tree_flatten(params_pytree)
@@ -1090,7 +1101,7 @@ def compute_grads_gpu(
                 t1 = time.time()
                 if verbose:
                     try: 
-                        if RANK == 0: print(f"GPU Full Batch Jacobian time: {t1 - t0:.4f}s")
+                        print(f"GPU Full Batch Jacobian time: {t1 - t0:.4f}s")
                     except NameError: pass
             
             # Chunked execution for jacrev
