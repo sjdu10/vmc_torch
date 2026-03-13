@@ -2,7 +2,7 @@
 
 ## Overview
 
-`vmc_torch` is a **scalable, parallelized implementation of Variational Monte Carlo (VMC)** designed for calculating the **ground-state properties** of quantum many-body lattice Hamiltonians.
+`vmc_torch` is a **scalable implementation of Variational Monte Carlo (VMC)** designed for studying the **ground-state properties** of quantum many-body lattice Hamiltonians with **flexible** variational wavefunction *Ansätze*.
 
 Built upon **PyTorch**, this library offers great flexibility in choice of variational *Ansätze*, including Neural Quantum States (NQS) and Tensor Network States (TNS), and hybrid TN-NN models such as NN-fTNS [1].
 
