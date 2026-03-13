@@ -14,7 +14,7 @@ Built upon **PyTorch**, this library offers great flexibility in choice of varia
     * **Neuralized fermionic TNS (NN-fTNS):** Hybrid TN-NN model that improves over both fermionic TNS and NQS, see [1] for details.
     * **Tensor Network Functions (TNF):** Function defined by tensor networks with arbitrary geometry. E.g. TNF derived from (1+1)D quantum circuit that supports volume-law entanglement structure, see [2] for details.
 * **Massively Parallel VMC Sampling:** Utilizes **`mpi4py`** to distribute the Markov Chain Monte Carlo (MCMC) sampling process, suitable on high-performance computing (HPC) clusters.
-* **HPC Ready:** Built for large-scale VMC calculations, suitable for deployment across **thousands of CPU cores**. **Note:** *Current implementation is optimized for CPU cores via MPI. GPU acceleration is actively under development.*
+* **HPC Ready:** Built for large-scale VMC calculations, suitable for deployment across **thousands of CPU cores**. **Note:** *Current parallization is optimized for CPU via MPI. GPU acceleration is actively under development.*
 * **Auto-differentiation for Optimization:** Leverages PyTorch's automatic differentiation engine for efficient, large-scale energy minimization using techniques like Stochastic Reconfiguration (SR) and other state-of-the-art ML optimizers.
 
 ## 🚀 Installation
