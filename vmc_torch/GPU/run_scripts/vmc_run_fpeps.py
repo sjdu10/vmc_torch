@@ -31,7 +31,7 @@ from vmc_torch.GPU.vmc_utils import (
     evaluate_energy,
     random_initial_config,
 )
-from vmcconfig import (
+from vmc_torch.GPU.run_scripts.vmcconfig import (
     VMCConfig,
     load_checkpoint,
     make_on_step_end,

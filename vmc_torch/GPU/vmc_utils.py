@@ -1007,8 +1007,10 @@ def compute_grads_gpu(
                         sc, lac = aux_c
                         signs[b_start:b_end] = sc.detach().cpu()
                         log_abs[b_start:b_end] = lac.detach().cpu()
+                        del sc, lac, aux_c
                     else:
                         amps[b_start:b_end] = aux_c.detach().cpu()
+                        del aux_c
 
                     del grads_chunk, leaves_c, flat_c
             else:
@@ -1060,8 +1062,10 @@ def compute_grads_gpu(
                         sc, lac = aux_c
                         signs[b_start:b_end] = sc.detach()
                         log_abs[b_start:b_end] = lac.detach()
+                        del sc, lac, aux_c
                     else:
                         amps[b_start:b_end] = aux_c.detach()
+                        del aux_c
                     del grads_chunk, leaves_c, flat_c
 
             # Final cleanup
