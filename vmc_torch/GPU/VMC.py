@@ -732,7 +732,10 @@ class VMC_GPU:
                 device=device,
                 run_sr=config.run_sr,
             )
-            
+
+            # Free CPU-resident lpg before next step's grad alloc
+            del local_lpg, local_energies
+
             # --- NaN/Inf check on SR gradients ---
             pv0 = torch.nn.utils.parameters_to_vector(
                 model.parameters(),

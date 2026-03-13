@@ -109,7 +109,7 @@ def main():
         # NN backflow hyperparameters
         nn_eta = 1.0
         embed_dim = 16
-        hidden_dim = N_sites
+        hidden_dim = N_sites*8
         kernel_size = 3
         cnn_layers = 1
         # ========== Hamiltonian ==========
