@@ -2,15 +2,15 @@
 
 ## Overview
 
-`vmc_torch` is a **high-performance, parallelized implementation of Variational Monte Carlo (VMC)** designed to accurately determine the **ground-state properties** of quantum many-body lattice Hamiltonians.
+`vmc_torch` is a **scalable, parallelized implementation of Variational Monte Carlo (VMC)** designed for calculating the **ground-state properties** of quantum many-body lattice Hamiltonians.
 
-Built upon **PyTorch**, this library offers unparalleled flexibility, enabling researchers to seamlessly integrate and train cutting-edge quantum *Ansätze*, including Neural Quantum States (NQS) and sophisticated Tensor Network States (TNS), and hybrid TN-NN models such as NN-fTNS [1].
+Built upon **PyTorch**, this library offers great flexibility, enabling researchers to train quantum variational *Ansätze*, including Neural Quantum States (NQS) and sophisticated Tensor Network States (TNS), and hybrid TN-NN models such as NN-fTNS [1].
 
 ### Key Features and Capabilities
 
 * **Diverse Variational Ansätze Support:** Supports a wide spectrum of modern wavefunctions:
     * **Neural Quantum States (NQS):** Leveraging PyTorch's native capabilities for large-scale, trainable neural network models.
-    * **Tensor Network States (TNS):** Integrates with state-of-the-art TN libraries (`quimb`, `symmray`) for handling Matrix Product States (MPS), Projected Entangled Pair States (PEPS), and more, bosonic or fermionic.
+    * **Tensor Network States (TNS):** Integrates with TN libraries (`quimb`, `symmray`) for handling Matrix Product States (MPS), Projected Entangled Pair States (PEPS), and more, bosonic or fermionic.
     * **Neuralized fermionic TNS (NN-fTNS):** Hybrid TN-NN model that improves over both fermionic TNS and NQS, see [1] for details.
     * **Tensor Network Functions (TNF):** Function defined by tensor networks with arbitrary geometry. E.g. TNF derived from (1+1)D quantum circuit that supports volume-law entanglement structure, see [2] for details.
 * **Massively Parallel VMC Sampling:** Utilizes **`mpi4py`** to distribute the Markov Chain Monte Carlo (MCMC) sampling process, suitable on high-performance computing (HPC) clusters.
