@@ -233,6 +233,16 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
         self.radius = 0
 
+        # Cache for vmapped reuse functions, keyed by
+        # (direction, bMPS_keys_tuple).
+        self._vamp_reuse_cache = {}
+
+        # Compiled cache for export+compile bMPS caching.
+        # Populated by export_and_compile_cache().
+        self._compiled_cache = {}
+        self._cache_manifest_x = None
+        self._cache_manifest_y = None
+
         super().__init__(params_list=params_tensors)
 
     # ----- Param preprocessing -----
@@ -632,6 +642,14 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         params = self._vamp_params_preprocess(params)
         return self._vmapped_amplitude(x, params)
 
+    def _get_cached_vamp_reuse(self, cache_key, in_dims):
+        """Get or create a cached vmapped amplitude_reuse fn."""
+        if cache_key not in self._vamp_reuse_cache:
+            self._vamp_reuse_cache[cache_key] = torch.vmap(
+                self.amplitude_reuse, in_dims=in_dims,
+            )
+        return self._vamp_reuse_cache[cache_key]
+
     def vamp_reuse(
         self,
         x,
@@ -644,29 +662,22 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         selected_rows=None,
         selected_cols=None,
     ):
-        """Batched amplitude with bMPS environment reuse.
-
-        Uses torch.vmap over amplitude_reuse with appropriate in_dims
-        for the batched bMPS parameter pytrees.
-        """
+        """Batched amplitude with bMPS environment reuse."""
         params = self._vamp_params_preprocess(params)
 
         if (bMPS_params_xmin is not None
                 and bMPS_params_xmax is not None):
-            return torch.vmap(
-                self.amplitude_reuse,
-                in_dims=(
-                    0,
-                    None,
-                    None,
-                    self.bMPS_params_x_in_dims[bMPS_keys[0]],
-                    self.bMPS_params_x_in_dims[bMPS_keys[1]],
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            )(
+            cache_key = ('x', bMPS_keys[0], bMPS_keys[1])
+            in_dims = (
+                0, None, None,
+                self.bMPS_params_x_in_dims[bMPS_keys[0]],
+                self.bMPS_params_x_in_dims[bMPS_keys[1]],
+                None, None, None, None,
+            )
+            fn = self._get_cached_vamp_reuse(
+                cache_key, in_dims,
+            )
+            return fn(
                 x, params, bMPS_keys,
                 bMPS_params_xmin, bMPS_params_xmax,
                 bMPS_params_ymin, bMPS_params_ymax,
@@ -675,20 +686,17 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
         if (bMPS_params_ymin is not None
                 and bMPS_params_ymax is not None):
-            return torch.vmap(
-                self.amplitude_reuse,
-                in_dims=(
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    self.bMPS_params_y_in_dims[bMPS_keys[0]],
-                    self.bMPS_params_y_in_dims[bMPS_keys[1]],
-                    None,
-                    None,
-                ),
-            )(
+            cache_key = ('y', bMPS_keys[0], bMPS_keys[1])
+            in_dims = (
+                0, None, None, None, None,
+                self.bMPS_params_y_in_dims[bMPS_keys[0]],
+                self.bMPS_params_y_in_dims[bMPS_keys[1]],
+                None, None,
+            )
+            fn = self._get_cached_vamp_reuse(
+                cache_key, in_dims,
+            )
+            return fn(
                 x, params, bMPS_keys,
                 bMPS_params_xmin, bMPS_params_xmax,
                 bMPS_params_ymin, bMPS_params_ymax,
@@ -696,12 +704,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             )
 
         # No reuse — full contraction via vmap
-        return torch.vmap(
-            self.amplitude_reuse,
-            in_dims=(
-                0, None, None, None, None, None, None, None, None,
-            ),
-        )(
+        cache_key = ('full', None, None)
+        in_dims = (
+            0, None, None,
+            None, None, None, None, None, None,
+        )
+        fn = self._get_cached_vamp_reuse(
+            cache_key, in_dims,
+        )
+        return fn(
             x, params, bMPS_keys,
             bMPS_params_xmin, bMPS_params_xmax,
             bMPS_params_ymin, bMPS_params_ymax,
@@ -791,7 +802,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
 
     def export_and_compile_reuse(
         self, example_x, mode='default', verbose=True,
-        use_log_amp=False,
+        use_log_amp=False, directions=('x', 'y'),
     ):
         """Pre-export amplitude_reuse for all reuse patterns.
 
@@ -816,6 +827,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             use_log_amp: if True, export amplitude_reuse_log instead
                 of amplitude_reuse. forward_reuse_log() will dispatch
                 to compiled path; forward_reuse() to eager.
+            directions: tuple of directions to compile,
+                e.g. ('x',) or ('x', 'y').
         """
         import quimb as qu
         from torch.export import export
@@ -832,7 +845,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         n_tn_params = len(params_list)
 
         patterns = []
-        for direction in ('x', 'y'):
+        for direction in directions:
             L = self.Lx if direction == 'x' else self.Ly
             for width in (1, 2):
                 for start in range(L - width + 1):
@@ -1411,23 +1424,16 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             self._raw_bMPS_y_keys.add(('ymin', 1))
             self._raw_bMPS_y_keys.add(('ymax', self.Ly - 2))
 
-    def cache_bMPS_params_vmap(self, x):
-        """Compute batched bMPS params for all x and y environments.
-
-        Args:
-            x: (B, N_sites) int64 — batch of configurations
-
-        Returns:
-            (bMPS_params_x_dict, bMPS_params_y_dict) — batched pytrees
-        """
+    def _cache_bMPS_params_vmap_eager(self, x):
+        """Eager vmap implementation of cache_bMPS_params_vmap."""
         import quimb as qu
         import quimb.tensor as qtn
 
         params = qu.utils.tree_unflatten(
-            self.params, self.params_pytree
+            self.params, self.params_pytree,
         )
 
-        def cache_bMPS_params_single(x_single, params):
+        def cache_single(x_single, params):
             tns = qtn.unpack(params, self.skeleton)
             if self._loc_basis_perm is not None:
                 x_single = self._loc_basis_perm[x_single]
@@ -1439,9 +1445,9 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 max_bond=self.chi, cutoff=0.0,
                 **self.contract_boundary_opts,
             )
-            bMPS_params_x_dict = {}
+            bMPS_x = {}
             for key, btn in env_x.items():
-                bMPS_params_x_dict[key] = (
+                bMPS_x[key] = (
                     get_params_ftn(btn),
                     torch.as_tensor(btn.exponent),
                 )
@@ -1449,39 +1455,72 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 max_bond=self.chi, cutoff=0.0,
                 **self.contract_boundary_opts,
             )
-            bMPS_params_y_dict = {}
+            bMPS_y = {}
             for key, btn in env_y.items():
-                bMPS_params_y_dict[key] = (
+                bMPS_y[key] = (
                     get_params_ftn(btn),
                     torch.as_tensor(btn.exponent),
                 )
-            return bMPS_params_x_dict, bMPS_params_y_dict
+            return bMPS_x, bMPS_y
 
         return torch.vmap(
-            cache_bMPS_params_single,
-            in_dims=(0, None),
+            cache_single, in_dims=(0, None),
         )(x, params)
 
-    def cache_bMPS_params_any_direction_vmap(
-        self, x, direction='x',
-    ):
-        """Compute batched bMPS params for one direction + amplitudes.
+    def cache_bMPS_params_vmap(self, x):
+        """Compute batched bMPS params for all x and y envs.
+
+        Uses compiled path if available, else eager vmap.
 
         Args:
             x: (B, N_sites) int64 — batch of configurations
-            direction: 'x' or 'y'
 
         Returns:
-            (bMPS_params_dict, amp_vals) — batched pytree + (B,) amps
+            (bMPS_x_dict, bMPS_y_dict) — batched pytrees
+        """
+        if not self._compiled_cache:
+            return self._cache_bMPS_params_vmap_eager(x)
+
+        params_list = list(self.params)
+        results = {}
+
+        for direction in ('x', 'y'):
+            if direction in self._compiled_cache:
+                entry = self._compiled_cache[direction]
+                flat_out = entry['fn'](x, *params_list)
+                results[direction] = (
+                    self._unflatten_cache_output(
+                        flat_out, entry['manifest'],
+                    )
+                )
+            else:
+                # Fallback: run eager for this direction
+                bMPS_x, bMPS_y = (
+                    self._cache_bMPS_params_vmap_eager(x)
+                )
+                if direction == 'x':
+                    results['x'] = bMPS_x
+                    results['y'] = bMPS_y
+                else:
+                    results['y'] = bMPS_y
+                break
+
+        return results['x'], results['y']
+
+    def _cache_bMPS_params_any_direction_vmap_eager(
+        self, x, direction='x',
+    ):
+        """Eager vmap implementation of
+        cache_bMPS_params_any_direction_vmap.
         """
         import quimb as qu
         import quimb.tensor as qtn
 
         params = qu.utils.tree_unflatten(
-            self.params, self.params_pytree
+            self.params, self.params_pytree,
         )
 
-        def cache_bMPS_params_x_single(x_single, params):
+        def cache_x_single(x_single, params):
             tns = qtn.unpack(params, self.skeleton)
             if self._loc_basis_perm is not None:
                 x_single = self._loc_basis_perm[x_single]
@@ -1497,15 +1536,15 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 env_x[('xmin', self.Lx // 2)]
                 | env_x[('xmax', self.Lx // 2 - 1)]
             ).contract()
-            bMPS_params_x_dict = {}
+            bMPS_x = {}
             for key, btn in env_x.items():
-                bMPS_params_x_dict[key] = (
+                bMPS_x[key] = (
                     get_params_ftn(btn),
                     torch.as_tensor(btn.exponent),
                 )
-            return bMPS_params_x_dict, amp_val
+            return bMPS_x, amp_val
 
-        def cache_bMPS_params_y_single(x_single, params):
+        def cache_y_single(x_single, params):
             tns = qtn.unpack(params, self.skeleton)
             if self._loc_basis_perm is not None:
                 x_single = self._loc_basis_perm[x_single]
@@ -1521,24 +1560,300 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 env_y[('ymin', self.Ly // 2)]
                 | env_y[('ymax', self.Ly // 2 - 1)]
             ).contract()
-            bMPS_params_y_dict = {}
+            bMPS_y = {}
             for key, btn in env_y.items():
-                bMPS_params_y_dict[key] = (
+                bMPS_y[key] = (
                     get_params_ftn(btn),
                     torch.as_tensor(btn.exponent),
                 )
-            return bMPS_params_y_dict, amp_val
+            return bMPS_y, amp_val
 
         if direction == 'x':
             return torch.vmap(
-                cache_bMPS_params_x_single,
-                in_dims=(0, None),
+                cache_x_single, in_dims=(0, None),
             )(x, params)
         else:
             return torch.vmap(
-                cache_bMPS_params_y_single,
-                in_dims=(0, None),
+                cache_y_single, in_dims=(0, None),
             )(x, params)
+
+    def cache_bMPS_params_any_direction_vmap(
+        self, x, direction='x',
+    ):
+        """Compute batched bMPS params for one direction
+        + amplitudes.
+
+        Uses compiled path if available, else eager vmap.
+
+        Args:
+            x: (B, N_sites) int64
+            direction: 'x' or 'y'
+
+        Returns:
+            (bMPS_params_dict, amp_vals)
+        """
+        if direction not in self._compiled_cache:
+            return (
+                self
+                ._cache_bMPS_params_any_direction_vmap_eager(
+                    x, direction,
+                )
+            )
+
+        # Compiled path
+        entry = self._compiled_cache[direction]
+        params_list = list(self.params)
+        flat_out = entry['fn'](x, *params_list)
+        bMPS_dict = self._unflatten_cache_output(
+            flat_out, entry['manifest'],
+        )
+
+        # Compute amplitude via forward_reuse (cheap: 1 row)
+        if direction == 'x':
+            amps = self.forward_reuse(
+                x,
+                bMPS_params_x_batched=bMPS_dict,
+                selected_rows=[self.Lx // 2],
+            )
+        else:
+            amps = self.forward_reuse(
+                x,
+                bMPS_params_y_batched=bMPS_dict,
+                selected_cols=[self.Ly // 2],
+            )
+
+        return bMPS_dict, amps
+
+    # ----- Compiled bMPS cache export -----
+
+    def _build_cache_manifest(self, example_x):
+        """Build output manifests for x and y cache functions.
+
+        Runs _cache_bMPS_params_vmap_eager on a single-sample
+        batch to discover the output structure (keys and tensor
+        counts).
+
+        Args:
+            example_x: (N_sites,) int64 — single config
+
+        Sets:
+            self._cache_manifest_x: list of (key, n_tensors)
+            self._cache_manifest_y: list of (key, n_tensors)
+        """
+        x_batch = example_x.unsqueeze(0)  # (1, N_sites)
+        bMPS_x, bMPS_y = (
+            self._cache_bMPS_params_vmap_eager(x_batch)
+        )
+
+        # x-direction manifest: sorted keys, count tensors
+        self._cache_manifest_x = []
+        for key in sorted(bMPS_x.keys()):
+            params_list, _exponent = bMPS_x[key]
+            self._cache_manifest_x.append(
+                (key, len(params_list))
+            )
+
+        # y-direction manifest
+        self._cache_manifest_y = []
+        for key in sorted(bMPS_y.keys()):
+            params_list, _exponent = bMPS_y[key]
+            self._cache_manifest_y.append(
+                (key, len(params_list))
+            )
+
+    def _unflatten_cache_output(self, flat_outputs, manifest):
+        """Unflatten a flat tuple of tensors back into bMPS dict.
+
+        Args:
+            flat_outputs: tuple/list of tensors in manifest order.
+                For each key: n_tensors param tensors + 1 exponent.
+            manifest: list of (key, n_tensors) from
+                _build_cache_manifest.
+
+        Returns:
+            dict {key: (params_list, exponent)}
+        """
+        result = {}
+        idx = 0
+        for key, n_tensors in manifest:
+            params = list(flat_outputs[idx:idx + n_tensors])
+            exponent = flat_outputs[idx + n_tensors]
+            result[key] = (params, exponent)
+            idx += n_tensors + 1
+        return result
+
+    def _make_cache_wrapper(self, direction):
+        """Create a flat-in/flat-out wrapper for cache export.
+
+        The wrapper takes (x_single, *flat_tn_params) and returns
+        a flat tuple of tensors: for each bMPS key in manifest
+        order, (param_tensors..., exponent_scalar).
+
+        Args:
+            direction: 'x' or 'y'
+
+        Returns:
+            (wrapper_fn, manifest) — the wrapper function and
+            corresponding manifest.
+        """
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        manifest = (
+            self._cache_manifest_x
+            if direction == 'x'
+            else self._cache_manifest_y
+        )
+        skeleton = self.skeleton
+        chi = self.chi
+        contract_boundary_opts = self.contract_boundary_opts
+        params_pytree = self.params_pytree
+        dtype = self.dtype
+        loc_basis_perm = self._loc_basis_perm
+
+        def wrapper(x_single, *flat_tn_params):
+            params = qu.utils.tree_unflatten(
+                list(flat_tn_params), params_pytree,
+            )
+            tns = qtn.unpack(params, skeleton)
+            if loc_basis_perm is not None:
+                x_single = loc_basis_perm[x_single]
+            amp = tns.isel({
+                tns.site_ind(site): x_single[i]
+                for i, site in enumerate(tns.sites)
+            })
+            if direction == 'x':
+                envs = amp.compute_x_environments(
+                    max_bond=chi, cutoff=0.0,
+                    **contract_boundary_opts,
+                )
+            else:
+                envs = amp.compute_y_environments(
+                    max_bond=chi, cutoff=0.0,
+                    **contract_boundary_opts,
+                )
+
+            # Flatten output in manifest order
+            flat_out = []
+            for key, _n_tensors in manifest:
+                btn = envs[key]
+                flat_params = get_params_ftn(btn)
+                flat_out.extend(flat_params)
+                flat_out.append(
+                    torch.as_tensor(
+                        btn.exponent, dtype=dtype,
+                    )
+                )
+            return tuple(flat_out)
+
+        return wrapper, manifest
+
+    def export_and_compile_cache(
+        self,
+        example_x,
+        mode='default',
+        verbose=True,
+        directions=('x', 'y'),
+    ):
+        """Export+compile the bMPS cache functions.
+
+        Exports compute_x_environments and compute_y_environments
+        separately via torch.export -> torch.vmap -> torch.compile.
+
+        Must be called after cache_bMPS_skeleton().
+
+        Args:
+            example_x: (N_sites,) int64 on target device.
+            mode: torch.compile mode.
+            verbose: print progress.
+            directions: tuple of directions to compile,
+                e.g. ('x',) or ('x', 'y').
+        """
+        import torch.nn as nn_mod
+        from torch.export import export
+
+        device = example_x.device
+        params_list = list(self.params)
+        n_tn = len(params_list)
+
+        # Build manifests if not done
+        if self._cache_manifest_x is None:
+            if verbose:
+                print("Building cache manifests...")
+            self._build_cache_manifest(example_x)
+
+        for direction in directions:
+            if verbose:
+                print(
+                    f"Exporting cache_{direction} "
+                    f"({len(params_list)} TN tensors)..."
+                )
+
+            wrapper_fn, manifest = (
+                self._make_cache_wrapper(direction)
+            )
+
+            class _CacheModule(nn_mod.Module):
+                def __init__(self_, fn):
+                    super().__init__()
+                    self_._fn = fn
+
+                def forward(self_, x, *flat_args):
+                    return self_._fn(x, *flat_args)
+
+            try:
+                with torch.no_grad():
+                    exported = export(
+                        _CacheModule(wrapper_fn),
+                        (example_x, *params_list),
+                    )
+                exported_module = exported.module()
+
+                # Move CPU constants to GPU
+                self._move_exported_constants_to_device(
+                    device,
+                    exported_module=exported_module,
+                )
+
+                # vmap over batch dim (x batched, params not)
+                vmapped = torch.vmap(
+                    exported_module,
+                    in_dims=(0, *([None] * n_tn)),
+                )
+
+                compiled = torch.compile(
+                    vmapped, mode=mode,
+                )
+
+                self._compiled_cache[direction] = {
+                    'fn': compiled,
+                    'manifest': manifest,
+                    'exported_module': exported_module,
+                }
+
+                if verbose:
+                    n_out = sum(
+                        nt + 1 for _, nt in manifest
+                    )
+                    print(
+                        f"  cache_{direction}: OK "
+                        f"({len(manifest)} keys, "
+                        f"{n_out} output tensors)"
+                    )
+
+            except Exception as e:
+                if verbose:
+                    print(
+                        f"  cache_{direction}: FAILED: {e}"
+                    )
+                import traceback
+                traceback.print_exc()
+
+        if verbose:
+            print(
+                f"Compiled cache: "
+                f"{list(self._compiled_cache.keys())}"
+            )
 
     # ----- Incremental bMPS updates -----
 

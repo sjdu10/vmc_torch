@@ -7,7 +7,11 @@ All models share the same interface from WavefunctionModel_GPU:
 """
 from ._base import WavefunctionModel_GPU
 from .pureTNS import fPEPS_Model_GPU, fPEPS_Model_reuse_GPU
-from .pureTNS_spin import PEPS_Model_GPU, PEPS_Model_reuse_GPU
+from .pureTNS_spin import (
+    PEPS_Model_GPU,
+    PEPS_Model_reuse_GPU,
+    PEPS_Model_reuse_compiled_cache_GPU,
+)
 from .pureNN import PureNN_GPU
 from .slater import SlaterDeterminant_GPU
 from .NNBF import NNBF_GPU, AttentionNNBF_GPU
@@ -25,4 +29,5 @@ __all__ = [
     "Conv2D_Geometric_fPEPS_GPU",
     "PEPS_Model_GPU",
     "PEPS_Model_reuse_GPU",
+    "PEPS_Model_reuse_compiled_cache_GPU",
 ]

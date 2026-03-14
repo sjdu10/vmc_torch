@@ -1202,11 +1202,667 @@ class MetropolisExchangeSpinSamplerReuse_GPU(SamplerGPU):
         return fxs, current_amps
 
 
+class MetropolisExchangeSpinSamplerXReuse_GPU(SamplerGPU):
+    """Metropolis exchange sampler with x-only bMPS reuse.
+
+    Interleaved sweep: for each row, processes row edges
+    (horizontal) then col edges (vertical to next row),
+    all using x-direction boundary MPS only. Eliminates
+    the expensive y-direction bMPS caching.
+    """
+
+    @torch.inference_mode()
+    def step(
+        self,
+        fxs: torch.Tensor,
+        model,
+        graph,
+        compile: bool = False,
+        verbose: bool = False,
+        use_log_amp: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One MCMC sweep with x-only bMPS reuse.
+
+        For each row r:
+          (a) sweep row edges in row r
+          (b) sweep col edges between rows r and r+1
+          (c) update xmin bMPS past row r
+
+        Args:
+            fxs: (B, N_sites) int64 walker configs.
+            model: PEPS_Model_reuse_GPU with
+                cache_bMPS_skeleton already called.
+            graph: Lattice graph with .row_edges,
+                .col_edges.
+            compile: Unused (kept for interface compat).
+            verbose: Print per-phase timing info.
+            use_log_amp: If True, work in log-space and
+                return (signs, log_abs) instead of amps.
+
+        Returns:
+            fxs: (B, N_sites) int64 updated configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs)
+                tuple when use_log_amp=True.
+        """
+        B = fxs.shape[0]
+        device = fxs.device
+        Ly = model.Ly
+        Lx = model.Lx
+
+        # Pre-group col edges by row pair
+        col_edges_by_row_pair = {}
+        for col, edges in graph.col_edges.items():
+            for (i, j) in edges:
+                r = min(i // Ly, j // Ly)
+                col_edges_by_row_pair.setdefault(
+                    r, []
+                ).append((i, j))
+
+        # Count edges for progress tracking
+        total_edges = sum(
+            len(e) for e in graph.row_edges.values()
+        ) + sum(
+            len(e) for e in graph.col_edges.values()
+        )
+
+        n_updates = 0
+        if verbose:
+            t_total_start = time.time()
+            t_propose = 0.0
+            t_forward = 0.0
+
+        # Cache x-direction bMPS only
+        if verbose:
+            t0 = time.time()
+        bMPS_x, current_amps = (
+            model.cache_bMPS_params_any_direction_vmap(
+                fxs, direction='x',
+            )
+        )
+        if use_log_amp:
+            cur_signs = torch.sign(current_amps)
+            cur_log_abs = torch.log(
+                current_amps.abs().clamp(min=1e-45),
+            )
+        if verbose:
+            print(
+                f" cache bMPS x: "
+                f"{time.time() - t0:.4f}s"
+            )
+
+        for row in range(Lx):
+            # (a) Row edges in this row
+            if row in graph.row_edges:
+                selected_rows = list(range(
+                    max(0, row - model.radius),
+                    min(Lx, row + model.radius + 1),
+                ))
+                for edge in graph.row_edges[row]:
+                    n_updates += 1
+                    i, j = edge
+
+                    if verbose:
+                        t00 = time.time()
+                    proposed_fxs, new_flags = (
+                        propose_spin_exchange_vec(
+                            i, j, fxs,
+                        )
+                    )
+                    if verbose:
+                        t11 = time.time()
+                        t_propose += t11 - t00
+
+                    if not new_flags.any():
+                        continue
+
+                    n_changed = new_flags.sum().item()
+
+                    if verbose:
+                        t10 = time.time()
+
+                    if use_log_amp:
+                        prop_signs, prop_log_abs = (
+                            model.forward_reuse_log(
+                                proposed_fxs,
+                                bMPS_params_x_batched=(
+                                    bMPS_x
+                                ),
+                                selected_rows=(
+                                    selected_rows
+                                ),
+                            )
+                        )
+                        ratio = torch.exp(
+                            2.0
+                            * (prop_log_abs - cur_log_abs),
+                        )
+                    else:
+                        proposed_amps = (
+                            model.forward_reuse(
+                                proposed_fxs,
+                                bMPS_params_x_batched=(
+                                    bMPS_x
+                                ),
+                                selected_rows=(
+                                    selected_rows
+                                ),
+                            )
+                        )
+                        ratio = (
+                            (proposed_amps.abs() ** 2)
+                            / (current_amps.abs() ** 2)
+                        )
+
+                    if verbose:
+                        t11 = time.time()
+                        t_forward += t11 - t10
+                        print(
+                            f" Edge ({i}, {j}): "
+                            f"{n_changed} / {B} "
+                            f"proposed, forward: "
+                            f"{t11-t10:.4f}s, "
+                            f"total forward: "
+                            f"{t_forward:.4f}s, "
+                            f"progress: "
+                            f"{n_updates}/{total_edges}"
+                        )
+
+                    probs = torch.rand(B, device=device)
+                    accept_mask = (
+                        new_flags & (probs < ratio)
+                    )
+
+                    if accept_mask.any():
+                        fxs[accept_mask] = (
+                            proposed_fxs[accept_mask]
+                        )
+                        if use_log_amp:
+                            cur_signs[accept_mask] = (
+                                prop_signs[accept_mask]
+                            )
+                            cur_log_abs[accept_mask] = (
+                                prop_log_abs[accept_mask]
+                            )
+                        else:
+                            current_amps[accept_mask] = (
+                                proposed_amps[accept_mask]
+                            )
+
+            # (b) Col edges: row -> row+1
+            if row in col_edges_by_row_pair:
+                selected_rows = list(range(
+                    max(0, row - model.radius),
+                    min(
+                        Lx,
+                        row + 1 + model.radius + 1,
+                    ),
+                ))
+                for edge in col_edges_by_row_pair[row]:
+                    n_updates += 1
+                    i, j = edge
+
+                    if verbose:
+                        t00 = time.time()
+                    proposed_fxs, new_flags = (
+                        propose_spin_exchange_vec(
+                            i, j, fxs,
+                        )
+                    )
+                    if verbose:
+                        t11 = time.time()
+                        t_propose += t11 - t00
+
+                    if not new_flags.any():
+                        continue
+
+                    n_changed = new_flags.sum().item()
+
+                    if verbose:
+                        t10 = time.time()
+
+                    if use_log_amp:
+                        prop_signs, prop_log_abs = (
+                            model.forward_reuse_log(
+                                proposed_fxs,
+                                bMPS_params_x_batched=(
+                                    bMPS_x
+                                ),
+                                selected_rows=(
+                                    selected_rows
+                                ),
+                            )
+                        )
+                        ratio = torch.exp(
+                            2.0
+                            * (prop_log_abs - cur_log_abs),
+                        )
+                    else:
+                        proposed_amps = (
+                            model.forward_reuse(
+                                proposed_fxs,
+                                bMPS_params_x_batched=(
+                                    bMPS_x
+                                ),
+                                selected_rows=(
+                                    selected_rows
+                                ),
+                            )
+                        )
+                        ratio = (
+                            (proposed_amps.abs() ** 2)
+                            / (current_amps.abs() ** 2)
+                        )
+
+                    if verbose:
+                        t11 = time.time()
+                        t_forward += t11 - t10
+                        print(
+                            f" Edge ({i}, {j}): "
+                            f"{n_changed} / {B} "
+                            f"proposed, forward: "
+                            f"{t11-t10:.4f}s, "
+                            f"total forward: "
+                            f"{t_forward:.4f}s, "
+                            f"progress: "
+                            f"{n_updates}/{total_edges}"
+                        )
+
+                    probs = torch.rand(B, device=device)
+                    accept_mask = (
+                        new_flags & (probs < ratio)
+                    )
+
+                    if accept_mask.any():
+                        fxs[accept_mask] = (
+                            proposed_fxs[accept_mask]
+                        )
+                        if use_log_amp:
+                            cur_signs[accept_mask] = (
+                                prop_signs[accept_mask]
+                            )
+                            cur_log_abs[accept_mask] = (
+                                prop_log_abs[accept_mask]
+                            )
+                        else:
+                            current_amps[accept_mask] = (
+                                proposed_amps[accept_mask]
+                            )
+
+            # (c) Update bMPS xmin past this row
+            if row < Lx - 1:
+                bMPS_x = (
+                    model.update_bMPS_params_to_row_vmap(
+                        fxs, row, bMPS_x,
+                        from_which='xmin',
+                    )
+                )
+
+        if verbose:
+            t1 = time.time()
+            print(
+                f"Sample next: "
+                f"{t1-t_total_start:.4f}s for "
+                f"{n_updates} edges "
+                f"(avg "
+                f"{(t1-t_total_start)/n_updates:.4f}"
+                f"s/edge, B={B})"
+            )
+            print(
+                f"  Propose: {t_propose:.4f}s "
+                f"(avg "
+                f"{t_propose/n_updates:.4f}s/edge)"
+            )
+            print(
+                f"  Forward: {t_forward:.4f}s "
+                f"(avg "
+                f"{t_forward/n_updates:.4f}s/edge)"
+            )
+
+        if use_log_amp:
+            return fxs, (cur_signs, cur_log_abs)
+        return fxs, current_amps
+
+
+class MetropolisExchangeSpinfulSamplerXReuse_GPU(SamplerGPU):
+    """Metropolis exchange sampler with x-only bMPS reuse
+    for spinful fermions.
+
+    Interleaved sweep: for each row, processes row edges
+    (horizontal) then col edges (vertical to next row),
+    all using x-direction boundary MPS only. Eliminates
+    the expensive y-direction bMPS caching.
+
+    Args:
+        hopping_rate: Fraction of proposals that are
+            hoppings (vs exchanges). Default 0.25.
+    """
+
+    def __init__(self, hopping_rate: float = 0.25):
+        self.hopping_rate = hopping_rate
+
+    @torch.inference_mode()
+    def step(
+        self,
+        fxs: torch.Tensor,
+        model,
+        graph,
+        compile: bool = False,
+        verbose: bool = False,
+        use_log_amp: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One MCMC sweep with x-only bMPS reuse.
+
+        For each row r:
+          (a) sweep row edges in row r
+          (b) sweep col edges between rows r and r+1
+          (c) update xmin bMPS past row r
+
+        Args:
+            fxs: (B, N_sites) int64 walker configs.
+            model: fPEPS_Model_reuse_GPU with
+                cache_bMPS_skeleton already called.
+            graph: Lattice graph with .row_edges,
+                .col_edges.
+            compile: Unused (kept for interface compat).
+            verbose: Print per-phase timing info.
+            use_log_amp: If True, work in log-space and
+                return (signs, log_abs) instead of amps.
+
+        Returns:
+            fxs: (B, N_sites) int64 updated configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs)
+                tuple when use_log_amp=True.
+        """
+        B = fxs.shape[0]
+        device = fxs.device
+        Ly = model.Ly
+        Lx = model.Lx
+
+        # Pre-group col edges by row pair
+        col_edges_by_row_pair = {}
+        for col, edges in graph.col_edges.items():
+            for (i, j) in edges:
+                r = min(i // Ly, j // Ly)
+                col_edges_by_row_pair.setdefault(
+                    r, []
+                ).append((i, j))
+
+        # Count edges for progress tracking
+        total_edges = sum(
+            len(e) for e in graph.row_edges.values()
+        ) + sum(
+            len(e) for e in graph.col_edges.values()
+        )
+
+        n_updates = 0
+        if verbose:
+            t_total_start = time.time()
+            t_propose = 0.0
+            t_forward = 0.0
+
+        # Cache x-direction bMPS only
+        if verbose:
+            t0 = time.time()
+        bMPS_x, current_amps = (
+            model.cache_bMPS_params_any_direction_vmap(
+                fxs, direction='x',
+            )
+        )
+        if use_log_amp:
+            cur_signs = torch.sign(current_amps)
+            cur_log_abs = torch.log(
+                current_amps.abs().clamp(min=1e-45),
+            )
+        if verbose:
+            print(
+                f" cache bMPS x: "
+                f"{time.time() - t0:.4f}s"
+            )
+
+        for row in range(Lx):
+            # (a) Row edges in this row
+            if row in graph.row_edges:
+                selected_rows = list(range(
+                    max(0, row - model.radius),
+                    min(Lx, row + model.radius + 1),
+                ))
+                for edge in graph.row_edges[row]:
+                    n_updates += 1
+                    i, j = edge
+
+                    if verbose:
+                        t00 = time.time()
+                    proposed_fxs, new_flags = (
+                        propose_exchange_or_hopping_vec(
+                            i, j, fxs,
+                            self.hopping_rate,
+                        )
+                    )
+                    if verbose:
+                        t11 = time.time()
+                        t_propose += t11 - t00
+
+                    if not new_flags.any():
+                        continue
+
+                    n_changed = new_flags.sum().item()
+
+                    if verbose:
+                        t10 = time.time()
+
+                    if use_log_amp:
+                        prop_signs, prop_log_abs = (
+                            model.forward_reuse_log(
+                                proposed_fxs,
+                                bMPS_params_x_batched=(
+                                    bMPS_x
+                                ),
+                                selected_rows=(
+                                    selected_rows
+                                ),
+                            )
+                        )
+                        ratio = torch.exp(
+                            2.0
+                            * (prop_log_abs - cur_log_abs),
+                        )
+                    else:
+                        proposed_amps = (
+                            model.forward_reuse(
+                                proposed_fxs,
+                                bMPS_params_x_batched=(
+                                    bMPS_x
+                                ),
+                                selected_rows=(
+                                    selected_rows
+                                ),
+                            )
+                        )
+                        ratio = (
+                            (proposed_amps.abs() ** 2)
+                            / (current_amps.abs() ** 2)
+                        )
+
+                    if verbose:
+                        t11 = time.time()
+                        t_forward += t11 - t10
+                        print(
+                            f" Edge ({i}, {j}): "
+                            f"{n_changed} / {B} "
+                            f"proposed, forward: "
+                            f"{t11-t10:.4f}s, "
+                            f"total forward: "
+                            f"{t_forward:.4f}s, "
+                            f"progress: "
+                            f"{n_updates}/{total_edges}"
+                        )
+
+                    probs = torch.rand(B, device=device)
+                    accept_mask = (
+                        new_flags & (probs < ratio)
+                    )
+
+                    if accept_mask.any():
+                        fxs[accept_mask] = (
+                            proposed_fxs[accept_mask]
+                        )
+                        if use_log_amp:
+                            cur_signs[accept_mask] = (
+                                prop_signs[accept_mask]
+                            )
+                            cur_log_abs[accept_mask] = (
+                                prop_log_abs[accept_mask]
+                            )
+                        else:
+                            current_amps[accept_mask] = (
+                                proposed_amps[accept_mask]
+                            )
+
+            # (b) Col edges: row -> row+1
+            if row in col_edges_by_row_pair:
+                selected_rows = list(range(
+                    max(0, row - model.radius),
+                    min(
+                        Lx,
+                        row + 1 + model.radius + 1,
+                    ),
+                ))
+                for edge in col_edges_by_row_pair[row]:
+                    n_updates += 1
+                    i, j = edge
+
+                    if verbose:
+                        t00 = time.time()
+                    proposed_fxs, new_flags = (
+                        propose_exchange_or_hopping_vec(
+                            i, j, fxs,
+                            self.hopping_rate,
+                        )
+                    )
+                    if verbose:
+                        t11 = time.time()
+                        t_propose += t11 - t00
+
+                    if not new_flags.any():
+                        continue
+
+                    n_changed = new_flags.sum().item()
+
+                    if verbose:
+                        t10 = time.time()
+
+                    if use_log_amp:
+                        prop_signs, prop_log_abs = (
+                            model.forward_reuse_log(
+                                proposed_fxs,
+                                bMPS_params_x_batched=(
+                                    bMPS_x
+                                ),
+                                selected_rows=(
+                                    selected_rows
+                                ),
+                            )
+                        )
+                        ratio = torch.exp(
+                            2.0
+                            * (prop_log_abs - cur_log_abs),
+                        )
+                    else:
+                        proposed_amps = (
+                            model.forward_reuse(
+                                proposed_fxs,
+                                bMPS_params_x_batched=(
+                                    bMPS_x
+                                ),
+                                selected_rows=(
+                                    selected_rows
+                                ),
+                            )
+                        )
+                        ratio = (
+                            (proposed_amps.abs() ** 2)
+                            / (current_amps.abs() ** 2)
+                        )
+
+                    if verbose:
+                        t11 = time.time()
+                        t_forward += t11 - t10
+                        print(
+                            f" Edge ({i}, {j}): "
+                            f"{n_changed} / {B} "
+                            f"proposed, forward: "
+                            f"{t11-t10:.4f}s, "
+                            f"total forward: "
+                            f"{t_forward:.4f}s, "
+                            f"progress: "
+                            f"{n_updates}/{total_edges}"
+                        )
+
+                    probs = torch.rand(B, device=device)
+                    accept_mask = (
+                        new_flags & (probs < ratio)
+                    )
+
+                    if accept_mask.any():
+                        fxs[accept_mask] = (
+                            proposed_fxs[accept_mask]
+                        )
+                        if use_log_amp:
+                            cur_signs[accept_mask] = (
+                                prop_signs[accept_mask]
+                            )
+                            cur_log_abs[accept_mask] = (
+                                prop_log_abs[accept_mask]
+                            )
+                        else:
+                            current_amps[accept_mask] = (
+                                proposed_amps[accept_mask]
+                            )
+
+            # (c) Update bMPS xmin past this row
+            if row < Lx - 1:
+                bMPS_x = (
+                    model.update_bMPS_params_to_row_vmap(
+                        fxs, row, bMPS_x,
+                        from_which='xmin',
+                    )
+                )
+
+        if verbose:
+            t1 = time.time()
+            print(
+                f"Sample next: "
+                f"{t1-t_total_start:.4f}s for "
+                f"{n_updates} edges "
+                f"(avg "
+                f"{(t1-t_total_start)/n_updates:.4f}"
+                f"s/edge, B={B})"
+            )
+            print(
+                f"  Propose: {t_propose:.4f}s "
+                f"(avg "
+                f"{t_propose/n_updates:.4f}s/edge)"
+            )
+            print(
+                f"  Forward: {t_forward:.4f}s "
+                f"(avg "
+                f"{t_forward/n_updates:.4f}s/edge)"
+            )
+
+        if use_log_amp:
+            return fxs, (cur_signs, cur_log_abs)
+        return fxs, current_amps
+
+
 __all__ = [
     "SamplerGPU",
     "MetropolisExchangeSpinfulSamplerGPU",
     "MetropolisExchangeSpinfulSamplerReuse_GPU",
+    "MetropolisExchangeSpinfulSamplerXReuse_GPU",
     "MetropolisExchangeSpinSamplerGPU",
     "MetropolisExchangeSpinSamplerReuse_GPU",
+    "MetropolisExchangeSpinSamplerXReuse_GPU",
     "propose_spin_exchange_vec",
 ]

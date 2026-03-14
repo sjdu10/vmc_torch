@@ -1,12 +1,14 @@
-"""GPU VMC for spinful Fermi-Hubbard with bMPS reuse.
+"""GPU VMC for spin-1/2 Heisenberg with compiled bMPS cache.
 
-Uses fPEPS_Model_reuse_GPU with cached boundary MPS environments
-for incremental updates during sampling and energy evaluation.
+Uses PEPS_Model_reuse_GPU: the bMPS caching stage
+(compute_x/y_environments) is export+compiled for ~4x speedup.
 
 Run:
-    torchrun --nproc_per_node=<N> vmc_run_fpeps_reuse.py
-    torchrun --nproc_per_node=1 vmc_run_fpeps_reuse.py
+    torchrun --nproc_per_node=<N> vmc_run_spin_reuse_compiled_cache.py
+    torchrun --nproc_per_node=1 vmc_run_spin_reuse_compiled_cache.py
 """
+import os
+import time
 from dataclasses import dataclass
 
 import torch
@@ -19,27 +21,26 @@ from vmc_torch.GPU.VMC import (
     print_sampling_settings,
     setup_distributed,
 )
-from vmc_torch.GPU.hamiltonian import (
-    spinful_Fermi_Hubbard_square_lattice_torch,
+from vmc_torch.GPU.vmc_utils import (
+    compute_grads_cheap_gpu,
+    evaluate_energy_reuse_x,
+)
+from vmc_torch.hamiltonian_torch import (
+    spin_Heisenberg_square_lattice_torch,
 )
 from vmc_torch.GPU.models import (
-    fPEPS_Model_reuse_GPU,
+    PEPS_Model_reuse_GPU,
 )
 from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
-    MetropolisExchangeSpinfulSamplerReuse_GPU,
-    MetropolisExchangeSpinfulSamplerXReuse_GPU,
+    MetropolisExchangeSpinSamplerXReuse_GPU,
+    MetropolisExchangeSpinSamplerReuse_GPU,
 )
 from vmc_torch.GPU.vmc_setup import (
+    generate_random_spin_peps,
     initialize_walkers,
-    load_or_generate_peps,
+    random_spin_config_sz0,
     setup_linalg_hooks,
-)
-from vmc_torch.GPU.vmc_utils import (
-    compute_grads_cheap_gpu,
-    evaluate_energy_reuse,
-    evaluate_energy_reuse_x,
-    random_initial_config,
 )
 from vmcconfig import (
     VMCConfig,
@@ -53,23 +54,23 @@ from vmcconfig import (
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
+    '/GPU/data'
 )
 
 
 @dataclass
 class ReuseCfg(VMCConfig):
     """Reuse-model specific settings."""
-    use_export_compile_reuse: bool = True
-    use_export_compile_cache: bool = True
+    use_export_compile_reuse: bool = False
     use_cheap_grad: bool = True
-    use_x_only: bool = True
+
 
 vmc_cfg = ReuseCfg(
-    batch_size=256,
-    ns_per_rank=256,
-    grad_batch_size=128,
-    vmc_steps=1000,
+    batch_size=1,
+    ns_per_rank=1,
+    grad_batch_size=1,
+    vmc_steps=10,
     burn_in_steps=0,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
@@ -80,7 +81,7 @@ vmc_cfg = ReuseCfg(
     use_export_compile=False,
     save_every=10,
     resume_step=0,
-    verbose=False,
+    verbose=True,
 )
 vmc_cfg.lr_scheduler = DecayScheduler(
     init_lr=vmc_cfg.learning_rate,
@@ -91,76 +92,67 @@ warmup_cfg = VMCWarmupConfig(
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
     run_sampling=True,
-    run_locE=True,
+    run_locE=False,
     run_grad=False,
 )
 
 
 def main():
-    setup_linalg_hooks(jitter=1e-8)
+    setup_linalg_hooks(jitter=1e-16)
     torch.set_default_dtype(dtype)
 
     try:
-        rank, world_size, device = setup_distributed(cpu=False)
+        rank, world_size, device = setup_distributed()
         torch.set_default_device(device)
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 8, 8
+        Lx, Ly = 16, 12
         N_sites = Lx * Ly
-        t = 1.0
-        U = 8.0
-        N_f = N_sites - 8 # 8 holes
-        n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 8  # PEPS bond dimension
-        chi = 4*D  # boundary bond dim
+        J = 1.0
+        D = 8
+        chi = 4*D
 
         # ========== Hamiltonian ==========
-        H = spinful_Fermi_Hubbard_square_lattice_torch(
-            Lx,
-            Ly,
-            t,
-            U,
-            N_f,
-            pbc=False,
-            n_fermions_per_spin=n_fermions_per_spin,
-            no_u1_symmetry=False,
-            gpu=True,
+        H = spin_Heisenberg_square_lattice_torch(
+            Lx, Ly, J=J, total_sz=0,
         )
         H.precompute_hops_gpu(device)
-        graph = H.graph
 
-        # ========== Variational state (fPEPS reuse model) ==========
-        fpeps_base = (
-            f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
-            f"/N={N_f}/Z2/D={D}/"
+        # ED reference for small systems
+        if rank == 0 and N_sites <= 16:
+            H_dense = H.to_dense()
+            import scipy.sparse.linalg as la
+            gs_e = la.eigsh(
+                H_dense, k=1, which='SA', tol=1e-8,
+            )[0][0]
+            print(
+                f"ED ground state E/site: "
+                f"{gs_e / N_sites:.8f}"
+            )
+
+        # ========== Model ==========
+        peps = generate_random_spin_peps(
+            Lx, Ly, D, seed=42, dtype=dtype,
         )
-        peps = load_or_generate_peps(
-            Lx, Ly, t, U, N_f, D,
-            seed=42, dtype=dtype,
-            file_path=fpeps_base,
-            scale_factor=4,
-        )
-        model = fPEPS_Model_reuse_GPU(
+        model = PEPS_Model_reuse_GPU(
             tn=peps,
             max_bond=chi,
             dtype=dtype,
             contract_boundary_opts={
                 'mode': 'mps',
-                'equalize_norms': 1.0,
                 'canonize': True,
+                'equalize_norms': 1.0,
             },
-            bold=True
+            bold=False,
         )
         model.to(device)
 
         # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"t={t}_U={U}/N={N_f}/Z2/D={D}/"
-            f"{model._get_name()}/chi={chi}/"
+            f"J={J}/D={D}/{model._get_name()}/chi={chi}/"
         )
-        import os
         os.makedirs(output_dir, exist_ok=True)
         model_name = model._get_name()
         N_params = sum(
@@ -174,53 +166,49 @@ def main():
 
         if rank == 0:
             print(
-                f"Model: {N_params} params | "
-                f"{world_size} GPUs | {device}"
+                f"System: {Lx}x{Ly} Heisenberg, "
+                f"J={J}, Sz=0"
             )
             print(
-                f"System: {Lx}x{Ly} Fermi-Hubbard, "
-                f"t={t}, U={U}, N_f={N_f}, D={D}, chi={chi}"
+                f"Model: {model_name} D={D}, "
+                f"chi={chi}, {N_params} params | "
+                f"{world_size} GPUs | {device}"
             )
 
-        # ========== bMPS skeleton init (one-time) ==========
-        example_x = random_initial_config(
-            N_f, N_sites, seed=0,
+        # ========== bMPS skeleton + compiled cache ==========
+        example_x = random_spin_config_sz0(
+            N_sites, seed=0,
         ).to(device)
+        t0 = time.time()
+        model.cache_bMPS_skeleton(example_x)
+        if rank == 0:
+            print(
+                f'Cached skeleton time='
+                f'{time.time()-t0:.1f}s'
+            )
 
         if rank == 0:
-            print("Initializing bMPS skeleton...")
-        model.cache_bMPS_skeleton(example_x)
-
-        # ========== Export + compile cache (optional) ==========
-        if vmc_cfg.use_export_compile_cache:
-            if rank == 0:
-                print("Exporting cache functions...")
-            cache_dirs = (
-                ('x',) if vmc_cfg.use_x_only
-                else ('x', 'y')
-            )
-            model.export_and_compile_cache(
-                example_x, mode='default',
-                verbose=(rank == 0),
-                directions=cache_dirs,
+            print("Exporting cache functions...")
+        t0 = time.time()
+        model.export_and_compile_cache(
+            example_x, mode='default',
+            verbose=(rank == 0),
+            directions=('x',),
+        )
+        if rank == 0:
+            print(
+                f'Cache export+compile time='
+                f'{time.time()-t0:.1f}s'
             )
 
-        # ========== Export + compile reuse (optional) ==========
         if vmc_cfg.use_export_compile_reuse:
             if rank == 0:
                 print("Exporting reuse patterns...")
-            cache_dirs = (
-                ('x',) if vmc_cfg.use_x_only
-                else ('x', 'y')
-            )
             model.export_and_compile_reuse(
                 example_x, mode='default',
                 verbose=(rank == 0),
                 use_log_amp=vmc_cfg.use_log_amp,
-                directions=cache_dirs,
             )
-
-        # ========== Export + compile full contraction ==========
         if vmc_cfg.use_export_compile:
             if rank == 0:
                 print("Running torch.export + compile...")
@@ -230,17 +218,14 @@ def main():
             )
 
         print_sampling_settings(
-            rank,
-            world_size,
-            vmc_cfg.batch_size,
-            vmc_cfg.ns_per_rank,
-            vmc_cfg.grad_batch_size,
+            rank, world_size, vmc_cfg.batch_size,
+            vmc_cfg.ns_per_rank, vmc_cfg.grad_batch_size,
         )
 
         # ========== Initialize walkers ==========
         fxs = initialize_walkers(
-            init_fn=lambda seed: random_initial_config(
-                N_f, N_sites, seed=seed,
+            init_fn=lambda seed: random_spin_config_sz0(
+                N_sites, seed=seed,
             ),
             batch_size=vmc_cfg.batch_size,
             seed=42, rank=rank, device=device,
@@ -248,12 +233,13 @@ def main():
 
         # ========== Stats + callback ==========
         system_str = (
-            f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
-            f'N_f={N_f}, D={D}, chi={chi}'
+            f'{Lx}x{Ly} Heisenberg, J={J}, '
+            f'D={D}, chi={chi}'
         )
         stats_file = make_stats_file(
             output_dir, model_name,
-            vmc_cfg.resume_step, suffix='_reuse',
+            vmc_cfg.resume_step,
+            suffix='_reuse_compiled_cache',
         )
         stats = make_stats(
             system_str, N_params,
@@ -265,24 +251,13 @@ def main():
         )
 
         # ========== VMC driver ==========
-        if vmc_cfg.use_x_only:
-            sampler = (
-                MetropolisExchangeSpinfulSamplerXReuse_GPU()
-            )
-            energy_fn = evaluate_energy_reuse_x
-        else:
-            sampler = (
-                MetropolisExchangeSpinfulSamplerReuse_GPU()
-            )
-            energy_fn = evaluate_energy_reuse
-
         vmc = VMC_GPU(
-            sampler=sampler,
+            sampler=MetropolisExchangeSpinSamplerXReuse_GPU(),
             preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),
-            evaluate_energy_fn=energy_fn,
+            evaluate_energy_fn=evaluate_energy_reuse_x,
             **(
                 {'compute_grads_fn': compute_grads_cheap_gpu}
                 if vmc_cfg.use_cheap_grad
@@ -291,20 +266,12 @@ def main():
         )
 
         fxs = vmc.run_warmup(
-            fxs=fxs,
-            model=model,
-            graph=graph,
-            hamiltonian=H,
-            rank=rank,
-            config=warmup_cfg,
+            fxs=fxs, model=model, graph=H.graph,
+            hamiltonian=H, rank=rank, config=warmup_cfg,
         )
-
-        energy_history, _ = vmc.run_vmc_loop(
-            fxs=fxs,
-            model=model,
-            hamiltonian=H,
-            graph=graph,
-            rank=rank,
+        energy_history, fxs = vmc.run_vmc_loop(
+            fxs=fxs, model=model, hamiltonian=H,
+            graph=H.graph, rank=rank,
             world_size=world_size,
             config=VMCLoopConfig.from_vmc_config(
                 vmc_cfg,
@@ -314,7 +281,6 @@ def main():
             on_step_end=on_step_end,
         )
 
-        # ========== Summary ==========
         print_summary(
             rank, energy_history,
             system_str, stats_file,

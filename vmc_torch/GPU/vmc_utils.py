@@ -583,63 +583,105 @@ def evaluate_energy_reuse(
             )
 
     # 3. Classify connected configs by change type
-    # Note: batch_ids may NOT be contiguous (GPU get_conn_batch
-    # interleaves by hop type). Use batch_ids[k] directly.
+    # Vectorized: compare all conn configs vs parents at once
     if verbose:
         t0 = time.time()
 
     total_conn = conn_etas.shape[0]
-    conn_etas_cpu = conn_etas.cpu()
-    fxs_cpu = fxs.cpu()
+    Lx = model.Lx
+    radius = model.radius
+
+    # (total_conn, N_sites) bool: which sites differ
+    parent_fxs = fxs[batch_ids]  # (total_conn, N_sites)
+    diff = (conn_etas != parent_fxs)  # on GPU
+
+    # Reshape to (total_conn, Lx, Ly)
+    diff_2d = diff.view(total_conn, Lx, Ly)
+    row_changed = diff_2d.any(dim=2)  # (total_conn, Lx)
+    col_changed = diff_2d.any(dim=1)  # (total_conn, Ly)
+
+    # Count changed sites per config
+    n_changed = diff.sum(dim=1)  # (total_conn,)
+
+    # Diagonal: 0 changed sites, or exactly 1 (single-site
+    # change treated as diagonal by detect_changed_row_col_pair)
+    diagonal_mask = (n_changed <= 1)
+
+    offdiag_mask = ~diagonal_mask
+    offdiag_idxs = torch.nonzero(
+        offdiag_mask,
+    ).squeeze(-1)  # (n_offdiag,)
+
     batch_ids_cpu = batch_ids.cpu()
 
-    # Key: (mode, indices_tuple) -> {global_idxs, parent_idxs}
     tasks_map = {}
-    diagonal_mask = torch.zeros(
-        total_conn, dtype=torch.bool, device=device,
-    )
-    diagonal_parent_indices = []
+    if offdiag_idxs.numel() > 0:
+        rc = row_changed[offdiag_idxs]  # (n_offdiag, Lx)
+        cc = col_changed[offdiag_idxs]  # (n_offdiag, Ly)
 
-    for k in range(total_conn):
-        b = batch_ids_cpu[k].item()
-        fx_cpu = fxs_cpu[b]
-        eta_cpu = conn_etas_cpu[k]
-        is_row, is_col, pos = detect_changed_row_col_pair(
-            fx_cpu, eta_cpu, Ly,
+        # Count changed rows/cols per config
+        n_rows = rc.sum(dim=1)  # (n_offdiag,)
+        n_cols = cc.sum(dim=1)  # (n_offdiag,)
+
+        # delta_row = n_rows - 1, delta_col = n_cols - 1
+        # is_row when delta_row <= delta_col, i.e. n_rows <= n_cols
+        is_row_mask = (n_rows <= n_cols)  # (n_offdiag,)
+
+        row_arange = torch.arange(Lx, device=device)
+        col_arange = torch.arange(Ly, device=device)
+
+        # For row changes: find min/max changed row
+        row_vals_min = torch.where(
+            rc, row_arange, torch.tensor(Lx, device=device),
         )
-        if pos is None:
-            # Diagonal term
-            diagonal_mask[k] = True
-            diagonal_parent_indices.append(b)
-            continue
+        rmin = row_vals_min.min(dim=1).values
+        row_vals_max = torch.where(
+            rc, row_arange, torch.tensor(-1, device=device),
+        )
+        rmax = row_vals_max.max(dim=1).values
 
-        # Expand by model radius
-        if is_row:
-            pos = list(range(
-                max(0, min(pos) - model.radius),
-                min(
-                    model.Lx,
-                    max(pos) + model.radius + 1,
-                ),
-            ))
-        else:
-            pos = list(range(
-                max(0, min(pos) - model.radius),
-                min(
-                    model.Ly,
-                    max(pos) + model.radius + 1,
-                ),
-            ))
+        # For col changes: find min/max changed col
+        col_vals_min = torch.where(
+            cc, col_arange, torch.tensor(Ly, device=device),
+        )
+        cmin = col_vals_min.min(dim=1).values
+        col_vals_max = torch.where(
+            cc, col_arange, torch.tensor(-1, device=device),
+        )
+        cmax = col_vals_max.max(dim=1).values
 
-        mode = 'row' if is_row else 'col'
-        group_key = (mode, tuple(sorted(pos)))
-        if group_key not in tasks_map:
-            tasks_map[group_key] = {
-                'global_idxs': [],
-                'parent_idxs': [],
-            }
-        tasks_map[group_key]['global_idxs'].append(k)
-        tasks_map[group_key]['parent_idxs'].append(b)
+        # Expand by radius and clamp
+        row_lo = (rmin - radius).clamp(min=0)
+        row_hi = (rmax + radius + 1).clamp(max=Lx)
+        col_lo = (cmin - radius).clamp(min=0)
+        col_hi = (cmax + radius + 1).clamp(max=Ly)
+
+        # Move to CPU for dict grouping
+        is_row_cpu = is_row_mask.cpu()
+        row_lo_cpu = row_lo.cpu()
+        row_hi_cpu = row_hi.cpu()
+        col_lo_cpu = col_lo.cpu()
+        col_hi_cpu = col_hi.cpu()
+        offdiag_idxs_cpu = offdiag_idxs.cpu()
+
+        for i in range(offdiag_idxs_cpu.shape[0]):
+            k = offdiag_idxs_cpu[i].item()
+            b = batch_ids_cpu[k].item()
+            if is_row_cpu[i]:
+                lo = row_lo_cpu[i].item()
+                hi = row_hi_cpu[i].item()
+                group_key = ('row', tuple(range(lo, hi)))
+            else:
+                lo = col_lo_cpu[i].item()
+                hi = col_hi_cpu[i].item()
+                group_key = ('col', tuple(range(lo, hi)))
+            if group_key not in tasks_map:
+                tasks_map[group_key] = {
+                    'global_idxs': [],
+                    'parent_idxs': [],
+                }
+            tasks_map[group_key]['global_idxs'].append(k)
+            tasks_map[group_key]['parent_idxs'].append(b)
 
     n_diag = int(diagonal_mask.sum())
     n_groups = len(tasks_map)
@@ -674,13 +716,11 @@ def evaluate_energy_reuse(
         )
 
     # A. Diagonal terms — direct copy (no forward pass)
-    if diagonal_parent_indices:
+    if n_diag > 0:
         diag_locs = torch.nonzero(
             diagonal_mask,
         ).squeeze(-1)
-        parents = torch.tensor(
-            diagonal_parent_indices, device=device,
-        )
+        parents = batch_ids[diag_locs]
         if use_log_amp:
             conn_signs[diag_locs] = cur_signs[parents]
             conn_log_abs[diag_locs] = cur_log_abs[parents]
@@ -817,6 +857,360 @@ def evaluate_energy_reuse(
 
     if return_bMPS:
         return energy, local_energies, bMPS_x, bMPS_y
+    return energy, local_energies
+
+
+def detect_changed_rows(fx1, fx2, Ly):
+    """Find which rows differ between two configs.
+
+    Returns sorted list of changed row indices,
+    or None if configs are identical (diagonal term).
+    """
+    changed_pos = torch.nonzero(fx1 - fx2)
+    if changed_pos.shape[0] == 0:
+        return None
+    rows = set()
+    for pos in changed_pos:
+        rows.add(pos.item() // Ly)
+    return sorted(rows)
+
+
+@torch.inference_mode()
+def evaluate_energy_reuse_x(
+    fxs, model, H, current_amps,
+    verbose=False, use_log_amp=False,
+    return_bMPS=False, **kwargs,
+):
+    """Compute local energies using x-only bMPS reuse.
+
+    Like evaluate_energy_reuse but caches only x-direction bMPS
+    and handles all connected configs (row AND column edge hops)
+    via selected_rows. Matches the XReuse sampler approach.
+
+    Args:
+        fxs: (B, N_sites) int64 configurations.
+        model: PEPS model with cache_bMPS_params_any_direction_vmap.
+        H: Hamiltonian with get_conn or get_conn_batch_gpu.
+        current_amps: (B,) amplitudes at fxs. When
+            use_log_amp=True, this is (signs, log_abs).
+        verbose: Print timing breakdown.
+        use_log_amp: If True, current_amps is a
+            (signs, log_abs) tuple and connected amps
+            are evaluated in log-space.
+
+    Returns:
+        energy: Mean local energy, scalar.
+        local_energies: Per-sample local energies, (B,).
+    """
+    import numpy as np
+
+    B = fxs.shape[0]
+    device = fxs.device
+    Ly = model.Ly
+
+    # Unpack log-amp current state if needed
+    if use_log_amp:
+        cur_signs, cur_log_abs = current_amps
+
+    if verbose:
+        t0 = time.time()
+
+    # 1. Cache x-direction bMPS only
+    bMPS_x, current_amps_from_cache = (
+        model.cache_bMPS_params_any_direction_vmap(
+            fxs, direction='x',
+        )
+    )
+
+    if verbose:
+        t1 = time.time()
+        print(f"  cache bMPS (x-only): {t1 - t0:.4f}s")
+
+    # 2. Get connected configurations
+    # --- GPU-batched path: zero CPU round-trips ---
+    if hasattr(H, '_hop_list'):
+        if verbose:
+            t0 = time.time()
+        conn_etas, conn_eta_coeffs, batch_ids = (
+            H.get_conn_batch_gpu(fxs)
+        )
+        conn_eta_num = torch.bincount(
+            batch_ids, minlength=B,
+        )
+        if verbose:
+            t1 = time.time()
+            print(
+                f"  GPU get_conn_batch time: "
+                f"{t1 - t0:.4f}s"
+                f" ({conn_etas.shape[0]} connected)"
+            )
+
+    # --- Fallback: CPU get_conn ---
+    else:
+        if verbose:
+            t0 = time.time()
+            print(
+                "  Warning: falling back to CPU "
+                "get_conn (no _hop_list)"
+            )
+        fxs_cpu = fxs.cpu()
+        all_etas_np, all_coeffs_np = [], []
+        conn_eta_num_list = []
+        for fx in fxs_cpu:
+            eta, coeffs = H.get_conn(fx)
+            conn_eta_num_list.append(len(eta))
+            all_etas_np.append(np.asarray(eta))
+            all_coeffs_np.append(np.asarray(coeffs))
+        conn_etas = torch.tensor(
+            np.concatenate(all_etas_np), device=device,
+        )
+        conn_eta_coeffs = torch.tensor(
+            np.concatenate(all_coeffs_np),
+            device=device, dtype=torch.float64,
+        )
+        conn_eta_num = torch.tensor(
+            conn_eta_num_list, device=device,
+        )
+        batch_ids = torch.repeat_interleave(
+            torch.arange(B, device=device), conn_eta_num,
+        )
+        if verbose:
+            t1 = time.time()
+            print(
+                f"  CPU get_conn: {t1 - t0:.4f}s"
+                f" ({conn_etas.shape[0]} connected)"
+            )
+
+    # 3. Classify connected configs — all as row changes
+    # Vectorized: compare all conn configs vs parents at once
+    if verbose:
+        t0 = time.time()
+
+    total_conn = conn_etas.shape[0]
+    Lx = model.Lx
+    radius = model.radius
+
+    # (total_conn, N_sites) bool: which sites differ
+    parent_fxs = fxs[batch_ids]  # (total_conn, N_sites)
+    diff = (conn_etas != parent_fxs)  # on GPU
+
+    # Reshape to (total_conn, Lx, Ly), check which rows changed
+    diff_2d = diff.view(total_conn, Lx, Ly)
+    row_changed = diff_2d.any(dim=2)  # (total_conn, Lx)
+
+    # Diagonal: no sites differ
+    diagonal_mask = ~diff.any(dim=1)  # (total_conn,)
+
+    # For non-diagonal, encode row pattern as integer key
+    # row_changed is (total_conn, Lx) bool on GPU
+    # Compute min/max changed row per config, then expand
+    # by radius to get the group key.
+    # Use argmax tricks on GPU to find min/max row.
+    offdiag_mask = ~diagonal_mask
+    offdiag_idxs = torch.nonzero(
+        offdiag_mask,
+    ).squeeze(-1)  # (n_offdiag,)
+
+    batch_ids_cpu = batch_ids.cpu()
+
+    tasks_map = {}
+    if offdiag_idxs.numel() > 0:
+        rc = row_changed[offdiag_idxs]  # (n_offdiag, Lx)
+        # row indices: 0..Lx-1
+        row_arange = torch.arange(Lx, device=device)
+        # min changed row: first True in each row
+        # Set False positions to Lx so they don't win min
+        row_vals = torch.where(
+            rc, row_arange, torch.tensor(Lx, device=device),
+        )
+        rmin = row_vals.min(dim=1).values  # (n_offdiag,)
+        # max changed row
+        row_vals_max = torch.where(
+            rc, row_arange, torch.tensor(-1, device=device),
+        )
+        rmax = row_vals_max.max(dim=1).values  # (n_offdiag,)
+
+        # Expand by radius and clamp
+        pos_min = (rmin - radius).clamp(min=0)
+        pos_max = (rmax + radius + 1).clamp(max=Lx)
+
+        # Encode group key as (pos_min, pos_max) pair
+        # Move to CPU for dict grouping
+        pos_min_cpu = pos_min.cpu()
+        pos_max_cpu = pos_max.cpu()
+        offdiag_idxs_cpu = offdiag_idxs.cpu()
+
+        for i in range(offdiag_idxs_cpu.shape[0]):
+            k = offdiag_idxs_cpu[i].item()
+            b = batch_ids_cpu[k].item()
+            lo = pos_min_cpu[i].item()
+            hi = pos_max_cpu[i].item()
+            group_key = ('row', tuple(range(lo, hi)))
+            if group_key not in tasks_map:
+                tasks_map[group_key] = {
+                    'global_idxs': [],
+                    'parent_idxs': [],
+                }
+            tasks_map[group_key]['global_idxs'].append(k)
+            tasks_map[group_key]['parent_idxs'].append(b)
+
+    n_diag = int(diagonal_mask.sum())
+    n_groups = len(tasks_map)
+    n_offdiag = total_conn - n_diag
+    if verbose:
+        t1 = time.time()
+        print(
+            f"  classify (x-only): {t1 - t0:.4f}s "
+            f"({n_groups} groups, {n_diag} diagonal, "
+            f"{n_offdiag} off-diagonal)"
+        )
+
+    # 4. Evaluate connected amplitudes
+    if verbose:
+        t0 = time.time()
+
+    _amp_dtype = (
+        cur_log_abs.dtype if use_log_amp
+        else current_amps.dtype
+    )
+
+    if use_log_amp:
+        conn_signs = torch.zeros(
+            total_conn, dtype=_amp_dtype, device=device,
+        )
+        conn_log_abs = torch.zeros(
+            total_conn, dtype=_amp_dtype, device=device,
+        )
+    else:
+        conn_amps = torch.zeros(
+            total_conn, dtype=_amp_dtype, device=device,
+        )
+
+    # A. Diagonal terms — direct copy (no forward pass)
+    if n_diag > 0:
+        diag_locs = torch.nonzero(
+            diagonal_mask,
+        ).squeeze(-1)
+        parents = batch_ids[diag_locs]
+        if use_log_amp:
+            conn_signs[diag_locs] = cur_signs[parents]
+            conn_log_abs[diag_locs] = cur_log_abs[parents]
+        else:
+            conn_amps[diag_locs] = current_amps[parents]
+
+    # B. Non-diagonal terms — grouped x-direction reuse.
+    # Pad each chunk to fixed size B to avoid torch.compile
+    # recompilation on varying batch sizes.
+    chunk_counter = 0
+    total_chunks = sum(
+        (len(d['global_idxs']) + B - 1) // B
+        for d in tasks_map.values()
+    )
+
+    for (mode, indices), data in tasks_map.items():
+        global_idxs = data['global_idxs']
+        parent_idxs = data['parent_idxs']
+
+        for start in range(0, len(global_idxs), B):
+            if verbose:
+                t00 = time.time()
+            chunk_counter += 1
+            end = min(start + B, len(global_idxs))
+            batch_global = global_idxs[start:end]
+            batch_parents = parent_idxs[start:end]
+            actual = len(batch_global)
+
+            target_configs = conn_etas[batch_global]
+            subset_parents = torch.tensor(
+                batch_parents, device=device,
+            )
+
+            # Pad to fixed size B if needed
+            if actual < B:
+                pad = B - actual
+                target_configs = torch.cat([
+                    target_configs,
+                    target_configs[:1].expand(pad, -1),
+                ], dim=0)
+                subset_parents = torch.cat([
+                    subset_parents,
+                    subset_parents[:1].expand(pad),
+                ], dim=0)
+
+            subset_env_x = _slice_env_dict(
+                bMPS_x, subset_parents,
+            )
+
+            if use_log_amp:
+                cs, cla = model.forward_reuse_log(
+                    target_configs,
+                    bMPS_params_x_batched=subset_env_x,
+                    selected_rows=list(indices),
+                )
+                locs = torch.tensor(
+                    batch_global, device=device,
+                )
+                conn_signs[locs] = cs[:actual]
+                conn_log_abs[locs] = cla[:actual]
+            else:
+                amps_chunk = model.forward_reuse(
+                    target_configs,
+                    bMPS_params_x_batched=subset_env_x,
+                    selected_rows=list(indices),
+                )
+                locs = torch.tensor(
+                    batch_global, device=device,
+                )
+                conn_amps[locs] = amps_chunk[:actual]
+
+            if verbose:
+                print(
+                    f"  Evaluating connected amplitudes: "
+                    f"chunk {chunk_counter} / "
+                    f"{total_chunks} "
+                    f"({mode} {list(indices)}, "
+                    f"{actual} configs), "
+                    f"delta t_forward: "
+                    f"{time.time() - t00:.4f}s, "
+                    f"total t_forward: "
+                    f"{time.time() - t0:.4f}s"
+                )
+
+    if verbose:
+        t1 = time.time()
+        print(
+            f"  GPU forward for connected configs "
+            f"time: {t1 - t0:.4f}s"
+        )
+
+    # 5. Compute local energies via vectorized index_add_
+    if use_log_amp:
+        amp_ratio = (
+            conn_signs
+            * cur_signs[batch_ids]
+            * torch.exp(
+                conn_log_abs - cur_log_abs[batch_ids],
+            )
+        )
+        terms = conn_eta_coeffs * amp_ratio
+    else:
+        current_amps_expanded = current_amps[batch_ids]
+        terms = conn_eta_coeffs * (
+            conn_amps / current_amps_expanded
+        )
+
+    local_energies = torch.zeros(
+        B, device=device, dtype=terms.dtype,
+    )
+    local_energies.index_add_(0, batch_ids, terms)
+
+    energy = torch.mean(local_energies)
+
+    if verbose:
+        print(f"  E_loc mean: {energy.item():.6f}")
+
+    if return_bMPS:
+        return energy, local_energies, bMPS_x
     return energy, local_energies
 
 

@@ -31,7 +31,7 @@ def _find_free_port():
         return s.getsockname()[1]
 
 
-def setup_distributed(cuda_rank: Optional[int] = None):
+def setup_distributed(cuda_rank: Optional[int] = None, cpu: bool = False):
     if "RANK" not in os.environ:
         print("Warning: Not using torchrun. Single device.")
         os.environ["RANK"] = "0"
@@ -50,8 +50,11 @@ def setup_distributed(cuda_rank: Optional[int] = None):
     world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
 
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+    if not cpu:
+        # torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
     return rank, world_size, device
 
 
@@ -251,6 +254,8 @@ class VMC_GPU:
                 )
                 if len(energy_result) == 4:
                     _, local_E, bMPS_x, bMPS_y = energy_result
+                elif len(energy_result) == 3:
+                    _, local_E, bMPS_x = energy_result
                 else:
                     _, local_E = energy_result
                     bMPS_x = None

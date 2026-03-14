@@ -24,14 +24,18 @@ from vmc_torch.GPU.VMC import (
 from vmc_torch.GPU.vmc_utils import (
     compute_grads_cheap_gpu,
     evaluate_energy_reuse,
+    evaluate_energy_reuse_x,
 )
 from vmc_torch.hamiltonian_torch import (
     spin_Heisenberg_square_lattice_torch,
 )
-from vmc_torch.GPU.models import PEPS_Model_reuse_GPU
+from vmc_torch.GPU.models import (
+    PEPS_Model_reuse_GPU,
+)
 from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
     MetropolisExchangeSpinSamplerReuse_GPU,
+    MetropolisExchangeSpinSamplerXReuse_GPU,
 )
 from vmc_torch.GPU.vmc_setup import (
     generate_random_spin_peps,
@@ -60,15 +64,17 @@ DEFAULT_DATA_ROOT = (
 class ReuseCfg(VMCConfig):
     """Reuse-model specific settings."""
     use_export_compile_reuse: bool = False
+    use_export_compile_cache: bool = True
     use_cheap_grad: bool = True
+    use_x_only: bool = True
 
 
 vmc_cfg = ReuseCfg(
-    batch_size=1024,
-    ns_per_rank=1024,
-    grad_batch_size=256,
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=512,
     vmc_steps=10,
-    burn_in_steps=0,
+    burn_in_steps=2,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
     use_distributed_sr_minres=True,
@@ -88,7 +94,7 @@ warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    run_sampling=False,
+    run_sampling=True,
     run_locE=False,
     run_grad=False,
 )
@@ -104,10 +110,10 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 8, 8
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         J = 1.0
-        D = 8
+        D = 4
         chi = 4*D
 
         # ========== Hamiltonian ==========
@@ -180,13 +186,31 @@ def main():
         model.cache_bMPS_skeleton(example_x)
         print(f'Cached skeleton time={time.time()-t0}')
 
+        if vmc_cfg.use_export_compile_cache:
+            if rank == 0:
+                print("Exporting cache functions...")
+            cache_dirs = (
+                ('x',) if vmc_cfg.use_x_only
+                else ('x', 'y')
+            )
+            model.export_and_compile_cache(
+                example_x, mode='default',
+                verbose=(rank == 0),
+                directions=cache_dirs,
+            )
+
         if vmc_cfg.use_export_compile_reuse:
             if rank == 0:
                 print("Exporting reuse patterns...")
+            cache_dirs = (
+                ('x',) if vmc_cfg.use_x_only
+                else ('x', 'y')
+            )
             model.export_and_compile_reuse(
                 example_x, mode='default',
                 verbose=(rank == 0),
                 use_log_amp=vmc_cfg.use_log_amp,
+                directions=cache_dirs,
             )
         if vmc_cfg.use_export_compile:
             if rank == 0:
@@ -229,13 +253,24 @@ def main():
         )
 
         # ========== VMC driver ==========
+        if vmc_cfg.use_x_only:
+            sampler = (
+                MetropolisExchangeSpinSamplerXReuse_GPU()
+            )
+            energy_fn = evaluate_energy_reuse_x
+        else:
+            sampler = (
+                MetropolisExchangeSpinSamplerReuse_GPU()
+            )
+            energy_fn = evaluate_energy_reuse
+
         vmc = VMC_GPU(
-            sampler=MetropolisExchangeSpinSamplerReuse_GPU(),
+            sampler=sampler,
             preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),
-            evaluate_energy_fn=evaluate_energy_reuse,
+            evaluate_energy_fn=energy_fn,
             **(
                 {'compute_grads_fn': compute_grads_cheap_gpu}
                 if vmc_cfg.use_cheap_grad
