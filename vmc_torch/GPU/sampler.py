@@ -1689,7 +1689,7 @@ class MetropolisExchangeSpinfulSamplerXReuse_GPU(SamplerGPU):
                         t11 = time.time()
                         t_forward += t11 - t10
                         print(
-                            f" Edge ({i}, {j}): "
+                            f" Edge ({i}, {j}) (single row): "
                             f"{n_changed} / {B} "
                             f"proposed, forward: "
                             f"{t11-t10:.4f}s, "
@@ -1790,7 +1790,7 @@ class MetropolisExchangeSpinfulSamplerXReuse_GPU(SamplerGPU):
                         t11 = time.time()
                         t_forward += t11 - t10
                         print(
-                            f" Edge ({i}, {j}): "
+                            f" Edge ({i}, {j}) (two rows): "
                             f"{n_changed} / {B} "
                             f"proposed, forward: "
                             f"{t11-t10:.4f}s, "

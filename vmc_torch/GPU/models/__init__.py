@@ -16,6 +16,7 @@ from .pureNN import PureNN_GPU
 from .slater import SlaterDeterminant_GPU
 from .NNBF import NNBF_GPU, AttentionNNBF_GPU
 from .NNfTNS import NNfTNS_Model_GPU, Conv2D_Geometric_fPEPS_GPU
+from .AttentionNNfTNS import Attention_Geometric_fPEPS_GPU
 
 __all__ = [
     "WavefunctionModel_GPU",
@@ -27,6 +28,7 @@ __all__ = [
     "AttentionNNBF_GPU",
     "NNfTNS_Model_GPU",
     "Conv2D_Geometric_fPEPS_GPU",
+    "Attention_Geometric_fPEPS_GPU",
     "PEPS_Model_GPU",
     "PEPS_Model_reuse_GPU",
     "PEPS_Model_reuse_compiled_cache_GPU",

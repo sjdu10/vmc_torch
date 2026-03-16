@@ -7,6 +7,10 @@ Run:
     torchrun --nproc_per_node=<N> vmc_run_fpeps_reuse.py
     torchrun --nproc_per_node=1 vmc_run_fpeps_reuse.py
 """
+import os
+os.environ['OMP_NUM_THREADS'] = '1'  # for better CPU multi-processing performance
+os.environ['MKL_NUM_THREADS'] = '1'  # for better CPU multi-processing performance
+os.environ['OPENBLAS_NUM_THREADS'] = '1'  # for better CPU multi-processing performance
 from dataclasses import dataclass
 
 import torch
@@ -66,10 +70,10 @@ class ReuseCfg(VMCConfig):
     use_x_only: bool = True
 
 vmc_cfg = ReuseCfg(
-    batch_size=2,
-    ns_per_rank=2,
-    grad_batch_size=2,
-    vmc_steps=10,
+    batch_size=10,
+    ns_per_rank=10,
+    grad_batch_size=10,
+    vmc_steps=1,
     burn_in_steps=0,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
@@ -91,7 +95,7 @@ warmup_cfg = VMCWarmupConfig(
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
     run_sampling=True,
-    run_locE=True,
+    run_locE=False,
     run_grad=False,
 )
 
@@ -150,7 +154,7 @@ def main():
                 'equalize_norms': 1.0,
                 'canonize': True,
             },
-            bold=True
+            bold=False,
         )
         model.to(device)
 
