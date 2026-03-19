@@ -80,7 +80,7 @@ If you find this code useful, please consider citing it:
   journal = {Phys. Rev. B},
   volume = {113},
   pages = {085134},
-  year = {2025},
+  year = {2026},
   doi = {10.1103/x8vl-qf14}
 }
 ```
