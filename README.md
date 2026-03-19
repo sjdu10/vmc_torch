@@ -62,6 +62,29 @@ This code is the result of the research detailed in:
 
 
 
+### Citation
+
+If you find this code useful, please consider citing it:
+
+```bibtex
+@software{vmc_torch,
+  author = {Du, Si-Jing},
+  title = {vmc\_torch: Flexible Variational Monte Carlo with PyTorch},
+  url = {https://github.com/sjdu10/vmc_torch},
+  year = {2025}
+}
+
+@article{du2025neuralized,
+  title = {Neuralized fermionic tensor networks for quantum many-body systems},
+  author = {Du, Si-Jing and Chen, Ao and Chan, Garnet Kin-Lic},
+  journal = {Phys. Rev. B},
+  volume = {113},
+  pages = {085134},
+  year = {2025},
+  doi = {10.1103/x8vl-qf14}
+}
+```
+
 ### Core Dependencies
 
 `vmc_torch` builds on and interoperates with leading libraries in Tensor Networks and quantum many-body calculations:
