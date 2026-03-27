@@ -55,18 +55,18 @@ DEFAULT_DATA_ROOT = (
 )
 
 vmc_cfg = VMCConfig(
-    batch_size=2048,
-    ns_per_rank=2048,
-    grad_batch_size=512,
+    batch_size=4096,
+    ns_per_rank=4096,
+    grad_batch_size=1048,
     vmc_steps=200,
-    burn_in_steps=0,
+    burn_in_steps=1,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
     use_distributed_sr_minres=True,
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=False,
+    use_export_compile=True,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -101,7 +101,7 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 2, 2
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         t, U = 1.0, 8.0
         N_f = N_sites - 2

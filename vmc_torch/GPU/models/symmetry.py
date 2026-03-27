@@ -510,77 +510,94 @@ class SymmetryProjectedModel(WavefunctionModel_GPU):
 # =================================================================
 
 
-# Quimb encoding -> fermion count per site
-# 0=empty->0, 1=down->1, 2=up->1, 3=both->2
-_QUIMB_TO_NFERMIONS = torch.tensor(
-    [0, 1, 1, 2], dtype=torch.long,
-)
+def build_mode_perms(perms):
+    """Build 2N-mode permutations from N-site permutations.
 
-
-def build_inversion_masks(perms):
-    """Precompute inversion masks for all group elements.
-
-    For each group element g with site permutation perm_g,
-    inv_mask[g, i, j] = True iff i < j and perm_g[i] > perm_g[j].
-
-    These pairs are the sites whose fermions need to swap
-    past each other under the permutation g.
+    For the symmray interleaved convention [d0, u0, d1, u1, ...],
+    a site permutation g that maps site i -> g(i) induces a
+    mode permutation:
+        mode 2*i   (down at site i) -> mode 2*g(i)   (down at g(i))
+        mode 2*i+1 (up at site i)   -> mode 2*g(i)+1 (up at g(i))
 
     Args:
         perms: (|G|, N_sites) int64 site permutations.
 
     Returns:
-        inv_masks: (|G|, N_sites, N_sites) bool.
+        mode_perms: (|G|, 2*N_sites) int64 mode permutations.
     """
     n_group, N = perms.shape
-    # upper triangle: i < j
-    upper = torch.triu(
-        torch.ones(N, N, dtype=torch.bool), diagonal=1,
+    mode_perms = torch.empty(
+        n_group, 2 * N, dtype=torch.long,
     )
-    # perm_g[i] > perm_g[j] for each group element
-    # perms: (|G|, N), compare (|G|, N, 1) vs (|G|, 1, N)
-    g_i = perms.unsqueeze(2)  # (|G|, N, 1)
-    g_j = perms.unsqueeze(1)  # (|G|, 1, N)
-    inv_masks = (g_i > g_j) & upper  # (|G|, N, N)
+    # mode 2i -> 2*g(i), mode 2i+1 -> 2*g(i)+1
+    mode_perms[:, 0::2] = 2 * perms        # down modes
+    mode_perms[:, 1::2] = 2 * perms + 1    # up modes
+    return mode_perms
+
+
+def build_mode_inv_masks(mode_perms):
+    """Precompute inversion masks at the 2N-mode level.
+
+    inv_mask[g, m1, m2] = True iff m1 < m2 and
+    mode_perm_g[m1] > mode_perm_g[m2].
+
+    Args:
+        mode_perms: (|G|, 2*N_sites) int64.
+
+    Returns:
+        inv_masks: (|G|, 2*N, 2*N) bool.
+    """
+    n_group, M = mode_perms.shape
+    upper = torch.triu(
+        torch.ones(M, M, dtype=torch.bool), diagonal=1,
+    )
+    g_i = mode_perms.unsqueeze(2)  # (|G|, 2N, 1)
+    g_j = mode_perms.unsqueeze(1)  # (|G|, 1, 2N)
+    inv_masks = (g_i > g_j) & upper  # (|G|, 2N, 2N)
     return inv_masks
 
 
-def compute_fermion_signs(fxs, inv_masks):
+def compute_fermion_signs(fxs, mode_inv_masks):
     """Compute fermionic sign(g, n) for all group elements.
 
-    Uses the formula for the symmray interleaved convention:
-        sign(g, n) = (-1)^{sum_{inversions (i,j)} n_i * n_j}
+    Works at the 2N-mode level in the symmray interleaved
+    convention [d0, u0, d1, u1, ...]. The sign is the parity
+    of the mode permutation restricted to occupied modes:
 
-    where n_i is the number of fermions at site i (0, 1, or 2),
-    and the sum is over pairs (i < j) with g(i) > g(j).
+        sign(g, n) = (-1)^{# inversions among occupied modes}
+
+    This correctly accounts for cross-spin ordering — e.g.,
+    an up fermion at site i crossing a down fermion at site j.
 
     Args:
         fxs: (B, N_sites) int64, quimb encoding {0,1,2,3}.
-        inv_masks: (|G|, N, N) bool, from build_inversion_masks.
+        mode_inv_masks: (|G|, 2N, 2N) bool, precomputed.
 
     Returns:
         signs: (B, |G|) float64, each entry +1.0 or -1.0.
     """
     B, N = fxs.shape
-    n_group = inv_masks.shape[0]
 
-    # Fermion count per site: (B, N)
-    lookup = _QUIMB_TO_NFERMIONS.to(fxs.device)
-    n_counts = lookup[fxs]  # (B, N) long
+    # Build (B, 2N) occupation in symmray order [d0,u0,d1,u1,...]
+    occ_down = ((fxs == 1) | (fxs == 3)).long()  # (B, N)
+    occ_up = ((fxs == 2) | (fxs == 3)).long()     # (B, N)
+    # Interleave: [d0, u0, d1, u1, ...]
+    occ = torch.stack(
+        [occ_down, occ_up], dim=-1,
+    ).reshape(B, 2 * N)  # (B, 2N)
 
-    # Outer product: n_i * n_j -> (B, N, N)
-    n_pairs = n_counts.unsqueeze(2) * n_counts.unsqueeze(1)
+    # Occupied-pair matrix: occ_m1 * occ_m2 for all mode pairs
+    occ_pairs = (
+        occ.unsqueeze(2) * occ.unsqueeze(1)
+    )  # (B, 2N, 2N)
 
-    # For each g: exponent = sum of n_i*n_j over inversion pairs
-    # inv_masks: (|G|, N, N), n_pairs: (B, N, N)
-    # Result: (B, |G|)
-    # Cast to float for CUDA einsum (baddbmm not impl for Long)
+    # Count inversions among occupied modes for each g
+    # mode_inv_masks: (|G|, 2N, 2N), occ_pairs: (B, 2N, 2N)
     exponents = torch.einsum(
-        'gnm,bnm->bg',
-        inv_masks.float(), n_pairs.float(),
+        'gmn,bmn->bg',
+        mode_inv_masks.float(), occ_pairs.float(),
     ).long()
 
-    # sign = (-1)^exponent
     signs = 1.0 - 2.0 * (exponents % 2).to(torch.float64)
     return signs
 
@@ -597,9 +614,9 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
 
         psi^r(n) = (1/|G|) sum_g sign(g,n) chi^(r)(g) psi(D_g^{-1} n)
 
-    where sign(g,n) = (-1)^{sum_{i<j, g(i)>g(j)} n_i * n_j}
-    accounts for reordering fermionic creation operators after
-    the site permutation.
+    The sign is computed at the 2N-mode level in the symmray
+    interleaved convention [d0, u0, d1, u1, ...], properly
+    accounting for cross-spin ordering.
 
     Args:
         base_model: WavefunctionModel_GPU instance (e.g. fPEPS).
@@ -611,24 +628,59 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
     def __init__(self, base_model, Lx, Ly, irrep='A1'):
         super().__init__(base_model, Lx, Ly, irrep)
 
-        # Precompute inversion masks for fermionic sign
-        inv_masks = build_inversion_masks(self.perms)
-        self.register_buffer('inv_masks', inv_masks)
+        # The projection formula requires sign(g^{-1}, n), NOT
+        # sign(g, n). These differ for non-self-inverse elements
+        # (e.g., C4 vs C4^3). We build mode masks from the
+        # INVERSE site permutations so that mode_inv_masks[g]
+        # gives the inversions for g^{-1}.
+        N = self.perms.shape[1]
+        inv_perms = torch.empty_like(self.perms)
+        for g in range(self.n_group):
+            inv_perms[g][self.perms[g]] = torch.arange(
+                N, dtype=torch.long,
+            )
+
+        mode_perms = build_mode_perms(inv_perms)
+        mode_inv_masks = build_mode_inv_masks(mode_perms)
+        self.register_buffer('mode_perms', mode_perms)
+        self.register_buffer('mode_inv_masks', mode_inv_masks)
+
+    # ----- Helper: single-sample sign -----
+
+    def _single_sample_signs(self, x):
+        """Compute sign(g, x) for all g, single sample.
+
+        Args:
+            x: (N_sites,) int64, quimb encoding.
+
+        Returns:
+            signs: (|G|,) float64.
+        """
+        N = x.shape[0]
+        # Build symmray occupation: [d0, u0, d1, u1, ...]
+        occ_d = ((x == 1) | (x == 3)).long()  # (N,)
+        occ_u = ((x == 2) | (x == 3)).long()  # (N,)
+        occ = torch.stack(
+            [occ_d, occ_u], dim=-1,
+        ).reshape(2 * N)  # (2N,)
+
+        # Occupied-pair products
+        occ_pairs = occ.unsqueeze(1) * occ.unsqueeze(0)  # (2N, 2N)
+
+        # Count inversions for each g
+        exponents = (
+            self.mode_inv_masks.long() * occ_pairs
+        ).sum(dim=(1, 2))  # (|G|,)
+
+        return 1.0 - 2.0 * (exponents % 2).to(
+            torch.float64,
+        )
 
     # ----- Single-sample interface -----
 
     def amplitude(self, x, params_list):
-        """Single-sample projected amplitude with fermionic sign.
-
-        Args:
-            x: (N_sites,) int64, quimb encoding.
-            params_list: list of parameter tensors.
-
-        Returns:
-            Scalar projected amplitude.
-        """
-        lookup = _QUIMB_TO_NFERMIONS.to(x.device)
-        n_counts = lookup[x]  # (N,)
+        """Single-sample projected amplitude with fermionic sign."""
+        fsigns = self._single_sample_signs(x)  # (|G|,)
 
         total = torch.tensor(
             0.0, dtype=self.characters.dtype,
@@ -639,29 +691,15 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
             amp_g = self.base_model.amplitude(
                 x_g, params_list,
             )
-            # Fermionic sign for this group element
-            n_pairs = (
-                n_counts.unsqueeze(1) * n_counts.unsqueeze(0)
-            )
-            exp_g = (
-                n_pairs * self.inv_masks[g]
-            ).sum()
-            sign_g = 1.0 - 2.0 * (exp_g % 2).to(
-                self.characters.dtype,
-            )
             total = (
                 total
-                + sign_g * self.characters[g] * amp_g
+                + fsigns[g] * self.characters[g] * amp_g
             )
         return total / self.n_group
 
     def log_amplitude(self, x, params_list):
         """Single-sample log projected amplitude with sign."""
-        lookup = _QUIMB_TO_NFERMIONS.to(x.device)
-        n_counts = lookup[x]
-        n_pairs = (
-            n_counts.unsqueeze(1) * n_counts.unsqueeze(0)
-        )
+        fsigns = self._single_sample_signs(x)  # (|G|,)
 
         signs = []
         log_abs_vals = []
@@ -670,12 +708,8 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
             s_g, la_g = self.base_model.log_amplitude(
                 x_g, params_list,
             )
-            exp_g = (n_pairs * self.inv_masks[g]).sum()
-            fsign_g = 1.0 - 2.0 * (exp_g % 2).to(
-                s_g.dtype,
-            )
             signs.append(
-                fsign_g * self.characters[g] * s_g
+                fsigns[g] * self.characters[g] * s_g
             )
             log_abs_vals.append(la_g)
 
@@ -715,7 +749,7 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
         amps_grouped = amps_flat.reshape(B, self.n_group)
 
         # Fermionic signs: (B, |G|)
-        fsigns = compute_fermion_signs(x, self.inv_masks)
+        fsigns = compute_fermion_signs(x, self.mode_inv_masks)
 
         projected = (
             (amps_grouped * self.characters * fsigns)
@@ -736,7 +770,7 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
         log_abs_g = log_abs_flat.reshape(B, self.n_group)
 
         # Fermionic signs: (B, |G|)
-        fsigns = compute_fermion_signs(x, self.inv_masks)
+        fsigns = compute_fermion_signs(x, self.mode_inv_masks)
 
         eff_signs = signs_g * self.characters * fsigns
 
@@ -776,7 +810,7 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
         amps_grouped = amps_flat.reshape(B, self.n_group)
 
         # Fermionic signs (no grad needed — config-only)
-        fsigns = compute_fermion_signs(x, self.inv_masks)
+        fsigns = compute_fermion_signs(x, self.mode_inv_masks)
 
         return (
             (amps_grouped * self.characters * fsigns)
@@ -798,7 +832,7 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
         signs_g = signs_flat.reshape(B, self.n_group)
         log_abs_g = log_abs_flat.reshape(B, self.n_group)
 
-        fsigns = compute_fermion_signs(x, self.inv_masks)
+        fsigns = compute_fermion_signs(x, self.mode_inv_masks)
         eff_signs = signs_g * self.characters * fsigns
 
         max_la = log_abs_g.max(dim=1, keepdim=True).values
