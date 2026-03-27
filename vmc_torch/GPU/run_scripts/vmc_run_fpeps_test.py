@@ -57,8 +57,8 @@ DEFAULT_DATA_ROOT = (
 vmc_cfg = VMCConfig(
     batch_size=2048,
     ns_per_rank=2048,
-    grad_batch_size=1024,
-    vmc_steps=1000,
+    grad_batch_size=512,
+    vmc_steps=200,
     burn_in_steps=1,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
@@ -66,7 +66,7 @@ vmc_cfg = VMCConfig(
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=True,
+    use_export_compile=False,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -79,7 +79,7 @@ warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    run_sampling=False,
+    run_sampling=True,
     run_locE=False,
     run_grad=True,
 )
@@ -99,14 +99,14 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 8, 8
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 8
+        N_f = N_sites - 2
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 10  # PEPS bond dimension (start small)
-        chi = 10  # boundary bond dim
+        D = 4  # PEPS bond dimension (start small)
+        chi = -1  # boundary bond dim
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -139,6 +139,11 @@ def main():
             max_bond=chi,
             dtype=dtype,
             contract_boundary_opts={
+                # 'mode': 'fit',
+                # 'tn_fit': 'zipup',
+                # 'bsz':2,
+                # 'max_iterations':5,
+                # 'tol':0.0,
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
@@ -177,16 +182,6 @@ def main():
 
         if rank == 0:
             print("Initializing bMPS skeleton...")
-
-        # ========== Export + compile reuse (optional) ==========
-        if vmc_cfg.use_export_compile_reuse:
-            if rank == 0:
-                print("Exporting reuse patterns...")
-            model.export_and_compile_reuse(
-                example_x, mode='default',
-                verbose=(rank == 0),
-                use_log_amp=vmc_cfg.use_log_amp,
-            )
 
         # ========== Export + compile full contraction ==========
         if vmc_cfg.use_export_compile:

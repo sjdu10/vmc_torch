@@ -55,7 +55,7 @@ vmc_cfg = VMCConfig(
     batch_size=2048,
     ns_per_rank=2048,
     grad_batch_size=1024,
-    vmc_steps=1000,
+    vmc_steps=2,
     burn_in_steps=1,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
@@ -86,7 +86,7 @@ warmup_cfg = VMCWarmupConfig(
 
 def main():
     setup_linalg_hooks(
-        jitter=1e-12, qr_via_eigh=True,
+        jitter=1e-8, qr_via_eigh=True,
         cholesky_qr=False, cholesky_qr_adaptive_jitter=False,
     )
     torch.set_default_dtype(dtype)
@@ -97,14 +97,14 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 8, 8
+        Lx, Ly = 4, 2
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 8  # 2 holes -> 14 fermions
+        N_f = N_sites - 2  # 2 holes -> 14 fermions
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 10   # PEPS bond dimension
-        chi = 10  # exact contraction
+        D = 4   # PEPS bond dimension
+        chi = -1  # exact contraction
 
         # NN backflow hyperparameters
         nn_eta = 1.0

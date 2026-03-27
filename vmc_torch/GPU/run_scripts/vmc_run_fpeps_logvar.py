@@ -1,11 +1,13 @@
-"""GPU VMC for spin-1/2 Heisenberg model on a square lattice.
+"""GPU VMC for fPEPS using log-variance loss + AdamW.
+
+Based on arXiv:2603.15853 (Jin): minimizes log(Var[E_L] + gamma)
+via a surrogate loss and standard AdamW, eliminating the
+expensive per-sample gradient matrix required by SR.
 
 Run:
-    torchrun --nproc_per_node=<N> vmc_run_spin.py
-    torchrun --nproc_per_node=1 vmc_run_spin.py   # single GPU
+    torchrun --nproc_per_node=<N> vmc_run_fpeps_logvar.py
+    torchrun --nproc_per_node=1 vmc_run_fpeps_logvar.py
 """
-import os
-
 import torch
 import torch.distributed as dist
 
@@ -16,72 +18,73 @@ from vmc_torch.GPU.VMC import (
     print_sampling_settings,
     setup_distributed,
 )
-from vmc_torch.hamiltonian_torch import (
-    spin_Heisenberg_square_lattice_torch,
+from vmc_torch.GPU.hamiltonian import (
+    spinful_Fermi_Hubbard_square_lattice_torch,
 )
-from vmc_torch.GPU.models import PEPS_Model_GPU
-from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
+from vmc_torch.GPU.models import fPEPS_Model_GPU
 from vmc_torch.GPU.sampler import (
-    MetropolisExchangeSpinSamplerGPU,
+    MetropolisExchangeSpinfulSamplerGPU,
 )
 from vmc_torch.GPU.vmc_setup import (
-    generate_random_spin_peps,
     initialize_walkers,
-    random_spin_config_sz0,
+    load_or_generate_peps,
     setup_linalg_hooks,
 )
-from vmcconfig import (
+from vmc_torch.GPU.vmc_utils import (
+    evaluate_energy,
+    random_initial_config,
+)
+from vmc_torch.GPU.run_scripts.vmcconfig import (
     VMCConfig,
+    load_checkpoint,
     make_on_step_end,
-    make_preconditioner,
     make_stats,
     make_stats_file,
+    make_torch_optimizer,
     print_summary,
 )
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
-    '/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch'
+    '/vmc_torch/GPU/data'
 )
 
 vmc_cfg = VMCConfig(
-    batch_size=2048,
-    ns_per_rank=2048,
-    grad_batch_size=1024,
-    vmc_steps=50,
-    burn_in_steps=2,
-    learning_rate=0.1,
-    sr_diag_shift=5e-4,
-    use_distributed_sr_minres=True,
-    sr_rtol=1e-4,
-    offload_grad_to_cpu=True,
+    batch_size=128,
+    ns_per_rank=4096,
+    grad_batch_size=64,
+    vmc_steps=40,
+    burn_in_steps=0,
+    # SR fields unused — log-variance uses AdamW
+    run_sr=False,
     use_log_amp=True,
-    use_export_compile=True,
+    use_export_compile=False,
     save_every=10,
     resume_step=0,
     verbose=False,
-)
-vmc_cfg.lr_scheduler = DecayScheduler(
-    init_lr=vmc_cfg.learning_rate,
-    decay_rate=0.9, patience=50,
+    # Log-variance settings
+    logvar_gamma=1e-3,
+    logvar_lr=1e-3,
+    logvar_weight_decay=0.0,
 )
 
 warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
-    offload_grad_to_cpu=vmc_cfg.offload_grad_to_cpu,
-    run_sampling=True,
+    run_sampling=False,
     run_locE=False,
-    run_grad=False,
+    run_grad=False,  # No per-sample grads needed
 )
 
 
 def main():
     setup_linalg_hooks(
         jitter=1e-8, qr_via_eigh=True,
-        cholesky_qr=False, cholesky_qr_adaptive_jitter=False,
+        cholesky_qr=False,
+        cholesky_qr_adaptive_jitter=False,
+        nonuniform_diag=True,
     )
     torch.set_default_dtype(dtype)
 
@@ -91,35 +94,36 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 4
+        Lx, Ly = 4, 2
         N_sites = Lx * Ly
-        J = 1.0
+        t, U = 1.0, 8.0
+        N_f = 6
+        n_fermions_per_spin = (N_f // 2, N_f // 2)
         D = 4
-        chi = 8
+        chi = -1
 
         # ========== Hamiltonian ==========
-        H = spin_Heisenberg_square_lattice_torch(
-            Lx, Ly, J=J, total_sz=0,
+        H = spinful_Fermi_Hubbard_square_lattice_torch(
+            Lx, Ly, t, U, N_f,
+            pbc=False,
+            n_fermions_per_spin=n_fermions_per_spin,
+            no_u1_symmetry=False,
+            gpu=True,
         )
         H.precompute_hops_gpu(device)
 
-        # ED reference for small systems
-        if rank == 0 and N_sites <= 16:
-            H_dense = H.to_dense()
-            import scipy.sparse.linalg as la
-            gs_e = la.eigsh(
-                H_dense, k=1, which='SA', tol=1e-8,
-            )[0][0]
-            print(
-                f"ED ground state E/site: "
-                f"{gs_e / N_sites:.8f}"
-            )
-
         # ========== Model ==========
-        peps = generate_random_spin_peps(
-            Lx, Ly, D, seed=42, dtype=dtype,
+        fpeps_base = (
+            f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
+            f"/N={N_f}/Z2/D={D}/"
         )
-        model = PEPS_Model_GPU(
+        peps = load_or_generate_peps(
+            Lx, Ly, t, U, N_f, D,
+            seed=42, dtype=dtype,
+            file_path=fpeps_base,
+            scale_factor=4,
+        )
+        model = fPEPS_Model_GPU(
             tn=peps,
             max_bond=chi,
             dtype=dtype,
@@ -127,7 +131,7 @@ def main():
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
-                # 'compress_opts': {'seed': 42},
+                'compress_opts': {'seed': 42},
             },
         )
         model.to(device)
@@ -135,36 +139,51 @@ def main():
         # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"J={J}/D={D}/chi={chi}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/"
+            f"{model._get_name()}/chi={chi}/"
+            f"logvar/"
         )
+        import os
         os.makedirs(output_dir, exist_ok=True)
         model_name = model._get_name()
         N_params = sum(
             p.numel() for p in model.parameters()
         )
 
+        load_checkpoint(
+            model, output_dir, model_name,
+            vmc_cfg.resume_step, device, rank,
+        )
+
         if rank == 0:
             print(
-                f"System: {Lx}x{Ly} Heisenberg, "
-                f"J={J}, Sz=0"
+                f"Model: {N_params} params | "
+                f"{world_size} GPUs | {device}"
             )
             print(
-                f"Model: PEPS D={D}, chi={chi}, "
-                f"{N_params} params | "
-                f"{world_size} GPUs | {device}"
+                f"LogVar: gamma={vmc_cfg.logvar_gamma}, "
+                f"lr={vmc_cfg.logvar_lr}, "
+                f"wd={vmc_cfg.logvar_weight_decay}"
             )
 
         # ========== Export + compile ==========
+        example_x = random_initial_config(
+            N_f, N_sites, seed=0,
+        ).to(device)
         if vmc_cfg.use_export_compile:
-            example_x = random_spin_config_sz0(
-                N_sites, seed=0,
-            ).to(device)
             if rank == 0:
                 print("Running torch.export + compile...")
+            import time as _time
+            _t0 = _time.time()
             model.export_and_compile(
-                example_x, mode='default',
+                example_x,
                 use_log_amp=vmc_cfg.use_log_amp,
             )
+            if rank == 0:
+                print(
+                    f"Export + compile done in "
+                    f"{_time.time() - _t0:.1f}s"
+                )
 
         print_sampling_settings(
             rank, world_size, vmc_cfg.batch_size,
@@ -173,8 +192,8 @@ def main():
 
         # ========== Initialize walkers ==========
         fxs = initialize_walkers(
-            init_fn=lambda seed: random_spin_config_sz0(
-                N_sites, seed=seed,
+            init_fn=lambda seed: random_initial_config(
+                N_f, N_sites, seed=seed,
             ),
             batch_size=vmc_cfg.batch_size,
             seed=42, rank=rank, device=device,
@@ -182,12 +201,12 @@ def main():
 
         # ========== Stats + callback ==========
         system_str = (
-            f'{Lx}x{Ly} Heisenberg, J={J}, '
-            f'D={D}, chi={chi}'
+            f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
+            f'N_f={N_f}, D={D}, chi={chi}'
         )
         stats_file = make_stats_file(
             output_dir, model_name,
-            vmc_cfg.resume_step,
+            vmc_cfg.resume_step, suffix='_logvar',
         )
         stats = make_stats(
             system_str, N_params,
@@ -198,25 +217,24 @@ def main():
             model_name, model, vmc_cfg.save_every,
         )
 
+        # ========== AdamW optimizer ==========
+        torch_opt = make_torch_optimizer(model, vmc_cfg)
+
         # ========== VMC driver ==========
         vmc = VMC_GPU(
-            sampler=MetropolisExchangeSpinSamplerGPU(),
-            preconditioner=make_preconditioner(vmc_cfg),
-            optimizer=SGDGPU(
-                learning_rate=vmc_cfg.learning_rate,
+            sampler=(
+                MetropolisExchangeSpinfulSamplerGPU()
             ),
+            preconditioner=None,
+            optimizer=None,
+            evaluate_energy_fn=evaluate_energy,
         )
 
         fxs = vmc.run_warmup(
             fxs=fxs, model=model, graph=H.graph,
-            hamiltonian=H, rank=rank,
-            config=VMCWarmupConfig(
-                use_export_compile=vmc_cfg.use_export_compile,
-                grad_batch_size=vmc_cfg.grad_batch_size,
-                use_log_amp=vmc_cfg.use_log_amp,
-            ),
+            hamiltonian=H, rank=rank, config=warmup_cfg,
         )
-        energy_history, fxs = vmc.run_vmc_loop(
+        energy_history, _ = vmc.run_vmc_loop_logvar(
             fxs=fxs, model=model, hamiltonian=H,
             graph=H.graph, rank=rank,
             world_size=world_size,
@@ -225,6 +243,7 @@ def main():
                 n_params=N_params,
                 nsites=N_sites,
             ),
+            torch_optimizer=torch_opt,
             on_step_end=on_step_end,
         )
 

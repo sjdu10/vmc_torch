@@ -1,8 +1,11 @@
-"""GPU VMC for spin-1/2 Heisenberg model on a square lattice.
+"""GPU VMC for spinful Fermi-Hubbard with fPEPS + C2v symmetry projection.
+
+4x2 lattice, 6 fermions (3 up + 3 down), D=4, chi=-1 (exact contraction).
+Projects onto A1 irrep of C2v (4 elements: e, C2, sigma_v, sigma_v').
 
 Run:
-    torchrun --nproc_per_node=<N> vmc_run_spin.py
-    torchrun --nproc_per_node=1 vmc_run_spin.py   # single GPU
+    torchrun --nproc_per_node=<N> vmc_run_fpeps_symm.py
+    torchrun --nproc_per_node=1 vmc_run_fpeps_symm.py
 """
 import os
 
@@ -16,19 +19,25 @@ from vmc_torch.GPU.VMC import (
     print_sampling_settings,
     setup_distributed,
 )
-from vmc_torch.hamiltonian_torch import (
-    spin_Heisenberg_square_lattice_torch,
+from vmc_torch.GPU.hamiltonian import (
+    spinful_Fermi_Hubbard_square_lattice_torch,
 )
-from vmc_torch.GPU.models import PEPS_Model_GPU
+from vmc_torch.GPU.models import fPEPS_Model_GPU
+from vmc_torch.GPU.models.symmetry import (
+    FermionSymmetryProjectedModel,
+)
 from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
-    MetropolisExchangeSpinSamplerGPU,
+    MetropolisExchangeSpinfulSamplerGPU,
 )
 from vmc_torch.GPU.vmc_setup import (
-    generate_random_spin_peps,
     initialize_walkers,
-    random_spin_config_sz0,
+    load_or_generate_peps,
     setup_linalg_hooks,
+)
+from vmc_torch.GPU.vmc_utils import (
+    evaluate_energy,
+    random_initial_config,
 )
 from vmcconfig import (
     VMCConfig,
@@ -41,23 +50,23 @@ from vmcconfig import (
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
-    '/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch'
+    '/vmc_torch/GPU/data'
 )
 
 vmc_cfg = VMCConfig(
     batch_size=2048,
     ns_per_rank=2048,
-    grad_batch_size=1024,
-    vmc_steps=50,
-    burn_in_steps=2,
+    grad_batch_size=512,
+    vmc_steps=200,
+    burn_in_steps=0,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
     use_distributed_sr_minres=True,
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=True,
+    use_export_compile=False,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -66,22 +75,23 @@ vmc_cfg.lr_scheduler = DecayScheduler(
     init_lr=vmc_cfg.learning_rate,
     decay_rate=0.9, patience=50,
 )
-
 warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
     offload_grad_to_cpu=vmc_cfg.offload_grad_to_cpu,
-    run_sampling=True,
+    run_sampling=False,
     run_locE=False,
-    run_grad=False,
+    run_grad=True,
 )
 
 
 def main():
     setup_linalg_hooks(
         jitter=1e-8, qr_via_eigh=True,
-        cholesky_qr=False, cholesky_qr_adaptive_jitter=False,
+        cholesky_qr=False,
+        cholesky_qr_adaptive_jitter=False,
+        nonuniform_diag=True,
     )
     torch.set_default_dtype(dtype)
 
@@ -91,35 +101,37 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 4
+        Lx, Ly = 2, 2
         N_sites = Lx * Ly
-        J = 1.0
+        t, U = 1.0, 8.0
+        N_f = N_sites - 2
+        n_fermions_per_spin = (N_f // 2, N_f // 2)
         D = 4
-        chi = 8
+        chi = -1  # exact contraction
+        irrep = 'A1'
 
         # ========== Hamiltonian ==========
-        H = spin_Heisenberg_square_lattice_torch(
-            Lx, Ly, J=J, total_sz=0,
+        H = spinful_Fermi_Hubbard_square_lattice_torch(
+            Lx, Ly, t, U, N_f,
+            pbc=False,
+            n_fermions_per_spin=n_fermions_per_spin,
+            no_u1_symmetry=False,
+            gpu=True,
         )
         H.precompute_hops_gpu(device)
 
-        # ED reference for small systems
-        if rank == 0 and N_sites <= 16:
-            H_dense = H.to_dense()
-            import scipy.sparse.linalg as la
-            gs_e = la.eigsh(
-                H_dense, k=1, which='SA', tol=1e-8,
-            )[0][0]
-            print(
-                f"ED ground state E/site: "
-                f"{gs_e / N_sites:.8f}"
-            )
-
         # ========== Model ==========
-        peps = generate_random_spin_peps(
-            Lx, Ly, D, seed=42, dtype=dtype,
+        fpeps_base = (
+            f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
+            f"/N={N_f}/Z2/D={D}/"
         )
-        model = PEPS_Model_GPU(
+        peps = load_or_generate_peps(
+            Lx, Ly, t, U, N_f, D,
+            seed=42, dtype=dtype,
+            file_path=fpeps_base,
+            scale_factor=4,
+        )
+        base_model = fPEPS_Model_GPU(
             tn=peps,
             max_bond=chi,
             dtype=dtype,
@@ -127,44 +139,62 @@ def main():
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
-                # 'compress_opts': {'seed': 42},
             },
         )
-        model.to(device)
+        base_model.to(device)
+
+        # Wrap with fermionic symmetry projection (C2v for 4x2)
+        model = FermionSymmetryProjectedModel(
+            base_model, Lx, Ly, irrep=irrep,
+        )
+        group_name = 'C4v' if Lx == Ly else 'C2v'
 
         # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"J={J}/D={D}/chi={chi}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/"
+            f"symm_{irrep}/"
         )
         os.makedirs(output_dir, exist_ok=True)
-        model_name = model._get_name()
+        model_name = (
+            f"FermSymm_{irrep}_{base_model._get_name()}"
+        )
         N_params = sum(
             p.numel() for p in model.parameters()
         )
 
         if rank == 0:
             print(
-                f"System: {Lx}x{Ly} Heisenberg, "
-                f"J={J}, Sz=0"
+                f"System: {Lx}x{Ly} Fermi-Hubbard, "
+                f"t={t}, U={U}, N_f={N_f} "
+                f"({n_fermions_per_spin[0]}up+"
+                f"{n_fermions_per_spin[1]}dn)"
             )
             print(
-                f"Model: PEPS D={D}, chi={chi}, "
+                f"Model: fPEPS D={D}, chi={chi}, "
+                f"{group_name} {irrep} projection, "
                 f"{N_params} params | "
                 f"{world_size} GPUs | {device}"
             )
 
         # ========== Export + compile ==========
+        example_x = random_initial_config(
+            N_f, N_sites, seed=0,
+        ).to(device)
         if vmc_cfg.use_export_compile:
-            example_x = random_spin_config_sz0(
-                N_sites, seed=0,
-            ).to(device)
             if rank == 0:
                 print("Running torch.export + compile...")
+            import time as _time
+            _t0 = _time.time()
             model.export_and_compile(
-                example_x, mode='default',
+                example_x,
                 use_log_amp=vmc_cfg.use_log_amp,
             )
+            if rank == 0:
+                print(
+                    f"Export + compile done in "
+                    f"{_time.time() - _t0:.1f}s"
+                )
 
         print_sampling_settings(
             rank, world_size, vmc_cfg.batch_size,
@@ -173,8 +203,8 @@ def main():
 
         # ========== Initialize walkers ==========
         fxs = initialize_walkers(
-            init_fn=lambda seed: random_spin_config_sz0(
-                N_sites, seed=seed,
+            init_fn=lambda seed: random_initial_config(
+                N_f, N_sites, seed=seed,
             ),
             batch_size=vmc_cfg.batch_size,
             seed=42, rank=rank, device=device,
@@ -182,8 +212,9 @@ def main():
 
         # ========== Stats + callback ==========
         system_str = (
-            f'{Lx}x{Ly} Heisenberg, J={J}, '
-            f'D={D}, chi={chi}'
+            f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
+            f'N_f={N_f}, D={D}, chi={chi}, '
+            f'{group_name} {irrep}'
         )
         stats_file = make_stats_file(
             output_dir, model_name,
@@ -200,23 +231,19 @@ def main():
 
         # ========== VMC driver ==========
         vmc = VMC_GPU(
-            sampler=MetropolisExchangeSpinSamplerGPU(),
+            sampler=MetropolisExchangeSpinfulSamplerGPU(),
             preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),
+            evaluate_energy_fn=evaluate_energy,
         )
 
         fxs = vmc.run_warmup(
             fxs=fxs, model=model, graph=H.graph,
-            hamiltonian=H, rank=rank,
-            config=VMCWarmupConfig(
-                use_export_compile=vmc_cfg.use_export_compile,
-                grad_batch_size=vmc_cfg.grad_batch_size,
-                use_log_amp=vmc_cfg.use_log_amp,
-            ),
+            hamiltonian=H, rank=rank, config=warmup_cfg,
         )
-        energy_history, fxs = vmc.run_vmc_loop(
+        energy_history, _ = vmc.run_vmc_loop(
             fxs=fxs, model=model, hamiltonian=H,
             graph=H.graph, rank=rank,
             world_size=world_size,

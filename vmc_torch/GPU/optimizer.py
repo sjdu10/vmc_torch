@@ -161,7 +161,15 @@ class OptimizerGPU:
                 direction_t,
                 learning_rate=learning_rate,
             )
-            torch.nn.utils.vector_to_parameters(updated, model.parameters())
+            # Copy values in-place to preserve storage identity.
+            # vector_to_parameters replaces .data with views of one
+            # big tensor, which changes storage layout and triggers
+            # torch.compile recompilation.
+            offset = 0
+            for p in model.parameters():
+                n = p.numel()
+                p.data.copy_(updated[offset:offset + n].view_as(p.data))
+                offset += n
 
     def reset(self) -> None:
         pass

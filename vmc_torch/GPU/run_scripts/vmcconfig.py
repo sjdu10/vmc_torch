@@ -87,10 +87,24 @@ class VMCConfig:
     verbose: bool = False
     outlier_clip_factor: float = 1e3
 
+    # ----- Log-variance (arXiv:2603.15853) -----
+    logvar_gamma: float = 1e-3
+    logvar_lr: float = 1e-3
+    logvar_weight_decay: float = 0.0
+
 
 # ============================================================
 # Helper functions for run scripts
 # ============================================================
+
+
+def make_torch_optimizer(model, cfg):
+    """Create torch.optim.AdamW for log-variance path."""
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.logvar_lr,
+        weight_decay=cfg.logvar_weight_decay,
+    )
 
 
 def make_preconditioner(cfg):

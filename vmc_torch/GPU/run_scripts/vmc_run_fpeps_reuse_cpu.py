@@ -116,7 +116,7 @@ def main():
         U = 8.0
         N_f = N_sites - 24 # 24 holes
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 8  # PEPS bond dimension
+        D = 4  # PEPS bond dimension
         chi = 4*D  # boundary bond dim
 
         # ========== Hamiltonian ==========
@@ -150,7 +150,12 @@ def main():
             max_bond=chi,
             dtype=dtype,
             contract_boundary_opts={
-                'mode': 'mps',
+                'mode': 'fit',
+                'tn_fit': 'zipup',
+                'bsz':2,
+                'max_iterations':5,
+                'tol':1e-5,
+                # 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
             },

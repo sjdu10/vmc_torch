@@ -13,13 +13,10 @@ from vmc_torch.GPU.optimizer import (
     PreconditionerGPU,
 )
 from vmc_torch.GPU.sampler import SamplerGPU
-# from vmc_torch.GPU.vmc_modules import (
-#     distributed_minres_solver_gpu,
-#     minSR_solver_gpu,
-# )
 from vmc_torch.GPU.vmc_utils import (
     compute_grads_gpu,
     evaluate_energy,
+    evaluate_energy_grad,
 )
 
 
@@ -51,7 +48,6 @@ def setup_distributed(cuda_rank: Optional[int] = None, cpu: bool = False):
     local_rank = int(os.environ["LOCAL_RANK"])
 
     if not cpu:
-        # torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cpu")
@@ -113,7 +109,9 @@ class VMCLoopConfig:
     # If set, overrides learning_rate each step.
     lr_scheduler: object = None
     verbose: bool = False
-    
+    # Log-variance (EXPERIMENTAL — not converging, see note in VMC_GPU)
+    logvar_gamma: float = 1e-3
+
     def __init__(self, **kwargs):
           for f in fields(self):
               setattr(self, f.name, kwargs.pop(f.name, f.default))
@@ -131,7 +129,6 @@ class VMCLoopConfig:
         ``sr_diag_shift`` in cfg maps to ``diag_shift`` here.
         """
         import dataclasses as _dc
-        loop_fields = {f.name for f in _dc.fields(cls)}
         cfg_fields = {f.name for f in _dc.fields(cfg)}
         kwargs = {}
         for f in _dc.fields(cfg):
@@ -174,9 +171,135 @@ class VMC_GPU:
         self.evaluate_energy_fn = evaluate_energy_fn
         self.compute_grads_fn = compute_grads_fn
 
-    # ----------------------------------------------------------
-    # Sampling phase: MCMC + energy + gradients
-    # ----------------------------------------------------------
+    # ==========================================================
+    # Distributed utilities
+    # ==========================================================
+
+    @staticmethod
+    def _sync_params(model):
+        """Broadcast model params from rank 0 to all ranks."""
+        if not dist.is_initialized():
+            return
+        if dist.get_world_size() <= 1:
+            return
+        for p in model.parameters():
+            dist.broadcast(p.data, src=0)
+
+    @staticmethod
+    def _allreduce_grads(model, world_size):
+        """Average param.grad across all ranks."""
+        if world_size <= 1:
+            return
+        for p in model.parameters():
+            if p.grad is not None:
+                dist.all_reduce(
+                    p.grad, op=dist.ReduceOp.SUM,
+                )
+                p.grad /= world_size
+
+    # ==========================================================
+    # Warmup
+    # ==========================================================
+
+    def run_warmup(
+        self,
+        fxs,
+        model,
+        graph,
+        hamiltonian,
+        rank,
+        config: VMCWarmupConfig,
+    ):
+        run_sampling = config.run_sampling
+        run_locE = config.run_locE
+        run_grad = config.run_grad
+        use_log_amp = config.use_log_amp
+
+        # Offload gradients to CPU when MINRES SR solver can work with
+        # CPU-resident data (scipy MINRES).
+        offload_grad_cpu = (
+            hasattr(self.preconditioner, 'use_scipy')
+            and self.preconditioner.use_scipy
+        ) or getattr(config, 'offload_grad_to_cpu', False)
+
+        self._sync_params(model)
+
+        if rank == 0 and config.verbose:
+            print("\n--- Warmup (1 sweep) ---")
+        t_warm = time.time()
+
+        with torch.inference_mode():
+            if run_sampling:
+                fxs, amps_out = self.sampler.step(
+                    fxs, model, graph,
+                    compile=config.use_export_compile,
+                    verbose=config.verbose,
+                    use_log_amp=use_log_amp,
+                )
+                if rank == 0 and config.verbose:
+                    print(
+                        f"  sample_next:     "
+                        f"{time.time() - t_warm:.2f}s"
+                    )
+                t1 = time.time()
+            if run_locE:
+                _, evals = self.evaluate_energy_fn(
+                    fxs, model, hamiltonian, amps_out,
+                    verbose=config.verbose,
+                    use_log_amp=use_log_amp,
+                )
+                if rank == 0 and config.verbose:
+                    print(
+                        f"  evaluate_energy: "
+                        f"{time.time() - t1:.2f}s"
+                    )
+        # Free inference-phase tensors before grad computation
+        try:
+            del amps_out, evals
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        if not run_grad:
+            return fxs
+        t2 = time.time()
+        with torch.enable_grad():
+            grads, grads_aux = self.compute_grads_fn(
+                fxs, model,
+                vectorize=True,
+                batch_size=config.grad_batch_size,
+                vmap_grad=True,
+                offload_to_cpu=offload_grad_cpu,
+                verbose=config.verbose,
+                use_log_amp=use_log_amp,
+            )
+        if rank == 0 and config.verbose:
+            print(
+                f"  compute_grads:   "
+                f"{time.time() - t2:.2f}s"
+            )
+            print(
+                f"  Warmup total:    "
+                f"{time.time() - t_warm:.2f}s"
+            )
+            # analyze grad stats
+            g_rms = (
+                torch.norm(grads).item()
+                / grads.numel() ** 0.5
+            )
+            print(
+                f"  [dbg] log_psi_grad: "
+                f"rms={g_rms:.4e}, "
+                f"max={grads.abs().max().item():.4e}"
+            )
+
+        del grads, grads_aux
+        torch.cuda.empty_cache()
+        return fxs
+
+    # ==========================================================
+    # Core VMC pipeline
+    # ==========================================================
 
     def _run_sampling_phase(
         self,
@@ -375,123 +498,6 @@ class VMC_GPU:
             phase_times,
         )
 
-    # ----------------------------------------------------------
-    # Parameter sync
-    # ----------------------------------------------------------
-
-    @staticmethod
-    def _sync_params(model):
-        """Broadcast model params from rank 0 to all ranks."""
-        if not dist.is_initialized():
-            return
-        if dist.get_world_size() <= 1:
-            return
-        for p in model.parameters():
-            dist.broadcast(p.data, src=0)
-
-    # ----------------------------------------------------------
-    # Warmup
-    # ----------------------------------------------------------
-
-    def run_warmup(
-        self,
-        fxs,
-        model,
-        graph,
-        hamiltonian,
-        rank,
-        config: VMCWarmupConfig,
-    ):
-        run_sampling = config.run_sampling
-        run_locE = config.run_locE
-        run_grad = config.run_grad
-        use_log_amp = config.use_log_amp
-
-        # Offload gradients to CPU when MINRES SR solver can work with
-        # CPU-resident data (scipy MINRES).
-        offload_grad_cpu = (                                                                                                                                                                                                                                    
-            hasattr(self.preconditioner, 'use_scipy')                                                                                                                                                                                                         
-            and self.preconditioner.use_scipy
-        ) or getattr(config, 'offload_grad_to_cpu', False)
-
-        self._sync_params(model)
-
-        if rank == 0 and config.verbose:
-            print("\n--- Warmup (1 sweep) ---")
-        t_warm = time.time()
-
-        with torch.inference_mode():
-            if run_sampling:
-                fxs, amps_out = self.sampler.step(
-                    fxs, model, graph,
-                    compile=config.use_export_compile,
-                    verbose=config.verbose,
-                    use_log_amp=use_log_amp,
-                )
-                if rank == 0 and config.verbose:
-                    print(
-                        f"  sample_next:     "
-                        f"{time.time() - t_warm:.2f}s"
-                    )
-                t1 = time.time()
-            if run_locE:
-                _, evals = self.evaluate_energy_fn(
-                    fxs, model, hamiltonian, amps_out,
-                    verbose=config.verbose,
-                    use_log_amp=use_log_amp,
-                )
-                if rank == 0 and config.verbose:
-                    print(
-                        f"  evaluate_energy: "
-                        f"{time.time() - t1:.2f}s"
-                    )
-        # Free inference-phase tensors before grad computation
-        try:
-            del amps_out, evals
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-        if not run_grad:
-            return fxs
-        t2 = time.time()
-        with torch.enable_grad():
-            grads, grads_aux = self.compute_grads_fn(
-                fxs, model,
-                vectorize=True,
-                batch_size=config.grad_batch_size,
-                vmap_grad=True,
-                offload_to_cpu=offload_grad_cpu,
-                verbose=config.verbose,
-                use_log_amp=use_log_amp,
-            )
-        if rank == 0 and config.verbose:
-            print(
-                f"  compute_grads:   "
-                f"{time.time() - t2:.2f}s"
-            )
-            print(
-                f"  Warmup total:    "
-                f"{time.time() - t_warm:.2f}s"
-            )
-            # analyze grad stats
-            g_rms = (
-                torch.norm(grads).item()                / grads.numel() ** 0.5
-            )
-            print(
-                f"  [dbg] log_psi_grad: "
-                f"rms={g_rms:.4e}, "
-                f"max={grads.abs().max().item():.4e}"
-            )
-
-        del grads, grads_aux
-        torch.cuda.empty_cache()
-        return fxs
-
-    # ----------------------------------------------------------
-    # Global energy statistics
-    # ----------------------------------------------------------
-
     def compute_global_energy_stats(
         self, local_energies, world_size,
     ):
@@ -514,10 +520,6 @@ class VMC_GPU:
         )
 
         return total_ns, energy_mean, energy_var
-
-    # ----------------------------------------------------------
-    # SR solver step
-    # ----------------------------------------------------------
 
     def solve_sr_step(
         self,
@@ -593,10 +595,6 @@ class VMC_GPU:
             )
             return energy_grad, time.time() - t0, None
 
-    # ----------------------------------------------------------
-    # Parameter update
-    # ----------------------------------------------------------
-
     def apply_parameter_update(
         self, model, dp, learning_rate, device,
     ):
@@ -622,13 +620,15 @@ class VMC_GPU:
                 current_params_vec
                 - learning_rate * dp_tensor
             )
-            torch.nn.utils.vector_to_parameters(
-                new_params_vec, model.parameters(),
-            )
-
-    # ----------------------------------------------------------
-    # Main VMC loop
-    # ----------------------------------------------------------
+            # Copy in-place to preserve storage identity
+            # (avoids torch.compile recompilation).
+            offset = 0
+            for p in model.parameters():
+                n = p.numel()
+                p.data.copy_(
+                    new_params_vec[offset:offset + n].view_as(p.data)
+                )
+                offset += n
 
     def run_vmc_loop(
         self,
@@ -755,7 +755,7 @@ class VMC_GPU:
                     f"[WARNING] SR dp has {dp_nan} NaN, "
                     f"{dp_inf} Inf out of {dp_t.numel()}"
                 )
-            
+
             # Apply parameter update
             if config.lr_scheduler is not None:
                 global_step = step + config.step_offset
@@ -827,6 +827,375 @@ class VMC_GPU:
                         "total_time": step_time,
                         "solver_info": info,
                         "fxs": all_fxs,
+                    }
+                )
+
+        if vmc_pbar is not None:
+            vmc_pbar.close()
+        return energy_history, fxs
+
+    # ==========================================================
+    # EXPERIMENTAL: Log-variance optimization (NOT VERIFIED)
+    #
+    # The pathwise and REINFORCE gradient terms individually
+    # pass FD checks, but they nearly perfectly cancel
+    # (cos ~ -0.9999), leaving a tiny, noise-dominated
+    # residual.  As a result, logvar optimization does NOT
+    # converge in practice.  These methods are kept for
+    # future investigation but should not be relied upon.
+    # See test_scripts/test_logvar_grad.py for details.
+    # ==========================================================
+
+    def _run_logvar_sampling_phase(
+        self,
+        fxs,
+        model,
+        hamiltonian,
+        graph,
+        ns_per_rank,
+        burn_in=False,
+        burn_in_steps=0,
+        use_export_compile=False,
+        use_log_amp=False,
+        verbose=False,
+    ):
+        """MCMC sampling + energy eval only (no gradient).
+
+        Returns:
+            all_fxs: (Ns, N_sites) sampled configs.
+            local_energies: (Ns,) local energies.
+            fxs: (B, N_sites) updated walker configs.
+            phase_times: dict with t_samp, t_locE.
+        """
+        B = fxs.shape[0]
+        t_samp, t_locE = 0.0, 0.0
+
+        if burn_in:
+            t0 = time.time()
+            fxs = self.sampler.burn_in(
+                fxs, model, graph, burn_in_steps,
+                compile=use_export_compile,
+                use_log_amp=use_log_amp,
+            )
+            print(
+                f'Burn-in: {burn_in_steps} steps, '
+                f'T_b = {time.time()-t0}'
+            )
+
+        local_energies_list = []
+        all_fxs_list = []
+        current_count = 0
+
+        while current_count < ns_per_rank:
+            needed = min(B, ns_per_rank - current_count)
+            with torch.inference_mode():
+                # 1. MCMC sweep
+                t0 = time.time()
+                fxs, amps_out = self.sampler.step(
+                    fxs, model, graph,
+                    compile=use_export_compile,
+                    use_log_amp=use_log_amp,
+                    verbose=verbose,
+                )
+                t_samp += time.time() - t0
+
+                # 2. Local energy
+                t0 = time.time()
+                energy_result = self.evaluate_energy_fn(
+                    fxs, model, hamiltonian, amps_out,
+                    use_log_amp=use_log_amp,
+                    verbose=verbose,
+                    return_bMPS=False,
+                )
+                if len(energy_result) == 2:
+                    _, local_E = energy_result
+                else:
+                    _, local_E = (
+                        energy_result[0],
+                        energy_result[1],
+                    )
+                t_locE += time.time() - t0
+
+            del amps_out
+
+            local_energies_list.append(
+                local_E[:needed].detach(),
+            )
+            # Save configs for surrogate loss forward pass
+            all_fxs_list.append(
+                fxs[:needed].detach().clone(),
+            )
+            current_count += needed
+            del local_E
+
+        local_energies = torch.cat(local_energies_list)
+        all_fxs = torch.cat(all_fxs_list)
+
+        phase_times = {
+            't_samp': t_samp,
+            't_locE': t_locE,
+        }
+        return all_fxs, local_energies, fxs, phase_times
+
+    @staticmethod
+    def _compute_logvar_loss(
+        all_fxs,
+        hamiltonian,
+        gamma,
+        model,
+        grad_batch_size,
+        use_log_amp=True,
+    ):
+        """Two-pass log-variance gradient: pathwise + REINFORCE.
+
+        Pass 1 (pathwise): Forward through evaluate_energy_grad
+        with grad tracking, compute L = log(Var[E_L] + gamma),
+        backprop. This captures dE_L/dtheta contributions.
+
+        Pass 2 (REINFORCE / score function): Using detached E_L
+        from pass 1, compute centered surrogate loss that
+        estimates Cov(O_k, (E_L - Ebar)^2). The centering
+        (-sigma^2 baseline) is essential because our psi is
+        unnormalized, so <O_k> != 0.
+
+        Full gradient:
+          dL/dtheta = (1/(sigma^2+gamma)) * d(sigma^2)/dtheta
+        where:
+          d(sigma^2)/dtheta = 2*Cov(O, (E_L-Ebar)^2)  [REINFORCE]
+                            + 2*<(E_L-Ebar)*dE_L/dtheta> [pathwise]
+
+        Returns:
+            (log_var_loss, energy_mean, energy_var):
+                scalars for logging. Grads are in param.grad.
+        """
+        Ns = all_fxs.shape[0]
+        model.zero_grad()
+
+        # === Pass 1: Pathwise (autograd through E_L) ===
+        local_E_list = []
+        for b_start in range(0, Ns, grad_batch_size):
+            b_end = min(b_start + grad_batch_size, Ns)
+            fxs_chunk = all_fxs[b_start:b_end]
+
+            if use_log_amp:
+                signs, log_abs = model.forward_log(
+                    fxs_chunk,
+                )
+                amps_for_eval = (signs, log_abs)
+            else:
+                amps_for_eval = model(fxs_chunk)
+
+            _, chunk_E = evaluate_energy_grad(
+                fxs_chunk, model, hamiltonian,
+                amps_for_eval,
+                use_log_amp=use_log_amp,
+            )
+            local_E_list.append(chunk_E)
+
+        local_E = torch.cat(local_E_list)
+        E_mean = local_E.mean()
+        E_var = ((local_E - E_mean) ** 2).mean()
+        loss = torch.log(E_var + gamma)
+        loss.backward()  # pathwise -> param.grad
+
+        # === Pass 2: REINFORCE (score function) ===
+        E_mean_val = E_mean.item()
+        E_var_val = E_var.item()
+        local_E_det = local_E.detach()
+
+        # Centered weights: Cov(O, (E_L-Ebar)^2)
+        # The -sigma^2 baseline accounts for <O> != 0
+        # from unnormalized psi.
+        weights = (
+            (local_E_det - E_mean_val) ** 2 - E_var_val
+        ) / (E_var_val + gamma)
+
+        for b_start in range(0, Ns, grad_batch_size):
+            b_end = min(b_start + grad_batch_size, Ns)
+            fxs_chunk = all_fxs[b_start:b_end]
+            w = weights[b_start:b_end]
+
+            if use_log_amp:
+                _, log_abs = model.forward_log(fxs_chunk)
+            else:
+                log_abs = torch.log(
+                    model(fxs_chunk).abs()
+                )
+
+            surr = (2.0 / Ns) * (w * log_abs).sum()
+            surr.backward()  # accumulates into param.grad
+
+        return (
+            loss.item(),
+            E_mean_val,
+            E_var_val,
+        )
+
+    def run_vmc_loop_logvar(
+        self,
+        fxs,
+        model,
+        hamiltonian,
+        graph,
+        rank,
+        world_size,
+        config: VMCLoopConfig,
+        torch_optimizer,
+        on_step_end: Optional[
+            Callable[[Dict[str, Any]], None]
+        ] = None,
+    ):
+        """VMC loop using log-variance loss + AdamW.
+
+        Instead of SR, computes a surrogate loss whose
+        gradient equals the REINFORCE estimator of
+        grad log(Var[E_L] + gamma).  AdamW updates params.
+        """
+        Warning(
+            "Log-variance optimization is experimental and "
+            "does not currently converge in practice. Use "
+            "with caution."
+        )
+        self._sync_params(model)
+
+        if rank == 0 and config.show_progress:
+            print(
+                f"\n--- VMC logvar "
+                f"({config.vmc_steps} steps) ---"
+            )
+            vmc_pbar = tqdm(
+                total=config.vmc_steps,
+                desc="VMC LogVar",
+            )
+        else:
+            vmc_pbar = None
+
+        gamma = config.logvar_gamma
+        energy_history = []
+
+        for step in range(config.vmc_steps):
+            t0 = time.time()
+
+            # 1. MCMC sampling (inference mode)
+            all_fxs_local, _, fxs, phase_times = (
+                self._run_logvar_sampling_phase(
+                    fxs=fxs,
+                    model=model,
+                    hamiltonian=hamiltonian,
+                    graph=graph,
+                    ns_per_rank=config.ns_per_rank,
+                    burn_in=(step == 0),
+                    burn_in_steps=config.burn_in_steps,
+                    use_export_compile=(
+                        config.use_export_compile
+                    ),
+                    use_log_amp=config.use_log_amp,
+                    verbose=config.verbose,
+                )
+            )
+
+            # 2. Log-variance loss with full autograd
+            #    (re-evaluates amps + E_L with grad tracking)
+            t_grad_0 = time.time()
+            torch_optimizer.zero_grad()
+            with torch.enable_grad():
+                log_var_loss, energy_mean, energy_var = (
+                    self._compute_logvar_loss(
+                        all_fxs_local,
+                        hamiltonian,
+                        gamma,
+                        model,
+                        config.grad_batch_size,
+                        use_log_amp=config.use_log_amp,
+                    )
+                )
+            t_grad = time.time() - t_grad_0
+
+            total_ns = (
+                all_fxs_local.shape[0] * world_size
+            )
+
+            # 3. Allreduce gradients
+            t_comm_0 = time.time()
+            self._allreduce_grads(model, world_size)
+            t_comm = time.time() - t_comm_0
+
+            # 4. AdamW step
+            torch_optimizer.step()
+
+            # 5. Sync params across ranks
+            self._sync_params(model)
+
+            del all_fxs_local
+
+            # Logging
+            step_time = time.time() - t0
+            e_per_site = energy_mean / config.nsites
+            err = (
+                np.sqrt(max(energy_var, 0.0) / total_ns)
+                / config.nsites
+            )
+            energy_history.append(e_per_site)
+
+            # Gradient norm for diagnostics
+            grad_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    grad_norm += p.grad.norm().item() ** 2
+            grad_norm = grad_norm ** 0.5
+
+            global_step = step + config.step_offset
+            if rank == 0 and config.show_progress:
+                t_s = phase_times.get('t_samp', 0.0)
+                t_e = phase_times.get('t_locE', 0.0)
+                print(
+                    f"Step {global_step:3d} | "
+                    f"E/site: {e_per_site:.6f} "
+                    f"+/- {err:.6f} | "
+                    f"logvar={log_var_loss:.4f} | "
+                    f"|g|={grad_norm:.4e} | "
+                    f"N={total_ns} | "
+                    f"T_samp={t_s:.1f}s "
+                    f"T_locE={t_e:.1f}s "
+                    f"T_grad={t_grad:.1f}s "
+                    f"T_comm={t_comm:.2f}s "
+                    f"T_total={step_time:.1f}s"
+                )
+                vmc_pbar.update(1)
+
+            # Gather walker configs for checkpoint
+            if world_size > 1:
+                _fxs_list = [
+                    torch.zeros_like(fxs)
+                    for _ in range(world_size)
+                ]
+                dist.all_gather(
+                    _fxs_list, fxs.contiguous(),
+                )
+                all_fxs_ckpt = torch.cat(
+                    _fxs_list, dim=0,
+                )
+            else:
+                all_fxs_ckpt = fxs
+
+            if on_step_end is not None:
+                on_step_end(
+                    {
+                        "step": global_step,
+                        "energy_mean": energy_mean,
+                        "energy_var": energy_var,
+                        "energy_per_site": e_per_site,
+                        "error_per_site": err,
+                        "total_samples": total_ns,
+                        "sample_time": (
+                            phase_times['t_samp']
+                            + phase_times['t_locE']
+                        ),
+                        "phase_times": phase_times,
+                        "sr_time": 0.0,
+                        "total_time": step_time,
+                        "solver_info": None,
+                        "fxs": all_fxs_ckpt,
                     }
                 )
 

@@ -1,8 +1,11 @@
-"""GPU VMC for spin-1/2 Heisenberg model on a square lattice.
+"""GPU VMC for spin-1/2 Heisenberg with C4v symmetry projection.
+
+Projects the PEPS wavefunction onto the A1 irrep of C4v:
+    psi^A1(s) = (1/8) sum_{g in C4v} psi(g^{-1} s)
 
 Run:
-    torchrun --nproc_per_node=<N> vmc_run_spin.py
-    torchrun --nproc_per_node=1 vmc_run_spin.py   # single GPU
+    torchrun --nproc_per_node=<N> vmc_run_spin_symm.py
+    torchrun --nproc_per_node=1 vmc_run_spin_symm.py
 """
 import os
 
@@ -20,6 +23,9 @@ from vmc_torch.hamiltonian_torch import (
     spin_Heisenberg_square_lattice_torch,
 )
 from vmc_torch.GPU.models import PEPS_Model_GPU
+from vmc_torch.GPU.models.symmetry import (
+    SymmetryProjectedModel,
+)
 from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
     MetropolisExchangeSpinSamplerGPU,
@@ -96,6 +102,7 @@ def main():
         J = 1.0
         D = 4
         chi = 8
+        irrep = 'A1'
 
         # ========== Hamiltonian ==========
         H = spin_Heisenberg_square_lattice_torch(
@@ -119,7 +126,7 @@ def main():
         peps = generate_random_spin_peps(
             Lx, Ly, D, seed=42, dtype=dtype,
         )
-        model = PEPS_Model_GPU(
+        base_model = PEPS_Model_GPU(
             tn=peps,
             max_bond=chi,
             dtype=dtype,
@@ -127,18 +134,24 @@ def main():
                 'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
-                # 'compress_opts': {'seed': 42},
             },
         )
-        model.to(device)
+        base_model.to(device)
+
+        # Wrap with symmetry projection
+        model = SymmetryProjectedModel(
+            base_model, Lx, Ly, irrep=irrep,
+        )
 
         # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"J={J}/D={D}/chi={chi}/"
+            f"J={J}/D={D}/chi={chi}/symm_{irrep}/"
         )
         os.makedirs(output_dir, exist_ok=True)
-        model_name = model._get_name()
+        model_name = (
+            f"SymmProj_{irrep}_{base_model._get_name()}"
+        )
         N_params = sum(
             p.numel() for p in model.parameters()
         )
@@ -150,6 +163,7 @@ def main():
             )
             print(
                 f"Model: PEPS D={D}, chi={chi}, "
+                f"C4v {irrep} projection, "
                 f"{N_params} params | "
                 f"{world_size} GPUs | {device}"
             )
@@ -183,7 +197,7 @@ def main():
         # ========== Stats + callback ==========
         system_str = (
             f'{Lx}x{Ly} Heisenberg, J={J}, '
-            f'D={D}, chi={chi}'
+            f'D={D}, chi={chi}, C4v {irrep}'
         )
         stats_file = make_stats_file(
             output_dir, model_name,

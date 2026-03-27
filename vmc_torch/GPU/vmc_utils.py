@@ -2,11 +2,15 @@ import quimb as qu
 import torch
 import time
 import random
-# from mpi4py import MPI
 from torch.utils._pytree import tree_map, tree_flatten
-import os                                                                                                                                                                                                                                                   
-                                                                                                                                                                                                                                                
-def cpu_mem_gb():                                                                                                                                                                                                                                           
+import os
+
+
+# ==========================================================
+# Utilities
+# ==========================================================
+
+def cpu_mem_gb():
     """Resident memory of this process in GB."""
     with open(f'/proc/{os.getpid()}/status') as f:
         for line in f:
@@ -14,7 +18,61 @@ def cpu_mem_gb():
                 return int(line.split()[1]) / 1024**2  # kB -> GB
     return 0.0
 
-#=== Utility functions for Metropolis-Hastings sampling ===#
+
+def random_initial_config(N_f, N_sites, seed=None):
+    if seed is not None:
+        torch.manual_seed(seed)
+    half_filled_config = torch.tensor(
+        [1, 2] * (N_sites // 2)
+    )
+    # Set first (Lx*Ly - N_f) sites to be empty (0)
+    empty_sites = list(range(N_sites - N_f))
+    doped_config = half_filled_config.clone()
+    doped_config[empty_sites] = 0
+    # Randomly permute the doped_config
+    perm = torch.randperm(N_sites)
+    doped_config = doped_config[perm]
+    num_1 = torch.sum(doped_config == 1).item()
+    num_2 = torch.sum(doped_config == 2).item()
+    assert num_1 == N_f // 2 and num_2 == N_f // 2, f"Number of spin up and spin down fermions should be {N_f // 2}, but got {num_1} and {num_2}"
+
+    return doped_config
+
+
+def are_pytrees_equal(tree1, tree2):
+    from torch.utils import _pytree as pytree
+    # Flatten both trees
+    leaves1, spec1 = pytree.tree_flatten(tree1)
+    leaves2, spec2 = pytree.tree_flatten(tree2)
+
+    # 1. Compare structure (TreeSpec)
+    if spec1 != spec2:
+        print("Tree structures differ.")
+        return False
+
+    # 2. Compare leaves (Tensors/Values)
+    if len(leaves1) != len(leaves2):
+        print("Number of leaves differ.")
+        return False
+
+    for l1, l2 in zip(leaves1, leaves2):
+        if torch.is_tensor(l1) and torch.is_tensor(l2):
+            if not torch.equal(l1, l2):
+                print("Tensor leaves differ.")
+                return False
+        else:
+            if (l1 != l2).any():
+                print("Non-tensor leaves differ.")
+                print("l1:", l1)
+                print("l2:", l2)
+                return False
+
+    return True
+
+
+# ==========================================================
+# Proposal functions (Metropolis-Hastings moves)
+# ==========================================================
 
 def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25, seed=None):
     if seed is not None:
@@ -148,7 +206,10 @@ def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25):
     return proposed_configs, diff_mask
 
 
-# Batched Metropolis-Hastings updates
+# ==========================================================
+# Sampling
+# ==========================================================
+
 @torch.inference_mode()
 def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, compile=False, **kwargs):
     """One full Metropolis-Hastings sweep over all lattice edges.
@@ -253,12 +314,19 @@ def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, compi
         print(f"  Forward time: {t_forward:.4f}s (avg {t_forward / n_updates:.4f}s per edge)")
     return fxs, current_amps
 
-@torch.inference_mode()
-def evaluate_energy(
+
+# ==========================================================
+# Energy evaluation
+# ==========================================================
+
+def _evaluate_energy_impl(
     fxs, fpeps_model, H, current_amps,
     verbose=False, use_log_amp=False, **kwargs,
 ):
-    """Compute local energies for a batch of configurations.
+    """Core energy evaluation (no grad context decorator).
+
+    Shared by evaluate_energy (inference_mode) and
+    evaluate_energy_grad (grad-enabled).
 
     For each config fxs[b], obtains connected configs and matrix
     elements via H.get_conn, evaluates amplitudes on all connected
@@ -398,15 +466,49 @@ def evaluate_energy(
             conn_amps / current_amps_expanded
         )
 
-    # Aggregate results
+    # Aggregate results (out-of-place for autograd support)
     local_energies = torch.zeros(
         B, device=device, dtype=terms.dtype,
-    )
-    local_energies.index_add_(0, batch_ids, terms)
+    ).index_add(0, batch_ids, terms)
 
     energy = torch.mean(local_energies)
 
     return energy, local_energies
+
+
+@torch.inference_mode()
+def evaluate_energy(
+    fxs, fpeps_model, H, current_amps,
+    verbose=False, use_log_amp=False, **kwargs,
+):
+    """Compute local energies (inference mode, no grad)."""
+    return _evaluate_energy_impl(
+        fxs, fpeps_model, H, current_amps,
+        verbose=verbose, use_log_amp=use_log_amp,
+        **kwargs,
+    )
+
+
+def evaluate_energy_grad(
+    fxs, fpeps_model, H, current_amps,
+    verbose=False, use_log_amp=False, **kwargs,
+):
+    """Compute local energies with grad tracking.
+
+    Same as evaluate_energy but without inference_mode,
+    so the computation graph is kept for backprop
+    (needed by the log-variance loss path).
+    """
+    return _evaluate_energy_impl(
+        fxs, fpeps_model, H, current_amps,
+        verbose=verbose, use_log_amp=use_log_amp,
+        **kwargs,
+    )
+
+
+# ==========================================================
+# Energy evaluation with bMPS reuse
+# ==========================================================
 
 def detect_changed_row_col_pair(fx1, fx2, Ly):
     """Classify which row(s) or col(s) differ between two configs.
@@ -1214,6 +1316,10 @@ def evaluate_energy_reuse_x(
     return energy, local_energies
 
 
+# ==========================================================
+# Gradient computation
+# ==========================================================
+
 def flatten_params(parameters):
     vec = []
     for param in parameters:
@@ -1743,55 +1849,3 @@ def compute_grads_cheap_gpu(
     if use_log_amp:
         return batched_grads_vec, (signs, log_abs)
     return batched_grads_vec, amps
-
-
-def random_initial_config(N_f, N_sites, seed=None):
-    if seed is not None:
-        torch.manual_seed(seed)
-    half_filled_config = torch.tensor(
-        [1, 2] * (N_sites // 2)
-    )
-    # Set first (Lx*Ly - N_f) sites to be empty (0)
-    empty_sites = list(range(N_sites - N_f))
-    doped_config = half_filled_config.clone()
-    doped_config[empty_sites] = 0
-    # Randomly permute the doped_config
-    perm = torch.randperm(N_sites)
-    doped_config = doped_config[perm]
-    num_1 = torch.sum(doped_config == 1).item()
-    num_2 = torch.sum(doped_config == 2).item()
-    assert num_1 == N_f // 2 and num_2 == N_f // 2, f"Number of spin up and spin down fermions should be {N_f // 2}, but got {num_1} and {num_2}"
-
-    return doped_config
-
-
-# =============== Debug ================
-def are_pytrees_equal(tree1, tree2):
-    from torch.utils import _pytree as pytree
-    # Flatten both trees
-    leaves1, spec1 = pytree.tree_flatten(tree1)
-    leaves2, spec2 = pytree.tree_flatten(tree2)
-    
-    # 1. Compare structure (TreeSpec)
-    if spec1 != spec2:
-        print("Tree structures differ.")
-        return False
-    
-    # 2. Compare leaves (Tensors/Values)
-    if len(leaves1) != len(leaves2):
-        print("Number of leaves differ.")
-        return False
-        
-    for l1, l2 in zip(leaves1, leaves2):
-        if torch.is_tensor(l1) and torch.is_tensor(l2):
-            if not torch.equal(l1, l2):
-                print("Tensor leaves differ.")
-                return False
-        else:
-            if (l1 != l2).any():
-                print("Non-tensor leaves differ.")
-                print("l1:", l1)
-                print("l2:", l2)
-                return False
-                
-    return True

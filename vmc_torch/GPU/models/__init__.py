@@ -17,6 +17,10 @@ from .slater import SlaterDeterminant_GPU
 from .NNBF import NNBF_GPU, AttentionNNBF_GPU
 from .NNfTNS import NNfTNS_Model_GPU, Conv2D_Geometric_fPEPS_GPU
 from .AttentionNNfTNS import Attention_Geometric_fPEPS_GPU
+from .symmetry import (
+    SymmetryProjectedModel,
+    FermionSymmetryProjectedModel,
+)
 
 __all__ = [
     "WavefunctionModel_GPU",
@@ -32,4 +36,6 @@ __all__ = [
     "PEPS_Model_GPU",
     "PEPS_Model_reuse_GPU",
     "PEPS_Model_reuse_compiled_cache_GPU",
+    "SymmetryProjectedModel",
+    "FermionSymmetryProjectedModel",
 ]
