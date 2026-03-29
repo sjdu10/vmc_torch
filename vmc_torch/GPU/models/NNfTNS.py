@@ -790,6 +790,85 @@ class NNfTNS_Model_GPU(WavefunctionModel_GPU):
         self._exported = True
         self._exported_log_amp = use_log_amp
 
+    def export_grad(
+        self, mode='default', use_log_amp=False,
+        do_compile=False, **compile_kwargs,
+    ):
+        """Build vmap(grad) for NNfTNS models.
+
+        Single-sample function: NN (dynamo-traceable) + exported TN
+        (pure aten ops).
+
+        Args:
+            do_compile: if True, wrap with torch.compile (long
+                warmup). Default False.
+        """
+        assert self._exported, (
+            "Call export_and_compile() before export_grad()"
+        )
+        exported_tn = self._exported_tn_module
+        nn_container = self._nn_container
+        nn_param_names = self._nn_param_names
+        nn_param_dtypes = self._nn_param_dtypes
+        n_ftn = self.n_ftn
+        n_total = len(list(self.params))
+        argnums = tuple(range(1, n_total + 1))
+        in_dims = (0,) + (None,) * n_total
+
+        if use_log_amp:
+            def single_fn(x_i, *all_params):
+                ftn_ps = all_params[:n_ftn]
+                nn_ps = all_params[n_ftn:]
+                nn_dict = {
+                    name: p.to(dt) if p.dtype != dt else p
+                    for name, p, dt in zip(
+                        nn_param_names, nn_ps,
+                        nn_param_dtypes,
+                    )
+                }
+                nn_out = torch.func.functional_call(
+                    nn_container[0], nn_dict,
+                    (x_i.unsqueeze(0),),
+                ).squeeze(0)
+                sign, log_abs = exported_tn(
+                    x_i, nn_out, *ftn_ps,
+                )
+                return log_abs, (sign, log_abs)
+        else:
+            def single_fn(x_i, *all_params):
+                ftn_ps = all_params[:n_ftn]
+                nn_ps = all_params[n_ftn:]
+                nn_dict = {
+                    name: p.to(dt) if p.dtype != dt else p
+                    for name, p, dt in zip(
+                        nn_param_names, nn_ps,
+                        nn_param_dtypes,
+                    )
+                }
+                nn_out = torch.func.functional_call(
+                    nn_container[0], nn_dict,
+                    (x_i.unsqueeze(0),),
+                ).squeeze(0)
+                amp = exported_tn(
+                    x_i, nn_out, *ftn_ps,
+                )
+                return amp, amp
+
+        grad_fn = torch.func.grad(
+            single_fn, argnums=argnums, has_aux=True,
+        )
+        vmapped = torch.vmap(grad_fn, in_dims=in_dims)
+
+        if do_compile:
+            self._exported_grad_fn = torch.compile(
+                vmapped, mode=mode, **compile_kwargs,
+            )
+        else:
+            self._exported_grad_fn = vmapped
+
+        self._grad_exported = True
+        self._grad_use_log_amp = use_log_amp
+
     def _move_exported_tn_constants_to_device(self, device):
         """Move CPU constants in the exported TN graph to GPU.
 

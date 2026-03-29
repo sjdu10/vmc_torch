@@ -1387,316 +1387,243 @@ def _check_grads_amps(batched_grads_vec, amps, fpeps_model, configs=None):
 
 
 def compute_grads_gpu(
-    fxs, fpeps_model, vectorize=True, batch_size=None,
-    verbose=False, vmap_grad=False, offload_to_cpu=False,
-    use_log_amp=False, **kwargs,
+    fxs, fpeps_model, batch_size=None,
+    verbose=False, offload_to_cpu=False,
+    use_log_amp=False, **kwargs,  # kwargs for backward compat
 ):
-    """Vectorized gradient computation optimized for GPU.
+    """Per-sample gradient computation via vmap(grad) on GPU.
+
+    Uses compiled grad path when model.compile_grad() has been
+    called (torch.compile over vmap(grad(exported_fn))), otherwise
+    falls back to eager vmap(grad(vamp)).
 
     Args:
+        fxs: (B, N_sites) int64 configurations.
+        fpeps_model: model with .params and .vamp/.vamp_log.
+        batch_size: chunk size for gradient computation (B_grad).
         offload_to_cpu: if True, each (B_grad, Np) gradient chunk
-            is flattened and moved to CPU immediately after GPU
-            computation.  The final returned tensors live on CPU.
-            This keeps GPU peak memory at O(B_grad * Np) instead
-            of O(B * Np).
+            is moved to pinned CPU memory immediately after GPU
+            computation.  Keeps GPU peak memory at O(B_grad * Np).
         use_log_amp: if True, compute d(log|psi|)/d(params)
             directly. Returns (log_psi_grad, (signs, log_abs))
-            instead of (grads, amps). log_psi_grad is already the
-            log-derivative — no division by amps needed.
+            instead of (grads, amps).
     """
-    if vectorize:
-        # 1. Prepare parameters PyTree structure
-        # Compatible with ParameterList, ParameterDict, or direct Tensor List
+    B = fxs.shape[0]
+    B_grad = batch_size if batch_size is not None else B
+
+    # ------------------------------------------------------------------
+    # Check for compiled grad path
+    # ------------------------------------------------------------------
+    use_exported_grad = (
+        getattr(fpeps_model, '_grad_exported', False)
+        and getattr(
+            fpeps_model, '_grad_use_log_amp', False,
+        ) == use_log_amp
+    )
+
+    if use_exported_grad:
+        exported_grad_fn = fpeps_model._exported_grad_fn
+        params_list = list(fpeps_model.params)
+    else:
+        # Eager path: build vmap(grad(vamp)) function
         params_pytree = (
             list(fpeps_model.params)
-            if isinstance(fpeps_model.params, torch.nn.ParameterList)
+            if isinstance(
+                fpeps_model.params, torch.nn.ParameterList,
+            )
             else dict(fpeps_model.params)
-            if isinstance(fpeps_model.params, torch.nn.ParameterDict)
+            if isinstance(
+                fpeps_model.params, torch.nn.ParameterDict,
+            )
             else fpeps_model.params
         )
 
-        # ------------------------------------------------------------------
-        # Path A: vmap(grad) - Usually efficient for per-sample scalar grad
-        # ------------------------------------------------------------------
-        if vmap_grad:
-            B = fxs.shape[0]
-            # Determine chunk size to avoid OOM
-            B_grad = batch_size if batch_size is not None else B
-
-            if use_log_amp:
-                # Differentiate log|psi| directly — grad is O(1)
-                def single_sample_log_amp_func(x_i, p):
-                    sign, log_abs = fpeps_model.vamp_log(
-                        x_i.unsqueeze(0), p,
-                    )
-                    sign = sign.squeeze(0)
-                    log_abs = log_abs.squeeze(0)
-                    return log_abs, (sign, log_abs)
-
-                grad_vmap_fn = torch.vmap(
-                    torch.func.grad(
-                        single_sample_log_amp_func,
-                        argnums=1, has_aux=True,
-                    ),
-                    in_dims=(0, None),
+        if use_log_amp:
+            def single_sample_log_amp_func(x_i, p):
+                sign, log_abs = fpeps_model.vamp_log(
+                    x_i.unsqueeze(0), p,
                 )
-            else:
-                # Original: differentiate amp directly
-                def single_sample_amp_func(x_i, p):
-                    amp = fpeps_model.vamp(
-                        x_i.unsqueeze(0), p,
-                    ).squeeze(0)
-                    return amp, amp
+                sign = sign.squeeze(0)
+                log_abs = log_abs.squeeze(0)
+                return log_abs, (sign, log_abs)
 
-                grad_vmap_fn = torch.vmap(
-                    torch.func.grad(
-                        single_sample_amp_func,
-                        argnums=1, has_aux=True,
-                    ),
-                    in_dims=(0, None),
-                )
-
-            t0 = time.time()
-
-            if offload_to_cpu:
-                # Pre-allocate CPU buffer and write chunks
-                # directly to avoid torch.cat peak doubling.
-                leaves_p, _ = tree_flatten(params_pytree)
-                Np = sum(p.numel() for p in leaves_p)
-                p_dtype = leaves_p[0].dtype
-                del leaves_p
-
-                batched_grads_vec = torch.empty(
-                    B, Np, dtype=p_dtype, device='cpu',
-                )
-                if use_log_amp:
-                    signs = torch.empty(
-                        B, dtype=p_dtype, device='cpu',
-                    )
-                    log_abs = torch.empty(
-                        B, dtype=p_dtype, device='cpu',
-                    )
-                else:
-                    amps = torch.empty(
-                        B, dtype=p_dtype, device='cpu',
-                    )
-
-                for b_start in range(0, B, B_grad):
-                    if verbose:
-                        print(f"Processing grad chunk: {b_start} to {min(b_start + B_grad, B)} / {B}")
-                    b_end = min(b_start + B_grad, B)
-                    fxs_chunk = fxs[b_start:b_end]
-
-                    grads_chunk, aux_c = grad_vmap_fn(
-                        fxs_chunk, params_pytree,
-                    )
-
-                    grads_chunk = tree_map(
-                        lambda x: x.detach(), grads_chunk,
-                    )
-
-                    # Flatten to (B_grad, Np) on GPU, then offload
-                    leaves_c, _ = tree_flatten(grads_chunk)
-                    flat_c = torch.cat(
-                        [l.flatten(start_dim=1) for l in leaves_c],
-                        dim=1,
-                    )
-                    batched_grads_vec[b_start:b_end] = flat_c.cpu()
-
-                    if use_log_amp:
-                        sc, lac = aux_c
-                        signs[b_start:b_end] = sc.detach().cpu()
-                        log_abs[b_start:b_end] = lac.detach().cpu()
-                        del sc, lac, aux_c
-                    else:
-                        amps[b_start:b_end] = aux_c.detach().cpu()
-                        del aux_c
-
-                    del grads_chunk, leaves_c, flat_c
-            else:
-                # Standard path: pre-allocate and fill in-place.
-                leaves_p, _ = tree_flatten(params_pytree)
-                Np = sum(p.numel() for p in leaves_p)
-                dtype = leaves_p[0].dtype
-                device = leaves_p[0].device
-                del leaves_p
-
-                batched_grads_vec = torch.empty(
-                    B, Np, dtype=dtype, device=device,
-                )
-                if use_log_amp:
-                    signs = torch.empty(
-                        B, dtype=dtype, device=device,
-                    )
-                    log_abs = torch.empty(
-                        B, dtype=dtype, device=device,
-                    )
-                else:
-                    amps = torch.empty(
-                        B, dtype=dtype, device=device,
-                    )
-
-                for b_start in range(0, B, B_grad):
-                    if verbose:
-                        print(f"Processing grad chunk: {b_start} to {min(b_start + B_grad, B)} / {B}")
-                    b_end = min(b_start + B_grad, B)
-                    fxs_chunk = fxs[b_start:b_end]
-
-                    grads_chunk, aux_c = grad_vmap_fn(
-                        fxs_chunk, params_pytree,
-                    )
-
-                    grads_chunk = tree_map(
-                        lambda x: x.detach(), grads_chunk,
-                    )
-
-                    # Flatten and write directly into buffer
-                    leaves_c, _ = tree_flatten(grads_chunk)
-                    flat_c = torch.cat(
-                        [leaf.flatten(start_dim=1)
-                         for leaf in leaves_c],
-                        dim=1,
-                    )
-                    batched_grads_vec[b_start:b_end] = flat_c
-                    if use_log_amp:
-                        sc, lac = aux_c
-                        signs[b_start:b_end] = sc.detach()
-                        log_abs[b_start:b_end] = lac.detach()
-                        del sc, lac, aux_c
-                    else:
-                        amps[b_start:b_end] = aux_c.detach()
-                        del aux_c
-                    del grads_chunk, leaves_c, flat_c
-
-            # Final cleanup
-            batched_grads_vec = batched_grads_vec.detach()
-            fpeps_model.zero_grad()
-
-            t1 = time.time()
-            if verbose:
-                print(f"GPU Batched vmap(grad) time: {t1 - t0:.4f}s")
-
-            if use_log_amp:
-                _check_grads_amps(
-                    batched_grads_vec, log_abs, fpeps_model,
-                )
-                return batched_grads_vec, (signs, log_abs)
-            else:
-                _check_grads_amps(
-                    batched_grads_vec, amps, fpeps_model,
-                )
-                return batched_grads_vec, amps
-
-        # ------------------------------------------------------------------
-        # Path B: jacrev - Standard Jacobian Reverse Mode
-        # ------------------------------------------------------------------
+            grad_vmap_fn = torch.vmap(
+                torch.func.grad(
+                    single_sample_log_amp_func,
+                    argnums=1, has_aux=True,
+                ),
+                in_dims=(0, None),
+            )
         else:
-            # Deprecated warning: jacrev path is less memory efficient and may OOM on large batches, prefer vmap(grad) with chunking
-            Warning = ("jacrev path is less memory efficient and may OOM on large batches, "
-                       "prefer vmap(grad) with chunking. This path will be removed in future versions.")
-            def g(x, p):
-                results = fpeps_model.vamp(x, p)
-                return results, results
+            def single_sample_amp_func(x_i, p):
+                amp = fpeps_model.vamp(
+                    x_i.unsqueeze(0), p,
+                ).squeeze(0)
+                return amp, amp
 
-            # If no batch_size limit, try to compute all at once (RISKY on GPU)
-            if batch_size is None:
-                t0 = time.time()
-                jac_pytree, amps = torch.func.jacrev(g, argnums=1, has_aux=True)(fxs, params_pytree)
-                t1 = time.time()
-                if verbose:
-                    try: 
-                        print(f"GPU Full Batch Jacobian time: {t1 - t0:.4f}s")
-                    except NameError: pass
-            
-            # Chunked execution for jacrev
-            else:
-                B = fxs.shape[0]
-                B_grad = batch_size
-                jac_pytree_list = []
-                amps_list = []
-                
-                t0 = time.time()
-                for b_start in range(0, B, B_grad):
-                    b_end = min(b_start + B_grad, B)
-                    
-                    # jacrev computation
-                    jac_pytree_b, amps_b = torch.func.jacrev(g, argnums=1, has_aux=True)(
-                        fxs[b_start:b_end], params_pytree
-                    )
-                    
-                    # Detach to free compute graph
-                    amps_b = amps_b.detach()
-                    jac_pytree_b = tree_map(lambda x: x.detach(), jac_pytree_b)
+            grad_vmap_fn = torch.vmap(
+                torch.func.grad(
+                    single_sample_amp_func,
+                    argnums=1, has_aux=True,
+                ),
+                in_dims=(0, None),
+            )
 
-                    jac_pytree_list.append(jac_pytree_b)
-                    amps_list.append(amps_b)
-
-                # Concatenate results
-                jac_pytree = tree_map(lambda *leaves: torch.cat(leaves, dim=0), *jac_pytree_list)
-                amps = torch.cat(amps_list, dim=0)
-                t1 = time.time()
-                if verbose:
-                    try:
-                        if RANK == 0: print(f"GPU Chunked Jacobian time: {t1 - t0:.4f}s")
-                    except NameError: pass
-
-            # Process jac_pytree to flat vector
-            leaves, _ = tree_flatten(jac_pytree)
-            leaves_flattend = [leaf.flatten(start_dim=1) for leaf in leaves]
-            batched_grads_vec = torch.cat(leaves_flattend, dim=1)
-            
-            if amps.dim() == 1: amps.unsqueeze_(1)
-            
-            # Cleanup
-            batched_grads_vec = batched_grads_vec.detach()
-            amps = amps.detach()
-            if 'jac_pytree' in locals(): del jac_pytree
-            fpeps_model.zero_grad()
-
-            _check_grads_amps(batched_grads_vec, amps, fpeps_model)
-            return batched_grads_vec, amps
-
+    # ------------------------------------------------------------------
+    # Pre-allocate output buffers
+    # ------------------------------------------------------------------
+    if use_exported_grad:
+        Np = sum(p.numel() for p in params_list)
+        p_dtype = params_list[0].dtype
     else:
-        # ------------------------------------------------------------------
-        # Non-Vectorized Sequential Fallback
-        # ------------------------------------------------------------------
-        amps = []
-        batched_grads_vec = []
-        t0 = time.time()
-        
-        # Helper to flatten gradients from .grad attributes
-        def flatten_grads(model):
-            grads_list = []
-            for p in model.parameters():
-                if p.grad is not None:
-                    grads_list.append(p.grad.flatten())
-                else:
-                    grads_list.append(torch.zeros_like(p).flatten())
-            return torch.cat(grads_list)
+        leaves_p, _ = tree_flatten(params_pytree)
+        Np = sum(p.numel() for p in leaves_p)
+        p_dtype = leaves_p[0].dtype
+        del leaves_p
 
-        for fx in fxs:
-            amp = fpeps_model(fx.unsqueeze(0))
-            amps.append(amp)
-            
-            # Standard backward
-            amp.backward()
-            
-            # Collect gradients
-            # Assuming params is flat list or consistent iteration order
-            current_grads = flatten_grads(fpeps_model)
-            batched_grads_vec.append(current_grads)
-            
-            fpeps_model.zero_grad()
-            
-        t1 = time.time()
+    if offload_to_cpu:
+        # Pinned memory for faster D2H transfer
+        batched_grads_vec = torch.empty(
+            B, Np, dtype=p_dtype, device='cpu',
+            pin_memory=True,
+        )
+        if use_log_amp:
+            signs = torch.empty(
+                B, dtype=p_dtype, device='cpu',
+                pin_memory=True,
+            )
+            log_abs = torch.empty(
+                B, dtype=p_dtype, device='cpu',
+                pin_memory=True,
+            )
+        else:
+            amps = torch.empty(
+                B, dtype=p_dtype, device='cpu',
+                pin_memory=True,
+            )
+    else:
+        device = fxs.device
+        batched_grads_vec = torch.empty(
+            B, Np, dtype=p_dtype, device=device,
+        )
+        if use_log_amp:
+            signs = torch.empty(
+                B, dtype=p_dtype, device=device,
+            )
+            log_abs = torch.empty(
+                B, dtype=p_dtype, device=device,
+            )
+        else:
+            amps = torch.empty(
+                B, dtype=p_dtype, device=device,
+            )
+
+    # ------------------------------------------------------------------
+    # Chunked gradient computation
+    # ------------------------------------------------------------------
+    t0 = time.time()
+
+    for b_start in range(0, B, B_grad):
+        b_end = min(b_start + B_grad, B)
         if verbose:
-            try:
-                if RANK == 0: print(f"GPU Sequential time: {t1 - t0:.4f}s")
-            except NameError: pass
-            
-        amps = torch.stack(amps, dim=0)
-        batched_grads_vec = torch.stack(batched_grads_vec, dim=0)
-        
+            print(
+                f"Processing grad chunk: "
+                f"{b_start} to {b_end} / {B}"
+            )
+        fxs_chunk = fxs[b_start:b_end]
+        actual_size = b_end - b_start
+
+        if use_exported_grad:
+            # Pad last chunk to B_grad to avoid recompilation
+            if actual_size < B_grad:
+                pad = fxs_chunk[0:1].expand(
+                    B_grad - actual_size, -1,
+                )
+                fxs_chunk = torch.cat(
+                    [fxs_chunk, pad], dim=0,
+                )
+
+            grads_tuple, aux_c = exported_grad_fn(
+                fxs_chunk, *params_list,
+            )
+            # grads_tuple: tuple of (B_grad, *param_shape)
+            flat_c = torch.cat(
+                [g.detach().flatten(start_dim=1)
+                 for g in grads_tuple],
+                dim=1,
+            )[:actual_size]
+
+            if use_log_amp:
+                sc, lac = aux_c
+                sc = sc.detach()[:actual_size]
+                lac = lac.detach()[:actual_size]
+            else:
+                aux_c = aux_c.detach()[:actual_size]
+        else:
+            grads_chunk, aux_c = grad_vmap_fn(
+                fxs_chunk, params_pytree,
+            )
+            grads_chunk = tree_map(
+                lambda x: x.detach(), grads_chunk,
+            )
+            leaves_c, _ = tree_flatten(grads_chunk)
+            flat_c = torch.cat(
+                [lf.flatten(start_dim=1) for lf in leaves_c],
+                dim=1,
+            )
+            if use_log_amp:
+                sc, lac = aux_c
+                sc = sc.detach()
+                lac = lac.detach()
+            else:
+                aux_c = aux_c.detach()
+            del grads_chunk, leaves_c
+
+        # Write to output buffer
+        if offload_to_cpu:
+            batched_grads_vec[b_start:b_end] = flat_c.cpu()
+            if use_log_amp:
+                signs[b_start:b_end] = sc.cpu()
+                log_abs[b_start:b_end] = lac.cpu()
+            else:
+                amps[b_start:b_end] = aux_c.cpu()
+        else:
+            batched_grads_vec[b_start:b_end] = flat_c
+            if use_log_amp:
+                signs[b_start:b_end] = sc
+                log_abs[b_start:b_end] = lac
+            else:
+                amps[b_start:b_end] = aux_c
+
+        del flat_c
+        if use_log_amp:
+            del sc, lac
+        else:
+            del aux_c
+
+    # ------------------------------------------------------------------
+    # Final cleanup and return
+    # ------------------------------------------------------------------
+    batched_grads_vec = batched_grads_vec.detach()
+    fpeps_model.zero_grad()
+
+    t1 = time.time()
+    if verbose:
+        label = "exported" if use_exported_grad else "eager"
+        print(
+            f"GPU vmap(grad) [{label}] time: "
+            f"{t1 - t0:.4f}s"
+        )
+
+    if use_log_amp:
+        _check_grads_amps(
+            batched_grads_vec, log_abs, fpeps_model,
+        )
+        return batched_grads_vec, (signs, log_abs)
+    else:
+        _check_grads_amps(
+            batched_grads_vec, amps, fpeps_model,
+        )
         return batched_grads_vec, amps
 
 

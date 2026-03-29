@@ -3,7 +3,7 @@ GPU-compatible modular VMC functions using torch.distributed (NCCL).
 
 Mirrors the CPU vmap_modules.py but uses torch.distributed.all_reduce
 instead of MPI.Allreduce.  Key memory optimization: log_psi_grad = grad/amp
-is computed inline during sampling (Trick #2), so we never hold both
+is computed inline during sampling, so we never hold both
 the raw (B, Np) gradient matrix and the (B,) amplitude vector at the
 same time across the gathering step.
 
@@ -116,9 +116,7 @@ def run_sampling_phase_gpu(
         with torch.enable_grad():
             local_grads, grads_aux = compute_grads_gpu(
                 fxs, model,
-                vectorize=True,
                 batch_size=grad_batch_size,
-                vmap_grad=True,
                 use_log_amp=use_log_amp,
             )
 

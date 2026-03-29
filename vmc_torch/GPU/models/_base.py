@@ -305,3 +305,56 @@ class WavefunctionModel_GPU(nn.Module):
             **kwargs,
         )
         self._compiled = True
+
+    def export_grad(
+        self, mode='default', use_log_amp=False,
+        do_compile=False, **compile_kwargs,
+    ):
+        """Build vmap(grad(exported_fn)) for fast grads.
+
+        Requires export_and_compile() or export_only() first.
+        Uses the exported aten-ops FX graph so vmap/grad bypass
+        quimb/symmray Python dispatch entirely.
+
+        Args:
+            mode: torch.compile mode (only used if do_compile).
+            use_log_amp: must match the export's use_log_amp.
+            do_compile: if True, wrap with torch.compile for
+                further kernel fusion (adds long warmup).
+                Default False — export-only is usually enough.
+            **compile_kwargs: passed to torch.compile.
+        """
+        assert self._exported, (
+            "Call export_and_compile() before export_grad()"
+        )
+        exported_module = self._exported_module
+        params_list = list(self.params)
+        n_params = len(params_list)
+        argnums = tuple(range(1, n_params + 1))
+        in_dims = (0,) + (None,) * n_params
+
+        if use_log_amp:
+            def single_fn(x_i, *flat_params):
+                sign, log_abs = exported_module(
+                    x_i, *flat_params,
+                )
+                return log_abs, (sign, log_abs)
+        else:
+            def single_fn(x_i, *flat_params):
+                amp = exported_module(x_i, *flat_params)
+                return amp, amp
+
+        grad_fn = torch.func.grad(
+            single_fn, argnums=argnums, has_aux=True,
+        )
+        vmapped = torch.vmap(grad_fn, in_dims=in_dims)
+
+        if do_compile:
+            self._exported_grad_fn = torch.compile(
+                vmapped, mode=mode, **compile_kwargs,
+            )
+        else:
+            self._exported_grad_fn = vmapped
+
+        self._grad_exported = True
+        self._grad_use_log_amp = use_log_amp

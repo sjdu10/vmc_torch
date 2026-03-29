@@ -504,6 +504,166 @@ class SymmetryProjectedModel(WavefunctionModel_GPU):
             self.base_model._exported_log_amp
         )
 
+    def export_grad(
+        self, mode='default', use_log_amp=False,
+        do_compile=False, **compile_kwargs,
+    ):
+        """Build vmap(grad) with symmetry projection.
+
+        The single-sample function loops over |G| group elements,
+        calling the base model's exported single-sample function
+        for each permuted config, weighted by characters.
+
+        Args:
+            do_compile: if True, wrap with torch.compile.
+                Default False.
+        """
+        assert self.base_model._exported, (
+            "Call export_and_compile() before export_grad()"
+        )
+        base = self.base_model
+        perms = self.perms        # (|G|, N)
+        chars = self.characters   # (|G|,)
+        n_group = self.n_group
+        params_list = list(base.params)
+        n_params = len(params_list)
+        argnums = tuple(range(1, n_params + 1))
+        in_dims = (0,) + (None,) * n_params
+
+        # Get base model's exported single-sample fn
+        base_fn = self._get_base_single_sample_fn(
+            use_log_amp,
+        )
+
+        if use_log_amp:
+            def single_fn(x_i, *flat_params):
+                # Evaluate each group element
+                signs_list = []
+                log_abs_list = []
+                for g in range(n_group):
+                    x_g = x_i[perms[g]]
+                    s_g, la_g = base_fn(x_g, *flat_params)
+                    signs_list.append(
+                        chars[g] * s_g
+                    )
+                    log_abs_list.append(la_g)
+                signs_t = torch.stack(signs_list)
+                log_abs_t = torch.stack(log_abs_list)
+                max_la = log_abs_t.max()
+                weighted = (
+                    signs_t
+                    * torch.exp(log_abs_t - max_la)
+                ).sum()
+                result_sign = torch.sign(weighted)
+                result_log_abs = (
+                    max_la
+                    + torch.log(
+                        weighted.abs().clamp(min=1e-45)
+                    )
+                    - torch.log(
+                        torch.tensor(
+                            float(n_group),
+                            dtype=max_la.dtype,
+                            device=max_la.device,
+                        )
+                    )
+                )
+                return result_log_abs, (
+                    result_sign, result_log_abs,
+                )
+        else:
+            def single_fn(x_i, *flat_params):
+                total = torch.tensor(
+                    0.0, dtype=chars.dtype,
+                    device=x_i.device,
+                )
+                for g in range(n_group):
+                    x_g = x_i[perms[g]]
+                    amp_g = base_fn(x_g, *flat_params)
+                    total = total + chars[g] * amp_g
+                result = total / n_group
+                return result, result
+
+        grad_fn = torch.func.grad(
+            single_fn, argnums=argnums, has_aux=True,
+        )
+        vmapped = torch.vmap(grad_fn, in_dims=in_dims)
+
+        if do_compile:
+            self._exported_grad_fn = torch.compile(
+                vmapped, mode=mode, **compile_kwargs,
+            )
+        else:
+            self._exported_grad_fn = vmapped
+
+        self._grad_exported = True
+        self._grad_use_log_amp = use_log_amp
+
+    def _get_base_single_sample_fn(self, use_log_amp):
+        """Return the base model's exported single-sample fn.
+
+        Handles both pure TNS (has _exported_module) and
+        NNfTNS (has _exported_tn_module + NN).
+        """
+        base = self.base_model
+        if hasattr(base, '_exported_tn_module'):
+            # NNfTNS: NN + exported TN
+            exported_tn = base._exported_tn_module
+            nn_container = base._nn_container
+            nn_param_names = base._nn_param_names
+            nn_param_dtypes = base._nn_param_dtypes
+            n_ftn = base.n_ftn
+
+            if use_log_amp:
+                def fn(x_i, *all_params):
+                    ftn_ps = all_params[:n_ftn]
+                    nn_ps = all_params[n_ftn:]
+                    nn_dict = {
+                        name: p.to(dt)
+                        if p.dtype != dt else p
+                        for name, p, dt in zip(
+                            nn_param_names, nn_ps,
+                            nn_param_dtypes,
+                        )
+                    }
+                    nn_out = torch.func.functional_call(
+                        nn_container[0], nn_dict,
+                        (x_i.unsqueeze(0),),
+                    ).squeeze(0)
+                    return exported_tn(
+                        x_i, nn_out, *ftn_ps,
+                    )
+            else:
+                def fn(x_i, *all_params):
+                    ftn_ps = all_params[:n_ftn]
+                    nn_ps = all_params[n_ftn:]
+                    nn_dict = {
+                        name: p.to(dt)
+                        if p.dtype != dt else p
+                        for name, p, dt in zip(
+                            nn_param_names, nn_ps,
+                            nn_param_dtypes,
+                        )
+                    }
+                    nn_out = torch.func.functional_call(
+                        nn_container[0], nn_dict,
+                        (x_i.unsqueeze(0),),
+                    ).squeeze(0)
+                    return exported_tn(
+                        x_i, nn_out, *ftn_ps,
+                    )
+            return fn
+        else:
+            # Pure TNS: _exported_module
+            exported = base._exported_module
+            if use_log_amp:
+                def fn(x_i, *flat_params):
+                    return exported(x_i, *flat_params)
+            else:
+                def fn(x_i, *flat_params):
+                    return exported(x_i, *flat_params)
+            return fn
+
 
 # =================================================================
 #  Fermionic sign computation
@@ -855,3 +1015,122 @@ class FermionSymmetryProjectedModel(SymmetryProjectedModel):
             )
         )
         return result_sign, result_log_abs
+
+    def export_grad(
+        self, mode='default', use_log_amp=False,
+        do_compile=False, **compile_kwargs,
+    ):
+        """Build vmap(grad) with fermionic symmetry.
+
+        Same as SymmetryProjectedModel.export_grad but includes
+        fermionic sign factors.
+
+        Args:
+            do_compile: if True, wrap with torch.compile.
+                Default False.
+        """
+        assert self.base_model._exported, (
+            "Call export_and_compile() before export_grad()"
+        )
+        base = self.base_model
+        perms = self.perms
+        chars = self.characters
+        n_group = self.n_group
+        # Capture buffers as local vars for torch.func compat
+        mode_inv_masks = self.mode_inv_masks
+        params_list = list(base.params)
+        n_params = len(params_list)
+        argnums = tuple(range(1, n_params + 1))
+        in_dims = (0,) + (None,) * n_params
+
+        base_fn = self._get_base_single_sample_fn(
+            use_log_amp,
+        )
+
+        # Single-sample fermionic sign (captured via closure)
+        def _fsigns(x_i):
+            N = x_i.shape[0]
+            occ_d = ((x_i == 1) | (x_i == 3)).long()
+            occ_u = ((x_i == 2) | (x_i == 3)).long()
+            occ = torch.stack(
+                [occ_d, occ_u], dim=-1,
+            ).reshape(2 * N)
+            occ_pairs = (
+                occ.unsqueeze(1) * occ.unsqueeze(0)
+            )
+            exponents = (
+                mode_inv_masks.long() * occ_pairs
+            ).sum(dim=(1, 2))
+            return 1.0 - 2.0 * (exponents % 2).to(
+                torch.float64,
+            )
+
+        if use_log_amp:
+            def single_fn(x_i, *flat_params):
+                fsigns = _fsigns(x_i)
+                signs_list = []
+                log_abs_list = []
+                for g in range(n_group):
+                    x_g = x_i[perms[g]]
+                    s_g, la_g = base_fn(
+                        x_g, *flat_params,
+                    )
+                    signs_list.append(
+                        fsigns[g] * chars[g] * s_g
+                    )
+                    log_abs_list.append(la_g)
+                signs_t = torch.stack(signs_list)
+                log_abs_t = torch.stack(log_abs_list)
+                max_la = log_abs_t.max()
+                weighted = (
+                    signs_t
+                    * torch.exp(log_abs_t - max_la)
+                ).sum()
+                result_sign = torch.sign(weighted)
+                result_log_abs = (
+                    max_la
+                    + torch.log(
+                        weighted.abs().clamp(min=1e-45)
+                    )
+                    - torch.log(
+                        torch.tensor(
+                            float(n_group),
+                            dtype=max_la.dtype,
+                            device=max_la.device,
+                        )
+                    )
+                )
+                return result_log_abs, (
+                    result_sign, result_log_abs,
+                )
+        else:
+            def single_fn(x_i, *flat_params):
+                fsigns = _fsigns(x_i)
+                total = torch.tensor(
+                    0.0, dtype=chars.dtype,
+                    device=x_i.device,
+                )
+                for g in range(n_group):
+                    x_g = x_i[perms[g]]
+                    amp_g = base_fn(x_g, *flat_params)
+                    total = (
+                        total
+                        + fsigns[g] * chars[g] * amp_g
+                    )
+                result = total / n_group
+                return result, result
+
+        grad_fn = torch.func.grad(
+            single_fn, argnums=argnums, has_aux=True,
+        )
+        vmapped = torch.vmap(grad_fn, in_dims=in_dims)
+
+        if do_compile:
+            self._exported_grad_fn = torch.compile(
+                vmapped, mode=mode, **compile_kwargs,
+            )
+        else:
+            self._exported_grad_fn = vmapped
+
+        self._grad_exported = True
+        self._grad_use_log_amp = use_log_amp

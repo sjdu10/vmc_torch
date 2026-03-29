@@ -70,9 +70,9 @@ class ReuseCfg(VMCConfig):
     use_x_only: bool = True
 
 vmc_cfg = ReuseCfg(
-    batch_size=10,
-    ns_per_rank=10,
-    grad_batch_size=10,
+    batch_size=1,
+    ns_per_rank=1,
+    grad_batch_size=1,
     vmc_steps=1,
     burn_in_steps=0,
     learning_rate=0.1,
@@ -95,8 +95,8 @@ warmup_cfg = VMCWarmupConfig(
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
     run_sampling=True,
-    run_locE=False,
-    run_grad=False,
+    run_locE=True,
+    run_grad=True,
 )
 
 
@@ -110,13 +110,13 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 16, 12
+        Lx, Ly = 16, 8
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
         N_f = N_sites - 24 # 24 holes
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4  # PEPS bond dimension
+        D = 8  # PEPS bond dimension
         chi = 4*D  # boundary bond dim
 
         # ========== Hamiltonian ==========
@@ -150,12 +150,12 @@ def main():
             max_bond=chi,
             dtype=dtype,
             contract_boundary_opts={
-                'mode': 'fit',
-                'tn_fit': 'zipup',
-                'bsz':2,
-                'max_iterations':5,
-                'tol':1e-5,
-                # 'mode': 'mps',
+                # 'mode': 'fit',
+                # 'tn_fit': 'zipup',
+                # 'bsz':2,
+                # 'max_iterations':5,
+                # 'tol':1e-5,
+                'mode': 'mps',
                 'equalize_norms': 1.0,
                 'canonize': True,
             },

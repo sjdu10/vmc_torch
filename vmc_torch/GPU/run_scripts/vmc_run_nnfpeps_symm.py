@@ -1,9 +1,11 @@
-"""GPU VMC with Conv2D-Geometric NN-fPEPS backflow model — 4x4 system.
+"""GPU VMC with Conv2D-Geometric NN-fPEPS + C2v/C4v symmetry projection.
 
 Run:
-    torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps_4x4.py
-    torchrun --nproc_per_node=2 run_scripts/vmc_run_nnfpeps_4x4.py
+    torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps_symm.py
+    torchrun --nproc_per_node=2 run_scripts/vmc_run_nnfpeps_symm.py
 """
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -17,8 +19,9 @@ from vmc_torch.GPU.VMC import (
 from vmc_torch.GPU.hamiltonian import (
     spinful_Fermi_Hubbard_square_lattice_torch,
 )
-from vmc_torch.GPU.models import (
-    Conv2D_Geometric_fPEPS_GPU,
+from vmc_torch.GPU.models import Conv2D_Geometric_fPEPS_GPU
+from vmc_torch.GPU.models.symmetry import (
+    FermionSymmetryProjectedModel,
 )
 from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
@@ -41,14 +44,12 @@ from vmc_torch.GPU.run_scripts.vmcconfig import (
 )
 
 dtype = torch.float64
-nnbackbone_dtype = torch.float64
+nnbackbone_dtype = torch.float32
 
-# Data paths
 DEFAULT_DATA_ROOT = (
     '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
     '/GPU/data'
 )
-# SU-initialized PEPS from CPU vmap pipeline
 CPU_DATA_ROOT = DEFAULT_DATA_ROOT
 
 vmc_cfg = VMCConfig(
@@ -72,6 +73,7 @@ vmc_cfg.lr_scheduler = DecayScheduler(
     init_lr=vmc_cfg.learning_rate,
     decay_rate=0.9, patience=100,
 )
+
 warmup_cfg = VMCWarmupConfig(
     use_export_compile=vmc_cfg.use_export_compile,
     grad_batch_size=vmc_cfg.grad_batch_size,
@@ -86,7 +88,8 @@ warmup_cfg = VMCWarmupConfig(
 def main():
     setup_linalg_hooks(
         jitter=1e-8, qr_via_eigh=True,
-        cholesky_qr=False, cholesky_qr_adaptive_jitter=False,
+        cholesky_qr=False,
+        cholesky_qr_adaptive_jitter=False,
     )
     torch.set_default_dtype(dtype)
 
@@ -100,10 +103,11 @@ def main():
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 2  # 2 holes -> 14 fermions
+        N_f = N_sites - 2
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 4   # PEPS bond dimension
-        chi = -2  # exact contraction
+        D = 4
+        chi = -1
+        irrep = 'A1'
 
         # NN backflow hyperparameters
         nn_eta = 1.0
@@ -111,13 +115,10 @@ def main():
         hidden_dim = 4*N_sites
         kernel_size = 3
         cnn_layers = 1
+
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
-            Lx,
-            Ly,
-            t,
-            U,
-            N_f,
+            Lx, Ly, t, U, N_f,
             pbc=False,
             n_fermions_per_spin=n_fermions_per_spin,
             no_u1_symmetry=False,
@@ -126,7 +127,7 @@ def main():
         H.precompute_hops_gpu(device)
         graph = H.graph
 
-        # ========== Variational state (NN-fPEPS model) ==========
+        # ========== Variational state (NN-fPEPS + symmetry) ==========
         fpeps_base = (
             f"{CPU_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
             f"/N={N_f}/Z2/D={D}/"
@@ -137,22 +138,25 @@ def main():
             file_path=fpeps_base,
             scale_factor=4,
         )
-        
         # Set init_scale relative to fTN param magnitudes
         import quimb.tensor as qtn
         import quimb as qu
         _params, _ = qtn.pack(peps)
-        _flat, _ = qu.utils.tree_flatten(_params, get_ref=True)
+        _flat, _ = qu.utils.tree_flatten(
+            _params, get_ref=True,
+        )
         ftn_params_mean = torch.mean(torch.stack([
             torch.as_tensor(p, dtype=dtype).abs().mean()
             for p in _flat
         ])).item()
         init_scale = 1e-2 * ftn_params_mean
         if rank == 0:
-            print(f"ftn_params_mean={ftn_params_mean:.6e}, "
-                  f"init_scale={init_scale:.6e}")
-            
-        model = Conv2D_Geometric_fPEPS_GPU(
+            print(
+                f"ftn_params_mean={ftn_params_mean:.6e}, "
+                f"init_scale={init_scale:.6e}"
+            )
+
+        base_model = Conv2D_Geometric_fPEPS_GPU(
             tn=peps,
             max_bond=chi,
             nn_eta=nn_eta,
@@ -169,21 +173,41 @@ def main():
                 'canonize': True,
             },
         )
-        model.to(device)
-        n_params = sum(p.numel() for p in model.parameters())
-        # estimate the gpu mem needed for grad:
-        grad_mem_estimate = vmc_cfg.batch_size * n_params * 8 / 1024**3
+        base_model.to(device)
+
+        # Wrap with fermionic symmetry projection
+        group_name = 'C4v' if Lx == Ly else 'C2v'
+        model = FermionSymmetryProjectedModel(
+            base_model, Lx, Ly, irrep=irrep,
+        )
+
+        n_params = sum(
+            p.numel() for p in model.parameters()
+        )
         if rank == 0:
             print(
-                f"Model has {n_params} parameters, "
-                f"estimated grad memory per batch: {grad_mem_estimate:.2f} GB"
+                f"System: {Lx}x{Ly} Fermi-Hubbard, "
+                f"t={t}, U={U}, N_f={N_f} "
+                f"({n_fermions_per_spin[0]}up+"
+                f"{n_fermions_per_spin[1]}dn)"
+            )
+            print(
+                f"Model: NN-fPEPS D={D}, chi={chi}, "
+                f"{group_name} {irrep} projection, "
+                f"{n_params} params | "
+                f"{world_size} GPUs | {device}"
+            )
+            print(
+                f"nn_eta={nn_eta}, embed={embed_dim}, "
+                f"hidden={hidden_dim}, "
+                f"kernel={kernel_size}, layers={cnn_layers}"
             )
 
-        # Export + compile (optional, ~10-40s one-time cost)
+        # ========== Export + compile ==========
+        example_x = random_initial_config(
+            N_f, N_sites, seed=0,
+        ).to(device)
         if vmc_cfg.use_export_compile:
-            example_x = random_initial_config(
-                N_f, N_sites, seed=0,
-            ).to(device)
             if rank == 0:
                 print("Running torch.export + compile...")
             import time as _time
@@ -192,9 +216,6 @@ def main():
                 example_x,
                 use_log_amp=vmc_cfg.use_log_amp,
             )
-            # model.export_grad(
-            #     use_log_amp=vmc_cfg.use_log_amp,
-            # )
             if rank == 0:
                 print(
                     f"Export + compile done in "
@@ -204,42 +225,27 @@ def main():
         # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"t={t}_U={U}/N={N_f}/Z2/D={D}/{model._get_name()}/chi={chi}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/"
+            f"{base_model._get_name()}/"
+            f"chi={chi}/symm_{irrep}/"
         )
-        import os
         os.makedirs(output_dir, exist_ok=True)
-        model_name = model._get_name()
-        N_params = sum(p.numel() for p in model.parameters())
+        model_name = (
+            f"FermSymm_{irrep}_"
+            f"{base_model._get_name()}"
+        )
+        N_params = sum(
+            p.numel() for p in model.parameters()
+        )
 
         load_checkpoint(
             model, output_dir, model_name,
             vmc_cfg.resume_step, device, rank,
         )
 
-        if rank == 0:
-            print(
-                f"Model: {model_name} | {N_params} params | "
-                f"TN: {model.n_ftn} tensors, "
-                f"NN: {sum(p.numel() for p in list(model.parameters())[-len(model._nn_param_names):])} params"
-            )
-            print(
-                f"nn_eta={nn_eta}, embed={embed_dim}, "
-                f"hidden={hidden_dim}, "
-                f"kernel={kernel_size}, layers={cnn_layers}"
-            )
-            print(
-                f"backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}, "
-            )
-            print(
-                f"{world_size} GPUs | {device}"
-            )
-
         print_sampling_settings(
-            rank,
-            world_size,
-            vmc_cfg.batch_size,
-            vmc_cfg.ns_per_rank,
-            vmc_cfg.grad_batch_size,
+            rank, world_size, vmc_cfg.batch_size,
+            vmc_cfg.ns_per_rank, vmc_cfg.grad_batch_size,
         )
 
         # ========== Initialize walkers ==========
@@ -255,8 +261,9 @@ def main():
         system_str = (
             f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
             f'N_f={N_f}, D={D}, chi={chi}, '
+            f'{group_name} {irrep}, '
             f'nn_eta={nn_eta}, embed={embed_dim}, '
-            f'hidden={hidden_dim}, backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}'
+            f'hidden={hidden_dim}'
         )
         stats_file = make_stats_file(
             output_dir, model_name,
@@ -281,20 +288,13 @@ def main():
         )
 
         fxs = vmc.run_warmup(
-            fxs=fxs,
-            model=model,
-            graph=graph,
-            hamiltonian=H,
-            rank=rank,
+            fxs=fxs, model=model, graph=graph,
+            hamiltonian=H, rank=rank,
             config=warmup_cfg,
         )
-
         energy_history, _ = vmc.run_vmc_loop(
-            fxs=fxs,
-            model=model,
-            hamiltonian=H,
-            graph=graph,
-            rank=rank,
+            fxs=fxs, model=model, hamiltonian=H,
+            graph=graph, rank=rank,
             world_size=world_size,
             config=VMCLoopConfig.from_vmc_config(
                 vmc_cfg,

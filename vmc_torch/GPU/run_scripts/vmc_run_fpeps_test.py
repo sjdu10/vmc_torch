@@ -99,7 +99,7 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 4
+        Lx, Ly = 4, 2
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0

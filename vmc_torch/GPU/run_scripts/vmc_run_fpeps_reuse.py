@@ -66,10 +66,10 @@ class ReuseCfg(VMCConfig):
     use_x_only: bool = True
 
 vmc_cfg = ReuseCfg(
-    batch_size=2,
-    ns_per_rank=2,
-    grad_batch_size=2,
-    vmc_steps=10,
+    batch_size=64,
+    ns_per_rank=64,
+    grad_batch_size=64,
+    vmc_steps=0,
     burn_in_steps=0,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
@@ -92,7 +92,7 @@ warmup_cfg = VMCWarmupConfig(
     use_log_amp=vmc_cfg.use_log_amp,
     run_sampling=True,
     run_locE=True,
-    run_grad=False,
+    run_grad=True,
 )
 
 
@@ -101,12 +101,12 @@ def main():
     torch.set_default_dtype(dtype)
 
     try:
-        rank, world_size, device = setup_distributed(cpu=True)
+        rank, world_size, device = setup_distributed(cpu=False)
         torch.set_default_device(device)
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 16, 12
+        Lx, Ly = 16, 8
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
