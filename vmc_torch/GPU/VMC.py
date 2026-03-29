@@ -243,11 +243,19 @@ class VMC_GPU:
                     )
                 t1 = time.time()
             if run_locE:
-                _, evals = self.evaluate_energy_fn(
+                energy_result = self.evaluate_energy_fn(
                     fxs, model, hamiltonian, amps_out,
-                    verbose=config.verbose,
                     use_log_amp=use_log_amp,
+                    verbose=config.verbose,
+                    return_bMPS=True,
                 )
+                if len(energy_result) == 4:
+                    _, local_E, bMPS_x, bMPS_y = energy_result
+                elif len(energy_result) == 3:
+                    _, local_E, bMPS_x = energy_result
+                else:
+                    _, local_E = energy_result
+                    bMPS_x = None
                 if rank == 0 and config.verbose:
                     print(
                         f"  evaluate_energy: "
@@ -255,7 +263,7 @@ class VMC_GPU:
                     )
         # Free inference-phase tensors before grad computation
         try:
-            del amps_out, evals
+            del amps_out, local_E
             torch.cuda.empty_cache()
         except Exception:
             pass
@@ -272,6 +280,7 @@ class VMC_GPU:
                 offload_to_cpu=offload_grad_cpu,
                 verbose=config.verbose,
                 use_log_amp=use_log_amp,
+                bMPS_params_x=bMPS_x,
             )
         if rank == 0 and config.verbose:
             print(

@@ -70,10 +70,10 @@ class ReuseCfg(VMCConfig):
     use_x_only: bool = True
 
 vmc_cfg = ReuseCfg(
-    batch_size=1,
-    ns_per_rank=1,
-    grad_batch_size=1,
-    vmc_steps=1,
+    batch_size=10,
+    ns_per_rank=10,
+    grad_batch_size=10,
+    vmc_steps=0,
     burn_in_steps=0,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
@@ -159,7 +159,7 @@ def main():
                 'equalize_norms': 1.0,
                 'canonize': True,
             },
-            bold=False,
+            bold=True,
         )
         model.to(device)
 
