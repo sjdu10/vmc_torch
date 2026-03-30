@@ -1492,6 +1492,9 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         self.bMPS_params_x_in_dims = qu.utils.tree_map(
             lambda _: 0, bMPS_params_dict
         )
+        # Reference params for creating placeholders with
+        # matching pytree structure (used by sides= option)
+        self._bMPS_x_ref_params = bMPS_params_dict
 
         # Detect raw (single-row, D-bonded) x-envs:
         # ('xmin', 1) = row 0 only, ('xmax', Lx-2) = last row
@@ -1518,6 +1521,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         self.bMPS_params_y_in_dims = qu.utils.tree_map(
             lambda _: 0, bMPS_params_dict
         )
+        self._bMPS_y_ref_params = bMPS_params_dict
 
         self._raw_bMPS_y_keys = set()
         if self.Ly >= 3:
@@ -1608,10 +1612,18 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         return results['x'], results['y']
 
     def _cache_bMPS_params_any_direction_vmap_eager(
-        self, x, direction='x',
+        self, x, direction='x', sides='both',
     ):
         """Eager vmap implementation of
         cache_bMPS_params_any_direction_vmap.
+
+        Args:
+            x: (B, N_sites) int64
+            direction: 'x' or 'y'
+            sides: 'both', 'xmin', 'xmax', 'ymin', 'ymax'
+                If not 'both', only compute envs from that side
+                and fill the opposite side with empty-TN
+                placeholders.
         """
         import quimb as qu
         import quimb.tensor as qtn
@@ -1628,15 +1640,42 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 tns.site_ind(site): x_single[i]
                 for i, site in enumerate(tns.sites)
             })
-            env_x = amp.compute_x_environments(
-                max_bond=self.chi, cutoff=0.0,
-                **self.contract_boundary_opts,
-            )
-            amp_val = (
-                env_x[('xmin', self.Lx // 2)]
-                | env_x[('xmax', self.Lx // 2 - 1)]
-            ).contract()
-            bMPS_x = {}
+            if sides == 'both':
+                env_x = amp.compute_x_environments(
+                    max_bond=self.chi, cutoff=0.0,
+                    **self.contract_boundary_opts,
+                )
+            elif sides == 'xmax':
+                env_x = amp.compute_xmax_environments(
+                    max_bond=self.chi, cutoff=0.0,
+                    **self.contract_boundary_opts,
+                )
+            elif sides == 'xmin':
+                env_x = amp.compute_xmin_environments(
+                    max_bond=self.chi, cutoff=0.0,
+                    **self.contract_boundary_opts,
+                )
+
+            # Amplitude: use the non-empty side
+            if sides == 'xmax':
+                amp_val = (
+                    amp.select(tns.row_tag(0))
+                    | env_x[('xmax', 0)]
+                ).contract()
+            elif sides == 'xmin':
+                amp_val = (
+                    env_x[('xmin', self.Lx - 1)]
+                    | amp.select(tns.row_tag(self.Lx - 1))
+                ).contract()
+            else:
+                amp_val = (
+                    env_x[('xmin', self.Lx // 2)]
+                    | env_x[('xmax', self.Lx // 2 - 1)]
+                ).contract()
+
+            # Start from ref params (correct pytree shape),
+            # overwrite with real computed envs
+            bMPS_x = dict(self._bMPS_x_ref_params)
             for key, btn in env_x.items():
                 bMPS_x[key] = (
                     get_params_ftn(btn),
@@ -1652,15 +1691,41 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 tns.site_ind(site): x_single[i]
                 for i, site in enumerate(tns.sites)
             })
-            env_y = amp.compute_y_environments(
-                max_bond=self.chi, cutoff=0.0,
-                **self.contract_boundary_opts,
-            )
-            amp_val = (
-                env_y[('ymin', self.Ly // 2)]
-                | env_y[('ymax', self.Ly // 2 - 1)]
-            ).contract()
-            bMPS_y = {}
+            if sides == 'both':
+                env_y = amp.compute_y_environments(
+                    max_bond=self.chi, cutoff=0.0,
+                    **self.contract_boundary_opts,
+                )
+            elif sides == 'ymax':
+                env_y = amp.compute_ymax_environments(
+                    max_bond=self.chi, cutoff=0.0,
+                    **self.contract_boundary_opts,
+                )
+            elif sides == 'ymin':
+                env_y = amp.compute_ymin_environments(
+                    max_bond=self.chi, cutoff=0.0,
+                    **self.contract_boundary_opts,
+                )
+
+            if sides == 'ymax':
+                amp_val = (
+                    amp.select(tns.col_tag(0))
+                    | env_y[('ymax', 0)]
+                ).contract()
+            elif sides == 'ymin':
+                amp_val = (
+                    env_y[('ymin', self.Ly - 1)]
+                    | amp.select(tns.col_tag(self.Ly - 1))
+                ).contract()
+            else:
+                amp_val = (
+                    env_y[('ymin', self.Ly // 2)]
+                    | env_y[('ymax', self.Ly // 2 - 1)]
+                ).contract()
+
+            # Start from ref params (correct pytree shape),
+            # overwrite with real computed envs
+            bMPS_y = dict(self._bMPS_y_ref_params)
             for key, btn in env_y.items():
                 bMPS_y[key] = (
                     get_params_ftn(btn),
@@ -1678,7 +1743,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             )(x, params)
 
     def cache_bMPS_params_any_direction_vmap(
-        self, x, direction='x',
+        self, x, direction='x', sides='both',
     ):
         """Compute batched bMPS params for one direction
         + amplitudes.
@@ -1688,6 +1753,9 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         Args:
             x: (B, N_sites) int64
             direction: 'x' or 'y'
+            sides: 'both', 'xmin', 'xmax', 'ymin', 'ymax'
+                If not 'both', only compute envs from that
+                side (saves ~half the caching time).
 
         Returns:
             (bMPS_params_dict, amp_vals)
@@ -1696,7 +1764,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             return (
                 self
                 ._cache_bMPS_params_any_direction_vmap_eager(
-                    x, direction,
+                    x, direction, sides=sides,
                 )
             )
 
