@@ -206,7 +206,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         self.Ly = tn.Ly
         self.chi = max_bond
         self.debug = kwargs.get('debug', False)
-        self.bold = bold # whether to aggresively do exact contraction for 3-row TN - for GPU this is often faster than doing SVD with small bond dimension
+        self.bold = bold # whether to aggresively do exact contraction, if True: do exact contraction for any assembly of bMPS and row TN (can have 3,4 rows); if 3, exact contract only when 3 rows
 
         # bMPS skeleton/in_dims dicts — populated by cache_bMPS_skeleton
         self.bMPS_x_skeletons = {}
@@ -395,29 +395,63 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 site_ind_id=tns._site_ind_id,
             )
             if self.chi > 0:
-                if len(amp_reuse.tensors) > 2 * self.Ly:
-                    # Skip boundary contraction when either
-                    # env is a raw row (D bonds). The small
-                    # SVDs are very slow under torch.vmap.
-                    # Let cotengra contract all tensors
-                    # directly instead.
+                if len(amp_reuse.tensors) > 2 * self.Ly and (self.bold is not True):
                     has_raw = (
                         bMPS_keys[0] in self._raw_bMPS_x_keys
                         or bMPS_keys[1]
                         in self._raw_bMPS_x_keys
                     )
-                    if not has_raw and not self.bold:
-                        amp_reuse.contract_boundary_from_xmin_(
+
+                    if has_raw:
+                        is_xmin_bmps = bMPS_keys[0] in self._raw_bMPS_x_keys
+                        is_xmax_bmps = bMPS_keys[1] in self._raw_bMPS_x_keys
+                        if is_xmin_bmps:
+                            amp_reuse.contract_boundary_from_xmin_(
+                                max_bond=self.chi, cutoff=0.0,
+                                xrange=[
+                                    bMPS_keys[0][1]-1,
+                                    bMPS_keys[0][1],
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+                        elif is_xmax_bmps:
+                            amp_reuse.contract_boundary_from_xmax_(
+                                max_bond=self.chi, cutoff=0.0,
+                                xrange=[
+                                    bMPS_keys[1][1]+1,
+                                    bMPS_keys[1][1],
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+
+                    if len(amp_reuse.tensors) == 4 * self.Ly:  # exactly 4 rows
+                        amp_reuse.contract_boundary_from_xmax_(
                             max_bond=self.chi, cutoff=0.0,
                             xrange=[
-                                bMPS_keys[0][1],
-                                min(
-                                    bMPS_keys[0][1] + 1,
-                                    self.Lx - 1,
+                                bMPS_keys[1][1]+1,
+                                max(
+                                    bMPS_keys[1][1],
+                                    0,
                                 ),
                             ],
                             **self.contract_boundary_opts,
                         )
+
+                    if len(amp_reuse.tensors) == 3 * self.Ly:  # exactly 3 rows
+                        if self.bold == 3:
+                            pass
+                        else:
+                            amp_reuse.contract_boundary_from_xmin_(
+                                max_bond=self.chi, cutoff=0.0,
+                                xrange=[
+                                    bMPS_keys[0][1],
+                                    min(
+                                        bMPS_keys[0][1] + 1,
+                                        self.Lx - 1,
+                                    ),
+                                ],
+                                **self.contract_boundary_opts,
+                            )
             return amp_reuse.contract()
 
         # y-environment reuse
@@ -449,24 +483,63 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 site_ind_id=tns._site_ind_id,
             )
             if self.chi > 0:
-                if len(amp_reuse.tensors) > 2 * self.Lx:
+                if len(amp_reuse.tensors) > 2 * self.Lx and (self.bold is not True):
                     has_raw = (
                         bMPS_keys[0] in self._raw_bMPS_y_keys
                         or bMPS_keys[1]
                         in self._raw_bMPS_y_keys
                     )
-                    if not has_raw and not self.bold:
-                        amp_reuse.contract_boundary_from_ymin_(
+
+                    if has_raw:
+                        is_ymin_bmps = bMPS_keys[0] in self._raw_bMPS_y_keys
+                        is_ymax_bmps = bMPS_keys[1] in self._raw_bMPS_y_keys
+                        if is_ymin_bmps:
+                            amp_reuse.contract_boundary_from_ymin_(
+                                max_bond=self.chi, cutoff=0.0,
+                                yrange=[
+                                    bMPS_keys[0][1]-1,
+                                    bMPS_keys[0][1],
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+                        elif is_ymax_bmps:
+                            amp_reuse.contract_boundary_from_ymax_(
+                                max_bond=self.chi, cutoff=0.0,
+                                yrange=[
+                                    bMPS_keys[1][1]+1,
+                                    bMPS_keys[1][1],
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+
+                    if len(amp_reuse.tensors) == 4 * self.Lx:  # exactly 4 cols
+                        amp_reuse.contract_boundary_from_ymax_(
                             max_bond=self.chi, cutoff=0.0,
                             yrange=[
-                                bMPS_keys[0][1],
-                                min(
-                                    bMPS_keys[0][1] + 1,
-                                    self.Ly - 1,
+                                bMPS_keys[1][1]+1,
+                                max(
+                                    bMPS_keys[1][1],
+                                    0,
                                 ),
                             ],
                             **self.contract_boundary_opts,
                         )
+
+                    if len(amp_reuse.tensors) == 3 * self.Lx:  # exactly 3 cols
+                        if self.bold == 3:
+                            pass
+                        else:
+                            amp_reuse.contract_boundary_from_ymin_(
+                                max_bond=self.chi, cutoff=0.0,
+                                yrange=[
+                                    bMPS_keys[0][1],
+                                    min(
+                                        bMPS_keys[0][1] + 1,
+                                        self.Ly - 1,
+                                    ),
+                                ],
+                                **self.contract_boundary_opts,
+                            )
             return amp_reuse.contract()
 
         # Full contraction fallback
@@ -542,24 +615,65 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 site_ind_id=tns._site_ind_id,
             )
             if self.chi > 0:
-                if len(amp_reuse.tensors) > 2 * self.Ly:
+                if len(amp_reuse.tensors) > 2 * self.Ly and (self.bold is not True):
                     has_raw = (
                         bMPS_keys[0] in self._raw_bMPS_x_keys
                         or bMPS_keys[1]
                         in self._raw_bMPS_x_keys
                     )
-                    if not has_raw and not self.bold:
-                        amp_reuse.contract_boundary_from_xmin_(
+                            
+                    if has_raw:
+                        is_xmin_bmps = bMPS_keys[0] in self._raw_bMPS_x_keys
+                        is_xmax_bmps = bMPS_keys[1] in self._raw_bMPS_x_keys
+                        if is_xmin_bmps:
+                            amp_reuse.contract_boundary_from_xmin_(
+                                max_bond=self.chi, cutoff=0.0,
+                                xrange=[
+                                    bMPS_keys[0][1]-1,
+                                    bMPS_keys[0][1],
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+                        elif is_xmax_bmps:
+                            amp_reuse.contract_boundary_from_xmax_(
+                                max_bond=self.chi, cutoff=0.0,
+                                xrange=[
+                                    bMPS_keys[1][1]+1,
+                                    bMPS_keys[1][1],
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+                            
+                    if len(amp_reuse.tensors) == 4 * self.Ly:  # exactly 4 rows
+                        amp_reuse.contract_boundary_from_xmax_(
                             max_bond=self.chi, cutoff=0.0,
                             xrange=[
-                                bMPS_keys[0][1],
-                                min(
-                                    bMPS_keys[0][1] + 1,
-                                    self.Lx - 1,
+                                bMPS_keys[1][1]+1,
+                                max(
+                                    bMPS_keys[1][1],
+                                    0,
                                 ),
                             ],
                             **self.contract_boundary_opts,
                         )
+                        
+                    if len(amp_reuse.tensors) == 3 * self.Ly:  # exactly 3 rows
+                        if self.bold == 3:
+                            # exactly contract the 3-row TN without SVDs - often faster on GPU than doing SVD with small bond dimension
+                            pass
+                        else:
+                            amp_reuse.contract_boundary_from_xmin_(
+                                max_bond=self.chi, cutoff=0.0,
+                                xrange=[
+                                    bMPS_keys[0][1],
+                                    min(
+                                        bMPS_keys[0][1] + 1,
+                                        self.Lx - 1,
+                                    ),
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+                    
             sign, exp10 = amp_reuse.contract(
                 strip_exponent=True,
             )
@@ -595,24 +709,64 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
                 site_ind_id=tns._site_ind_id,
             )
             if self.chi > 0:
-                if len(amp_reuse.tensors) > 2 * self.Lx:
+                if len(amp_reuse.tensors) > 2 * self.Lx and (self.bold is not True):
                     has_raw = (
                         bMPS_keys[0] in self._raw_bMPS_y_keys
                         or bMPS_keys[1]
                         in self._raw_bMPS_y_keys
                     )
-                    if not has_raw and not self.bold:
-                        amp_reuse.contract_boundary_from_ymin_(
+
+                    if has_raw:
+                        is_ymin_bmps = bMPS_keys[0] in self._raw_bMPS_y_keys
+                        is_ymax_bmps = bMPS_keys[1] in self._raw_bMPS_y_keys
+                        if is_ymin_bmps:
+                            amp_reuse.contract_boundary_from_ymin_(
+                                max_bond=self.chi, cutoff=0.0,
+                                yrange=[
+                                    bMPS_keys[0][1]-1,
+                                    bMPS_keys[0][1],
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+                        elif is_ymax_bmps:
+                            amp_reuse.contract_boundary_from_ymax_(
+                                max_bond=self.chi, cutoff=0.0,
+                                yrange=[
+                                    bMPS_keys[1][1]+1,
+                                    bMPS_keys[1][1],
+                                ],
+                                **self.contract_boundary_opts,
+                            )
+
+                    if len(amp_reuse.tensors) == 4 * self.Lx:  # exactly 4 cols
+                        amp_reuse.contract_boundary_from_ymax_(
                             max_bond=self.chi, cutoff=0.0,
                             yrange=[
-                                bMPS_keys[0][1],
-                                min(
-                                    bMPS_keys[0][1] + 1,
-                                    self.Ly - 1,
+                                bMPS_keys[1][1]+1,
+                                max(
+                                    bMPS_keys[1][1],
+                                    0,
                                 ),
                             ],
                             **self.contract_boundary_opts,
                         )
+
+                    if len(amp_reuse.tensors) == 3 * self.Lx:  # exactly 3 cols
+                        if self.bold == 3:
+                            # exactly contract the 3-col TN without SVDs - often faster on GPU than doing SVD with small bond dimension
+                            pass
+                        else:
+                            amp_reuse.contract_boundary_from_ymin_(
+                                max_bond=self.chi, cutoff=0.0,
+                                yrange=[
+                                    bMPS_keys[0][1],
+                                    min(
+                                        bMPS_keys[0][1] + 1,
+                                        self.Ly - 1,
+                                    ),
+                                ],
+                                **self.contract_boundary_opts,
+                            )
             sign, exp10 = amp_reuse.contract(
                 strip_exponent=True,
             )
