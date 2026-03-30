@@ -1296,33 +1296,28 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         """
         import quimb as qu
 
-        # Determine the reuse key
+        # Determine the reuse key and extract bMPS boundary params
+        key = None
+        bMPS_keys = None
+        bMPS_params_xmin = bMPS_params_xmax = None
+        bMPS_params_ymin = bMPS_params_ymax = None
+
         if selected_rows is not None:
             key = ('x', tuple(selected_rows))
             bMPS_keys = [
                 ('xmin', min(selected_rows)),
                 ('xmax', max(selected_rows)),
             ]
-            bMPS_params_xmin = bMPS_params_x_batched[
-                bMPS_keys[0]
-            ]
-            bMPS_params_xmax = bMPS_params_x_batched[
-                bMPS_keys[1]
-            ]
+            bMPS_params_xmin = bMPS_params_x_batched[bMPS_keys[0]]
+            bMPS_params_xmax = bMPS_params_x_batched[bMPS_keys[1]]
         elif selected_cols is not None:
             key = ('y', tuple(selected_cols))
             bMPS_keys = [
                 ('ymin', min(selected_cols)),
                 ('ymax', max(selected_cols)),
             ]
-            bMPS_params_ymin = bMPS_params_y_batched[
-                bMPS_keys[0]
-            ]
-            bMPS_params_ymax = bMPS_params_y_batched[
-                bMPS_keys[1]
-            ]
-        else:
-            key = None
+            bMPS_params_ymin = bMPS_params_y_batched[bMPS_keys[0]]
+            bMPS_params_ymax = bMPS_params_y_batched[bMPS_keys[1]]
 
         # Try compiled path (only when exported for amplitude, not log)
         if (
@@ -1357,35 +1352,6 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             )
 
         # Fallback to eager
-        bMPS_params_xmin = None
-        bMPS_params_xmax = None
-        bMPS_params_ymin = None
-        bMPS_params_ymax = None
-        bMPS_keys = None
-
-        if selected_rows is not None:
-            bMPS_keys = [
-                ('xmin', min(selected_rows)),
-                ('xmax', max(selected_rows)),
-            ]
-            bMPS_params_xmin = bMPS_params_x_batched[
-                bMPS_keys[0]
-            ]
-            bMPS_params_xmax = bMPS_params_x_batched[
-                bMPS_keys[1]
-            ]
-        if selected_cols is not None:
-            bMPS_keys = [
-                ('ymin', min(selected_cols)),
-                ('ymax', max(selected_cols)),
-            ]
-            bMPS_params_ymin = bMPS_params_y_batched[
-                bMPS_keys[0]
-            ]
-            bMPS_params_ymax = bMPS_params_y_batched[
-                bMPS_keys[1]
-            ]
-
         return self.vamp_reuse(
             x, self.params,
             bMPS_keys=bMPS_keys,
@@ -1417,33 +1383,28 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         """
         import quimb as qu
 
-        # Determine the reuse key
+        # Determine the reuse key and extract bMPS boundary params
+        key = None
+        bMPS_keys = None
+        bMPS_params_xmin = bMPS_params_xmax = None
+        bMPS_params_ymin = bMPS_params_ymax = None
+
         if selected_rows is not None:
             key = ('x', tuple(selected_rows))
             bMPS_keys = [
                 ('xmin', min(selected_rows)),
                 ('xmax', max(selected_rows)),
             ]
-            bMPS_params_xmin = bMPS_params_x_batched[
-                bMPS_keys[0]
-            ]
-            bMPS_params_xmax = bMPS_params_x_batched[
-                bMPS_keys[1]
-            ]
+            bMPS_params_xmin = bMPS_params_x_batched[bMPS_keys[0]]
+            bMPS_params_xmax = bMPS_params_x_batched[bMPS_keys[1]]
         elif selected_cols is not None:
             key = ('y', tuple(selected_cols))
             bMPS_keys = [
                 ('ymin', min(selected_cols)),
                 ('ymax', max(selected_cols)),
             ]
-            bMPS_params_ymin = bMPS_params_y_batched[
-                bMPS_keys[0]
-            ]
-            bMPS_params_ymax = bMPS_params_y_batched[
-                bMPS_keys[1]
-            ]
-        else:
-            key = None
+            bMPS_params_ymin = bMPS_params_y_batched[bMPS_keys[0]]
+            bMPS_params_ymax = bMPS_params_y_batched[bMPS_keys[1]]
 
         # Try compiled path (only when exported for log-amp)
         if (
@@ -1478,35 +1439,6 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
             )
 
         # Fallback to eager
-        bMPS_params_xmin = None
-        bMPS_params_xmax = None
-        bMPS_params_ymin = None
-        bMPS_params_ymax = None
-        bMPS_keys = None
-
-        if selected_rows is not None:
-            bMPS_keys = [
-                ('xmin', min(selected_rows)),
-                ('xmax', max(selected_rows)),
-            ]
-            bMPS_params_xmin = bMPS_params_x_batched[
-                bMPS_keys[0]
-            ]
-            bMPS_params_xmax = bMPS_params_x_batched[
-                bMPS_keys[1]
-            ]
-        if selected_cols is not None:
-            bMPS_keys = [
-                ('ymin', min(selected_cols)),
-                ('ymax', max(selected_cols)),
-            ]
-            bMPS_params_ymin = bMPS_params_y_batched[
-                bMPS_keys[0]
-            ]
-            bMPS_params_ymax = bMPS_params_y_batched[
-                bMPS_keys[1]
-            ]
-
         return self.vamp_reuse_log(
             x, self.params,
             bMPS_keys=bMPS_keys,
