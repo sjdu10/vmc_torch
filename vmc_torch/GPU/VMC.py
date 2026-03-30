@@ -267,21 +267,28 @@ class VMC_GPU:
             torch.cuda.empty_cache()
         except Exception:
             pass
-
-        if not run_grad:
-            return fxs
+        
         t2 = time.time()
-        with torch.enable_grad():
-            grads, grads_aux = self.compute_grads_fn(
-                fxs, model,
-                vectorize=True,
-                batch_size=config.grad_batch_size,
-                vmap_grad=True,
-                offload_to_cpu=offload_grad_cpu,
-                verbose=config.verbose,
-                use_log_amp=use_log_amp,
-                bMPS_params_x=bMPS_x,
-            )
+        if run_grad:
+            with torch.enable_grad():
+                grads, grads_aux = self.compute_grads_fn(
+                    fxs, model,
+                    vectorize=True,
+                    batch_size=config.grad_batch_size,
+                    vmap_grad=True,
+                    offload_to_cpu=offload_grad_cpu,
+                    verbose=config.verbose,
+                    use_log_amp=use_log_amp,
+                    bMPS_params_x=bMPS_x,
+                )
+                # analyze grad stats
+                g_rms = (
+                    torch.norm(grads).item()
+                    / grads.numel() ** 0.5
+                )
+                del grads, grads_aux
+                torch.cuda.empty_cache()
+        
         if rank == 0 and config.verbose:
             print(
                 f"  compute_grads:   "
@@ -291,19 +298,14 @@ class VMC_GPU:
                 f"  Warmup total:    "
                 f"{time.time() - t_warm:.2f}s"
             )
-            # analyze grad stats
-            g_rms = (
-                torch.norm(grads).item()
-                / grads.numel() ** 0.5
-            )
-            print(
-                f"  [dbg] log_psi_grad: "
-                f"rms={g_rms:.4e}, "
-                f"max={grads.abs().max().item():.4e}"
-            )
+            if run_grad:
+                print(
+                    f"  [dbg] log_psi_grad: "
+                    f"rms={g_rms:.4e}, "
+                    f"max={grads.abs().max().item():.4e}"
+                )
 
-        del grads, grads_aux
-        torch.cuda.empty_cache()
+        
         return fxs
 
     # ==========================================================
