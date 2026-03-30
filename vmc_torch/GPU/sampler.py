@@ -461,7 +461,7 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
             t0 = time.time()
         bMPS_x, current_amps = (
             model.cache_bMPS_params_any_direction_vmap(
-                fxs, direction='x',
+                fxs, direction='x', sides='xmax',
             )
         )
         if use_log_amp:
@@ -571,7 +571,7 @@ class MetropolisExchangeSpinfulSamplerReuse_GPU(SamplerGPU):
             t0 = time.time()
         bMPS_y, current_amps = (
             model.cache_bMPS_params_any_direction_vmap(
-                fxs, direction='y',
+                fxs, direction='y', sides='ymax',
             )
         )
         if use_log_amp:
@@ -1607,7 +1607,7 @@ class MetropolisExchangeSpinfulSamplerXReuse_GPU(SamplerGPU):
             t0 = time.time()
         bMPS_x, current_amps = (
             model.cache_bMPS_params_any_direction_vmap(
-                fxs, direction='x',
+                fxs, direction='x', sides='xmax',
             )
         )
         if use_log_amp:
