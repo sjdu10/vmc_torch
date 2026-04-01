@@ -729,10 +729,10 @@ def size_aware_svd(
             finally:
                 torch.backends.cuda.preferred_linalg_library(prev)
     elif backend == 'cuSOLVER':
-        if x.is_cuda and n > 32:
-            return RobustSVD_EIG.apply(
-                x, jitter, driver, nonuniform_diag,
-            )
+        # if x.is_cuda and n > 32:
+        return RobustSVD_EIG.apply(
+            x, jitter, driver, nonuniform_diag,
+        )
     else:
         raise ValueError(f"Unsupported backend: {backend}")
 

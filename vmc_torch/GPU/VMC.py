@@ -229,6 +229,7 @@ class VMC_GPU:
         t_warm = time.time()
 
         with torch.inference_mode():
+            bMPS_x = None
             if run_sampling:
                 fxs, amps_out = self.sampler.step(
                     fxs, model, graph,
@@ -255,7 +256,6 @@ class VMC_GPU:
                     _, local_E, bMPS_x = energy_result
                 else:
                     _, local_E = energy_result
-                    bMPS_x = None
                 if rank == 0 and config.verbose:
                     print(
                         f"  evaluate_energy: "
@@ -286,8 +286,6 @@ class VMC_GPU:
                     torch.norm(grads).item()
                     / grads.numel() ** 0.5
                 )
-                del grads, grads_aux
-                torch.cuda.empty_cache()
         
         if rank == 0 and config.verbose:
             print(
@@ -305,6 +303,9 @@ class VMC_GPU:
                     f"max={grads.abs().max().item():.4e}"
                 )
 
+        if run_grad:
+            del grads, grads_aux
+        torch.cuda.empty_cache()
         
         return fxs
 

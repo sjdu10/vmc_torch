@@ -17,8 +17,12 @@ DEFAULT_DATA_ROOT = (
 
 
 def setup_linalg_hooks(
-    jitter=1e-16, driver=None,
-    qr_via_eigh=True, cholesky_qr=False,
+    random_truncated_svd=False,
+    jitter=1e-16, 
+    driver=None,
+    
+    qr_via_eigh=True, 
+    cholesky_qr=False,
     cholesky_qr_adaptive_jitter=False,
     nonuniform_diag=False,
 ):
@@ -30,14 +34,23 @@ def setup_linalg_hooks(
             degeneracies.  Stabilizes backward for matrices with
             repeated or near-degenerate singular values.
     """
-    ar.register_function(
-        'torch',
-        'linalg.svd',
-        lambda x: size_aware_svd(
-            x, jitter=jitter, driver=driver,
-            nonuniform_diag=nonuniform_diag,
-        ),
-    )
+    if random_truncated_svd:
+        from symmray.linalg import svd_rand_truncated
+        from functools import partial
+        svd_rand_truncated_new = partial(
+            svd_rand_truncated,
+            seed=42,
+        )
+        ar.register_function("symmray", "svd_truncated", svd_rand_truncated_new)
+    else:
+        ar.register_function(
+            'torch',
+            'linalg.svd',
+            lambda x: size_aware_svd(
+                x, jitter=jitter, driver=driver,
+                nonuniform_diag=nonuniform_diag,
+            ),
+        )
     if qr_via_eigh and cholesky_qr:
         raise ValueError(
             "Cannot use both qr_via_eigh and cholesky_qr."

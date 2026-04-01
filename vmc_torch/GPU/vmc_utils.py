@@ -1581,12 +1581,19 @@ def compute_grads_gpu(
 
         # Write to output buffer
         if offload_to_cpu:
-            batched_grads_vec[b_start:b_end] = flat_c.cpu()
+            if verbose:
+                time_to_cpu = time.time()
+            batched_grads_vec[b_start:b_end].copy_(flat_c, non_blocking=True) 
             if use_log_amp:
                 signs[b_start:b_end] = sc.cpu()
                 log_abs[b_start:b_end] = lac.cpu()
             else:
                 amps[b_start:b_end] = aux_c.cpu()
+            if verbose:
+                print(
+                    f"  GPU to CPU transfer time: "
+                    f"{time.time() - time_to_cpu:.4f}s"
+                )
         else:
             batched_grads_vec[b_start:b_end] = flat_c
             if use_log_amp:
