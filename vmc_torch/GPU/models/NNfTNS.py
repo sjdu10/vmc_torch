@@ -16,6 +16,7 @@ to provide:
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ._base import WavefunctionModel_GPU
 
@@ -149,19 +150,36 @@ class _CNN_Geometric_Backflow_GPU(nn.Module):
 
         # B. Shared CNN backbone (in backbone_dtype for speed)
         in_channels = embed_dim + 2
-        cnn_layers = []
-        cnn_layers.append(nn.Conv2d(
-            in_channels, hidden_dim, kernel_size,
-            padding='same', dtype=bb_dt,
-        ))
-        cnn_layers.append(nn.GELU())
-        for _ in range(layers - 1):
-            cnn_layers.append(nn.Conv2d(
-                hidden_dim, hidden_dim, kernel_size,
+        self._use_residual = (layers > 4)
+
+        # Stem: project input channels -> hidden_dim
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                in_channels, hidden_dim, kernel_size,
                 padding='same', dtype=bb_dt,
-            ))
-            cnn_layers.append(nn.GELU())
-        self.backbone = nn.Sequential(*cnn_layers)
+            ),
+            nn.GELU(),
+        )
+
+        if self._use_residual:
+            # Residual blocks for deep backbones (layers >= 3)
+            self.res_convs = nn.ModuleList([
+                nn.Conv2d(
+                    hidden_dim, hidden_dim, kernel_size,
+                    padding='same', dtype=bb_dt,
+                )
+                for _ in range(layers - 1)
+            ])
+        else:
+            # Plain sequential for shallow backbones
+            extra = []
+            for _ in range(layers - 1):
+                extra.append(nn.Conv2d(
+                    hidden_dim, hidden_dim, kernel_size,
+                    padding='same', dtype=bb_dt,
+                ))
+                extra.append(nn.GELU())
+            self.backbone = nn.Sequential(*extra)
 
         # C. Per-geometry output heads (in dtype for TN precision).
         #    float32 backbone features get promoted automatically
@@ -225,7 +243,12 @@ class _CNN_Geometric_Backflow_GPU(nn.Module):
         h_in = torch.cat([h, coords], dim=1)
 
         # 2. Shared backbone -> (B, hidden_dim, Lx, Ly)
-        features = self.backbone(h_in)
+        features = self.stem(h_in)
+        if self._use_residual:
+            for conv in self.res_convs:
+                features = features + F.gelu(conv(features))
+        else:
+            features = self.backbone(features)
 
         # Flatten spatial: (B, N_sites, hidden_dim)
         features_flat = features.flatten(2).permute(0, 2, 1)
