@@ -7601,7 +7601,7 @@ class NeuralBackflow_spinful(wavefunctionModel):
         self.param_shapes = [param.shape for param in self.parameters()]
 
         self.model_structure = {
-            'Neuralbackflow':{'N_site': self.hilbert.size, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
+            'Neuralbackflow':{'N_site': self.hilbert.n_orbitals, 'N_fermions': self.hilbert.n_fermions, 'N_fermions_per_spin': self.hilbert.n_fermions_per_spin}
         }
 
     def amplitude(self, x, **kwargs):
@@ -7646,16 +7646,16 @@ class NNBF(wavefunctionModel):
         
         # Initialize the parameter M (N x Nf matrix)
         self.M = nn.Parameter(
-            kernel_init(torch.empty(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)) 
+            kernel_init(torch.empty(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)) 
             if kernel_init is not None 
-            else torch.randn(self.hilbert.size, self.hilbert.n_fermions, dtype=self.param_dtype)
+            else torch.randn(self.hilbert.n_orbitals, self.hilbert.n_fermions, dtype=self.param_dtype)
         )
 
         # Initialize the neural network layer, input is n and output a matrix with the same shape as M
         self.nn = nn.Sequential(
-            nn.Linear(self.hilbert.size, hidden_dim),
+            nn.Linear(self.hilbert.n_orbitals, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.hilbert.size*self.hilbert.n_fermions),
+            nn.Linear(hidden_dim, self.hilbert.n_orbitals*self.hilbert.n_fermions),
         )
 
         # Convert NNs to the appropriate data type
