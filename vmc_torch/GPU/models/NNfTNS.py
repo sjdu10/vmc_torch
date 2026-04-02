@@ -37,6 +37,73 @@ class _CNN_Geometric_Backflow_GPU(nn.Module):
     Output: (B, total_ftn_params) concatenated delta vector
 
     Ported from vmap/models/ConvNNfTNS.py::CNN_Geometric_Generator.
+
+    Structure (layers <= 4, plain sequential):
+
+        (B, N_sites) int64
+            │
+            ▼
+        ┌──────────────────────┐
+        │  Embedding(phys_dim, │
+        │    embed_dim)        │   (B, embed_dim, Lx, Ly)
+        └──────────┬───────────┘
+                   │ cat coord_grid (2 channels)
+                   ▼
+            (B, embed_dim+2, Lx, Ly)
+                   │
+        ┌──────────┴───────────┐
+        │  Conv2d → GELU       │  stem: in_ch → hidden_dim
+        ├──────────────────────┤
+        │  Conv2d → GELU       │  ×(layers-1)
+        │  Conv2d → GELU       │
+        │     ...              │
+        └──────────┬───────────┘
+                   │
+            (B, hidden_dim, Lx, Ly)
+                   │ flatten + permute
+                   ▼
+            (B, N_sites, hidden_dim)
+                   │
+          ┌────────┼────────┬─── ... ───┐
+          ▼        ▼        ▼           ▼
+       ┌──────┐┌──────┐┌──────┐    ┌──────┐
+       │Linear││Linear││Linear│    │Linear│  per-geometry
+       │(BULK)││(EDGE)││(CRNR)│...│(type) │  output heads
+       └──┬───┘└──┬───┘└──┬───┘   └──┬───┘
+          │       │       │           │
+          └───────┴───────┴─── ... ───┘
+                       │ concat + site-order permute
+                       ▼
+                (B, total_ftn_params)
+
+
+    Structure (layers > 4, residual backbone):
+
+        ... (same embedding + coord_grid) ...
+                   │
+        ┌──────────┴───────────┐
+        │  Conv2d → GELU       │  stem: in_ch → hidden_dim
+        └──────────┬───────────┘
+                   │
+              ┌────┴────┐
+              │    ▼    │
+              │ Conv2d  │
+              │    │    │
+              │  GELU   │  ×(layers-1) residual blocks
+              │    │    │
+              └──► + ◄──┘
+                   │
+              ┌────┴────┐
+              │    ▼    │
+              │ Conv2d  │
+              │    │    │
+              │  GELU   │
+              │    │    │
+              └──► + ◄──┘
+                   │
+                  ...
+                   │
+          ... (same geometry heads) ...
     """
 
     def __init__(
@@ -268,6 +335,298 @@ class _CNN_Geometric_Backflow_GPU(nn.Module):
             group_outputs.append(head(group_feats).flatten(1))
 
         # 5. Concat in group order, permute to site order
+        out_group_order = torch.cat(group_outputs, dim=1)
+        return out_group_order[:, self._site_order_idx]
+
+
+# ================================================================
+#  ViT Geometric Backflow Generator (GPU)
+# ================================================================
+
+
+class _ViT_Geometric_Backflow_GPU(nn.Module):
+    """ViT-style backflow generator with geometry-aware output heads.
+
+    Same interface as _CNN_Geometric_Backflow_GPU:
+        Input:  (B, N_sites) int64 configuration
+        Output: (B, total_ftn_params) concatenated delta vector
+
+    Uses shared embedding + learned positional encoding, a linear
+    projection to hidden_dim, then explicit pre-norm transformer
+    blocks (nn.MultiheadAttention + FFN with residual connections),
+    followed by per-geometry output heads.
+
+    Structure:
+
+        (B, N_sites) int64
+            |
+            v
+        +------------------------+
+        | Embedding(phys_dim,    |
+        |   embed_dim)           |   (B, N_sites, embed_dim)
+        +-----------+------------+
+                    | + pos_embed (1, N_sites, embed_dim)
+                    v
+            (B, N_sites, embed_dim)
+                    |
+        +-----------+------------+
+        | Linear(embed_dim,      |
+        |   hidden_dim)          |   token projection
+        +-----------+------------+
+                    |
+            (B, N_sites, hidden_dim)
+                    |
+               +----+----+
+               |    v    |
+               | LN      |
+               | MHSA    |  x layers
+               | +res    |  (nn.MultiheadAttention,
+               | LN      |   pre-norm, GELU FFN)
+               | FFN     |
+               | +res    |
+               +----+----+
+                    |
+        +-----------+------------+
+        | Final LayerNorm        |   (B, N_sites, hidden_dim)
+        +-----------+------------+
+                    |
+          +--------+--------+--- ... ---+
+          v        v        v           v
+       +------++------++------+    +------+
+       |Linear||Linear||Linear|    |Linear| per-geometry
+       |(BULK)||(EDGE)||(CRNR)|...|(type) | output heads
+       +--+---++--+---++--+---+   +--+---+
+          |       |       |           |
+          +-------+-------+--- ... ---+
+                       | concat + site-order permute
+                       v
+                (B, total_ftn_params)
+
+    Args:
+        tn: quimb fPEPS tensor network
+        embed_dim: token embedding dimension
+        hidden_dim: transformer model dimension (d_model)
+        layers: number of transformer encoder blocks
+        n_heads: number of attention heads (default 4)
+        ff_mult: FFN expansion factor (default 4,
+            so ff_dim = hidden_dim * ff_mult)
+        dtype: output precision (float64)
+        backbone_dtype: backbone precision (float32 for speed)
+    """
+
+    def __init__(
+        self,
+        tn,
+        embed_dim,
+        hidden_dim,
+        layers=2,
+        n_heads=4,
+        ff_mult=4,
+        dtype=torch.float64,
+        backbone_dtype=None,
+    ):
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        super().__init__()
+        self.dtype = dtype
+        self.backbone_dtype = backbone_dtype if backbone_dtype else dtype
+        self.Lx = tn.Lx
+        self.Ly = tn.Ly
+        self.n_sites = self.Lx * self.Ly
+        self._n_layers = layers
+
+        # --- 1. Analyze geometry and group sites ---
+        ftn_params, _ = qtn.pack(tn)
+        ftn_params_flat, _ = qu.utils.tree_flatten(
+            ftn_params, get_ref=True,
+        )
+
+        groups = {}          # {g_type: [site_idx, ...]}
+        group_output_dims = {}  # {g_type: int}
+
+        for i in range(self.n_sites):
+            x, y = divmod(i, self.Ly)
+            g_type = self._get_geometric_type(x, y)
+
+            if g_type not in groups:
+                groups[g_type] = []
+                p = ftn_params_flat[i]
+                group_output_dims[g_type] = (
+                    p.numel()
+                    if isinstance(p, torch.Tensor)
+                    else p.size
+                )
+            groups[g_type].append(i)
+
+        group_names = list(groups.keys())
+        self._n_groups = len(group_names)
+
+        # Register gather indices as buffers
+        self._gather_buf_names = []
+        for k, name in enumerate(group_names):
+            buf_name = f'_gather_{k}'
+            self._gather_buf_names.append(buf_name)
+            self.register_buffer(
+                buf_name,
+                torch.tensor(groups[name], dtype=torch.long),
+            )
+
+        # Build permutation: group-order concat -> site-order concat
+        site_order_idx = []
+        site_to_group_offset = {}
+        group_offset = 0
+        for name in group_names:
+            out_dim = group_output_dims[name]
+            for local_i, site_idx in enumerate(groups[name]):
+                start = group_offset + local_i * out_dim
+                site_to_group_offset[site_idx] = (
+                    start, out_dim,
+                )
+            group_offset += len(groups[name]) * out_dim
+
+        for site_idx in range(self.n_sites):
+            start, out_dim = site_to_group_offset[site_idx]
+            site_order_idx.extend(
+                range(start, start + out_dim),
+            )
+
+        self.register_buffer(
+            '_site_order_idx',
+            torch.tensor(site_order_idx, dtype=torch.long),
+        )
+
+        # --- 2. Network architecture ---
+        bb_dt = self.backbone_dtype
+        ff_dim = hidden_dim * ff_mult
+
+        # A. Token embedding + learned positional encoding
+        self.embedding = nn.Embedding(
+            tn.phys_dim(), embed_dim,
+        )
+        self.pos_embed = nn.Parameter(
+            torch.randn(
+                1, self.n_sites, embed_dim, dtype=bb_dt,
+            ) * 0.02,
+        )
+
+        # B. Linear projection: embed_dim -> hidden_dim
+        self.proj = nn.Linear(
+            embed_dim, hidden_dim, dtype=bb_dt,
+        )
+
+        # C. Transformer blocks (explicit components)
+        self.norms1 = nn.ModuleList([
+            nn.LayerNorm(hidden_dim, dtype=bb_dt)
+            for _ in range(layers)
+        ])
+        self.attns = nn.ModuleList([
+            nn.MultiheadAttention(
+                hidden_dim, n_heads,
+                batch_first=True, dtype=bb_dt,
+            )
+            for _ in range(layers)
+        ])
+        self.norms2 = nn.ModuleList([
+            nn.LayerNorm(hidden_dim, dtype=bb_dt)
+            for _ in range(layers)
+        ])
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, ff_dim, dtype=bb_dt),
+                nn.GELU(),
+                nn.Linear(ff_dim, hidden_dim, dtype=bb_dt),
+            )
+            for _ in range(layers)
+        ])
+
+        # D. Final LayerNorm
+        self.final_norm = nn.LayerNorm(
+            hidden_dim, dtype=bb_dt,
+        )
+
+        # E. Per-geometry output heads (in dtype for TN precision)
+        self.heads = nn.ModuleList()
+        for name in group_names:
+            self.heads.append(nn.Linear(
+                hidden_dim, group_output_dims[name], dtype=dtype,
+            ))
+
+    def _get_geometric_type(self, x, y):
+        """Classify site (x, y) into one of 9 geometric types."""
+        is_top = (x == 0)
+        is_bottom = (x == self.Lx - 1)
+        is_left = (y == 0)
+        is_right = (y == self.Ly - 1)
+
+        if is_top and is_left:
+            return "CORNER_TL"
+        if is_top and is_right:
+            return "CORNER_TR"
+        if is_bottom and is_left:
+            return "CORNER_BL"
+        if is_bottom and is_right:
+            return "CORNER_BR"
+        if is_top:
+            return "EDGE_TOP"
+        if is_bottom:
+            return "EDGE_BOTTOM"
+        if is_left:
+            return "EDGE_LEFT"
+        if is_right:
+            return "EDGE_RIGHT"
+        return "BULK"
+
+    def initialize_output_scale(self, scale):
+        """Small-init output heads so model starts near pure fPEPS."""
+        for head in self.heads:
+            nn.init.normal_(head.weight, mean=0.0, std=scale)
+            if head.bias is not None:
+                nn.init.zeros_(head.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, N_sites) int64
+
+        Returns:
+            (B, total_ftn_params) float — concatenated backflow delta
+        """
+        # 1. Token embedding + positional encoding
+        h = self.embedding(x).to(self.backbone_dtype)
+        h = h + self.pos_embed  # (B, N_sites, embed_dim)
+
+        # 2. Project to hidden_dim
+        h = self.proj(h)  # (B, N_sites, hidden_dim)
+
+        # 3. Transformer blocks (pre-norm + residual)
+        for i in range(self._n_layers):
+            # Self-attention
+            h_norm = self.norms1[i](h)
+            attn_out, _ = self.attns[i](
+                h_norm, h_norm, h_norm,
+            )
+            h = h + attn_out
+
+            # FFN
+            h = h + self.ffns[i](self.norms2[i](h))
+
+        # 4. Final LayerNorm
+        h = self.final_norm(h)  # (B, N_sites, hidden_dim)
+
+        # 5. Cast to output dtype
+        h = h.to(self.dtype)
+
+        # 6. Per-geometry heads
+        group_outputs = []
+        for buf_name, head in zip(
+            self._gather_buf_names, self.heads,
+        ):
+            gather_idx = getattr(self, buf_name)
+            group_feats = h.index_select(1, gather_idx)
+            group_outputs.append(head(group_feats).flatten(1))
+
+        # 7. Concat in group order, permute to site order
         out_group_order = torch.cat(group_outputs, dim=1)
         return out_group_order[:, self._site_order_idx]
 
@@ -998,6 +1357,76 @@ class Conv2D_Geometric_fPEPS_GPU(NNfTNS_Model_GPU):
             hidden_dim=hidden_dim,
             kernel_size=kernel_size,
             layers=layers,
+            dtype=dtype,
+            backbone_dtype=backbone_dtype,
+        )
+
+        # 2. Small-init output heads
+        nn_module.initialize_output_scale(init_scale)
+
+        # 3. Delegate to base class
+        super().__init__(
+            tn=tn,
+            nn_module=nn_module,
+            max_bond=max_bond,
+            nn_eta=nn_eta,
+            dtype=dtype,
+            contract_boundary_opts=contract_boundary_opts,
+        )
+
+
+# ================================================================
+#  ViT Geometric fPEPS Model (GPU) — thin subclass
+# ================================================================
+
+
+class ViT_Geometric_fPEPS_GPU(NNfTNS_Model_GPU):
+    """NN-fPEPS with ViT-Geometric backflow for GPU VMC.
+
+    Combines a ViT (self-attention) geometric backflow network
+    with fPEPS tensor network contraction. The transformer
+    produces per-sample additive corrections to the TN parameters,
+    which are then contracted via quimb.
+
+    Args:
+        tn: quimb fPEPS tensor network
+        max_bond: boundary contraction bond dimension (chi)
+        nn_eta: scale factor for NN backflow correction
+        embed_dim: token embedding dimension
+        hidden_dim: transformer model dimension (d_model)
+        layers: number of transformer encoder blocks (default 2)
+        n_heads: number of attention heads (default 4)
+        ff_mult: FFN expansion factor (default 4)
+        init_scale: initial scale for output heads (default 1e-5)
+        dtype: parameter dtype (default float64)
+        backbone_dtype: dtype for transformer backbone (default
+            None = same as dtype). Set to torch.float32 for speed.
+        contract_boundary_opts: options for boundary contraction
+    """
+
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        embed_dim,
+        hidden_dim,
+        layers=2,
+        n_heads=4,
+        ff_mult=4,
+        init_scale=1e-5,
+        dtype=torch.float64,
+        backbone_dtype=None,
+        contract_boundary_opts=None,
+    ):
+        # 1. Create ViT backflow module
+        nn_module = _ViT_Geometric_Backflow_GPU(
+            tn=tn,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            layers=layers,
+            n_heads=n_heads,
+            ff_mult=ff_mult,
             dtype=dtype,
             backbone_dtype=backbone_dtype,
         )
