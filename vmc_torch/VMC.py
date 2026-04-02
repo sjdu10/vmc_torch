@@ -11,6 +11,7 @@ COMM = MPI.COMM_WORLD
 SIZE = COMM.Get_size()
 RANK = COMM.Get_rank()
 np.set_printoptions(suppress=True,precision=6,linewidth=100)
+_torch_to_numpy_dtype = {torch.float32: np.float32, torch.float64: np.float64}
 
 class VMC:
     """
@@ -139,7 +140,7 @@ class VMC:
             if step == 0:
                 # bcast the initial parameter vector to all ranks
                 initial_param_vec = self._state.params_vec.detach().numpy()
-                new_param_vec = np.empty(self._state.Np, dtype=float)
+                new_param_vec = np.empty(self._state.Np, dtype=_torch_to_numpy_dtype.get(self._state.dtype, np.float64))
                 COMM.Bcast(initial_param_vec, root=0)
                 self._state.update_state(initial_param_vec) # Reload the initial parameter vector into the quantum state
 
@@ -249,7 +250,7 @@ class VMC:
                 self._state.reset() # Clear out the gradient of the state parameters
                 
             else:
-                new_param_vec = np.empty(self._state.Np, dtype=float)
+                new_param_vec = np.empty(self._state.Np, dtype=_torch_to_numpy_dtype.get(self._state.dtype, np.float64))
                 self._state.reset()
             
             self._state.clear_memory() # Clear out the memory
