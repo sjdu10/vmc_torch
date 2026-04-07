@@ -1,21 +1,20 @@
-"""GPU VMC for spinful Fermi-Hubbard with bMPS reuse.
+"""GPU VMC for spinful Fermi-Hubbard with HOTRG contraction.
 
-Uses fPEPS_Model_reuse_GPU with cached boundary MPS environments
-for incremental updates during sampling and energy evaluation.
+Uses fPEPS_Model_HOTRG_GPU for amplitude evaluation via HOTRG
+coarse-graining instead of boundary MPS contraction.
 
 Run:
-    torchrun --nproc_per_node=<N> vmc_run_fpeps_reuse.py
-    torchrun --nproc_per_node=1 vmc_run_fpeps_reuse.py
+    torchrun --nproc_per_node=<N> vmc_run_fpeps_hotrg.py
+    torchrun --nproc_per_node=1 vmc_run_fpeps_hotrg.py
 """
 import os
 import sys
-os.environ['OMP_NUM_THREADS'] = '4'  # for better CPU multi-processing performance
-os.environ['MKL_NUM_THREADS'] = '4'  # for better CPU multi-processing performance
-os.environ['OPENBLAS_NUM_THREADS'] = '4'  # for better CPU multi-processing performance
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+os.environ['OPENBLAS_NUM_THREADS'] = '4'
 
 import torch
 import torch.distributed as dist
-
 
 from vmc_torch.GPU.VMC import (
     VMC_GPU,
@@ -28,7 +27,7 @@ from vmc_torch.GPU.hamiltonian import (
     spinful_Fermi_Hubbard_square_lattice_torch,
 )
 from vmc_torch.GPU.models import (
-    fPEPS_Model_GPU,
+    fPEPS_Model_HOTRG_GPU,
 )
 from vmc_torch.GPU.optimizer import (
     DecayScheduler,
@@ -62,9 +61,9 @@ DEFAULT_DATA_ROOT = (
 )
 
 vmc_cfg = VMCConfig(
-    batch_size=1,
-    ns_per_rank=1,
-    grad_batch_size=1,
+    batch_size=16,
+    ns_per_rank=16,
+    grad_batch_size=16,
     vmc_steps=0,
     burn_in_steps=0,
     learning_rate=0.1,
@@ -73,7 +72,7 @@ vmc_cfg = VMCConfig(
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=False,
+    use_export_compile=True,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -91,6 +90,7 @@ warmup_cfg = VMCWarmupConfig(
     run_grad=False,
 )
 
+
 def main():
     setup_linalg_hooks(
         jitter=1e-8, qr_via_eigh=True,
@@ -101,7 +101,6 @@ def main():
 
     try:
         rank, world_size, device = setup_distributed(cpu=False)
-        # device = torch.device(f"cuda:1")
         torch.set_default_device(device)
         torch.manual_seed(42 + rank)
 
@@ -110,10 +109,10 @@ def main():
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
-        N_f = N_sites - 8
+        N_f = N_sites
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 16  # PEPS bond dimension (start small)
-        chi = D  # boundary bond dim
+        D = 8
+        chi = D  # HOTRG bond dimension
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -130,7 +129,7 @@ def main():
         H.precompute_hops_gpu(device)
         graph = H.graph
 
-        # ========== Variational state (fPEPS reuse model) ==========
+        # ========== Variational state (fPEPS HOTRG model) ==========
         fpeps_base = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
             f"/N={N_f}/Z2/D={D}/"
@@ -141,40 +140,33 @@ def main():
             file_path=fpeps_base,
             scale_factor=4,
         )
-        model = fPEPS_Model_GPU(
+        model = fPEPS_Model_HOTRG_GPU(
             tn=peps,
             max_bond=chi,
             dtype=dtype,
-            contract_boundary_opts={
-                # 'mode': 'fit',
-                # 'tn_fit': 'zipup',
-                # 'bsz':2,
-                # 'max_iterations':5,
-                # 'tol':0.0,
-                'mode': 'mps',
-                'equalize_norms': 1.0,
-                'canonize': True,
-            },
         )
         model.to(device)
 
-        # ========== Load checkpoint (optional) ==========
+        # ========== Setup ==========
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"t={t}_U={U}/N={N_f}/Z2/D={D}/{model._get_name()}/chi={chi}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/"
+            f"{model._get_name()}/chi={chi}/"
         )
-        import os
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Redirect stdout/stderr to log file
         log_path = os.path.join(
             output_dir,
-            f"record_{vmc_cfg.resume_step}_B={vmc_cfg.batch_size}_{device}_mkl={os.environ['MKL_NUM_THREADS']}.txt",
+            f"record_{vmc_cfg.resume_step}"
+            f"_B={vmc_cfg.batch_size}"
+            f"_{device}"
+            f"_mkl={os.environ['MKL_NUM_THREADS']}.txt",
         )
         log_file = open(log_path, 'w', buffering=1)
         sys.stdout = log_file
         sys.stderr = log_file
-        
+
         model_name = model._get_name()
         load_checkpoint(
             model, output_dir, model_name,
@@ -189,18 +181,15 @@ def main():
             )
             print(
                 f"System: {Lx}x{Ly} Fermi-Hubbard, "
-                f"t={t}, U={U}, N_f={N_f}, D={D}, chi={chi}"
+                f"t={t}, U={U}, N_f={N_f}, D={D}, "
+                f"chi={chi} (HOTRG)"
             )
 
-        # ========== bMPS skeleton init (one-time) ==========
+        # ========== Export + compile (optional) ==========
         example_x = random_initial_config(
             N_f, N_sites, seed=0,
         ).to(device)
 
-        if rank == 0:
-            print("Initializing bMPS skeleton...")
-
-        # ========== Export + compile full contraction ==========
         if vmc_cfg.use_export_compile:
             if rank == 0:
                 print("Running torch.export + compile...")
@@ -229,11 +218,11 @@ def main():
         # ========== Stats tracking ==========
         system_str = (
             f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
-            f'N_f={N_f}, D={D}, chi={chi}'
+            f'N_f={N_f}, D={D}, chi={chi} (HOTRG)'
         )
         stats_file = make_stats_file(
             output_dir, model_name,
-            vmc_cfg.resume_step, suffix='_reuse',
+            vmc_cfg.resume_step, suffix='_hotrg',
         )
         stats = make_stats(
             system_str, N_params,
@@ -241,11 +230,9 @@ def main():
         )
 
         # ========== VMC driver ==========
-        preconditioner = make_preconditioner(vmc_cfg)
-
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
-            preconditioner=preconditioner,
+            preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
             ),

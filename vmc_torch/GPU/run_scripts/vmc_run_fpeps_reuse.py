@@ -63,12 +63,12 @@ class ReuseCfg(VMCConfig):
     use_export_compile_reuse: bool = False
     use_export_compile_cache: bool = False
     use_cheap_grad: bool = True
-    use_x_only: bool = True
+    use_x_only: bool = False
 
 vmc_cfg = ReuseCfg(
-    batch_size=64,
-    ns_per_rank=64,
-    grad_batch_size=64,
+    batch_size=1,
+    ns_per_rank=1,
+    grad_batch_size=1,
     vmc_steps=0,
     burn_in_steps=0,
     learning_rate=0.1,
@@ -150,7 +150,7 @@ def main():
                 'equalize_norms': 1.0,
                 'canonize': True,
             },
-            bold=True
+            bold=3
         )
         model.to(device)
 
@@ -190,6 +190,7 @@ def main():
         if rank == 0:
             print("Initializing bMPS skeleton...")
         model.cache_bMPS_skeleton(example_x)
+
 
         # ========== Export + compile cache (optional) ==========
         if vmc_cfg.use_export_compile_cache:

@@ -45,25 +45,24 @@ nnbackbone_dtype = torch.float64
 
 # Data paths
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
-    '/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
 )
 # SU-initialized PEPS from CPU vmap pipeline
 CPU_DATA_ROOT = DEFAULT_DATA_ROOT
 
 vmc_cfg = VMCConfig(
-    batch_size=4096*2,
-    ns_per_rank=4096*2,
-    grad_batch_size=1024*2,
-    vmc_steps=1000,
-    burn_in_steps=1,
+    batch_size=4096*3,
+    ns_per_rank=4096*3,
+    grad_batch_size=4096,
+    vmc_steps=1500,
+    burn_in_steps=10,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
     use_distributed_sr_minres=True,
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=True,
+    use_export_compile=False,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -77,8 +76,8 @@ warmup_cfg = VMCWarmupConfig(
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
     offload_grad_to_cpu=vmc_cfg.offload_grad_to_cpu,
-    run_sampling=False,
-    run_locE=False,
+    run_sampling=True,
+    run_locE=True,
     run_grad=True,
 )
 
@@ -91,7 +90,7 @@ def main():
     torch.set_default_dtype(dtype)
 
     try:
-        rank, world_size, device = setup_distributed()
+        rank, world_size, device = setup_distributed(cuda_rank=1)
         torch.set_default_device(device)
         torch.manual_seed(42 + rank)
 
@@ -110,7 +109,7 @@ def main():
         embed_dim = 16
         hidden_dim = 4*N_sites
         kernel_size = 3
-        cnn_layers = 1
+        cnn_layers = 4
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
             Lx,
@@ -202,13 +201,14 @@ def main():
                 )
 
         # ========== Setup ==========
+        model_name = model._get_name()+f'_depth={cnn_layers}_kernel={kernel_size}_hidden={hidden_dim}'
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"t={t}_U={U}/N={N_f}/Z2/D={D}/{model._get_name()}/chi={chi}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/{model_name}/chi={chi}/"
         )
         import os
         os.makedirs(output_dir, exist_ok=True)
-        model_name = model._get_name()
+        
         N_params = sum(p.numel() for p in model.parameters())
 
         load_checkpoint(
@@ -255,7 +255,7 @@ def main():
         system_str = (
             f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
             f'N_f={N_f}, D={D}, chi={chi}, '
-            f'nn_eta={nn_eta}, embed={embed_dim}, '
+            f'nn_eta={nn_eta}, embed={embed_dim}, cnn_layers={cnn_layers}, kernel={kernel_size}, '
             f'hidden={hidden_dim}, backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}'
         )
         stats_file = make_stats_file(

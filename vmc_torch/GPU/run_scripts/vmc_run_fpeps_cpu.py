@@ -100,7 +100,7 @@ def main():
     torch.set_default_dtype(dtype)
 
     try:
-        rank, world_size, device = setup_distributed(cpu=False)
+        rank, world_size, device = setup_distributed(cpu=True)
         # device = torch.device(f"cuda:1")
         torch.set_default_device(device)
         torch.manual_seed(42 + rank)
@@ -112,7 +112,7 @@ def main():
         U = 8.0
         N_f = N_sites - 8
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 16  # PEPS bond dimension (start small)
+        D = 12  # PEPS bond dimension (start small)
         chi = D  # boundary bond dim
 
         # ========== Hamiltonian ==========

@@ -8,9 +8,10 @@ Run:
     torchrun --nproc_per_node=1 vmc_run_fpeps_reuse.py
 """
 import os
-os.environ['OMP_NUM_THREADS'] = '1'  # for better CPU multi-processing performance
-os.environ['MKL_NUM_THREADS'] = '1'  # for better CPU multi-processing performance
-os.environ['OPENBLAS_NUM_THREADS'] = '1'  # for better CPU multi-processing performance
+import sys
+os.environ['OMP_NUM_THREADS'] = '4'  # for better CPU multi-processing performance
+os.environ['MKL_NUM_THREADS'] = '4'  # for better CPU multi-processing performance
+os.environ['OPENBLAS_NUM_THREADS'] = '4'  # for better CPU multi-processing performance
 from dataclasses import dataclass
 
 import torch
@@ -67,12 +68,12 @@ class ReuseCfg(VMCConfig):
     use_export_compile_reuse: bool = False
     use_export_compile_cache: bool = False
     use_cheap_grad: bool = True
-    use_x_only: bool = True
+    use_x_only: bool = False
 
 vmc_cfg = ReuseCfg(
-    batch_size=10,
-    ns_per_rank=10,
-    grad_batch_size=10,
+    batch_size=1,
+    ns_per_rank=1,
+    grad_batch_size=1,
     vmc_steps=0,
     burn_in_steps=0,
     learning_rate=0.1,
@@ -116,7 +117,7 @@ def main():
         U = 8.0
         N_f = N_sites - 24 # 24 holes
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 8  # PEPS bond dimension
+        D = 12  # PEPS bond dimension
         chi = 4*D  # boundary bond dim
 
         # ========== Hamiltonian ==========
@@ -159,7 +160,7 @@ def main():
                 'equalize_norms': 1.0,
                 'canonize': True,
             },
-            bold=True,
+            bold=3,
         )
         model.to(device)
 
@@ -169,8 +170,17 @@ def main():
             f"t={t}_U={U}/N={N_f}/Z2/D={D}/"
             f"{model._get_name()}/chi={chi}/"
         )
-        import os
         os.makedirs(output_dir, exist_ok=True)
+
+        # Redirect stdout/stderr to log file
+        log_path = os.path.join(
+            output_dir,
+            f"record_{vmc_cfg.resume_step}_mkl={os.environ['MKL_NUM_THREADS']}.txt",
+        )
+        log_file = open(log_path, 'w', buffering=1)
+        sys.stdout = log_file
+        sys.stderr = log_file
+
         model_name = model._get_name()
         N_params = sum(
             p.numel() for p in model.parameters()
@@ -331,6 +341,10 @@ def main():
     finally:
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
+        if sys.stdout is not sys.__stdout__:
+            sys.stdout.close()
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
 
 
 if __name__ == "__main__":
