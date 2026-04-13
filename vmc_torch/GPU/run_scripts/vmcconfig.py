@@ -19,6 +19,7 @@ reduce boilerplate in run scripts while keeping full flexibility
 import json
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -26,6 +27,8 @@ from vmc_torch.GPU.optimizer import (
     DistributedMinSRGPU,
     DistributedSRMinresGPU,
     MinSRGPU,
+    SPRINGMinresGPU,
+    SPRINGMinSRGPU,
 )
 
 
@@ -68,6 +71,18 @@ class VMCConfig:
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
     param_chunk_size: int = 1024
+
+    # ----- SPRING (arXiv:2401.10190) -----
+    # When use_spring=True the spring_variant chooses between the
+    # iterative (Np-form, minres) and direct (Ns-form, minsr)
+    # Kaczmarz-inspired solvers.  Setting mu=0 recovers plain
+    # MINRES / minSR exactly.  norm_constraint enforces the paper's
+    # Eq. 37 Euclidean bound ||d_theta|| <= sqrt(C) via the SGD
+    # optimizer; leave None to disable.
+    use_spring: bool = False
+    spring_variant: str = 'minsr'   # 'minsr' | 'minres'
+    spring_mu: float = 0.99
+    norm_constraint: Optional[float] = None
 
     # ----- Compile -----
     use_export_compile: bool = False
@@ -112,7 +127,28 @@ def make_preconditioner(cfg):
 
     Returns None if no SR preconditioner is selected.
     Scripts can skip this and instantiate their own.
+
+    SPRING dispatch (``cfg.use_spring=True``) takes precedence over
+    the legacy MinSR / MINRES flags.  ``cfg.spring_variant`` picks
+    between the iterative (``'minres'``) and direct (``'minsr'``)
+    Kaczmarz-inspired solvers.
     """
+    if getattr(cfg, 'use_spring', False):
+        variant = getattr(cfg, 'spring_variant', 'minsr')
+        mu = getattr(cfg, 'spring_mu', 0.99)
+        if variant == 'minsr':
+            return SPRINGMinSRGPU(mu=mu)
+        elif variant == 'minres':
+            return SPRINGMinresGPU(
+                mu=mu,
+                rtol=cfg.sr_rtol,
+                maxiter=cfg.sr_maxiter,
+            )
+        else:
+            raise ValueError(
+                f"Unknown spring_variant: {variant!r} "
+                "(expected 'minsr' or 'minres')"
+            )
     if cfg.use_distributed_min_sr:
         return DistributedMinSRGPU(
             param_chunk_size=cfg.param_chunk_size,

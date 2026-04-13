@@ -11,6 +11,8 @@ Functions:
     run_sampling_phase_gpu  — local sampling + energy + inline log_psi_grad
     distributed_minres_solver_gpu — distributed MINRES via all_reduce
     minSR_solver_gpu        — minSR direct solve (gather to rank 0)
+    spring_minres_solver_gpu — SPRING via iterative MINRES (Np-form)
+    spring_minsr_solver_gpu  — SPRING via direct Cholesky (Ns-form)
     torch_minres            — pure-PyTorch MINRES (GPU-native)
 """
 import math
@@ -532,6 +534,136 @@ def distributed_minres_solver_gpu(
 
 
 # ===========================================================================
+# SPRING Iterative Solver (Np-form, mirrors distributed_minres_solver_gpu)
+# ===========================================================================
+def spring_minres_solver_gpu(
+    local_lpg,
+    local_energies,
+    energy_mean,
+    total_samples,
+    n_params,
+    diag_shift,
+    phi_prev,
+    mu,
+    rtol=1e-4,
+    maxiter=100,
+    run_SR=True,
+):
+    """SPRING iterative solver (Np-form).
+
+    Kaczmarz-inspired extension of distributed_minres_solver_gpu.
+    Via Sherman-Morrison-Woodbury, the full-Np form of SPRING is a
+    *single RHS modification* of the MinSR/MINRES linear system:
+
+        phi_k = (S + lam I)^-1 (g + mu * lam * phi_{k-1})
+
+    where g is the centered gradient, S = O^T O is the centered Gram,
+    and lam = diag_shift.  With mu=0 this reduces exactly to MINRES.
+
+    See the derivation in
+    vmc_torch/GPU/models/theory/spring_derivation.ipynb for how this
+    Np-form is obtained from paper Eq. 33 (Goldshlager et al. 2024,
+    arXiv:2401.10190).
+
+    Args:
+        local_lpg: (n_local, Np) GPU tensor or numpy array.
+        local_energies: (n_local,) GPU tensor or numpy array.
+        energy_mean: global mean energy (float).
+        total_samples: total samples across all ranks.
+        n_params: number of parameters Np.
+        diag_shift: Tikhonov damping lam.
+        phi_prev: (Np,) torch.float64 tensor on GPU, persistent SPRING
+            state.  Caller assigns phi_prev <- dp after the call.
+        mu: Kaczmarz decay factor.  mu=0 collapses to MINRES.
+        rtol: MINRES relative tolerance.
+        maxiter: max MINRES iterations.
+        run_SR: if False, return only the energy gradient.
+
+    Returns:
+        dp: (Np,) GPU tensor — the new phi_k (gradient direction).
+        sr_time: wall-clock time (seconds).
+        info: MINRES convergence flag (0 on success).
+    """
+    t0 = time.time()
+    world_size = dist.get_world_size()
+    device = torch.device('cuda')
+
+    # Ensure inputs are GPU tensors.
+    if not isinstance(local_lpg, torch.Tensor):
+        local_lpg = torch.tensor(
+            local_lpg, device=device, dtype=torch.float64,
+        )
+    else:
+        local_lpg = local_lpg.to(
+            device=device, dtype=torch.float64,
+        )
+    if not isinstance(local_energies, torch.Tensor):
+        local_energies = torch.tensor(
+            local_energies, device=device, dtype=torch.float64,
+        )
+    else:
+        local_energies = local_energies.to(
+            device=device, dtype=torch.float64,
+        )
+    n_local = local_energies.shape[0]
+
+    # Global statistics via all_reduce on GPU.
+    if n_local > 0:
+        local_sum_lpg = local_lpg.sum(dim=0)
+        local_sum_EO = local_energies @ local_lpg
+    else:
+        local_sum_lpg = torch.zeros(
+            n_params, device=device, dtype=torch.float64,
+        )
+        local_sum_EO = torch.zeros(
+            n_params, device=device, dtype=torch.float64,
+        )
+
+    if world_size > 1:
+        dist.all_reduce(local_sum_lpg, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
+
+    mean_lpg = local_sum_lpg / total_samples
+    mean_EO = local_sum_EO / total_samples
+    energy_grad = mean_EO - energy_mean * mean_lpg  # (Np,) GPU
+
+    if not run_SR:
+        t1 = time.time()
+        return energy_grad, t1 - t0, None
+
+    # Pure-GPU MINRES with identical matvec to distributed_minres_solver_gpu.
+    if world_size == 1:
+        def gpu_matvec(x):
+            inner = local_lpg @ x
+            Sx = local_lpg.T @ inner
+            Sx /= total_samples
+            Sx -= torch.dot(mean_lpg, x) * mean_lpg
+            return Sx + diag_shift * x
+    else:
+        def gpu_matvec(x):
+            if n_local > 0:
+                inner = local_lpg @ x
+                local_Sx = local_lpg.T @ inner
+            else:
+                local_Sx = torch.zeros_like(x)
+            dist.all_reduce(local_Sx, op=dist.ReduceOp.SUM)
+            local_Sx /= total_samples
+            local_Sx -= torch.dot(mean_lpg, x) * mean_lpg
+            return local_Sx + diag_shift * x
+
+    # SPRING: the only change vs. MINRES is the right-hand side.
+    phi_prev_t = phi_prev.to(device=device, dtype=torch.float64)
+    rhs = energy_grad + (mu * diag_shift) * phi_prev_t
+
+    dp, info = torch_minres(
+        gpu_matvec, rhs, rtol=rtol, maxiter=maxiter,
+    )
+
+    t1 = time.time()
+    return dp, t1 - t0, info
+
+
+# ===========================================================================
 # MinSR Direct Solver (gather to rank 0, GPU linear algebra)
 # ===========================================================================
 def minSR_solver_gpu(
@@ -678,6 +810,148 @@ def minSR_solver_gpu(
 
         t1 = time.time()
         return energy_grad, t1 - t0, None
+
+
+# ===========================================================================
+# SPRING Direct Solver (Ns-form, mirrors minSR_solver_gpu)
+# ===========================================================================
+def spring_minsr_solver_gpu(
+    local_lpg,
+    local_energies,
+    energy_mean,
+    total_samples,
+    n_params,
+    diag_shift,
+    phi_prev,
+    mu,
+    device=None,
+    do_SR=True,
+):
+    """SPRING direct Cholesky solver (Ns-form).
+
+    Kaczmarz-inspired extension of minSR_solver_gpu: projects the
+    previous SPRING iterate phi_prev onto the current minibatch's
+    solution hyperplane of the centered SR equation.  In our sign
+    convention e = +(E_L - <E>)/sqrt(Ns), the update is
+
+        phi_k = O^T (O O^T + lam I)^-1 (e - mu * O @ phi_{k-1})
+                + mu * phi_{k-1}
+
+    where O is the centered, 1/sqrt(Ns)-scaled log-psi gradient matrix
+    of shape (Ns, Np).  See paper Eq. 33 (Goldshlager et al. 2024,
+    arXiv:2401.10190) and the full derivation in
+    vmc_torch/GPU/models/theory/spring_derivation.ipynb.
+
+    With mu=0 this collapses exactly to minSR_solver_gpu.
+
+    Args:
+        local_lpg: (n_local, Np) GPU tensor or numpy array.
+        local_energies: (n_local,) GPU tensor or numpy array.
+        energy_mean: global mean energy (float).
+        total_samples: total samples across all ranks.
+        n_params: number of parameters Np.
+        diag_shift: Tikhonov damping lam.
+        phi_prev: (Np,) torch.float64 tensor, persistent SPRING state.
+            Caller is responsible for assigning phi_prev <- dp after
+            the call.  Can be passed on any rank; only rank 0 uses it
+            in the solve, then the result is broadcast.
+        mu: Kaczmarz decay factor (e.g. 0.99).  mu=0 recovers minSR.
+        device: torch device for the solve.
+        do_SR: if False, return only the energy gradient (no phi update).
+
+    Returns:
+        dp: (Np,) numpy array — the new phi_k (gradient direction).
+        sr_time: wall-clock time (seconds).
+        info: 0 on success, 1 if lstsq fallback was used.
+    """
+    if not do_SR:
+        # No phi update — delegate to minSR's energy-gradient path.
+        return minSR_solver_gpu(
+            local_lpg=local_lpg,
+            local_energies=local_energies,
+            energy_mean=energy_mean,
+            total_samples=total_samples,
+            n_params=n_params,
+            diag_shift=diag_shift,
+            device=device,
+            do_SR=False,
+        )
+
+    t0 = time.time()
+    if device is None:
+        device = torch.device('cuda')
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    # Accept GPU tensors — skip re-upload if already on device
+    if isinstance(local_lpg, torch.Tensor):
+        local_lpg_t = local_lpg.to(
+            device=device, dtype=torch.float64
+        ).contiguous()
+        local_E_t = local_energies.to(
+            device=device, dtype=torch.float64
+        ).contiguous()
+    else:
+        local_lpg_t = torch.tensor(
+            local_lpg, device=device, dtype=torch.float64
+        ).contiguous()
+        local_E_t = torch.tensor(
+            local_energies, device=device, dtype=torch.float64
+        ).contiguous()
+
+    if world_size > 1:
+        total_lpg_t = torch.zeros(
+            (total_samples, n_params),
+            device=device, dtype=torch.float64,
+        )
+        total_E_t = torch.zeros(
+            total_samples, device=device, dtype=torch.float64,
+        )
+        dist.all_gather_into_tensor(total_lpg_t, local_lpg_t)
+        dist.all_gather_into_tensor(total_E_t, local_E_t)
+    else:
+        total_lpg_t = local_lpg_t
+        total_E_t = local_E_t
+
+    phi_prev_t = phi_prev.to(device=device, dtype=torch.float64)
+
+    info = 0
+    dp_t = torch.zeros(
+        n_params, device=device, dtype=torch.float64
+    )
+
+    if rank == 0:
+        lpg_mean = torch.mean(total_lpg_t, dim=0)
+        lpg_centered = total_lpg_t - lpg_mean.unsqueeze(0)
+        lpg_scaled = lpg_centered / np.sqrt(total_samples)
+        E_s = (total_E_t - energy_mean) / np.sqrt(total_samples)
+
+        # SPRING: subtract the projection of the previous iterate
+        # onto the current minibatch's row-space (Kaczmarz step).
+        rhs = E_s - mu * (lpg_scaled @ phi_prev_t)
+
+        T = lpg_scaled @ lpg_scaled.T
+        T += diag_shift * torch.eye(
+            total_samples, device=device, dtype=torch.float64,
+        )
+
+        try:
+            alpha = torch.linalg.solve(T, rhs)
+        except RuntimeError:
+            alpha = torch.linalg.lstsq(T, rhs).solution
+            info = 1
+
+        # SPRING: add mu * phi_prev to lift the Ns-form solution
+        # into the Np-form iterate.
+        dp_t = lpg_scaled.T @ alpha + mu * phi_prev_t
+
+    if world_size > 1:
+        dist.broadcast(dp_t, src=0)
+
+    dp = dp_t.cpu().numpy()
+    t1 = time.time()
+    return dp, t1 - t0, info
 
 
 # ===========================================================================

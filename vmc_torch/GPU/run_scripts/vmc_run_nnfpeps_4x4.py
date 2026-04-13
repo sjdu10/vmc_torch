@@ -51,9 +51,9 @@ DEFAULT_DATA_ROOT = (
 CPU_DATA_ROOT = DEFAULT_DATA_ROOT
 
 vmc_cfg = VMCConfig(
-    batch_size=4096*3,
-    ns_per_rank=4096*3,
-    grad_batch_size=4096,
+    batch_size=4096,
+    ns_per_rank=4096,
+    grad_batch_size=1024,
     vmc_steps=1500,
     burn_in_steps=10,
     learning_rate=0.1,
@@ -66,6 +66,14 @@ vmc_cfg = VMCConfig(
     save_every=10,
     resume_step=0,
     verbose=False,
+    # --- SPRING (Goldshlager et al. 2024, arXiv:2401.10190) ---
+    # Flip use_spring=True to enable; with mu=0 it is bit-equivalent
+    # to the plain MinSR / MINRES path selected above.  See
+    # GPU/models/theory/spring_derivation.ipynb for the derivation.
+    use_spring=True,
+    spring_variant='minres',   # 'minsr' (direct) | 'minres' (iterative)
+    spring_mu=0.99,
+    norm_constraint=1e-3,     # e.g. 1e-3 to enable SPRING paper Eq. 37
 )
 vmc_cfg.lr_scheduler = DecayScheduler(
     init_lr=vmc_cfg.learning_rate,
@@ -90,7 +98,7 @@ def main():
     torch.set_default_dtype(dtype)
 
     try:
-        rank, world_size, device = setup_distributed(cuda_rank=1)
+        rank, world_size, device = setup_distributed()
         torch.set_default_device(device)
         torch.manual_seed(42 + rank)
 
@@ -102,7 +110,7 @@ def main():
         N_f = N_sites - 2  # 2 holes -> 14 fermions
         n_fermions_per_spin = (N_f // 2, N_f // 2)
         D = 4   # PEPS bond dimension
-        chi = -2  # exact contraction
+        chi = -3  # exact contraction
 
         # NN backflow hyperparameters
         nn_eta = 1.0
@@ -277,6 +285,7 @@ def main():
             preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
+                norm_constraint=vmc_cfg.norm_constraint,
             ),
         )
 

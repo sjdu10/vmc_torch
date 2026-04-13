@@ -176,6 +176,26 @@ class OptimizerGPU:
 
 
 class SGDGPU(OptimizerGPU):
+    """SGD with optional Euclidean norm constraint.
+
+    If ``norm_constraint`` is not None, clip the effective learning
+    rate per step so that ``||dp_applied|| <= sqrt(norm_constraint)``.
+    Concretely, ``eff_lr = min(lr, sqrt(C) / ||direction||)``.  This
+    implements the SPRING paper's Eq. 37 norm bound
+    (arXiv:2401.10190): ``d_theta = phi * min(eta, sqrt(C)/||phi||)``.
+
+    When ``norm_constraint=None`` (default), this reduces to plain SGD
+    and is bit-equivalent to the previous behavior.
+    """
+
+    def __init__(
+        self,
+        learning_rate: float = 1e-3,
+        norm_constraint: Optional[float] = None,
+    ):
+        super().__init__(learning_rate=learning_rate)
+        self.norm_constraint = norm_constraint
+
     def compute_update(
         self,
         params_vec: torch.Tensor,
@@ -183,6 +203,15 @@ class SGDGPU(OptimizerGPU):
         learning_rate: Optional[float] = None,
     ) -> torch.Tensor:
         lr = self.lr if learning_rate is None else learning_rate
+        if self.norm_constraint is not None:
+            direction_norm = torch.linalg.vector_norm(
+                direction_vec
+            ).item()
+            if direction_norm > 0:
+                lr = min(
+                    lr,
+                    (self.norm_constraint ** 0.5) / direction_norm,
+                )
         return params_vec - lr * direction_vec
 
 
@@ -843,6 +872,230 @@ def distributed_minSR_solver_gpu(
     return dp, t1 - t0, info
 
 
+# ===========================================================================
+# SPRING Iterative Solver (Np-form, mirrors distributed_minres_solver_gpu)
+# ===========================================================================
+def spring_minres_solver_gpu(
+    local_lpg,
+    local_energies,
+    energy_mean,
+    total_samples,
+    n_params,
+    diag_shift,
+    phi_prev,
+    mu,
+    rtol=1e-4,
+    maxiter=100,
+    run_SR=True,
+    device=None,
+):
+    """SPRING iterative solver (Np-form).
+
+    Kaczmarz-inspired extension of distributed_minres_solver_gpu.
+    Via Sherman-Morrison-Woodbury, the full-Np form of SPRING is a
+    *single RHS modification* of the MinSR/MINRES linear system:
+
+        phi_k = (S + lam I)^-1 (g + mu * lam * phi_{k-1})
+
+    where g is the centered gradient, S = O^T O the centered Gram,
+    and lam = diag_shift.  With mu=0 this reduces to plain MINRES.
+
+    See the derivation in
+    vmc_torch/GPU/models/theory/spring_derivation.ipynb.
+
+    Args mirror distributed_minres_solver_gpu, plus:
+        phi_prev: (Np,) torch.float64 GPU tensor — persistent state.
+        mu: Kaczmarz decay factor.
+    """
+    t0 = time.time()
+    world_size = dist.get_world_size()
+    if device is None:
+        device = torch.device('cuda')
+
+    assert isinstance(local_lpg, torch.Tensor), \
+        "local_lpg must be a torch.Tensor"
+    assert isinstance(local_energies, torch.Tensor), \
+        "local_energies must be a torch.Tensor"
+
+    local_lpg = local_lpg.to(device=device, dtype=torch.float64)
+    local_energies = local_energies.to(
+        device=device, dtype=torch.float64,
+    )
+    n_local = local_energies.shape[0]
+
+    if n_local > 0:
+        local_sum_lpg = local_lpg.sum(dim=0)
+        local_sum_EO = local_energies @ local_lpg
+    else:
+        local_sum_lpg = torch.zeros(
+            n_params, device=device, dtype=torch.float64,
+        )
+        local_sum_EO = torch.zeros(
+            n_params, device=device, dtype=torch.float64,
+        )
+
+    if world_size > 1:
+        dist.all_reduce(local_sum_lpg, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
+
+    mean_lpg = local_sum_lpg / total_samples
+    mean_EO = local_sum_EO / total_samples
+    energy_grad = mean_EO - energy_mean * mean_lpg  # (Np,) GPU
+
+    if not run_SR:
+        t1 = time.time()
+        return energy_grad, t1 - t0, None
+
+    # Pure-GPU MINRES with identical matvec to the MINRES baseline.
+    if world_size == 1:
+        def gpu_matvec(x):
+            inner = local_lpg @ x
+            Sx = local_lpg.T @ inner
+            Sx /= total_samples
+            Sx -= torch.dot(mean_lpg, x) * mean_lpg
+            return Sx + diag_shift * x
+    else:
+        def gpu_matvec(x):
+            if n_local > 0:
+                inner = local_lpg @ x
+                local_Sx = local_lpg.T @ inner
+            else:
+                local_Sx = torch.zeros_like(x)
+            dist.all_reduce(local_Sx, op=dist.ReduceOp.SUM)
+            local_Sx /= total_samples
+            local_Sx -= torch.dot(mean_lpg, x) * mean_lpg
+            return local_Sx + diag_shift * x
+
+    # SPRING: the only change vs. MINRES is the right-hand side.
+    phi_prev_t = phi_prev.to(device=device, dtype=torch.float64)
+    rhs = energy_grad + (mu * diag_shift) * phi_prev_t
+
+    dp, info = torch_minres(
+        gpu_matvec, rhs, rtol=rtol, maxiter=maxiter,
+    )
+
+    t1 = time.time()
+    return dp, t1 - t0, info
+
+
+# ===========================================================================
+# SPRING Direct Solver (Ns-form, mirrors minSR_solver_gpu)
+# ===========================================================================
+def spring_minsr_solver_gpu(
+    local_lpg,
+    local_energies,
+    energy_mean,
+    total_samples,
+    n_params,
+    diag_shift,
+    phi_prev,
+    mu,
+    device=None,
+    do_SR=True,
+):
+    """SPRING direct Cholesky solver (Ns-form).
+
+    Kaczmarz-inspired extension of minSR_solver_gpu.  In our sign
+    convention e = +(E_L - <E>)/sqrt(Ns), the update is
+
+        phi_k = O^T (O O^T + lam I)^-1 (e - mu O phi_{k-1})
+                + mu phi_{k-1}
+
+    where O is the centered, 1/sqrt(Ns)-scaled log-psi gradient
+    matrix.  See paper Eq. 33 (Goldshlager et al. 2024,
+    arXiv:2401.10190).  With mu=0 this collapses to minSR.
+
+    Args mirror minSR_solver_gpu, plus:
+        phi_prev: (Np,) torch.float64 tensor — persistent state.
+        mu: Kaczmarz decay factor.
+    """
+    if not do_SR:
+        return minSR_solver_gpu(
+            local_lpg=local_lpg,
+            local_energies=local_energies,
+            energy_mean=energy_mean,
+            total_samples=total_samples,
+            n_params=n_params,
+            diag_shift=diag_shift,
+            device=device,
+            do_SR=False,
+        )
+
+    t0 = time.time()
+    if device is None:
+        device = torch.device('cuda')
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if isinstance(local_lpg, torch.Tensor):
+        local_lpg_t = local_lpg.to(
+            device=device, dtype=torch.float64
+        ).contiguous()
+        local_E_t = local_energies.to(
+            device=device, dtype=torch.float64
+        ).contiguous()
+    else:
+        local_lpg_t = torch.tensor(
+            local_lpg, device=device, dtype=torch.float64
+        ).contiguous()
+        local_E_t = torch.tensor(
+            local_energies, device=device, dtype=torch.float64
+        ).contiguous()
+
+    if world_size > 1:
+        total_lpg_t = torch.zeros(
+            (total_samples, n_params),
+            device=device, dtype=torch.float64,
+        )
+        total_E_t = torch.zeros(
+            total_samples, device=device, dtype=torch.float64,
+        )
+        dist.all_gather_into_tensor(total_lpg_t, local_lpg_t)
+        dist.all_gather_into_tensor(total_E_t, local_E_t)
+    else:
+        total_lpg_t = local_lpg_t
+        total_E_t = local_E_t
+
+    phi_prev_t = phi_prev.to(device=device, dtype=torch.float64)
+
+    info = 0
+    dp_t = torch.zeros(
+        n_params, device=device, dtype=torch.float64
+    )
+
+    if rank == 0:
+        lpg_mean = torch.mean(total_lpg_t, dim=0)
+        lpg_centered = total_lpg_t - lpg_mean.unsqueeze(0)
+        lpg_scaled = lpg_centered / np.sqrt(total_samples)
+        E_s = (total_E_t - energy_mean) / np.sqrt(total_samples)
+
+        # SPRING: subtract projection of previous iterate onto the
+        # current minibatch's row-space (Kaczmarz step).
+        rhs = E_s - mu * (lpg_scaled @ phi_prev_t)
+
+        T = lpg_scaled @ lpg_scaled.T
+        T += diag_shift * torch.eye(
+            total_samples, device=device, dtype=torch.float64,
+        )
+
+        try:
+            alpha = torch.linalg.solve(T, rhs)
+        except RuntimeError:
+            alpha = torch.linalg.lstsq(T, rhs).solution
+            info = 1
+
+        # SPRING: lift Ns-form solution to the Np-form iterate.
+        dp_t = lpg_scaled.T @ alpha + mu * phi_prev_t
+
+    if world_size > 1:
+        dist.broadcast(dp_t, src=0)
+
+    dp = dp_t.cpu().numpy()
+    t1 = time.time()
+    return dp, t1 - t0, info
+
+
 class DistributedSRMinresGPU(PreconditionerGPU):
     def __init__(
         self,
@@ -953,6 +1206,117 @@ class DistributedMinSRGPU(PreconditionerGPU):
         )
 
 
+class SPRINGMinresGPU(PreconditionerGPU):
+    """SPRING preconditioner using iterative MINRES on the full Np
+    operator (N_p-form).
+
+    Holds a persistent ``phi_prev`` iterate between calls that
+    implements the Kaczmarz-style recurrence from
+    Goldshlager et al. 2024 (arXiv:2401.10190).  With ``mu=0`` this is
+    bit-equivalent to ``DistributedSRMinresGPU``.
+    """
+
+    def __init__(
+        self,
+        mu: float = 0.99,
+        rtol: float = 5e-5,
+        maxiter: int = 100,
+    ):
+        self.mu = mu
+        self.rtol = rtol
+        self.maxiter = maxiter
+        self.phi_prev: Optional[torch.Tensor] = None
+
+    def solve(
+        self,
+        *,
+        local_o,
+        local_energies,
+        energy_mean: float,
+        total_samples: int,
+        n_params: int,
+        diag_shift: float,
+        device: torch.device,
+        run_sr: bool,
+    ) -> Tuple[Any, float, Any]:
+        if self.phi_prev is None:
+            self.phi_prev = torch.zeros(
+                n_params, device=device, dtype=torch.float64,
+            )
+        dp, t_sr, info = spring_minres_solver_gpu(
+            local_lpg=local_o,
+            local_energies=local_energies,
+            energy_mean=energy_mean,
+            total_samples=total_samples,
+            n_params=n_params,
+            diag_shift=diag_shift,
+            phi_prev=self.phi_prev,
+            mu=self.mu,
+            rtol=self.rtol,
+            maxiter=self.maxiter,
+            run_SR=run_sr,
+            device=device,
+        )
+        if run_sr:
+            self.phi_prev = torch.as_tensor(
+                dp, device=device, dtype=torch.float64,
+            ).clone()
+        return dp, t_sr, info
+
+    def reset(self) -> None:
+        self.phi_prev = None
+
+
+class SPRINGMinSRGPU(PreconditionerGPU):
+    """SPRING preconditioner using the direct Cholesky minSR solve
+    (N_s-form).
+
+    Holds a persistent ``phi_prev`` iterate between calls.  With
+    ``mu=0`` this is bit-equivalent to ``MinSRGPU``.
+    """
+
+    def __init__(self, mu: float = 0.99):
+        self.mu = mu
+        self.phi_prev: Optional[torch.Tensor] = None
+
+    def solve(
+        self,
+        *,
+        local_o,
+        local_energies,
+        energy_mean: float,
+        total_samples: int,
+        n_params: int,
+        diag_shift: float,
+        device: torch.device,
+        run_sr: bool,
+    ) -> Tuple[Any, float, Any]:
+        if self.phi_prev is None:
+            self.phi_prev = torch.zeros(
+                n_params, device=device, dtype=torch.float64,
+            )
+        dp, t_sr, info = spring_minsr_solver_gpu(
+            local_lpg=local_o,
+            local_energies=local_energies,
+            energy_mean=energy_mean,
+            total_samples=total_samples,
+            n_params=n_params,
+            diag_shift=diag_shift,
+            phi_prev=self.phi_prev,
+            mu=self.mu,
+            device=device,
+            do_SR=run_sr,
+        )
+        if run_sr:
+            self.phi_prev = torch.as_tensor(
+                dp, device=device, dtype=torch.float64,
+            ).clone()
+        return dp, t_sr, info
+
+    def reset(self) -> None:
+        self.phi_prev = None
+
+
 __all__ = [
     "Scheduler",
     "TrivialScheduler",
@@ -964,4 +1328,6 @@ __all__ = [
     "DistributedSRMinresGPU",
     "MinSRGPU",
     "DistributedMinSRGPU",
+    "SPRINGMinresGPU",
+    "SPRINGMinSRGPU",
 ]

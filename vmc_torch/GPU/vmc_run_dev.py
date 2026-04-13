@@ -19,6 +19,8 @@ from vmc_torch.GPU.vmc_modules import (
     run_sampling_phase_gpu,
     distributed_minres_solver_gpu,
     minSR_solver_gpu,
+    spring_minres_solver_gpu,
+    spring_minsr_solver_gpu,
 )
 from vmc_torch.GPU.models import (
     fPEPS_Model_GPU,
@@ -205,6 +207,12 @@ burn_in_steps = 0
 run_SR = True
 use_minSR = False  # False: distributed MINRES
 
+# SPRING optimizer options.  When use_spring=True, use_minSR is ignored.
+use_spring = False               # master switch for SPRING
+spring_variant = 'minsr'         # 'minsr' (direct) | 'minres' (iterative)
+spring_mu = 0.99                 # Kaczmarz decay factor
+norm_constraint = None           # Euclidean norm bound C; None to disable
+
 # Output paths
 output_dir = (
     f"{pwd}/GPU/{Lx}x{Ly}/t=1.0_U=8.0/N={N_f}/Z2/D={D}"
@@ -246,6 +254,12 @@ if RANK == 0:
 
 energy_history = []
 
+# SPRING persistent state: phi_k iterate.  Starts at zero; on the first
+# step SPRING with mu=* is identical to plain MinSR because phi_0 = 0.
+phi_prev_gpu = torch.zeros(
+    n_params, device=device, dtype=torch.float64
+)
+
 for step in range(vmc_steps):
     t0 = time.time()
 
@@ -283,7 +297,38 @@ for step in range(vmc_steps):
 
     # --- Step 3: SR Solve ---
     t_sr_start = time.time()
-    if use_minSR:
+    if use_spring:
+        if spring_variant == 'minsr':
+            dp, t_sr, info = spring_minsr_solver_gpu(
+                local_lpg=local_O,
+                local_energies=local_energies,
+                energy_mean=energy_mean,
+                total_samples=Total_Ns,
+                n_params=n_params,
+                diag_shift=diag_shift,
+                phi_prev=phi_prev_gpu,
+                mu=spring_mu,
+                device=device,
+                do_SR=run_SR,
+            )
+        elif spring_variant == 'minres':
+            dp, t_sr, info = spring_minres_solver_gpu(
+                local_lpg=local_O,
+                local_energies=local_energies,
+                energy_mean=energy_mean,
+                total_samples=Total_Ns,
+                n_params=n_params,
+                diag_shift=diag_shift,
+                phi_prev=phi_prev_gpu,
+                mu=spring_mu,
+                rtol=5e-5,
+                run_SR=run_SR,
+            )
+        else:
+            raise ValueError(
+                f"Unknown spring_variant: {spring_variant}"
+            )
+    elif use_minSR:
         dp, t_sr, info = minSR_solver_gpu(
             local_lpg=local_O,
             local_energies=local_energies,
@@ -308,16 +353,29 @@ for step in range(vmc_steps):
 
     # --- Step 4: Parameter Update ---
     with torch.no_grad():
-        dp_tensor = torch.tensor(
+        dp_tensor = torch.as_tensor(
             dp, device=device, dtype=torch.float64
         )
+        # SPRING persistent state: phi_{k} <- dp for next iteration.
+        if use_spring:
+            phi_prev_gpu = dp_tensor.clone()
+
         current_params_vec = (
             torch.nn.utils.parameters_to_vector(
                 fpeps_model.parameters()
             )
         )
+        # Optional Euclidean norm constraint: dθ = φ·min(η, √C/||φ||)
+        eff_lr = learning_rate
+        if norm_constraint is not None:
+            dp_norm = torch.linalg.vector_norm(dp_tensor).item()
+            if dp_norm > 0:
+                eff_lr = min(
+                    learning_rate,
+                    (norm_constraint ** 0.5) / dp_norm,
+                )
         new_params_vec = (
-            current_params_vec - learning_rate * dp_tensor
+            current_params_vec - eff_lr * dp_tensor
         )
         torch.nn.utils.vector_to_parameters(
             new_params_vec, fpeps_model.parameters()
