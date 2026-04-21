@@ -1443,3 +1443,1417 @@ class ViT_Geometric_fPEPS_GPU(NNfTNS_Model_GPU):
             dtype=dtype,
             contract_boundary_opts=contract_boundary_opts,
         )
+
+
+# ================================================================
+#  Attention Geometric Backflow Generator (GPU)
+# ================================================================
+
+
+class _SelfAttentionBlock(nn.Module):
+    """Pre-norm transformer encoder block.
+
+    Structure:
+
+        (B, S, d_model)
+                │
+           ┌────┴────────────────┐
+           │        ▼            │
+           │    LayerNorm        │
+           │    QKV proj (d→3d)  │  pre-norm
+           │    SDPA [+mask]     │  attention
+           │    out_proj (d→d)   │  block
+           │        │            │
+           └───────►+ ◄──────────┘  residual
+                    │
+           ┌────────┴────────────┐
+           │        ▼            │
+           │    LayerNorm        │
+           │    Linear(d→ff_dim) │  pre-norm
+           │    GELU             │  FFN
+           │    Linear(ff_dim→d) │  block
+           │        │            │
+           └───────►+ ◄──────────┘  residual
+                    │
+                    ▼
+            (B, S, d_model)
+
+    Args:
+        d_model: embedding dimension
+        n_heads: number of attention heads
+        dim_feedforward: FFN hidden dimension
+        dtype: parameter dtype
+    """
+
+    def __init__(self, d_model, n_heads, dim_feedforward, dtype):
+        super().__init__()
+        assert d_model % n_heads == 0, (
+            f"d_model={d_model} not divisible by n_heads={n_heads}"
+        )
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        # Pre-norm attention
+        self.norm1 = nn.LayerNorm(d_model, dtype=dtype)
+        self.qkv_proj = nn.Linear(
+            d_model, 3 * d_model, dtype=dtype,
+        )
+        self.attn_out_proj = nn.Linear(
+            d_model, d_model, dtype=dtype,
+        )
+
+        # Pre-norm FFN
+        self.norm2 = nn.LayerNorm(d_model, dtype=dtype)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(dim_feedforward, d_model, dtype=dtype),
+        )
+
+    def forward(self, h, attn_mask=None):
+        """
+        Args:
+            h: (B, S, d_model)
+            attn_mask: optional (1, 1, S, S) float additive mask
+                (0 = allow, -inf = block). Float additive format
+                for vmap compatibility (SDPA's bool mask fails
+                under vmap).
+
+        Returns:
+            (B, S, d_model)
+        """
+        B, S, _ = h.shape
+
+        # --- Pre-norm attention + residual ---
+        h_norm = self.norm1(h)
+        qkv = self.qkv_proj(h_norm)  # (B, S, 3*d_model)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # Reshape to (B, n_heads, S, head_dim)
+        q = q.reshape(B, S, self.n_heads, self.head_dim)
+        q = q.permute(0, 2, 1, 3)
+        k = k.reshape(B, S, self.n_heads, self.head_dim)
+        k = k.permute(0, 2, 1, 3)
+        v = v.reshape(B, S, self.n_heads, self.head_dim)
+        v = v.permute(0, 2, 1, 3)
+
+        if attn_mask is None:
+            attn_out = F.scaled_dot_product_attention(q, k, v)
+        else:
+            # Manual attention with additive mask for vmap compat
+            scale = self.head_dim ** -0.5
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            scores = scores + attn_mask  # broadcasts (1,1,S,S)
+            attn_weights = torch.softmax(scores, dim=-1)
+            attn_out = torch.matmul(attn_weights, v)
+
+        # (B, n_heads, S, head_dim) -> (B, S, d_model)
+        attn_out = (
+            attn_out.permute(0, 2, 1, 3)
+            .reshape(B, S, -1)
+        )
+        h = h + self.attn_out_proj(attn_out)
+
+        # --- Pre-norm FFN + residual ---
+        h = h + self.ffn(self.norm2(h))
+        return h
+
+
+class _Attention_Geometric_Backflow_GPU(nn.Module):
+    """Self-attention backflow generator with geometry-aware output heads.
+
+    Input:  (B, N_sites) int64 configuration
+    Output: (B, total_ftn_params) concatenated delta vector
+
+    Per-site embedding (not shared) — each site has its own
+    learned (phys_dim → d_model) map, encoding position implicitly.
+    Shared attention blocks process all N_sites tokens globally (or
+    locally via float additive mask when ``radius`` is set).
+
+    Structure:
+
+        (B, N_sites) int64
+                │
+                ▼
+        ┌────────────────────────────────┐
+        │  per-site embed                │  site_embed (N, P, d_model)
+        │  one_hot (B,N,P) ⊗ embed      │  → (B, N_sites, d_model)
+        └──────────────┬─────────────────┘
+                       │  [optional local attn_mask (1,1,N,N) float]
+                       │
+        ┌──────────────┴─────────────────┐
+        │  _SelfAttentionBlock           │  × n_layers
+        │  (pre-norm QKV+SDPA+FFN+res)  │
+        └──────────────┬─────────────────┘
+                       │
+        ┌──────────────┴─────────────────┐
+        │  Final LayerNorm               │  (B, N_sites, d_model)
+        └──────────────┬─────────────────┘
+                       │  one d_model token per site
+                ┌──────┼──────┬── ... ──┐
+                ▼      ▼      ▼         ▼
+             ┌──────┐┌──────┐┌──────┐┌──────┐
+             │Linear││Linear││Linear││Linear│  per-geometry
+             │(BULK)││(EDGE)││(CRNR)││(... )│  output heads
+             └──┬───┘└──┬───┘└──┬───┘└──┬───┘
+                │       │       │        │
+                └───────┴───────┴── ... ─┘
+                             │  concat + site-order permute
+                             ▼
+                      (B, total_ftn_params)
+
+    Args:
+        tn: quimb fPEPS tensor network
+        d_model: attention embedding dimension
+        n_heads: number of attention heads
+        n_layers: number of transformer blocks
+        dim_feedforward: FFN hidden dimension
+        radius: local attention radius (Chebyshev distance).
+            None = global attention, int = local.
+        head_hidden_dim: hidden dim for output heads (default None
+            = single Linear). When set, heads become
+            Linear(d_model, hidden) -> GELU -> Linear(hidden, param_size).
+        dtype: output head precision (float64)
+        backbone_dtype: attention backbone precision (float32 for speed)
+    """
+
+    def __init__(
+        self,
+        tn,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        dim_feedforward=256,
+        radius=None,
+        head_hidden_dim=None,
+        dtype=torch.float64,
+        backbone_dtype=None,
+    ):
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        super().__init__()
+        self.dtype = dtype
+        self.backbone_dtype = backbone_dtype if backbone_dtype else dtype
+        self.Lx = tn.Lx
+        self.Ly = tn.Ly
+        self.n_sites = self.Lx * self.Ly
+        self.nn_radius = radius
+
+        bb_dt = self.backbone_dtype
+
+        # --- 1. Analyze geometry and group sites ---
+        ftn_params, _ = qtn.pack(tn)
+        ftn_params_flat, _ = qu.utils.tree_flatten(
+            ftn_params, get_ref=True,
+        )
+
+        # Get 2D coordinates from TN sites (not hardcoded divmod)
+        sites = list(tn.sites)
+        self._site_coords = [(s[0], s[1]) for s in sites]
+
+        groups = {}          # {g_type: [site_idx, ...]}
+        group_output_dims = {}  # {g_type: int}
+
+        for i in range(self.n_sites):
+            x, y = self._site_coords[i]
+            g_type = self._get_geometric_type(x, y)
+
+            if g_type not in groups:
+                groups[g_type] = []
+                p = ftn_params_flat[i]
+                group_output_dims[g_type] = (
+                    p.numel()
+                    if isinstance(p, torch.Tensor)
+                    else p.size
+                )
+            groups[g_type].append(i)
+
+        group_names = list(groups.keys())
+        self._n_groups = len(group_names)
+
+        # Register gather indices as buffers
+        self._gather_buf_names = []
+        for k, name in enumerate(group_names):
+            buf_name = f'_gather_{k}'
+            self._gather_buf_names.append(buf_name)
+            self.register_buffer(
+                buf_name,
+                torch.tensor(groups[name], dtype=torch.long),
+            )
+
+        # Build permutation: group-order -> site-order
+        site_to_group_offset = {}
+        group_offset = 0
+        for name in group_names:
+            out_dim = group_output_dims[name]
+            for local_i, site_idx in enumerate(groups[name]):
+                start = group_offset + local_i * out_dim
+                site_to_group_offset[site_idx] = (start, out_dim)
+            group_offset += len(groups[name]) * out_dim
+
+        site_order_idx = []
+        for site_idx in range(self.n_sites):
+            start, out_dim = site_to_group_offset[site_idx]
+            site_order_idx.extend(range(start, start + out_dim))
+
+        self.register_buffer(
+            '_site_order_idx',
+            torch.tensor(site_order_idx, dtype=torch.long),
+        )
+
+        # --- 2. Per-site embedding ---
+        # (N_sites, phys_dim, d_model) — each site has its own
+        # learned linear map from one-hot config to d_model.
+        # Position info encoded implicitly.
+        phys_dim = tn.phys_dim()
+        self.phys_dim = phys_dim
+        self.site_embed = nn.Parameter(
+            torch.randn(
+                self.n_sites, phys_dim, d_model, dtype=bb_dt,
+            ) * 0.02,
+        )
+
+        # --- 3. Optional local attention mask ---
+        if radius is not None:
+            # Additive float mask: 0 = allow, -inf = block.
+            # Float additive format instead of bool for vmap compat
+            # (SDPA's bool attn_mask fails under vmap).
+            mask = torch.zeros(
+                self.n_sites, self.n_sites, dtype=bb_dt,
+            )
+            for i in range(self.n_sites):
+                xi, yi = self._site_coords[i]
+                for j in range(self.n_sites):
+                    xj, yj = self._site_coords[j]
+                    if not (
+                        abs(xi - xj) <= radius
+                        and abs(yi - yj) <= radius
+                    ):
+                        mask[i, j] = float('-inf')  # block
+            # Shape (1, 1, S, S) to broadcast over (B, n_heads, S, S)
+            self.register_buffer(
+                '_attn_mask', mask.unsqueeze(0).unsqueeze(0),
+            )
+        else:
+            self._attn_mask = None
+
+        # --- 4. Shared attention blocks ---
+        self.attn_blocks = nn.ModuleList([
+            _SelfAttentionBlock(
+                d_model, n_heads, dim_feedforward, dtype=bb_dt,
+            )
+            for _ in range(n_layers)
+        ])
+
+        # --- 5. Final LayerNorm ---
+        self.final_norm = nn.LayerNorm(d_model, dtype=bb_dt)
+
+        # --- 6. Per-geometry output heads (in dtype for TN precision) ---
+        # Optional hidden layer: d_model -> hidden -> GELU -> param_size
+        # Without: d_model -> param_size (single linear)
+        self.heads = nn.ModuleList()
+        for name in group_names:
+            out_dim = group_output_dims[name]
+            if head_hidden_dim is not None:
+                self.heads.append(nn.Sequential(
+                    nn.Linear(
+                        d_model, head_hidden_dim, dtype=dtype,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        head_hidden_dim, out_dim, dtype=dtype,
+                    ),
+                ))
+            else:
+                self.heads.append(nn.Linear(
+                    d_model, out_dim, dtype=dtype,
+                ))
+
+    def _get_geometric_type(self, x, y):
+        """Classify site (x, y) into one of 9 geometric types."""
+        is_top = (x == 0)
+        is_bottom = (x == self.Lx - 1)
+        is_left = (y == 0)
+        is_right = (y == self.Ly - 1)
+
+        if is_top and is_left:
+            return "CORNER_TL"
+        if is_top and is_right:
+            return "CORNER_TR"
+        if is_bottom and is_left:
+            return "CORNER_BL"
+        if is_bottom and is_right:
+            return "CORNER_BR"
+        if is_top:
+            return "EDGE_TOP"
+        if is_bottom:
+            return "EDGE_BOTTOM"
+        if is_left:
+            return "EDGE_LEFT"
+        if is_right:
+            return "EDGE_RIGHT"
+        return "BULK"
+
+    def initialize_output_scale(self, scale):
+        """Small-init output heads so model starts near pure fPEPS.
+
+        For Sequential heads (with hidden layer), only the last
+        Linear gets small init — earlier layers use default init
+        so gradients flow through.
+        """
+        for head in self.heads:
+            if isinstance(head, nn.Sequential):
+                # Small-init only the last Linear
+                last_linear = head[-1]
+                nn.init.normal_(
+                    last_linear.weight, mean=0.0, std=scale,
+                )
+                if last_linear.bias is not None:
+                    nn.init.zeros_(last_linear.bias)
+            else:
+                nn.init.normal_(
+                    head.weight, mean=0.0, std=scale,
+                )
+                if head.bias is not None:
+                    nn.init.zeros_(head.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, N_sites) int64
+
+        Returns:
+            (B, total_ftn_params) float — concatenated backflow delta
+        """
+        B = x.shape[0]
+
+        # 1. Per-site embedding via one-hot + einsum
+        # Use identity indexing instead of F.one_hot to avoid
+        # scatter_ which is not vmap-compatible
+        eye = torch.eye(
+            self.phys_dim,
+            dtype=self.backbone_dtype,
+            device=x.device,
+        )
+        one_hot = eye[x]  # (B, N, P)
+        h = torch.einsum(
+            'bnp, npd -> bnd', one_hot, self.site_embed,
+        )  # (B, N, d_model)
+
+        # 2. Self-attention blocks (with optional local mask)
+        attn_mask = self._attn_mask  # None or (N, N) bool
+        for block in self.attn_blocks:
+            h = block(h, attn_mask=attn_mask)
+
+        # 3. Final LayerNorm
+        h = self.final_norm(h)  # (B, N_sites, d_model)
+
+        # 4. Cast to output dtype (no-op if backbone_dtype == dtype)
+        h = h.to(self.dtype)
+
+        # 5. Per-geometry heads (compile-friendly: fixed-length list)
+        group_outputs = []
+        for buf_name, head in zip(
+            self._gather_buf_names, self.heads,
+        ):
+            gather_idx = getattr(self, buf_name)
+            # (B, N_group, d_model)
+            group_feats = h.index_select(1, gather_idx)
+            # (B, N_group, out_dim) -> (B, N_group * out_dim)
+            group_outputs.append(head(group_feats).flatten(1))
+
+        # 6. Concat in group order, permute to site order
+        out_group_order = torch.cat(group_outputs, dim=1)
+        return out_group_order[:, self._site_order_idx]
+
+
+class Attention_Geometric_fPEPS_GPU(NNfTNS_Model_GPU):
+    """NN-fPEPS with self-attention geometric backflow for GPU VMC.
+
+    Combines a shared self-attention backbone with geometry-aware
+    output heads and fPEPS tensor network contraction.
+
+    Args:
+        tn: quimb fPEPS tensor network
+        max_bond: boundary contraction bond dimension (chi)
+        nn_eta: scale factor for NN backflow correction
+        d_model: attention embedding dimension (default 64)
+        n_heads: number of attention heads (default 4)
+        n_layers: number of transformer blocks (default 2)
+        dim_feedforward: FFN hidden dimension (default 256)
+        radius: local attention radius (None=global, int=local)
+        head_hidden_dim: hidden dim for output heads (default None
+            = single Linear). When set, heads become
+            Linear(d_model, hidden) -> GELU -> Linear(hidden, param_size).
+        init_scale: initial scale for output heads (default 1e-5)
+        dtype: parameter dtype (default float64)
+        backbone_dtype: dtype for attention backbone (default None)
+        contract_boundary_opts: options for boundary contraction
+    """
+
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        dim_feedforward=256,
+        radius=None,
+        head_hidden_dim=None,
+        init_scale=1e-5,
+        dtype=torch.float64,
+        backbone_dtype=None,
+        contract_boundary_opts=None,
+    ):
+        # 1. Create attention backflow module
+        nn_module = _Attention_Geometric_Backflow_GPU(
+            tn=tn,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            dim_feedforward=dim_feedforward,
+            radius=radius,
+            head_hidden_dim=head_hidden_dim,
+            dtype=dtype,
+            backbone_dtype=backbone_dtype,
+        )
+
+        # 2. Small-init output heads
+        nn_module.initialize_output_scale(init_scale)
+
+        # 3. Delegate to base class
+        super().__init__(
+            tn=tn,
+            nn_module=nn_module,
+            max_bond=max_bond,
+            nn_eta=nn_eta,
+            dtype=dtype,
+            contract_boundary_opts=contract_boundary_opts,
+        )
+
+        # 4. Store radius info for future bMPS reuse
+        self.nn_radius = radius
+        self.effective_radius = (
+            n_layers * radius if radius is not None else None
+        )
+
+
+# ================================================================
+#  Local-site attention backflow (GPU port of fTN_BFA_cluster_Model)
+# ================================================================
+
+
+def _get_rf_2d(Lx, Ly, radius):
+    """Chebyshev-radius receptive field for each site in Lx×Ly OBC lattice.
+
+    Returns:
+        dict[int, list[int]]: site_id -> neighbor site ids (row-major order,
+            includes the site itself).
+    """
+    rf = {}
+    for i in range(Lx):
+        for j in range(Ly):
+            site = i * Ly + j
+            neighbors = []
+            for di in range(-radius, radius + 1):
+                for dj in range(-radius, radius + 1):
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < Lx and 0 <= nj < Ly:
+                        neighbors.append(ni * Ly + nj)
+            rf[site] = neighbors
+    return rf
+
+
+class _LocalSite_Backflow_GPU(nn.Module):
+    """Local-receptive-field attention backflow generator.
+
+    GPU port of ``fTN_BFA_cluster_Model`` (model.py):
+
+    - Each site attends **only** to its Chebyshev-radius-r neighborhood
+      (``max_rf_size`` tokens per site, shorter than N_sites).
+    - Shared transformer blocks process all sites simultaneously by
+      reshaping to ``(B * N_sites, max_rf_size, d_model)``.
+    - Padded (out-of-bounds) positions are zeroed before and after
+      attention so they never contribute to the output.
+    - Per-geometry output heads receive flattened local context
+      ``max_rf_size * d_model``, mirroring the CPU model's
+      flatten-then-MLP pattern.
+
+    Input:  ``(B, N_sites)`` int64 configuration
+    Output: ``(B, total_ftn_params)`` concatenated delta vector
+
+    Structure:
+
+        (B, N_sites) int64
+                │
+                ▼  gather via padded_neighbors (N, R)
+        (B, N, R) int64    R = max_rf_size
+                │
+                ▼  shared Embedding(phys_dim, d_model)
+        (B, N, R, d_model) → zero OOB via pad_mask
+                │  reshape
+                ▼
+        (B*N, R, d_model)    key_padding_mask (B*N, R) bool
+                │
+        ┌───────┴───────────────────────────┐
+        │  nn.MultiheadAttention            │  × n_layers  (shared weights)
+        │  (pre-norm, key_padding_mask)     │  pre-norm attn + FFN + residual
+        └───────┬───────────────────────────┘
+                │
+        ┌───────┴──────────┐
+        │  Final LayerNorm │  zero OOB, flatten → (B*N, R*d)
+        └───────┬──────────┘
+                │  reshape
+                ▼
+        (B, N_sites, R*d_model)
+                │
+         ┌──────┼──────┬── ... ──┐
+         ▼      ▼      ▼         ▼
+      ┌──────┐┌──────┐┌──────┐┌──────┐
+      │Linear││Linear││Linear││Linear│  per-geometry output heads
+      │(BULK)││(EDGE)││(CRNR)││(... )│  (Linear or Linear→GELU→Linear)
+      └──┬───┘└──┬───┘└──┬───┘└──┬───┘
+         │       │       │        │
+         └───────┴───────┴── ... ─┘
+                     │  concat + site-order permute
+                     ▼
+              (B, total_ftn_params)
+
+    Args:
+        tn: quimb fPEPS tensor network
+        d_model: embedding / attention dimension
+        n_heads: number of attention heads
+        n_layers: number of pre-norm transformer blocks
+        dim_feedforward: FFN hidden dimension
+        radius: Chebyshev receptive-field radius (>= 1)
+        head_hidden_dim: if set, output heads are
+            ``Linear(R*d, head_hidden_dim) -> GELU ->
+            Linear(head_hidden_dim, param_size)``; if None, single
+            ``Linear(R*d, param_size)``.
+        dtype: TN-precision output dtype (default float64)
+        backbone_dtype: attention dtype (float32 for speed; default
+            same as dtype)
+    """
+
+    def __init__(
+        self,
+        tn,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        dim_feedforward=256,
+        radius=1,
+        head_hidden_dim=None,
+        dtype=torch.float64,
+        backbone_dtype=None,
+    ):
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        super().__init__()
+        self.dtype = dtype
+        self.backbone_dtype = backbone_dtype if backbone_dtype else dtype
+        bb_dt = self.backbone_dtype
+
+        self.Lx = tn.Lx
+        self.Ly = tn.Ly
+        self.n_sites = tn.Lx * tn.Ly
+        self.radius = radius
+        self.n_layers = n_layers
+
+        # --- 1. Receptive fields -> padding buffers ---
+        rf = _get_rf_2d(tn.Lx, tn.Ly, radius)
+        max_rf_size = max(len(v) for v in rf.values())
+        self.max_rf_size = max_rf_size
+
+        # padded_neighbors[i, :n_valid] = neighbor site ids,
+        # padded_neighbors[i, n_valid:] = 0  (harmless dummy index)
+        # pad_mask[i, j] = True  means position j is out-of-bounds
+        padded_neighbors = torch.zeros(
+            self.n_sites, max_rf_size, dtype=torch.long,
+        )
+        pad_mask = torch.ones(
+            self.n_sites, max_rf_size, dtype=torch.bool,
+        )
+        for site_id, neighbors in rf.items():
+            n = len(neighbors)
+            padded_neighbors[site_id, :n] = torch.tensor(
+                neighbors, dtype=torch.long,
+            )
+            pad_mask[site_id, :n] = False
+
+        self.register_buffer('padded_neighbors', padded_neighbors)
+        self.register_buffer('pad_mask', pad_mask)
+
+        # --- 2. Geometry analysis and site-order permutation ---
+        ftn_params, _ = qtn.pack(tn)
+        ftn_params_flat, _ = qu.utils.tree_flatten(
+            ftn_params, get_ref=True,
+        )
+
+        sites = list(tn.sites)
+        self._site_coords = [(s[0], s[1]) for s in sites]
+
+        groups = {}
+        group_output_dims = {}
+        for i in range(self.n_sites):
+            x_i, y_i = self._site_coords[i]
+            g_type = self._get_geometric_type(x_i, y_i)
+            if g_type not in groups:
+                groups[g_type] = []
+                p = ftn_params_flat[i]
+                group_output_dims[g_type] = (
+                    p.numel() if isinstance(p, torch.Tensor) else p.size
+                )
+            groups[g_type].append(i)
+
+        group_names = list(groups.keys())
+        self._n_groups = len(group_names)
+
+        self._gather_buf_names = []
+        for k, name in enumerate(group_names):
+            buf_name = f'_gather_{k}'
+            self._gather_buf_names.append(buf_name)
+            self.register_buffer(
+                buf_name,
+                torch.tensor(groups[name], dtype=torch.long),
+            )
+
+        site_to_group_offset = {}
+        group_offset = 0
+        for name in group_names:
+            out_dim = group_output_dims[name]
+            for local_i, site_idx in enumerate(groups[name]):
+                start = group_offset + local_i * out_dim
+                site_to_group_offset[site_idx] = (start, out_dim)
+            group_offset += len(groups[name]) * out_dim
+
+        site_order_idx = []
+        for site_idx in range(self.n_sites):
+            start, out_dim = site_to_group_offset[site_idx]
+            site_order_idx.extend(range(start, start + out_dim))
+
+        self.register_buffer(
+            '_site_order_idx',
+            torch.tensor(site_order_idx, dtype=torch.long),
+        )
+
+        # --- 3. Shared embedding ---
+        phys_dim = tn.phys_dim()
+        self.phys_dim = phys_dim
+        self.embedding = nn.Embedding(phys_dim, d_model, dtype=bb_dt)
+
+        # --- 4. Shared pre-norm transformer blocks ---
+        self.attn_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                d_model, n_heads, batch_first=True, dtype=bb_dt,
+            )
+            for _ in range(n_layers)
+        ])
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, dim_feedforward, dtype=bb_dt),
+                nn.GELU(),
+                nn.Linear(dim_feedforward, d_model, dtype=bb_dt),
+            )
+            for _ in range(n_layers)
+        ])
+        self.norms1 = nn.ModuleList([
+            nn.LayerNorm(d_model, dtype=bb_dt) for _ in range(n_layers)
+        ])
+        self.norms2 = nn.ModuleList([
+            nn.LayerNorm(d_model, dtype=bb_dt) for _ in range(n_layers)
+        ])
+
+        # --- 5. Final LayerNorm ---
+        self.final_norm = nn.LayerNorm(d_model, dtype=bb_dt)
+
+        # --- 6. Per-geometry output heads ---
+        # Input: max_rf_size * d_model (flattened local context,
+        # mirroring SelfAttn_FFNN_block's flatten + MLP in the CPU model)
+        head_in_dim = max_rf_size * d_model
+        self.heads = nn.ModuleList()
+        for name in group_names:
+            out_dim = group_output_dims[name]
+            if head_hidden_dim is not None:
+                self.heads.append(nn.Sequential(
+                    nn.Linear(head_in_dim, head_hidden_dim, dtype=dtype),
+                    nn.GELU(),
+                    nn.Linear(head_hidden_dim, out_dim, dtype=dtype),
+                ))
+            else:
+                self.heads.append(
+                    nn.Linear(head_in_dim, out_dim, dtype=dtype),
+                )
+
+    def _get_geometric_type(self, x, y):
+        """Classify site (x, y) into one of 9 geometric types."""
+        is_top = (x == 0)
+        is_bottom = (x == self.Lx - 1)
+        is_left = (y == 0)
+        is_right = (y == self.Ly - 1)
+
+        if is_top and is_left:
+            return "CORNER_TL"
+        if is_top and is_right:
+            return "CORNER_TR"
+        if is_bottom and is_left:
+            return "CORNER_BL"
+        if is_bottom and is_right:
+            return "CORNER_BR"
+        if is_top:
+            return "EDGE_TOP"
+        if is_bottom:
+            return "EDGE_BOTTOM"
+        if is_left:
+            return "EDGE_LEFT"
+        if is_right:
+            return "EDGE_RIGHT"
+        return "BULK"
+
+    def initialize_output_scale(self, scale):
+        """Small-init output heads so model starts near pure fPEPS."""
+        for head in self.heads:
+            if isinstance(head, nn.Sequential):
+                last_linear = head[-1]
+                nn.init.normal_(
+                    last_linear.weight, mean=0.0, std=scale,
+                )
+                if last_linear.bias is not None:
+                    nn.init.zeros_(last_linear.bias)
+            else:
+                nn.init.normal_(head.weight, mean=0.0, std=scale)
+                if head.bias is not None:
+                    nn.init.zeros_(head.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: ``(B, N_sites)`` int64
+
+        Returns:
+            ``(B, total_ftn_params)`` float — concatenated backflow delta
+        """
+        B = x.shape[0]
+        N = self.n_sites
+        R = self.max_rf_size
+
+        # 1. Gather local neighborhood occupations: (B, N, R)
+        gathered = x[:, self.padded_neighbors]
+
+        # 2. Embed: (B, N, R, d_model)
+        h = self.embedding(gathered).to(self.backbone_dtype)
+
+        # 3. Zero padded positions before attention so they
+        #    contribute nothing as keys or via residual.
+        #    pad_mask is (N, R), broadcast over B and d_model.
+        h = h.masked_fill(self.pad_mask.unsqueeze(-1), 0.0)
+
+        # 4. Reshape for batched transformer: (B*N, R, d_model)
+        h = h.view(B * N, R, -1)
+
+        # key_padding_mask: (B*N, R), True = ignore as key
+        key_pad = (
+            self.pad_mask.unsqueeze(0)
+            .expand(B, -1, -1)
+            .reshape(B * N, R)
+        )
+
+        # 5. Pre-norm transformer blocks with local key masking
+        for norm1, attn, norm2, ffn in zip(
+            self.norms1, self.attn_layers, self.norms2, self.ffns,
+        ):
+            h_norm = norm1(h)
+            attn_out, _ = attn(
+                h_norm, h_norm, h_norm,
+                key_padding_mask=key_pad,
+                need_weights=False,
+            )
+            h = h + attn_out
+            h = h + ffn(norm2(h))
+
+        # 6. Final norm + zero padded positions in output
+        h = self.final_norm(h)  # (B*N, R, d_model)
+        h = h.masked_fill(key_pad.unsqueeze(-1), 0.0)
+
+        # 7. Flatten local context: (B*N, R * d_model)
+        h = h.view(B * N, -1)
+
+        # 8. Cast to TN output dtype
+        h = h.to(self.dtype)
+
+        # 9. Reshape: (B, N_sites, R * d_model)
+        h = h.view(B, N, -1)
+
+        # 10. Per-geometry output heads
+        group_outputs = []
+        for buf_name, head in zip(
+            self._gather_buf_names, self.heads,
+        ):
+            gather_idx = getattr(self, buf_name)
+            # (B, N_group, R*d_model)
+            group_feats = h.index_select(1, gather_idx)
+            # (B, N_group * out_dim)
+            group_outputs.append(head(group_feats).flatten(1))
+
+        # 11. Concat in group order, permute to site order
+        out_group_order = torch.cat(group_outputs, dim=1)
+        return out_group_order[:, self._site_order_idx]
+
+
+class LocalSite_fPEPS_GPU(NNfTNS_Model_GPU):
+    """NN-fPEPS with local-receptive-field attention backflow.
+
+    GPU port of ``fTN_BFA_cluster_Model`` from model.py.
+
+    Each site's TN parameter correction is computed from its
+    Chebyshev-radius-r neighborhood only. This is the main structural
+    difference from ``Attention_Geometric_fPEPS_GPU``, which attends
+    globally (or with an additive mask) over all N_sites tokens.
+
+    Architecture:
+        1. Gather: ``(B, N_sites)`` -> ``(B, N_sites, max_rf_size)``
+        2. Embed + zero OOB positions
+        3. Shared pre-norm transformer (``n_layers`` blocks) over
+           ``max_rf_size`` local tokens per site
+        4. Flatten ``max_rf_size * d_model`` per site
+        5. Per-geometry-type output heads -> TN param corrections
+
+    All export / compile / grad logic is inherited from
+    ``NNfTNS_Model_GPU``.
+
+    Args:
+        tn: quimb fPEPS tensor network
+        max_bond: boundary contraction bond dimension (chi)
+        nn_eta: scale factor applied to NN backflow correction
+        d_model: embedding / attention dimension (default 64)
+        n_heads: number of attention heads (default 4)
+        n_layers: number of transformer encoder blocks (default 2)
+        dim_feedforward: FFN hidden dimension (default 256)
+        radius: Chebyshev receptive-field radius (default 1)
+        head_hidden_dim: if set, output heads are
+            ``Linear(R*d, head_hidden_dim) -> GELU ->
+            Linear(head_hidden_dim, param_size)``; if None, single
+            ``Linear(R*d, param_size)``.
+        init_scale: weight scale for output head init (default 1e-5)
+        dtype: parameter dtype (default float64)
+        backbone_dtype: dtype for attention backbone (default None =
+            same as dtype; set float32 for speed)
+        contract_boundary_opts: options forwarded to boundary
+            contraction
+    """
+
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        dim_feedforward=256,
+        radius=1,
+        head_hidden_dim=None,
+        init_scale=1e-5,
+        dtype=torch.float64,
+        backbone_dtype=None,
+        contract_boundary_opts=None,
+    ):
+        # 1. Build local-site attention backflow module
+        nn_module = _LocalSite_Backflow_GPU(
+            tn=tn,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            dim_feedforward=dim_feedforward,
+            radius=radius,
+            head_hidden_dim=head_hidden_dim,
+            dtype=dtype,
+            backbone_dtype=backbone_dtype,
+        )
+
+        # 2. Small-init output heads so model starts near pure fPEPS
+        nn_module.initialize_output_scale(init_scale)
+
+        # 3. Delegate to NNfTNS base class
+        super().__init__(
+            tn=tn,
+            nn_module=nn_module,
+            max_bond=max_bond,
+            nn_eta=nn_eta,
+            dtype=dtype,
+            contract_boundary_opts=contract_boundary_opts,
+        )
+
+        self.nn_radius = radius
+        self.max_rf_size = nn_module.max_rf_size
+
+
+# ================================================================
+#  Per-site original attention backflow (true CPU model replica)
+# ================================================================
+
+
+class _LocalSite_Original_Backflow_GPU(nn.Module):
+    """Per-site independent attention + output FFN.
+
+    Faithful GPU port of ``SelfAttn_FFNN_block`` in
+    ``fTN_BFA_cluster_Model``. Each site has its **own** independent
+    parameters stored as ``(N_sites, ...)`` batched tensors, applied
+    via ``einsum`` so all sites run in one GPU kernel.
+
+    Contrast with ``_LocalSite_Backflow_GPU``: that uses **shared**
+    weights (one transformer for all sites); this uses **per-site**
+    weights, matching the CPU model exactly.
+
+    Input:  ``(B, N_sites)`` int64 configuration
+    Output: ``(B, total_ftn_params)`` concatenated delta vector
+
+    Structure:
+
+        (B, N_sites) int64
+                │
+                ▼  gather via padded_neighbors (N, R)
+        (B, N, R) int64    R = max_rf_size
+                │
+                ▼  one-hot → einsum with embed_w (N, d, P)
+        (B, N, R, d_model) → zero OOB via pad_mask
+                │
+           ┌────┴─────────────────────────────────────┐
+           │    ▼                                     │
+           │  per-site QKV:  qkv_w (N, 3d, d)        │
+           │  → Q, K, V  (B, N, n_heads, R, d_head)  │
+           │  additive OOB mask (-1e9) → SDPA         │
+           │  out_proj:  out_proj_w (N, d, d)         │
+           │    │                                     │
+           └───►+ ◄───────────────────────────────────┘  residual
+                │
+                ▼  F.layer_norm([d_model])
+                   × per-site affine: ln_w (N, d),  ln_b (N, d)
+        (B, N, R, d_model) → zero OOB → flatten
+                │
+                ▼
+        (B, N_sites, R*d_model)
+                │
+         ┌──────┼──────┬── ... ──┐
+         ▼      ▼      ▼         ▼
+      ┌──────┐┌──────┐┌──────┐┌──────┐
+      │w1,b1 ││w1,b1 ││w1,b1 ││w1,b1 │  per-geometry 2-layer FFN
+      │LReLU ││LReLU ││LReLU ││LReLU │  (per-site einsum)
+      │w2,b2 ││w2,b2 ││w2,b2 ││w2,b2 │  w1 (Nk,h,R*d)  w2 (Nk,o,h)
+      └──┬───┘└──┬───┘└──┬───┘└──┬───┘
+         │       │       │        │
+         └───────┴───────┴── ... ─┘
+                     │  concat + site-order permute
+                     ▼
+              (B, total_ftn_params)
+
+    Args:
+        tn: quimb fPEPS tensor network
+        d_model: embedding / attention dimension
+        n_heads: number of attention heads
+        nn_hidden_dim: hidden dim of the output FFN
+            (maps to ``nn_final_dim`` in the CPU model)
+        radius: Chebyshev receptive-field radius (>= 1)
+        dtype: TN-precision output dtype (default float64)
+        backbone_dtype: attention/embedding dtype
+            (float32 for speed; default same as dtype)
+    """
+
+    def __init__(
+        self,
+        tn,
+        d_model=32,
+        n_heads=4,
+        nn_hidden_dim=16,
+        radius=1,
+        dtype=torch.float64,
+        backbone_dtype=None,
+    ):
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        super().__init__()
+        self.dtype = dtype
+        self.backbone_dtype = backbone_dtype if backbone_dtype else dtype
+        bb_dt = self.backbone_dtype
+
+        self.Lx = tn.Lx
+        self.Ly = tn.Ly
+        self.n_sites = tn.Lx * tn.Ly
+        self.radius = radius
+        self.d_model = d_model
+        self.n_heads = n_heads
+        assert d_model % n_heads == 0, (
+            f"d_model={d_model} must be divisible by n_heads={n_heads}"
+        )
+
+        # --- 1. Receptive fields and padding buffers (same as shared) ---
+        rf = _get_rf_2d(tn.Lx, tn.Ly, radius)
+        max_rf_size = max(len(v) for v in rf.values())
+        self.max_rf_size = max_rf_size
+
+        padded_neighbors = torch.zeros(
+            self.n_sites, max_rf_size, dtype=torch.long,
+        )
+        pad_mask = torch.ones(
+            self.n_sites, max_rf_size, dtype=torch.bool,
+        )
+        for site_id, neighbors in rf.items():
+            n = len(neighbors)
+            padded_neighbors[site_id, :n] = torch.tensor(
+                neighbors, dtype=torch.long,
+            )
+            pad_mask[site_id, :n] = False
+
+        self.register_buffer('padded_neighbors', padded_neighbors)
+        self.register_buffer('pad_mask', pad_mask)
+
+        # --- 2. Geometry analysis + site-order permutation ---
+        ftn_params, _ = qtn.pack(tn)
+        ftn_params_flat, _ = qu.utils.tree_flatten(
+            ftn_params, get_ref=True,
+        )
+
+        sites = list(tn.sites)
+        self._site_coords = [(s[0], s[1]) for s in sites]
+
+        groups = {}
+        group_output_dims = {}
+        for i in range(self.n_sites):
+            x_i, y_i = self._site_coords[i]
+            g_type = self._get_geometric_type(x_i, y_i)
+            if g_type not in groups:
+                groups[g_type] = []
+                p = ftn_params_flat[i]
+                group_output_dims[g_type] = (
+                    p.numel() if isinstance(p, torch.Tensor) else p.size
+                )
+            groups[g_type].append(i)
+
+        group_names = list(groups.keys())
+        self._n_groups = len(group_names)
+
+        self._gather_buf_names = []
+        for k, name in enumerate(group_names):
+            buf_name = f'_gather_{k}'
+            self._gather_buf_names.append(buf_name)
+            self.register_buffer(
+                buf_name,
+                torch.tensor(groups[name], dtype=torch.long),
+            )
+
+        site_to_group_offset = {}
+        group_offset = 0
+        for name in group_names:
+            out_dim = group_output_dims[name]
+            for local_i, site_idx in enumerate(groups[name]):
+                start = group_offset + local_i * out_dim
+                site_to_group_offset[site_idx] = (start, out_dim)
+            group_offset += len(groups[name]) * out_dim
+
+        site_order_idx = []
+        for site_idx in range(self.n_sites):
+            start, out_dim = site_to_group_offset[site_idx]
+            site_order_idx.extend(range(start, start + out_dim))
+
+        self.register_buffer(
+            '_site_order_idx',
+            torch.tensor(site_order_idx, dtype=torch.long),
+        )
+
+        phys_dim = tn.phys_dim()
+        self.phys_dim = phys_dim
+        N = self.n_sites
+
+        # --- 3. Per-site embedding: (N, d_model, phys_dim) ---
+        # Mirrors nn.Linear(phys_dim, d_model) per site.
+        # embed_w layout matches nn.Linear: weight shape (out, in).
+        self.embed_w = nn.Parameter(
+            torch.empty(N, d_model, phys_dim, dtype=bb_dt),
+        )
+        self.embed_b = nn.Parameter(torch.zeros(N, d_model, dtype=bb_dt))
+        nn.init.xavier_uniform_(self.embed_w.view(N * d_model, phys_dim))
+
+        # --- 4. Per-site attention ---
+        # Combined QKV projection: (N, 3*d_model, d_model)
+        self.qkv_w = nn.Parameter(
+            torch.empty(N, 3 * d_model, d_model, dtype=bb_dt),
+        )
+        self.qkv_b = nn.Parameter(torch.zeros(N, 3 * d_model, dtype=bb_dt))
+        nn.init.xavier_uniform_(self.qkv_w.view(N * 3 * d_model, d_model))
+
+        # Output projection: (N, d_model, d_model)
+        self.out_proj_w = nn.Parameter(
+            torch.empty(N, d_model, d_model, dtype=bb_dt),
+        )
+        self.out_proj_b = nn.Parameter(torch.zeros(N, d_model, dtype=bb_dt))
+        nn.init.xavier_uniform_(self.out_proj_w.view(N * d_model, d_model))
+
+        # --- 5. Per-site LayerNorm affine params ---
+        self.ln_w = nn.Parameter(torch.ones(N, d_model, dtype=bb_dt))
+        self.ln_b = nn.Parameter(torch.zeros(N, d_model, dtype=bb_dt))
+
+        # --- 6. Per-site output FFN (per-geometry-type for batching) ---
+        # Layer 1: (N_k, nn_hidden, max_rf * d_model)
+        # Layer 2: (N_k, out_dim_k, nn_hidden)
+        # Mirrors SelfAttn_FFNN_block.final_ffn.
+        head_in = max_rf_size * d_model
+        self.head_w1s = nn.ParameterList()
+        self.head_b1s = nn.ParameterList()
+        self.head_w2s = nn.ParameterList()
+        self.head_b2s = nn.ParameterList()
+        for name in group_names:
+            N_k = len(groups[name])
+            out_k = group_output_dims[name]
+            w1 = torch.empty(N_k, nn_hidden_dim, head_in, dtype=dtype)
+            nn.init.xavier_uniform_(w1.view(N_k * nn_hidden_dim, head_in))
+            self.head_w1s.append(nn.Parameter(w1))
+            self.head_b1s.append(
+                nn.Parameter(torch.zeros(N_k, nn_hidden_dim, dtype=dtype)),
+            )
+            w2 = torch.empty(N_k, out_k, nn_hidden_dim, dtype=dtype)
+            nn.init.xavier_uniform_(w2.view(N_k * out_k, nn_hidden_dim))
+            self.head_w2s.append(nn.Parameter(w2))
+            self.head_b2s.append(
+                nn.Parameter(torch.zeros(N_k, out_k, dtype=dtype)),
+            )
+
+    def _get_geometric_type(self, x, y):
+        """Classify site (x, y) into one of 9 geometric types."""
+        is_top = (x == 0)
+        is_bottom = (x == self.Lx - 1)
+        is_left = (y == 0)
+        is_right = (y == self.Ly - 1)
+
+        if is_top and is_left:
+            return "CORNER_TL"
+        if is_top and is_right:
+            return "CORNER_TR"
+        if is_bottom and is_left:
+            return "CORNER_BL"
+        if is_bottom and is_right:
+            return "CORNER_BR"
+        if is_top:
+            return "EDGE_TOP"
+        if is_bottom:
+            return "EDGE_BOTTOM"
+        if is_left:
+            return "EDGE_LEFT"
+        if is_right:
+            return "EDGE_RIGHT"
+        return "BULK"
+
+    def initialize_output_scale(self, scale):
+        """Small-init the final Linear (head_w2) to start near pure fPEPS."""
+        for head_w2, head_b2 in zip(self.head_w2s, self.head_b2s):
+            nn.init.normal_(head_w2, mean=0.0, std=scale)
+            nn.init.zeros_(head_b2)
+
+    def forward(self, x):
+        """
+        Args:
+            x: ``(B, N_sites)`` int64
+
+        Returns:
+            ``(B, total_ftn_params)`` float — concatenated backflow delta
+        """
+        B = x.shape[0]
+        N = self.n_sites
+        R = self.max_rf_size
+        d = self.d_model
+
+        # 1. Gather local neighborhood: (B, N, R)
+        gathered = x[:, self.padded_neighbors]
+
+        # 2. Per-site embedding via one-hot:
+        #    one_hot: (B, N, R, phys_dim)
+        #    embed_w: (N, d_model, phys_dim)  — (out, in) layout, like nn.Linear
+        #    h[b,n,r,:] = embed_w[n] @ one_hot[b,n,r,:] + embed_b[n]
+        eye = torch.eye(
+            self.phys_dim, dtype=self.backbone_dtype, device=x.device,
+        )
+        one_hot = eye[gathered]  # (B, N, R, phys_dim)
+        h = (
+            torch.einsum('bnrp, ndp -> bnrd', one_hot, self.embed_w)
+            + self.embed_b[None, :, None, :]
+        )  # (B, N, R, d_model)
+
+        # 3. Zero padded positions (OOB neighbors contribute nothing)
+        h = h.masked_fill(self.pad_mask.unsqueeze(-1), 0.0)
+
+        # 4. Per-site QKV projection:
+        #    qkv_w: (N, 3d, d)  →  qkv[b,n,r,:] = qkv_w[n] @ h[b,n,r,:] + qkv_b[n]
+        qkv = (
+            torch.einsum('bnrd, nDd -> bnrD', h, self.qkv_w)
+            + self.qkv_b[None, :, None, :]
+        )  # (B, N, R, 3*d)
+        q, k, v = qkv.chunk(3, dim=-1)  # each (B, N, R, d)
+
+        # 5. Scaled dot-product attention
+        nh = self.n_heads
+        hd = d // nh
+
+        # Reshape: (B*N, nh, R, hd)
+        q = q.reshape(B * N, R, nh, hd).permute(0, 2, 1, 3)
+        k = k.reshape(B * N, R, nh, hd).permute(0, 2, 1, 3)
+        v = v.reshape(B * N, R, nh, hd).permute(0, 2, 1, 3)
+
+        # key_padding_mask: (B*N, R) -> additive float mask (B*N, 1, 1, R)
+        key_pad = (
+            self.pad_mask.unsqueeze(0)
+            .expand(B, -1, -1)
+            .reshape(B * N, R)
+        )
+        mask_add = key_pad.unsqueeze(1).unsqueeze(2).to(q.dtype) * (-1e9)
+
+        scores = (
+            torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + mask_add
+        )  # (B*N, nh, R, R)
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_raw = torch.matmul(attn_weights, v)  # (B*N, nh, R, hd)
+
+        # Reshape back: (B, N, R, d)
+        attn_raw = (
+            attn_raw.permute(0, 2, 1, 3)
+            .reshape(B * N, R, d)
+            .view(B, N, R, d)
+        )
+
+        # 6. Per-site output projection:
+        #    out_proj_w: (N, d, d)
+        attn_out = (
+            torch.einsum('bnrd, nod -> bnro', attn_raw, self.out_proj_w)
+            + self.out_proj_b[None, :, None, :]
+        )  # (B, N, R, d)
+
+        # 7. Residual + per-site LayerNorm:
+        #    Mirrors F.layer_norm(attn + emb, [d]) in SelfAttn_FFNN_block
+        h = h + attn_out
+        # Normalize over d_model (no affine), then apply per-site scale/shift
+        h = F.layer_norm(h, [d])
+        h = h * self.ln_w[None, :, None, :] + self.ln_b[None, :, None, :]
+
+        # 8. Zero padded positions after LN
+        h = h.masked_fill(self.pad_mask.unsqueeze(-1), 0.0)
+
+        # 9. Flatten: (B, N, R * d_model), cast to output dtype
+        h = h.view(B, N, R * d).to(self.dtype)
+
+        # 10. Per-site output FFN (2-layer with LeakyReLU, per-geometry)
+        #     Mirrors SelfAttn_FFNN_block.final_ffn
+        group_outputs = []
+        for buf_name, hw1, hb1, hw2, hb2 in zip(
+            self._gather_buf_names,
+            self.head_w1s, self.head_b1s,
+            self.head_w2s, self.head_b2s,
+        ):
+            gather_idx = getattr(self, buf_name)
+            # group_feats: (B, N_k, R*d)
+            group_feats = h.index_select(1, gather_idx)
+
+            # Layer 1: (B, N_k, nn_hidden)
+            h_hid = (
+                torch.einsum('bni, nhi -> bnh', group_feats, hw1)
+                + hb1[None, :, :]
+            )
+            h_hid = F.leaky_relu(h_hid)  # match CPU model
+
+            # Layer 2: (B, N_k, out_dim_k)
+            out_k = (
+                torch.einsum('bnh, noh -> bno', h_hid, hw2)
+                + hb2[None, :, :]
+            )
+            group_outputs.append(out_k.flatten(1))
+
+        # 11. Concat in group order, permute to site order
+        out_group_order = torch.cat(group_outputs, dim=1)
+        return out_group_order[:, self._site_order_idx]
+
+
+class LocalSite_fPEPS_GPU_original(NNfTNS_Model_GPU):
+    """NN-fPEPS with per-site independent attention backflow.
+
+    Faithful GPU port of ``fTN_BFA_cluster_Model`` from model.py.
+
+    Each site has its **own** independent embedding, attention weights,
+    and output FFN — matching the per-site ``SelfAttn_FFNN_block``
+    structure exactly.
+
+    Parameters are stored as ``(N_sites, ...)`` batched tensors and
+    applied via ``einsum`` for GPU efficiency.
+
+    Contrast with ``LocalSite_fPEPS_GPU``: that uses **shared**
+    transformer weights (one set for all sites). This uses **per-site**
+    weights — more parameters, more expressive.
+
+    Architecture per site:
+        neighbors (R,)
+            → Embedding Linear(P, d)          [per-site]
+            → Self-attention QKV+SDPA+out_proj [per-site]
+            → Residual + LayerNorm
+            → Flatten (R*d,)
+            → Linear(R*d, nn_hidden)           [per-site, per-geom group]
+            → LeakyReLU
+            → Linear(nn_hidden, param_size)    [per-site, per-geom group]
+
+    Args:
+        tn: quimb fPEPS tensor network
+        max_bond: boundary contraction bond dimension (chi)
+        nn_eta: scale factor applied to NN backflow correction
+        d_model: embedding / attention dimension (default 32)
+        n_heads: number of attention heads (default 4)
+        nn_hidden_dim: hidden dim of output FFN
+            (maps to ``nn_final_dim`` in the CPU model, default 16)
+        radius: Chebyshev receptive-field radius (default 1)
+        init_scale: weight scale for output head init (default 1e-5)
+        dtype: parameter dtype (default float64)
+        backbone_dtype: dtype for attention/embedding backbone
+            (default None = same as dtype; set float32 for speed)
+        contract_boundary_opts: options forwarded to boundary
+            contraction
+    """
+
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        d_model=32,
+        n_heads=4,
+        nn_hidden_dim=16,
+        radius=1,
+        init_scale=1e-5,
+        dtype=torch.float64,
+        backbone_dtype=None,
+        contract_boundary_opts=None,
+    ):
+        # 1. Build per-site original backflow module
+        nn_module = _LocalSite_Original_Backflow_GPU(
+            tn=tn,
+            d_model=d_model,
+            n_heads=n_heads,
+            nn_hidden_dim=nn_hidden_dim,
+            radius=radius,
+            dtype=dtype,
+            backbone_dtype=backbone_dtype,
+        )
+
+        # 2. Small-init final output layer (head_w2) near pure fPEPS
+        nn_module.initialize_output_scale(init_scale)
+
+        # 3. Delegate to NNfTNS base class
+        super().__init__(
+            tn=tn,
+            nn_module=nn_module,
+            max_bond=max_bond,
+            nn_eta=nn_eta,
+            dtype=dtype,
+            contract_boundary_opts=contract_boundary_opts,
+        )
+
+        self.nn_radius = radius
+        self.max_rf_size = nn_module.max_rf_size

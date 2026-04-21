@@ -156,6 +156,126 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
 
 
 # =================================================================
+#  fPEPS with HOTRG contraction
+# =================================================================
+
+
+class fPEPS_Model_HOTRG_GPU(WavefunctionModel_GPU):
+    """fPEPS model using HOTRG contraction.
+
+    Uses quimb's contract_hotrg for amplitude evaluation instead
+    of boundary MPS contraction. HOTRG coarse-grains the 2D TN
+    by inserting oblique projectors between plaquettes.
+
+    Same interface as fPEPS_Model_GPU — drop-in replacement.
+    """
+
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        dtype=torch.float64,
+        contract_hotrg_opts=None,
+        **kwargs,
+    ):
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        if contract_hotrg_opts is None:
+            contract_hotrg_opts = {}
+
+        if tn.tensors[0].data.indices[-1]._linearmap is not None:
+            for ts in tn.tensors:
+                ts_data = ts.data
+                ts_data.indices[-1]._linearmap = None
+                ts.modify(data=ts_data)
+            self._loc_basis_perm = torch.tensor(
+                [0, 2, 3, 1], dtype=torch.long
+            )
+        else:
+            self._loc_basis_perm = None
+
+        params, skeleton = qtn.pack(tn)
+        self.dtype = dtype
+        self.skeleton = skeleton
+        self.contract_hotrg_opts = contract_hotrg_opts
+        self.chi = max_bond
+
+        params_flat, params_pytree = qu.utils.tree_flatten(
+            params, get_ref=True
+        )
+        self.params_pytree = params_pytree
+
+        params_tensors = [
+            torch.as_tensor(x, dtype=self.dtype)
+            for x in params_flat
+        ]
+
+        super().__init__(params_list=params_tensors)
+
+    def amplitude(self, x, params):
+        """Single-sample amplitude via HOTRG contraction.
+
+        Args:
+            x:      (N_sites,) int64 — one configuration
+            params: quimb pytree of parameter tensors
+
+        Returns:
+            scalar amplitude
+        """
+        import quimb.tensor as qtn
+
+        tn = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
+        amp = tn.isel({
+            tn.site_ind(site): x[i]
+            for i, site in enumerate(tn.sites)
+        })
+        return amp.contract_hotrg(
+            max_bond=self.chi,
+            cutoff=0.0,
+            **self.contract_hotrg_opts,
+        )
+
+    def log_amplitude(self, x, params):
+        """Single-sample log-amplitude via HOTRG contraction.
+
+        Returns:
+            (sign, log_abs) scalars
+        """
+        import quimb.tensor as qtn
+
+        tn = qtn.unpack(params, self.skeleton)
+        if self._loc_basis_perm is not None:
+            x = self._loc_basis_perm[x]
+        amp = tn.isel({
+            tn.site_ind(site): x[i]
+            for i, site in enumerate(tn.sites)
+        })
+        sign, exp10 = amp.contract_hotrg(
+            max_bond=self.chi,
+            cutoff=0.0,
+            equalize_norms=1.0,
+            strip_exponent=True,
+            **self.contract_hotrg_opts,
+        )
+        log_abs = exp10 * torch.log(torch.tensor(10.0))
+        return sign, log_abs
+
+    def _vamp_params_preprocess(self, params):
+        """Unflatten ParameterList -> quimb pytree."""
+        import quimb as qu
+
+        if isinstance(params, nn.ParameterList):
+            params = list(params)
+        params = qu.utils.tree_unflatten(
+            params, self.params_pytree,
+        )
+        return params
+
+
+# =================================================================
 #  fPEPS with bMPS environment reuse
 # =================================================================
 

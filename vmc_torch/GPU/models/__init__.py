@@ -6,7 +6,11 @@ All models share the same interface from WavefunctionModel_GPU:
   - vamp(x, params): batched amplitude for torch.func.grad
 """
 from ._base import WavefunctionModel_GPU
-from .pureTNS import fPEPS_Model_GPU, fPEPS_Model_reuse_GPU
+from .pureTNS import (
+    fPEPS_Model_GPU,
+    fPEPS_Model_HOTRG_GPU,
+    fPEPS_Model_reuse_GPU,
+)
 from .pureTNS_spin import (
     PEPS_Model_GPU,
     PEPS_Model_reuse_GPU,
@@ -19,8 +23,10 @@ from .NNfTNS import (
     NNfTNS_Model_GPU,
     Conv2D_Geometric_fPEPS_GPU,
     ViT_Geometric_fPEPS_GPU,
+    Attention_Geometric_fPEPS_GPU,
+    LocalSite_fPEPS_GPU,
+    LocalSite_fPEPS_GPU_original,
 )
-from .AttentionNNfTNS import Attention_Geometric_fPEPS_GPU
 from .symmetry import (
     SymmetryProjectedModel,
     FermionSymmetryProjectedModel,
@@ -29,6 +35,7 @@ from .symmetry import (
 __all__ = [
     "WavefunctionModel_GPU",
     "fPEPS_Model_GPU",
+    "fPEPS_Model_HOTRG_GPU",
     "fPEPS_Model_reuse_GPU",
     "PureNN_GPU",
     "SlaterDeterminant_GPU",
@@ -38,6 +45,8 @@ __all__ = [
     "Conv2D_Geometric_fPEPS_GPU",
     "ViT_Geometric_fPEPS_GPU",
     "Attention_Geometric_fPEPS_GPU",
+    "LocalSite_fPEPS_GPU",
+    "LocalSite_fPEPS_GPU_original",
     "PEPS_Model_GPU",
     "PEPS_Model_reuse_GPU",
     "PEPS_Model_reuse_compiled_cache_GPU",

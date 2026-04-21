@@ -51,10 +51,10 @@ DEFAULT_DATA_ROOT = (
 CPU_DATA_ROOT = DEFAULT_DATA_ROOT
 
 vmc_cfg = VMCConfig(
-    batch_size=4096,
-    ns_per_rank=4096,
-    grad_batch_size=1024,
-    vmc_steps=1500,
+    batch_size=4096*2,
+    ns_per_rank=4096*2,
+    grad_batch_size=1024*2,
+    vmc_steps=500,
     burn_in_steps=10,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
@@ -62,7 +62,7 @@ vmc_cfg = VMCConfig(
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=False,
+    use_export_compile=True,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -73,7 +73,7 @@ vmc_cfg = VMCConfig(
     use_spring=True,
     spring_variant='minres',   # 'minsr' (direct) | 'minres' (iterative)
     spring_mu=0.99,
-    norm_constraint=1e-3,     # e.g. 1e-3 to enable SPRING paper Eq. 37
+    norm_constraint=None,     # e.g. 1e-3 to enable SPRING paper Eq. 37
 )
 vmc_cfg.lr_scheduler = DecayScheduler(
     init_lr=vmc_cfg.learning_rate,
@@ -110,14 +110,14 @@ def main():
         N_f = N_sites - 2  # 2 holes -> 14 fermions
         n_fermions_per_spin = (N_f // 2, N_f // 2)
         D = 4   # PEPS bond dimension
-        chi = -3  # exact contraction
+        chi = -1  # exact contraction
 
         # NN backflow hyperparameters
         nn_eta = 1.0
         embed_dim = 16
         hidden_dim = 4*N_sites
         kernel_size = 3
-        cnn_layers = 4
+        cnn_layers = 2
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
             Lx,
