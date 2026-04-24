@@ -1,8 +1,6 @@
 """
 VMC for ab initio quantum chemistry using NNBF.
 
-Reproducing Liu & Clark, PRB 110, 115137 (2024).
-
 Usage:
     mpirun -np <N> python vmc_run_qc.py
 

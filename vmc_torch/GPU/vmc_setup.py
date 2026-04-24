@@ -82,10 +82,9 @@ def load_or_generate_peps(
     Lx, Ly, t, U, N_f, D, seed=42, dtype=torch.float64, scale_factor=4,
     data_root=DEFAULT_DATA_ROOT, file_path=None, 
 ):
-    """Load a pre-trained fPEPS from disk, or generate a random one."""
+    """Load a pre-trained Z2-fPEPS from disk, or generate a random one."""
     try:
-        u1z2 = True
-        appendix = '_U1SU' if u1z2 else ''
+        appendix = '_U1SU'
         if file_path is not None:
             base = file_path
         else:
@@ -114,8 +113,8 @@ def load_or_generate_peps(
         import symmray as sr
 
         print(
-            f'Could not load PEPS from pickle: {e}. '
-            f'Generating random PEPS instead.'
+            f'Could not load Z2-fPEPS from pickle: {e}. '
+            f'Generating random Z2-fPEPS instead.'
         )
         peps = sr.networks.PEPS_fermionic_rand(
             "Z2",

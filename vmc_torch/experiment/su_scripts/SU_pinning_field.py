@@ -1,6 +1,6 @@
 import os
 os.environ["NUMBA_NUM_THREADS"] = "20"
-from SU_func import (
+from vmc_torch.experiment.su_scripts.SU_func import (
     run_u1SU_w_pinning_field,
     run_u1SU,
     run_z2SU_from_u1SU,

@@ -43,8 +43,7 @@ from vmc_torch.GPU.run_scripts.vmcconfig import (
 
 dtype = torch.float64
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch'
-    '/vmc_torch/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data' # Change this to your desired data directory
 )
 
 vmc_cfg = VMCConfig(
@@ -73,17 +72,15 @@ warmup_cfg = VMCWarmupConfig(
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
     offload_grad_to_cpu=vmc_cfg.offload_grad_to_cpu,
-    run_sampling=True,
-    run_locE=False,
-    run_grad=True,
+    run_sampling=False, # whether we want to run sampling during warmup
+    run_locE=False, # whether we want to run local energy evaluation during warmup
+    run_grad=False, # whether we want to run gradient computation during warmup
 )
 
 
 def main():
     setup_linalg_hooks(
         jitter=1e-8, qr_via_eigh=True,
-        cholesky_qr=False,
-        cholesky_qr_adaptive_jitter=False,
         nonuniform_diag=True,
     )
     torch.set_default_dtype(dtype)
@@ -259,4 +256,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # To run this script, use:
+    # torchrun --nproc_per_node=<N> vmc_run_fpeps.py
+    # For example, to run on a single GPU:
+    # torchrun --nproc_per_node=1 vmc_run_fpeps.py
     main()

@@ -100,7 +100,7 @@ def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None
                 except Exception:
                     pass
         else:
-            raise NotImplementedError("Only Z2 symmetry is supported for converting old fTN to new symmray format for now.")
+            raise Warning("Only Z2 symmetry is supported for converting old fTN to new symmray format for now.")
     
     ftns = qtn.unpack(params, skeleton)
     # Precondition the fTNS
@@ -122,8 +122,6 @@ def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None
                 if isinstance(nested_dummy_modes, FermionicOperator):
                     ts.data._dummy_modes = (nested_dummy_modes,)
     return ftns
-
-
 
 
 
@@ -1016,10 +1014,12 @@ class fMPS(qtn.MatrixProductState):
         super().__init__(arrays, sites=sites, L=L, shape=shape, tags=tags, site_ind_id=site_ind_id, site_tag_id=site_tag_id, **tn_opts)
 
         self.symmetry = self.arrays[0].symmetry
-        try:
-            self.spinless = True if self.phys_dim() == 2 else False
-        except KeyError:
-            self.spinless = True if self.ind_size(self.site_ind_id.format(self.L-1)) == 2 else False
+        # try:
+        #     self.spinless = True if self.phys_dim() == 2 else False
+        # except KeyError:
+        #     self.spinless = True if self.ind_size(self.site_ind_id.format(self.L-1)) == 2 else False
+        
+        self.spinless = True if self.arrays[0].shape[-1]==2 else False
     
     def product_bra_state(self, config, reverse=1):
         """For product state ALWAYS make sure the set of dummy_modeses are different from the set of dummy_modeses in the TNS |psi>.
@@ -1089,7 +1089,6 @@ class fMPS(qtn.MatrixProductState):
 
         return product_tn
     
-    # NOTE: don't use @classmethod here, as we need to access the specific instance attributes
     def get_amp(self, config, inplace=False, conj=True, efficient=True):
         """Get the amplitude of a configuration in a fMPS."""
         if efficient:
@@ -1168,11 +1167,13 @@ class fMPS(qtn.MatrixProductState):
                     new_dummy_modes = (3*tid+2)*(-1)
                 elif int(n) == 3 or int(n) == 0:
                     new_dummy_modes = ()
-
                 new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
                 new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
                 dummy_modes = list(new_dummy_modes)[::-1]
-                
+                if len(new_charge_sec_data_dict) == 0:
+                    site_mapping = dict(zip(self.site_inds, config))
+                    amp = self.isel(selectors=site_mapping)
+                    return amp
                 new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
                 fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
@@ -1376,6 +1377,53 @@ def generate_random_fmps(L, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless
     )
     mps = mps.copy() # set symmetry during initialization
     return mps, charge_config
+
+
+def generate_random_fmps_symmray(L, D, seed, symmetry='U1', Nf=0, cyclic=False, spinless=False, subsizes=None):
+    """Generate a random spinless/spinful fermionic MPS of length L using symmray."""
+
+    def generate_initial_config(Nf, L):
+        np.random.seed(seed)
+        config = np.array([1] * Nf + [0] * (L - Nf))
+        np.random.shuffle(config)
+        return config
+
+    rcharge_config = generate_initial_config(Nf, L)
+    sites = list(range(L))
+
+    def site_charge(site):
+        if symmetry == 'U1':
+            charge_dict = dict(zip(sites, rcharge_config))
+            return int(charge_dict[site])
+        elif symmetry == 'Z2':
+            # all zero parity for random Z2 fMPS
+            return 0
+
+    fmps = sr.MPS_fermionic_rand(
+        symmetry,
+        L,
+        bond_dim=D,
+        phys_dim=4 if not spinless else 2,
+        site_charge=site_charge,
+        seed=seed,
+        cyclic=cyclic,
+        subsizes=subsizes,
+    )
+    fmps = format_fpeps_keys(fmps)
+
+    fmps.view_as_(
+        fMPS,
+        L=L,
+        site_ind_id="k{}",
+        site_tag_id="I{}",
+        cyclic=cyclic,
+    )
+    mps = fmps.copy()  # set symmetry during initialization
+    for ts in mps.tensors:
+        if ts.data.dummy_modes:
+            tid = ts.data.dummy_modes[0].label
+            ts.data._dummy_modes[0]._label = 3 * tid  # normalize to 3*tid convention
+    return mps
 
 
 def form_gated_fmps_tnf(
