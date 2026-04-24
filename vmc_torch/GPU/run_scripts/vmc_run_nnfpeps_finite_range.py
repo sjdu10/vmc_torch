@@ -60,17 +60,19 @@ vmc_cfg = VMCConfig(
     vmc_steps=500,
     burn_in_steps=10,
     learning_rate=0.1,
-    sr_diag_shift=5e-4,
-    use_distributed_sr_minres=True,
-    sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
     use_export_compile=True,
     save_every=10,
     resume_step=0,
     verbose=False,
+    # --- SR ---
+    run_sr=True,
+    sr_diag_shift=5e-4,
+    use_distributed_sr_minres=True,
+    sr_rtol=1e-4,
     # --- SPRING (Goldshlager et al. 2024, arXiv:2401.10190) ---
-    use_spring=True,
+    use_spring=False,
     spring_variant='minres',   # 'minsr' (direct) | 'minres' (iterative)
     spring_mu=0.99,
     norm_constraint=None,
@@ -103,7 +105,7 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 4
+        Lx, Ly = 4, 2
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
@@ -114,9 +116,9 @@ def main():
 
         # NN backflow hyperparameters
         nn_eta = 1.0
-        d_model = 32
+        d_model = 16
         n_heads = 4
-        nn_hidden_dim = 16
+        nn_hidden_dim = D
         radius = 1
 
         # ========== Hamiltonian ==========
@@ -283,11 +285,12 @@ def main():
         # ========== VMC driver ==========
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
-            preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
                 norm_constraint=vmc_cfg.norm_constraint,
             ),
+            # --------- SR preconditioner ---------
+            preconditioner=make_preconditioner(vmc_cfg),
         )
 
         fxs = vmc.run_warmup(

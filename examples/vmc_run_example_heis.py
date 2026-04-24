@@ -14,13 +14,12 @@ import quimb.tensor as qtn
 import autoray as ar
 
 from vmc_torch.experiment.tn_model import PEPS_model, PEPS_NN_Model, init_weights_to_zero, PEPS_NNproj_Model, PEPS_delocalized_Model
-from vmc_torch.sampler import MetropolisExchangeSamplerSpinless, MetropolisExchangeSamplerSpinful
+from vmc_torch.sampler import MetropolisExchangeSamplerSpinless
 from vmc_torch.variational_state import Variational_State
-from vmc_torch.optimizer import TrivialPreconditioner, SignedSGD, SGD, SR
+from vmc_torch.optimizer import SGD, SR
 from vmc_torch.VMC import VMC
 from vmc_torch.hamiltonian_torch import spin_Heisenberg_square_lattice_torch
 from vmc_torch.torch_utils import SVD,QR
-from vmc_torch.utils import closest_divisible
 
 # Register safe SVD and QR functions to torch
 ar.register_function('torch','linalg.svd',SVD.apply)

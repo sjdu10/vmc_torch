@@ -14,6 +14,8 @@ WavefunctionModel_GPU also provides:
   - vamp(x, params): batched amplitude for torch.func.grad
   - export_and_compile / export_only / compile_model
 """
+import os
+
 import torch
 import torch.nn as nn
 
@@ -121,9 +123,12 @@ class WavefunctionModel_GPU(nn.Module):
         return self._vmapped_log_amplitude(x, params)
 
     def forward_log(self, x):
-        """Dispatch: compiled -> exported -> eager for log-amplitude."""
+        """Dispatch: aoti -> compiled -> exported -> eager for log-amplitude."""
         if self._exported and self._exported_log_amp:
             params_list = list(self.params)
+            aoti = getattr(self, '_aoti_runner', None)
+            if aoti is not None:
+                return aoti(x, *params_list)
             if self._compiled:
                 return self._vmapped_compiled(x, *params_list)
             return self._vmapped_exported(x, *params_list)
@@ -132,9 +137,12 @@ class WavefunctionModel_GPU(nn.Module):
     # ----- Provided for free -----
 
     def forward(self, x):
-        """Dispatch: compiled -> exported -> eager."""
+        """Dispatch: aoti -> compiled -> exported -> eager."""
         if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
+            aoti = getattr(self, '_aoti_runner', None)
+            if aoti is not None:
+                return aoti(x, *params_list)
             if self._compiled:
                 return self._vmapped_compiled(x, *params_list)
             else:
@@ -200,7 +208,8 @@ class WavefunctionModel_GPU(nn.Module):
 
     def export_and_compile(
         self, example_x, mode='default',
-        use_log_amp=False, **compile_kwargs,
+        use_log_amp=False, cache_dir=None,
+        example_batch_x=None, **compile_kwargs,
     ):
         """Export + compile the amplitude function for GPU speedup.
 
@@ -208,6 +217,8 @@ class WavefunctionModel_GPU(nn.Module):
            capturing all ops as a pure aten-ops FX graph.
         2. torch.vmap batches the exported graph.
         3. torch.compile fuses the batched ops into CUDA kernels.
+        4. Optionally (if example_batch_x is given): AOTI compile the
+           vmapped graph so fresh processes skip dynamo+Triton entirely.
 
         Call AFTER .to(device).
 
@@ -219,33 +230,84 @@ class WavefunctionModel_GPU(nn.Module):
             use_log_amp: if True, export log_amplitude instead of
                 amplitude. forward_log() will dispatch to compiled
                 path; forward() will fall back to eager.
+            cache_dir: if provided, save/load the ExportedProgram
+                to/from this directory (alongside checkpoints).
+                Avoids re-running torch.export on restarts.
+            example_batch_x: if provided (B, N_sites) batch tensor,
+                build an AOTI package for the vmapped forward.
+                On future runs the AOTI runner is loaded instead of
+                going through dynamo+Triton — eliminates first-call
+                overhead (~13s → 0.02s). Set to None to disable (no
+                behavioral change, easy rollback).
         """
         from torch.export import export
 
         params_list = list(self.params)
+        n_params = len(params_list)
 
-        if use_log_amp:
-            export_fn = self._log_amplitude_for_export
-        else:
-            export_fn = self._amplitude_for_export
-
-        class _AmpModule(nn.Module):
-            def __init__(self_, amp_fn):
-                super().__init__()
-                self_._fn = amp_fn
-
-            def forward(self_, x, *flat_params):
-                return self_._fn(x, *flat_params)
-
-        with torch.no_grad():
-            exported = export(
-                _AmpModule(export_fn),
-                (example_x, *params_list),
+        # --- Determine cache path ---
+        if cache_dir is not None:
+            amp_tag = "logamp" if use_log_amp else "amp"
+            cache_path = os.path.join(
+                cache_dir, f"exported_{amp_tag}.pt2",
             )
+        else:
+            cache_path = None
+
+        # --- Load compiler artifacts before torch.compile ---
+        # Must be loaded before torch.compile so dynamo finds
+        # cached Triton kernels instead of recompiling from scratch.
+        if cache_dir is not None:
+            artifacts_path = os.path.join(
+                cache_dir, "compiler_artifacts.bin",
+            )
+            if os.path.exists(artifacts_path):
+                with open(artifacts_path, 'rb') as f:
+                    artifact_bytes = f.read()
+                torch.compiler.load_cache_artifacts(artifact_bytes)
+                print(
+                    f"Loaded compiler artifacts from "
+                    f"{artifacts_path}"
+                )
+        else:
+            artifacts_path = None
+        self._compiler_artifacts_path = artifacts_path
+
+        # --- Export or load from cache ---
+        if cache_path is not None and os.path.exists(cache_path):
+            print(f"Loading cached ExportedProgram from {cache_path}")
+            exported = torch.export.load(cache_path)
+        else:
+            if use_log_amp:
+                export_fn = self._log_amplitude_for_export
+            else:
+                export_fn = self._amplitude_for_export
+
+            class _AmpModule(nn.Module):
+                def __init__(self_, amp_fn):
+                    super().__init__()
+                    self_._fn = amp_fn
+
+                def forward(self_, x, *flat_params):
+                    return self_._fn(x, *flat_params)
+
+            print("Running torch.export (this may take a while)...")
+            with torch.no_grad():
+                exported = export(
+                    _AmpModule(export_fn),
+                    (example_x, *params_list),
+                )
+
+            # Save before device move so constants remain on CPU
+            # (portable across devices / restarts).
+            if cache_path is not None:
+                os.makedirs(cache_dir, exist_ok=True)
+                torch.export.save(exported, cache_path)
+                print(f"Saved ExportedProgram to {cache_path}")
+
         self._exported_module = exported.module()
         self._move_exported_constants_to_device(example_x.device)
 
-        n_params = len(params_list)
         self._vmapped_exported = torch.vmap(
             self._exported_module,
             in_dims=(0, *([None] * n_params)),
@@ -260,6 +322,94 @@ class WavefunctionModel_GPU(nn.Module):
         self._exported = True
         self._compiled = True
         self._exported_log_amp = use_log_amp
+
+        # --- AOTI: build or load ahead-of-time compiled runner ---
+        if example_batch_x is not None and cache_dir is not None:
+            aoti_path = os.path.join(cache_dir, "forward_aoti.pt2")
+            self._aoti_runner = self._load_or_build_aoti(
+                example_batch_x, aoti_path, use_log_amp,
+            )
+
+    def save_compiler_artifacts(self):
+        """Save compiled Triton kernel artifacts to cache_dir.
+
+        Call this AFTER the first forward pass (warmup) so that all
+        kernels have been compiled and can be captured. On the next
+        run, export_and_compile will load them automatically and the
+        first forward should be fast.
+        """
+        path = getattr(self, '_compiler_artifacts_path', None)
+        if path is None:
+            print(
+                "save_compiler_artifacts: no cache_dir set, "
+                "skipping."
+            )
+            return
+        try:
+            artifact_bytes, _ = (
+                torch.compiler.save_cache_artifacts()
+            )
+            with open(path, 'wb') as f:
+                f.write(artifact_bytes)
+            print(
+                f"Saved compiler artifacts to {path} "
+                f"({len(artifact_bytes) / 1e6:.1f} MB)"
+            )
+        except Exception as e:
+            print(f"save_compiler_artifacts failed: {e}")
+
+    def _load_or_build_aoti(
+        self, example_batch_x, aoti_path, use_log_amp,
+    ):
+        """Load or build an AOTI runner for the vmapped forward.
+
+        The AOTI runner is a self-contained compiled package that
+        bypasses dynamo+AOT+Triton on every fresh process — first call
+        takes ~0.02s instead of ~13s.
+
+        Args:
+            example_batch_x: (B, N_sites) batch tensor — fixes batch
+                size B in the compiled graph.
+            aoti_path: path to save/load the .pt2 package.
+            use_log_amp: must match the export's use_log_amp.
+
+        Returns:
+            callable runner (x_batch, *params) -> output
+        """
+        params_list = list(self.params)
+        n_params = len(params_list)
+
+        if os.path.exists(aoti_path):
+            print(f"Loading AOTI runner from {aoti_path}")
+            runner = torch._inductor.aoti_load_package(aoti_path)
+            print("  AOTI runner loaded.")
+            return runner
+
+        # Build: export(vmap(exported_module)) then aoti_compile
+        print("Building AOTI runner (one-time, ~40s)...")
+        vmapped_fn = torch.vmap(
+            self._exported_module,
+            in_dims=(0, *([None] * n_params)),
+        )
+
+        class _VmappedWrapper(nn.Module):
+            def forward(self_, x_batch, *flat_params):
+                return vmapped_fn(x_batch, *flat_params)
+
+        with torch.no_grad():
+            ep_vmapped = torch.export.export(
+                _VmappedWrapper(),
+                (example_batch_x, *params_list),
+            )
+
+        pkg_path = torch._inductor.aoti_compile_and_package(
+            ep_vmapped,
+            package_path=aoti_path,
+        )
+        print(f"  AOTI package saved to {pkg_path}")
+        runner = torch._inductor.aoti_load_package(pkg_path)
+        print("  AOTI runner ready.")
+        return runner
 
     def export_only(self, example_x, use_log_amp=False):
         """Export + vmap without compile.  Useful for debugging."""

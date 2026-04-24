@@ -48,18 +48,18 @@ DEFAULT_DATA_ROOT = (
 )
 
 vmc_cfg = VMCConfig(
-    batch_size=4,
-    ns_per_rank=4,
-    grad_batch_size=4,
-    vmc_steps=1000,
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=512,
+    vmc_steps=10,
     burn_in_steps=0,
     learning_rate=0.1,
     sr_diag_shift=5e-4,
     use_distributed_sr_minres=True,
     sr_rtol=1e-4,
-    offload_grad_to_cpu=True,
+    offload_grad_to_cpu=True, # Set to True to avoid GPU OOM for large models / batch sizes
     use_log_amp=True,
-    use_export_compile=False,
+    use_export_compile=True, # Set to True if you want model compilation (can reduce runtime for model forward but may slow down the first few steps due to compilation overhead)
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -73,7 +73,7 @@ warmup_cfg = VMCWarmupConfig(
     grad_batch_size=vmc_cfg.grad_batch_size,
     use_log_amp=vmc_cfg.use_log_amp,
     offload_grad_to_cpu=vmc_cfg.offload_grad_to_cpu,
-    run_sampling=False,
+    run_sampling=True,
     run_locE=False,
     run_grad=True,
 )
@@ -94,13 +94,13 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 8, 8
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         t, U = 1.0, 8.0
-        N_f = N_sites - 8
+        N_f = N_sites - 2
         n_fermions_per_spin = (N_f // 2, N_f // 2)
-        D = 10
-        chi = 10
+        D = 4
+        chi = -1
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -164,6 +164,10 @@ def main():
         example_x = random_initial_config(
             N_f, N_sites, seed=0,
         ).to(device)
+        example_batch_x = torch.stack([
+            random_initial_config(N_f, N_sites, seed=s)
+            for s in range(vmc_cfg.batch_size)
+        ]).to(device)
         if vmc_cfg.use_export_compile:
             if rank == 0:
                 print("Running torch.export + compile...")
@@ -172,6 +176,8 @@ def main():
             model.export_and_compile(
                 example_x,
                 use_log_amp=vmc_cfg.use_log_amp,
+                cache_dir=output_dir,
+                example_batch_x=example_batch_x,
             )
             if rank == 0:
                 print(
@@ -225,6 +231,12 @@ def main():
             fxs=fxs, model=model, graph=H.graph,
             hamiltonian=H, rank=rank, config=warmup_cfg,
         )
+
+        # Save compiled Triton kernels after warmup so next run
+        # loads them instead of recompiling.
+        if vmc_cfg.use_export_compile and rank == 0:
+            model.save_compiler_artifacts()
+
         energy_history, _ = vmc.run_vmc_loop(
             fxs=fxs, model=model, hamiltonian=H,
             graph=H.graph, rank=rank,

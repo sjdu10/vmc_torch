@@ -19,8 +19,12 @@ class PEPS_Model(nn.Module):
         self.params = torch.nn.ParameterList([
             torch.as_tensor(x, dtype=self.dtype) for x in params_flat
         ])
+        
+        self._vmapped_amplitude = torch.vmap(
+            self.amplitude,
+            in_dims=(0, None),
+        )
 
-    
     def amplitude(self, x, params):
         tn = qtn.unpack(params, self.skeleton)
         # might need to specify the right site ordering here
@@ -32,10 +36,7 @@ class PEPS_Model(nn.Module):
     
     def vamp(self, x, params):
         params = qu.utils.tree_unflatten(params, self.params_pytree)
-        return torch.vmap(
-            self.amplitude,
-            in_dims=(0, None),
-        )(x, params)
+        return self._vmapped_amplitude(x, params)
 
     def forward(self, x):
         return self.vamp(x, self.params)

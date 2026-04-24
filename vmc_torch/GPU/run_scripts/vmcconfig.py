@@ -21,6 +21,13 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+# Persist compiled kernel cache to home dir so it survives WSL2/tmp wipes.
+# setdefault: user can still override by setting the env var before launch.
+os.environ.setdefault(
+    "TORCHINDUCTOR_CACHE_DIR",
+    os.path.expanduser("~/.cache/torchinductor"),
+)
+
 import torch
 
 from vmc_torch.GPU.optimizer import (
@@ -59,17 +66,18 @@ class VMCConfig:
     # ----- Training -----
     vmc_steps: int = 100
     learning_rate: float = 0.1
-    run_sr: bool = True
     lr_scheduler: object = None
 
     # ----- SR solver -----
+    run_sr: bool = True
     sr_diag_shift: float = 1e-4
-    use_min_sr: bool = False
-    use_distributed_min_sr: bool = False
     use_distributed_sr_minres: bool = True
     minres_sr_use_scipy: bool = False
     sr_rtol: float = 1e-4
     sr_maxiter: int = 100
+    
+    use_min_sr: bool = False
+    use_distributed_min_sr: bool = False
     param_chunk_size: int = 1024
 
     # ----- SPRING (arXiv:2401.10190) -----
@@ -149,18 +157,20 @@ def make_preconditioner(cfg):
                 f"Unknown spring_variant: {variant!r} "
                 "(expected 'minsr' or 'minres')"
             )
-    if cfg.use_distributed_min_sr:
-        return DistributedMinSRGPU(
-            param_chunk_size=cfg.param_chunk_size,
-        )
-    elif cfg.use_min_sr:
-        return MinSRGPU()
-    elif cfg.use_distributed_sr_minres:
-        return DistributedSRMinresGPU(
-            rtol=cfg.sr_rtol,
-            maxiter=cfg.sr_maxiter,
-            use_scipy=cfg.minres_sr_use_scipy,
-        )
+    if getattr(cfg, 'run_sr', False):
+        if getattr(cfg, 'use_min_sr', False):
+            if getattr(cfg, 'use_distributed_min_sr', False):
+                return DistributedMinSRGPU(
+                    param_chunk_size=cfg.param_chunk_size,
+                )
+            return MinSRGPU()
+        elif getattr(cfg, 'use_distributed_sr_minres', False):
+            return DistributedSRMinresGPU(
+                rtol=cfg.sr_rtol,
+                maxiter=cfg.sr_maxiter,
+                use_scipy=cfg.minres_sr_use_scipy,
+            )
+    # No SR preconditioner selected
     return None
 
 
