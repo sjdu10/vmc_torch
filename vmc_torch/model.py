@@ -315,6 +315,149 @@ class circuit_TNF(wavefunctionModel):
 
         
 
+def _peps_sample_row_sequential(
+    effective_tn, peps, x, d, rng,
+    n_up_so_far=None, n_up_target=None, n_sites_total=None,
+):
+    """
+    Sample one row of a PEPS site-by-site using right-canonical form + density
+    matrix.  Implements Appendix B of arXiv:2109.07356.
+
+    At each column y, contracts all tensors tagged Y{y} in effective_tn into a
+    super-site M_y with shape (chi_L, chi_R, D_bot, d), where chi_L/chi_R are
+    compressed horizontal bonds, D_bot is the free bottom bond (chi_m=0:
+    traced over), and d is the physical dimension.
+
+    U(1) charge conservation (Sec. IV, arXiv:2109.07356):
+    When n_up_target is provided we track the total number of up-spins
+    (physical value 1) sampled so far and mask out physically forbidden
+    values at each site so that the global constraint is always satisfied.
+
+    Parameters
+    ----------
+    effective_tn : quimb TensorNetwork
+        compressed combined TN (boundary | PEPS row), one tensor per column.
+    peps : quimb PEPS
+    x    : int, current row index (used to find physical index k{x},{y})
+    d    : int, physical dimension
+    rng  : np.random.Generator
+    n_up_so_far  : int or None — cumulative up-spins sampled before this row
+    n_up_target  : int or None — target total number of up-spins (value==1)
+    n_sites_total: int or None — total sites in the lattice (Lx * Ly)
+
+    Returns
+    -------
+    sampled_row  : list[int], length Ly
+    log_prob_row : float
+    n_up_so_far  : int — updated count (unchanged if n_up_target is None)
+    """
+    import numpy as np
+
+    Ly = peps.Ly
+
+    # Index sets per column — used to classify M_y's external indices.
+    all_col_inds = []
+    for y in range(Ly):
+        col_inds = set()
+        for t in effective_tn.select_tensors(peps.y_tag(y)):
+            col_inds.update(t.inds)
+        all_col_inds.append(col_inds)
+
+    # Build M_list: one numpy array per column with shape (chi_L, chi_R, D_bot, d)
+    M_list = []
+    for y in range(Ly):
+        col_tensors = [
+            t.copy() for t in effective_tn.select_tensors(peps.y_tag(y))
+        ]
+        if len(col_tensors) == 1:
+            M_y_t = col_tensors[0]
+        else: # if contains 2 tensors from two uncontracted rows, contract them together first
+            M_y_t = qtn.TensorNetwork(col_tensors).contract()
+
+        p_ind = peps.site_ind(x, y)
+
+        # Classify external indices as left / right / bottom (physical excluded).
+        left_inds, right_inds, bot_inds = [], [], []
+        for ind in M_y_t.inds:
+            if ind == p_ind:
+                continue
+            in_left  = (y > 0)      and (ind in all_col_inds[y - 1])
+            in_right = (y < Ly - 1) and (ind in all_col_inds[y + 1])
+            if in_left:
+                left_inds.append(ind)
+            elif in_right:
+                right_inds.append(ind)
+            else:
+                bot_inds.append(ind)
+
+        ordered_inds = left_inds + right_inds + bot_inds + [p_ind]
+        M_y_t = M_y_t.transpose(*ordered_inds)
+        M_arr = np.asarray(M_y_t.data, dtype=complex)
+
+        chi_L = (int(np.prod([M_y_t.ind_size(i) for i in left_inds]))
+                 if left_inds else 1)
+        chi_R = (int(np.prod([M_y_t.ind_size(i) for i in right_inds]))
+                 if right_inds else 1)
+        D_bot = (int(np.prod([M_y_t.ind_size(i) for i in bot_inds]))
+                 if bot_inds else 1)
+
+        M_list.append(M_arr.reshape(chi_L, chi_R, D_bot, d))
+
+    # Right-canonicalize: LQ sweep from y=Ly-1 down to y=1.
+    # After this: Σ_{b,c,v} M_y[a,b,c,v] M_y*[a',b,c,v] = δ_{a,a'} for y > 0.
+    for y in range(Ly - 1, 0, -1):
+        chi_L, chi_R, D_bot, d_phys = M_list[y].shape
+        M_mat = M_list[y].reshape(chi_L, chi_R * D_bot * d_phys)
+        Q, R = np.linalg.qr(M_mat.conj().T, mode='reduced')
+        L = R.conj().T            # (chi_L, k)
+        k = L.shape[1]
+        M_list[y] = Q.conj().T.reshape(k, chi_R, D_bot, d_phys)
+        M_list[y - 1] = np.einsum('abcd,bk->akcd', M_list[y - 1], L)
+
+    # Left-to-right sampling with density matrix rho_L.
+    sampled_row  = []
+    log_prob_row = 0.0
+    rho_L = np.ones((1, 1), dtype=complex)    # trivial left boundary
+
+    for y in range(Ly):
+        M = M_list[y]                          # (chi_L, chi_R, D_bot, d)
+
+        # F_y[v, a, a'] = Σ_{b,c} M[a,b,c,v] M*[a',b,c,v]
+        F_y = np.einsum('abcv,dbcv->vad', M, M.conj())
+        probs = np.einsum('ad,vad->v', rho_L, F_y).real
+        probs = np.maximum(probs, 0.0)
+
+        # U(1) charge mask (Sec. IV, arXiv:2109.07356):
+        # Zero out values whose species has reached its bound, so the global
+        # charge constraint is guaranteed without any post-rejection.
+        if n_up_target is not None:
+            site_idx   = x * Ly + y
+            n_left     = n_sites_total - site_idx   # remaining sites incl. current
+            n_up_need  = n_up_target - n_up_so_far  # up-spins still required
+            if n_up_need <= 0:
+                probs[1] = 0.0   # enough ups collected — forbid more
+            if n_up_need >= n_left:
+                probs[0] = 0.0   # must take up at every remaining site
+
+        probs /= probs.sum()
+
+        v = int(rng.choice(d, p=probs))
+        sampled_row.append(v)
+        log_prob_row += np.log(float(probs[v]) + 1e-300)
+
+        if n_up_target is not None:
+            n_up_so_far += int(v == 1)
+
+        # rho_L_new[b,b'] = Σ_{a,a',c} M_v[a,b,c] rho_L[a,a'] M_v*[a',b',c]
+        M_v   = M[:, :, :, v]                 # (chi_L, chi_R, D_bot)
+        rho_L = np.einsum('abc,ap,pdc->bd', M_v, rho_L, M_v.conj())
+        tr = np.trace(rho_L)
+        if abs(tr) > 1e-300:
+            rho_L /= tr
+
+    return sampled_row, log_prob_row, n_up_so_far
+
+
 class PEPS_model(wavefunctionModel):
     def __init__(self, peps, max_bond=None):
         super().__init__()
@@ -360,6 +503,93 @@ class PEPS_model(wavefunctionModel):
             return func(x)
         else:
             return torch.stack([func(xi) for xi in x])
+
+    @torch.no_grad()
+    def direct_sample(self, chi_s=None, seed=None, total_sz=None):
+        """
+        Draw one independent configuration from p_c(S) via row-by-row
+        sequential sampling (arXiv:2109.07356, chi_m=0).
+
+        At each row x:
+          1. Compress B_{x-1} | row_x immediately to bond chi_s (eq 27).
+          2. Sample physical indices site-by-site (right-canonical + rho_L).
+          3. Fix physical indices → new single-layer boundary B_x.
+
+        U(1) symmetry (Sec. IV, arXiv:2109.07356):
+        If total_sz is given, charge conservation is enforced at sampling
+        time by masking forbidden physical values — no post-rejection needed.
+        For spin-1/2 (d=2, value 0=down / 1=up):
+          n_up_target = (Lx*Ly + total_sz) // 2
+
+        Parameters
+        ----------
+        chi_s    : int or None — boundary MPS bond dimension (default: max_bond)
+        seed     : int or np.random.Generator or None
+        total_sz : int or None — target total Sz (in units where each spin
+                   contributes ±1).  None = no symmetry constraint.
+
+        Returns
+        -------
+        config  : torch.Tensor, shape (Lx*Ly,), dtype int64
+        log_p_c : float
+        """
+        import numpy as np
+        from quimb.tensor.tn1d.compress import tensor_network_1d_compress
+
+        if chi_s is None:
+            chi_s = self.max_bond
+
+        params = {int(tid): data for tid, data in self.torch_tn_params.items()}
+        peps   = qtn.unpack(params, self.skeleton)
+
+        rng = np.random.default_rng(seed)
+        Lx, Ly = peps.Lx, peps.Ly
+        d = peps.phys_dim()
+        N = Lx * Ly
+        y_tags = [peps.y_tag(y) for y in range(Ly)]
+
+        # U(1) charge tracking: n_up_target = number of sites with value 1
+        # For spin-1/2 with Sz = n_up - n_down and target Sz = total_sz:
+        #   n_up_target = (N + total_sz) // 2
+        n_up_target = None
+        n_up_so_far = 0
+        if total_sz is not None:
+            n_up_target = (N + total_sz) // 2
+
+        config  = []
+        log_p_c = 0.0
+        B = None    # single-layer boundary MPS, one tensor per column, bond chi_s
+
+        for x in range(Lx):
+            row_tn = peps.select(peps.x_tag(x)).copy()
+
+            # Eq 27: compress B_{x-1} | row_x → single-layer MPS
+            combined = B | row_tn if B is not None else row_tn
+            if chi_s is not None:
+                combined_rc = tensor_network_1d_compress(
+                    combined, max_bond=chi_s, cutoff=0.0,
+                    method="direct", site_tags=y_tags
+                )
+            else:
+                combined_rc = combined
+
+            # Eq 28: sample physical indices from combined_rc
+            sampled_row, log_prob_row, n_up_so_far = _peps_sample_row_sequential(
+                combined_rc, peps, x, d, rng,
+                n_up_so_far=n_up_so_far,
+                n_up_target=n_up_target,
+                n_sites_total=N,
+            )
+            config.extend(sampled_row)
+            log_p_c += log_prob_row
+
+            # Fix physical indices → new boundary (already at bond chi_s)
+            isel_dict = {
+                peps.site_ind(x, y): int(sampled_row[y]) for y in range(Ly)
+            }
+            B = combined_rc.isel(isel_dict)
+
+        return torch.tensor(config, dtype=torch.int64), log_p_c
 
 class PEPS_model_reuse(wavefunctionModel):
     def __init__(
@@ -3708,15 +3938,15 @@ class fTNModel_reuse(wavefunctionModel):
             # Get the amplitude
             amp_tn = self.get_amp_tn(x_i)
 
-            if self.max_bond is None:
+            if self.max_bond is None and not self.cache_env_mode:
                 amp = amp_tn
-                if self.tree is None:
-                    opt = ctg.HyperOptimizer(
-                        progbar=True, max_repeats=10, parallel=True
-                    )
-                    self.tree = amp.contraction_tree(optimize=opt)
+                # if self.tree is None:
+                #     opt = ctg.HyperOptimizer(
+                #         progbar=True, max_repeats=10, parallel=True
+                #     )
+                #     self.tree = amp.contraction_tree(optimize=opt)
                 amp_val = amp.contract(
-                    optimize=self.tree
+                    # optimize=self.tree
                 )  # quimb will address the cached exponent automatically
 
             else:
