@@ -1856,6 +1856,142 @@ class MetropolisExchangeSpinfulSamplerXReuse_GPU(SamplerGPU):
         return fxs, current_amps
 
 
+class DirectProposalMCMCSamplerSpinGPU(SamplerGPU):
+    """Direct-sample-as-proposal Metropolis-Hastings sampler for spin PEPS.
+
+    At each step, draws B fresh proposals via `model.direct_sample_vmap(...)`
+    (vectorized over walkers) and accepts each independently with probability
+    min(1, w(S')/w(S)) where w(S) = |Ψ(S)|² / p_c(S). Targets p_Ψ.
+    Per-walker `log p_c` is cached across steps (and across `burn_in()`,
+    which calls `step()` repeatedly).
+
+    Requires `model` to have a `direct_sample_vmap(u_batch, chi_s, total_sz,
+    chi_m)` method (e.g. `PEPS_Model_GPU` in pureTNS_spin.py).
+
+    Args:
+        chi_s:    Boundary MPS bond for direct sampling. Defaults to model.chi.
+        chi_m:    Bottom marginal MPO bond (None or 0 = chi_m=0 approx).
+        total_sz: If given, enforce U(1) Sz constraint at sampling time.
+        base_seed: Unused — kept for backward compat. Per-walker randomness
+            now comes from `torch.rand(B, N, device=...)` driven by
+            PyTorch's RNG (seeded once in run scripts).
+    """
+
+    def __init__(
+        self, chi_s=None, chi_m=None, total_sz=None, base_seed=None,
+    ):
+        self.chi_s = chi_s
+        self.chi_m = chi_m
+        self.total_sz = total_sz
+        self.base_seed = base_seed   # unused; kept for backward compat
+        self._log_pc = None      # (B,) float64 on device, current chain state
+        self._step_idx = 0       # used only for verbose-print labelling
+
+    @torch.inference_mode()
+    def step(
+        self,
+        fxs: torch.Tensor,
+        model,
+        graph,
+        compile: bool = False,
+        verbose: bool = False,
+        use_log_amp: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One MH step: B fresh direct-sample proposals + accept/reject.
+
+        Args:
+            fxs: (B, N_sites) int64 walker configs on device.
+            model: nn.Module with .direct_sample(...) and .forward(x) -> (B,)
+                (or .forward_log(x) -> (signs, log_abs) for use_log_amp=True).
+            graph: ignored (kept for SamplerGPU contract).
+            use_log_amp: if True, work in log-amplitude space.
+
+        Returns:
+            fxs: (B, N_sites) int64 updated configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs) when use_log_amp.
+        """
+        device = fxs.device
+        B, _N = fxs.shape
+
+        # ---- 1. Draw B fresh proposals via vectorized direct_sample_vmap ----
+        if verbose:
+            t0 = time.time()
+        u_batch = torch.rand(
+            B, fxs.shape[1], device=device, dtype=torch.float64,
+        )
+        proposed_fxs_int, proposed_log_pc = model.direct_sample_vmap(
+            u_batch,
+            chi_s=self.chi_s,
+            total_sz=self.total_sz,
+            chi_m=self.chi_m,
+        )
+        proposed_fxs = proposed_fxs_int.to(fxs.dtype)
+        if verbose:
+            t_propose = time.time() - t0
+
+        # ---- 2. Evaluate amplitudes via compiled batched forward ----
+        if verbose:
+            t0 = time.time()
+        if use_log_amp:
+            cur_signs, cur_log_abs = model.forward_log(fxs)
+            prop_signs, prop_log_abs = model.forward_log(proposed_fxs)
+        else:
+            current_amps = model(fxs)
+            proposed_amps = model(proposed_fxs)
+        if verbose:
+            t_forward = time.time() - t0
+
+        # ---- 3. MH accept/reject ----
+        # log w = 2 log|Ψ| - log p_c
+        if use_log_amp:
+            log_w_prop = 2.0 * prop_log_abs - proposed_log_pc
+        else:
+            log_w_prop = (
+                2.0 * torch.log(proposed_amps.abs() + 1e-300)
+                - proposed_log_pc
+            )
+
+        if self._log_pc is None:
+            # First step: unconditional accept (no chain history yet).
+            accept_mask = torch.ones(B, dtype=torch.bool, device=device)
+        else:
+            if use_log_amp:
+                log_w_curr = 2.0 * cur_log_abs - self._log_pc
+            else:
+                log_w_curr = (
+                    2.0 * torch.log(current_amps.abs() + 1e-300)
+                    - self._log_pc
+                )
+            log_u = torch.log(torch.rand(B, device=device) + 1e-300)
+            accept_mask = log_u < (log_w_prop - log_w_curr)
+
+        # ---- 4. In-place updates for accepted walkers ----
+        fxs[accept_mask] = proposed_fxs[accept_mask]
+        if self._log_pc is None:
+            self._log_pc = proposed_log_pc.clone()
+        else:
+            self._log_pc[accept_mask] = proposed_log_pc[accept_mask]
+
+        if verbose:
+            n_acc = int(accept_mask.sum().item())
+            print(
+                f"  DirectMH step {self._step_idx}: "
+                f"propose {t_propose:.3f}s, "
+                f"forward {t_forward:.3f}s, "
+                f"accept {n_acc}/{B}",
+            )
+
+        self._step_idx += 1
+        if use_log_amp:
+            cur_signs[accept_mask] = prop_signs[accept_mask]
+            cur_log_abs[accept_mask] = prop_log_abs[accept_mask]
+            return fxs, (cur_signs, cur_log_abs)
+        else:
+            current_amps[accept_mask] = proposed_amps[accept_mask]
+            return fxs, current_amps
+
+
 __all__ = [
     "SamplerGPU",
     "MetropolisExchangeSpinfulSamplerGPU",
@@ -1864,5 +2000,6 @@ __all__ = [
     "MetropolisExchangeSpinSamplerGPU",
     "MetropolisExchangeSpinSamplerReuse_GPU",
     "MetropolisExchangeSpinSamplerXReuse_GPU",
+    "DirectProposalMCMCSamplerSpinGPU",
     "propose_spin_exchange_vec",
 ]

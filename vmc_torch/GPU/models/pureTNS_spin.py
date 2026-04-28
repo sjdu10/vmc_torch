@@ -186,6 +186,548 @@ class PEPS_Model_GPU(WavefunctionModel_GPU):
         )
         return params
 
+    def prepare_direct_sample(self, chi_m=None):
+        """Build CPU PEPS + (optional) bottom marginals, once per VMC step.
+
+        Hoists the per-step shared work out of `direct_sample` so it isn't
+        repeated for every walker. The returned `(peps_cpu, marginals)`
+        is passed back into `direct_sample(..., _peps=, _marginals=)`.
+        """
+        import quimb as qu
+        import quimb.tensor as qtn
+        from vmc_torch.model import _peps_compute_marginals
+
+        params_flat_cpu = [p.detach().cpu() for p in self.params]
+        params_pytree = qu.utils.tree_unflatten(
+            params_flat_cpu, self.params_pytree,
+        )
+        peps = qtn.unpack(params_pytree, self.skeleton)
+        marginals = (
+            _peps_compute_marginals(peps, chi_m)
+            if (chi_m and chi_m > 0) else None
+        )
+        return peps, marginals
+
+    @torch.no_grad()
+    def direct_sample(
+        self, chi_s=None, seed=None, total_sz=None, chi_m=None,
+        _peps=None, _marginals=None,
+    ):
+        """One i.i.d. config S ~ p_c via row-by-row sequential sampling.
+
+        Mirrors CPU `PEPS_model.direct_sample` (vmc_torch/model.py). Quimb
+        ops run eagerly on CPU. If `_peps`/`_marginals` are passed in,
+        skips the params-to-CPU + unpack + marginals work — used by the
+        GPU sampler `step()` to amortise that across B walkers.
+
+        Returns
+        -------
+        config  : torch.Tensor, shape (Lx*Ly,), dtype int64, on CPU
+        log_p_c : float
+        """
+        import numpy as np
+        from quimb.tensor.tn1d.compress import tensor_network_1d_compress
+        from vmc_torch.model import _peps_sample_row_sequential
+
+        if chi_s is None:
+            chi_s = self.chi
+
+        if _peps is None:
+            peps, marginals = self.prepare_direct_sample(chi_m=chi_m)
+        else:
+            peps, marginals = _peps, _marginals
+
+        rng = np.random.default_rng(seed)
+        Lx, Ly = peps.Lx, peps.Ly
+        d = peps.phys_dim()
+        N = Lx * Ly
+        y_tags = [peps.y_tag(y) for y in range(Ly)]
+
+        n_up_target = (
+            (N + total_sz) // 2 if total_sz is not None else None
+        )
+        n_up_so_far = 0
+
+        config, log_p_c = [], 0.0
+        B = None  # single-layer top boundary MPS
+        for x in range(Lx):
+            row_tn = peps.select(peps.x_tag(x)).copy()
+            combined = (B | row_tn) if B is not None else row_tn
+            if chi_s is not None and chi_s > 0:
+                combined_rc = tensor_network_1d_compress(
+                    combined, max_bond=chi_s, cutoff=0.0,
+                    method="direct", site_tags=y_tags,
+                )
+            else:
+                combined_rc = combined
+
+            sampled_row, log_p_row, n_up_so_far = (
+                _peps_sample_row_sequential(
+                    combined_rc, peps, x, d, rng,
+                    n_up_so_far=n_up_so_far,
+                    n_up_target=n_up_target,
+                    n_sites_total=N,
+                    marginals_x=(
+                        marginals[x] if marginals is not None else None
+                    ),
+                )
+            )
+            config.extend(sampled_row)
+            log_p_c += log_p_row
+
+            isel = {
+                peps.site_ind(x, y): int(sampled_row[y])
+                for y in range(Ly)
+            }
+            B = combined_rc.isel(isel)
+
+        return torch.tensor(config, dtype=torch.int64), log_p_c
+
+    # -----------------------------------------------------------------
+    #  Vectorized direct sampler (torch.vmap over walkers)
+    # -----------------------------------------------------------------
+    def direct_sample_single(
+        self,
+        u_rand,
+        params,
+        chi_s,
+        total_sz=None,
+        marginals=None,
+    ):
+        """One walker's direct sample. vmap-traceable.
+
+        Args:
+            u_rand:    (Lx*Ly,) torch float, uniform [0,1) — pre-drawn
+                outside vmap.
+            params:    quimb pytree of torch tensors (already unflattened).
+            chi_s:     Python int or None, boundary MPS bond.
+            total_sz:  Python int or None. If int, applies U(1) Sz mask
+                (d=2 only).
+            marginals: list of Lx quimb TNs (one per row, last may be None)
+                or None. Config-independent; broadcast across walkers under
+                vmap. None → chi_m=0 right-canonical+LTR path.
+
+        Returns:
+            config:  (Lx*Ly,) int64
+            log_p_c: scalar float
+        """
+        import quimb.tensor as qtn
+        from quimb.tensor.tn1d.compress import (
+            tensor_network_1d_compress,
+        )
+
+        tns = qtn.unpack(params, self.skeleton)
+        Lx, Ly = tns.Lx, tns.Ly
+        d = tns.phys_dim()
+        N = Lx * Ly
+        y_tags = [tns.y_tag(y) for y in range(Ly)]
+
+        if total_sz is not None:
+            assert d == 2, (
+                "U(1) total_sz mask only supports d=2 (spin-1/2)"
+            )
+            n_up_target = (N + total_sz) // 2
+        else:
+            n_up_target = None
+        n_up_so_far = torch.zeros(
+            (), dtype=torch.int64, device=u_rand.device,
+        )
+
+        config_list = []
+        log_p_c = torch.zeros(
+            (), dtype=u_rand.dtype, device=u_rand.device,
+        )
+        boundary = None
+
+        for x in range(Lx):
+            row_tn = tns.select(tns.x_tag(x)).copy()
+            combined = (
+                (boundary | row_tn) if boundary is not None else row_tn
+            )
+            if chi_s is not None and chi_s > 0:
+                combined_rc = tensor_network_1d_compress(
+                    combined, max_bond=chi_s, cutoff=0.0,
+                    method='direct', site_tags=y_tags,
+                )
+            else:
+                combined_rc = combined
+
+            marginals_x = (
+                marginals[x] if marginals is not None else None
+            )
+
+            sampled_row, log_p_row, n_up_so_far = (
+                self._sample_row_single(
+                    combined_rc, tns, x, d, u_rand, marginals_x,
+                    n_up_so_far, n_up_target, N,
+                )
+            )
+            config_list.extend(sampled_row)
+            log_p_c = log_p_c + log_p_row
+
+            # Fix this row's physical legs to sampled values
+            isel = {
+                tns.site_ind(x, y): sampled_row[y]
+                for y in range(Ly)
+            }
+            boundary = combined_rc.isel(isel)
+
+        return torch.stack(config_list), log_p_c
+
+    def _sample_row_single(
+        self,
+        combined_rc,
+        tns,
+        x,
+        d,
+        u_rand,
+        marginals_x,
+        n_up_so_far,
+        n_up_target,
+        N,
+    ):
+        """Sample row x site-by-site (LTR) using torch ops.
+
+        Inverse-CDF sample with `u_rand[x*Ly + y]` instead of rng.choice.
+        Branches on `marginals_x is None` for the chi_m=0 vs chi_m>0 path.
+
+        Returns
+        -------
+        sampled_row : list[torch_int64_scalar]
+        log_p_row   : torch scalar
+        n_up_so_far : torch_int64_scalar (updated)
+        """
+        import quimb.tensor as qtn
+
+        Ly = tns.Ly
+        y_tags = [tns.y_tag(y) for y in range(Ly)]
+        log_p_row = torch.zeros(
+            (), dtype=u_rand.dtype, device=u_rand.device,
+        )
+        sampled_row = []
+
+        if marginals_x is None:
+            # ---- chi_m=0 path: right-canonical + LTR rho_L only ----
+            for y in range(Ly - 1, 0, -1):
+                combined_rc.canonize_between(y_tags[y], y_tags[y - 1])
+            rho_L = None
+
+            for y in range(Ly):
+                phys_ind = tns.site_ind(x, y)
+                t_y = combined_rc[y_tags[y]]
+
+                left_ind = self._shared_ind(
+                    t_y, combined_rc, y_tags, y, -1, Ly,
+                )
+                right_ind = self._shared_ind(
+                    t_y, combined_rc, y_tags, y, +1, Ly,
+                )
+
+                # Compute probs[v] for v=0..d-1
+                probs_list = []
+                for v in range(d):
+                    tv = t_y.isel({phys_ind: v})
+                    if rho_L is None:
+                        p = (tv.H | tv).contract().real
+                    else:
+                        tv_c = tv.conj().reindex(
+                            {left_ind: left_ind + '_c'},
+                        )
+                        F_v = (tv | tv_c).contract(
+                            output_inds=[left_ind, left_ind + '_c'],
+                        )
+                        p = (rho_L | F_v).contract().real
+                    probs_list.append(p)
+                probs = torch.stack(probs_list)
+                probs = self._apply_u1_mask(
+                    probs, x, y, Ly, N, n_up_so_far, n_up_target,
+                )
+
+                v = self._inverse_cdf_sample(
+                    probs, u_rand[x * Ly + y], d,
+                )
+                sampled_row.append(v)
+                log_p_row = log_p_row + torch.log(probs[v] + 1e-300)
+                if n_up_target is not None:
+                    n_up_so_far = n_up_so_far + (v == 1).long()
+
+                # rho_L update for next site (uses torch-scalar v)
+                if right_ind is not None:
+                    tv = t_y.isel({phys_ind: v})
+                    if rho_L is None:
+                        tv_c = tv.conj().reindex(
+                            {right_ind: right_ind + '_c'},
+                        )
+                        rho_L = (tv | tv_c).contract(
+                            output_inds=[
+                                right_ind, right_ind + '_c',
+                            ],
+                        )
+                    else:
+                        tv_c = tv.conj().reindex({
+                            left_ind: left_ind + '_c',
+                            right_ind: right_ind + '_c',
+                        })
+                        rho_L = (rho_L | tv | tv_c).contract(
+                            output_inds=[
+                                right_ind, right_ind + '_c',
+                            ],
+                        )
+                    norm = (
+                        rho_L.reindex(
+                            {right_ind + '_c': right_ind},
+                        ).contract().real
+                    )
+                    rho_L = rho_L / (norm + 1e-300)
+
+            return sampled_row, log_p_row, n_up_so_far
+
+        # ---- chi_m > 0 path: 3-layer TN with rho_R precomputed ----
+
+        # Per-column index info
+        left_inds = []
+        right_inds = []
+        D_bot_lists = []
+        chi_m_L_list = []
+        chi_m_R_list = []
+        for y in range(Ly):
+            t_y = combined_rc[y_tags[y]]
+            m_y = marginals_x[y_tags[y]]
+            phys = tns.site_ind(x, y)
+
+            l_ind = self._shared_ind(
+                t_y, combined_rc, y_tags, y, -1, Ly,
+            )
+            r_ind = self._shared_ind(
+                t_y, combined_rc, y_tags, y, +1, Ly,
+            )
+            D_bots = [
+                i for i in t_y.inds
+                if i != phys and i != l_ind and i != r_ind
+            ]
+
+            cml, cmr = None, None
+            if m_y is not None:
+                D_ket_set = set(D_bots)
+                D_bra_set = {db + '*' for db in D_bots}
+                m_chi = [
+                    i for i in m_y.inds
+                    if i not in D_ket_set and i not in D_bra_set
+                ]
+                if y > 0:
+                    shared_m = (
+                        set(m_chi)
+                        & set(marginals_x[y_tags[y - 1]].inds)
+                    )
+                    cml = next(iter(shared_m)) if shared_m else None
+                if y < Ly - 1:
+                    shared_m = (
+                        set(m_chi)
+                        & set(marginals_x[y_tags[y + 1]].inds)
+                    )
+                    cmr = next(iter(shared_m)) if shared_m else None
+
+            left_inds.append(l_ind)
+            right_inds.append(r_ind)
+            D_bot_lists.append(D_bots)
+            chi_m_L_list.append(cml)
+            chi_m_R_list.append(cmr)
+
+        # RTL sweep: rho_R_list[y] = right env from sites y+1..Ly-1.
+        rho_R_list = [None] * Ly
+        for y in range(Ly - 2, -1, -1):
+            y1 = y + 1
+            t_y1 = combined_rc[y_tags[y1]]
+            m_y1 = marginals_x[y_tags[y1]]
+            l_y1 = left_inds[y1]
+            r_y1 = right_inds[y1]
+            D_y1 = D_bot_lists[y1]
+
+            rc = {db: db + '*' for db in D_y1}
+            if l_y1:
+                rc[l_y1] = l_y1 + '_c'
+            if r_y1:
+                rc[r_y1] = r_y1 + '_c'
+            t_y1_c = t_y1.conj().reindex(rc)
+
+            out = []
+            if l_y1:
+                out.extend([l_y1, l_y1 + '_c'])
+            if chi_m_L_list[y1]:
+                out.append(chi_m_L_list[y1])
+
+            tensors = [t_y1, t_y1_c]
+            if m_y1 is not None:
+                tensors.append(m_y1)
+            if rho_R_list[y1] is not None:
+                tensors.append(rho_R_list[y1])
+            rho_R_new = qtn.TensorNetwork(tensors).contract(
+                output_inds=out,
+            )
+
+            # Frobenius-norm normalization
+            norm_sq = (rho_R_new.H | rho_R_new).contract().real
+            rho_R_list[y] = rho_R_new * torch.rsqrt(
+                norm_sq + 1e-300,
+            )
+
+        # LTR sampling
+        rho_L = None
+        for y in range(Ly):
+            t_y = combined_rc[y_tags[y]]
+            m_y = marginals_x[y_tags[y]]
+            phys = tns.site_ind(x, y)
+            l_ind = left_inds[y]
+            r_ind = right_inds[y]
+            D_bots = D_bot_lists[y]
+            cmr = chi_m_R_list[y]
+            rho_R = rho_R_list[y]
+
+            probs_list = []
+            for v in range(d):
+                tv = t_y.isel({phys: v})
+                rc = {db: db + '*' for db in D_bots}
+                if l_ind:
+                    rc[l_ind] = l_ind + '_c'
+                if r_ind:
+                    rc[r_ind] = r_ind + '_c'
+                tv_c = tv.conj().reindex(rc)
+                tensors = [tv, tv_c]
+                if m_y is not None:
+                    tensors.append(m_y)
+                if rho_L is not None:
+                    tensors.append(rho_L)
+                if rho_R is not None:
+                    tensors.append(rho_R)
+                p = qtn.TensorNetwork(tensors).contract().real
+                probs_list.append(p)
+            probs = torch.stack(probs_list)
+            probs = self._apply_u1_mask(
+                probs, x, y, Ly, N, n_up_so_far, n_up_target,
+            )
+
+            v = self._inverse_cdf_sample(
+                probs, u_rand[x * Ly + y], d,
+            )
+            sampled_row.append(v)
+            log_p_row = log_p_row + torch.log(probs[v] + 1e-300)
+            if n_up_target is not None:
+                n_up_so_far = n_up_so_far + (v == 1).long()
+
+            # rho_L update for next site
+            if r_ind is not None:
+                tv = t_y.isel({phys: v})
+                rc = {db: db + '*' for db in D_bots}
+                if l_ind:
+                    rc[l_ind] = l_ind + '_c'
+                rc[r_ind] = r_ind + '_c'
+                tv_c = tv.conj().reindex(rc)
+
+                out = [r_ind, r_ind + '_c']
+                if cmr:
+                    out.append(cmr)
+
+                tensors = [tv, tv_c]
+                if m_y is not None:
+                    tensors.append(m_y)
+                if rho_L is not None:
+                    tensors.append(rho_L)
+                rho_L = qtn.TensorNetwork(tensors).contract(
+                    output_inds=out,
+                )
+                norm_sq = (rho_L.H | rho_L).contract().real
+                rho_L = rho_L * torch.rsqrt(norm_sq + 1e-300)
+
+        return sampled_row, log_p_row, n_up_so_far
+
+    @staticmethod
+    def _shared_ind(t_y, tn, y_tags, y, direction, Ly):
+        """Return the bond index name shared between t_y and its neighbour.
+
+        direction = -1 (left) or +1 (right). Returns None if at boundary
+        or no shared bond.
+        """
+        if direction == -1 and y == 0:
+            return None
+        if direction == +1 and y == Ly - 1:
+            return None
+        nbr = tn[y_tags[y + direction]]
+        shared = set(t_y.inds) & set(nbr.inds)
+        return next(iter(shared)) if shared else None
+
+    @staticmethod
+    def _apply_u1_mask(probs, x, y, Ly, N, n_up_so_far, n_up_target):
+        """Apply U(1) Sz mask + clamp to non-negative + normalize.
+
+        d=2 only (asserted in caller). Returns normalised probs (d=2,).
+        """
+        probs = torch.clamp(probs, min=0.0)
+        if n_up_target is not None:
+            site_idx = x * Ly + y
+            n_left = N - site_idx                  # Python int
+            # Python_int - torch_scalar stays on torch_scalar's device
+            n_up_need = n_up_target - n_up_so_far
+            mask_v0 = (n_up_need < n_left).to(probs.dtype)
+            mask_v1 = (n_up_need > 0).to(probs.dtype)
+            mask = torch.stack([mask_v0, mask_v1])
+            probs = probs * mask
+        probs = probs / (probs.sum() + 1e-300)
+        return probs
+
+    @staticmethod
+    def _inverse_cdf_sample(probs, u, d):
+        """Sample v in {0,...,d-1} from probs using inverse CDF with u."""
+        cs = torch.cumsum(probs, dim=0)
+        v = (cs <= u).sum()
+        v = torch.clamp(v, max=d - 1)
+        return v
+
+    @torch.no_grad()
+    def direct_sample_vmap(
+        self,
+        u_batch,
+        chi_s=None,
+        total_sz=None,
+        chi_m=None,
+    ):
+        """Vectorized direct sampler over a batch of B walkers.
+
+        Args:
+            u_batch:  (B, Lx*Ly) torch float, uniform [0,1).
+            chi_s:    boundary MPS bond. None → self.chi (or no compression
+                if self.chi <= 0).
+            total_sz: U(1) Sz constraint or None.
+            chi_m:    bottom marginal MPO bond. None or 0 → chi_m=0 path.
+
+        Returns:
+            configs: (B, Lx*Ly) int64
+            log_pcs: (B,) float
+        """
+        import quimb as qu
+        import quimb.tensor as qtn
+        from vmc_torch.model import _peps_compute_marginals
+
+        if chi_s is None:
+            chi_s = self.chi if self.chi > 0 else None
+
+        params = qu.utils.tree_unflatten(
+            list(self.params), self.params_pytree,
+        )
+
+        # Marginals are config-independent → compute once outside vmap.
+        if chi_m and chi_m > 0:
+            peps_eager = qtn.unpack(params, self.skeleton)
+            marginals = _peps_compute_marginals(peps_eager, chi_m)
+        else:
+            marginals = None
+
+        def _single(u, params):
+            return self.direct_sample_single(
+                u, params, chi_s, total_sz, marginals,
+            )
+
+        return torch.vmap(_single, in_dims=(0, None))(u_batch, params)
+
 
 # =================================================================
 #  PEPS with bMPS environment reuse (spin-compatible)

@@ -2236,3 +2236,306 @@ class MetropolisMPSSamplerSpinful(Sampler):
             )
 
         return self.current_config, self.current_amp
+
+
+class DirectProposalMCMCSamplerPEPS(Sampler):
+    """
+    MCMC sampler using direct samples as Metropolis-Hastings proposals.
+
+    At each step, draws a fresh config S' ~ p_c(S') via PEPS_model.direct_sample,
+    then accepts with probability min(1, w(S')/w(S)), w(S) = |Ψ(S)|² / p_c(S).
+    The chain targets p_Ψ, so the inherited sample() and sample_w_grad() methods
+    work correctly without IS reweighting.
+
+    Parameters
+    ----------
+    chi_s : int or None
+        Bond dimension for top boundary MPS. Defaults to vstate.vstate_func.max_bond.
+    chi_m : int or None
+        Bond dimension for bottom marginal MPO (None = chi_m=0 approximation).
+    """
+
+    def __init__(
+        self,
+        hi,
+        graph,
+        N_samples=2**8,
+        burn_in_steps=10,
+        reset_chain=False,
+        equal_partition=True,
+        chi_s=None,
+        chi_m=None,
+        total_sz=None,
+        dtype=torch.float32,
+        device=None,
+        debug=False,
+    ):
+        super().__init__(
+            hi,
+            graph,
+            N_samples=N_samples,
+            burn_in_steps=burn_in_steps,
+            reset_chain=reset_chain,
+            equal_partition=equal_partition,
+            dtype=dtype,
+            device=device,
+            debug=debug,
+        )
+        self.chi_s = chi_s
+        self.chi_m = chi_m
+        self.total_sz = total_sz
+        self._current_log_pc = None
+        self._current_amp = None
+
+    def reset(self):
+        super().reset()
+        self._current_log_pc = None
+        self._current_amp = None
+
+    @torch.no_grad()
+    def _sample_next(self, vstate, **kwargs):
+        """MH step with direct sample as proposal."""
+        chi_s = self.chi_s if self.chi_s is not None else vstate.vstate_func.max_bond
+
+        proposed_config, proposed_log_pc = vstate.vstate_func.direct_sample(
+            chi_s=chi_s, chi_m=self.chi_m, total_sz=self.total_sz
+        )
+        proposed_config = proposed_config.to(dtype=self.dtype)
+        proposed_amp = vstate.amplitude(proposed_config)
+
+        self.attempts += 1
+
+        # First step: unconditional accept
+        if self._current_amp is None or self._current_amp == 0:
+            self.current_config = proposed_config
+            self._current_amp = proposed_amp
+            self._current_log_pc = proposed_log_pc
+            self.accepts += 1
+            return self.current_config, self._current_amp
+
+        # log w = 2 log|Ψ| - log p_c
+        log_w_prop = (
+            2.0 * np.log(abs(proposed_amp.item()) + 1e-300) - proposed_log_pc
+        )
+        log_w_curr = (
+            2.0 * np.log(abs(self._current_amp.item()) + 1e-300)
+            - self._current_log_pc
+        )
+
+        if np.log(random.random() + 1e-300) < log_w_prop - log_w_curr:
+            self.current_config = proposed_config
+            self._current_amp = proposed_amp
+            self._current_log_pc = proposed_log_pc
+            self.accepts += 1
+
+        return self.current_config, self._current_amp
+
+
+class DirectSamplerPEPS(Sampler):
+    """
+    Pure direct sampler for bosonic PEPS.
+
+    Draws i.i.d. configs S_i ~ p_c and corrects with importance weights
+    w_i = |Ψ(S_i)|² / p_c(S_i) (arXiv:2109.07356, Eq. 33).
+
+    The sample() and sample_w_grad() methods return IS-weighted sums so
+    that the downstream variational_state.py aggregation gives the correct
+    IS-weighted expectation value.
+
+    Parameters
+    ----------
+    chi_s : int or None
+        Bond dimension for boundary MPS in direct sampling. Defaults to
+        vstate.vstate_func.max_bond at sample time.
+    chi_m : int or None
+        Bond dimension for bottom marginal MPO (None = chi_m=0 approximation).
+    """
+
+    def __init__(
+        self,
+        hi,
+        graph,
+        N_samples=2**8,
+        burn_in_steps=0,
+        reset_chain=False,
+        equal_partition=True,
+        chi_s=None,
+        chi_m=None,
+        total_sz=None,
+        dtype=torch.float32,
+        device=None,
+        debug=False,
+    ):
+        super().__init__(
+            hi,
+            graph,
+            N_samples=N_samples,
+            burn_in_steps=burn_in_steps,
+            reset_chain=reset_chain,
+            equal_partition=equal_partition,
+            dtype=dtype,
+            device=device,
+            debug=debug,
+        )
+        self.chi_s = chi_s
+        self.chi_m = chi_m
+        self.total_sz = total_sz
+        self._current_log_pc = None
+
+    @torch.no_grad()
+    def _sample_next(self, vstate, **kwargs):
+        """Draw one independent config from p_c; store log p_c for IS weight."""
+        chi_s = self.chi_s if self.chi_s is not None else vstate.vstate_func.max_bond
+        config, log_pc = vstate.vstate_func.direct_sample(
+            chi_s=chi_s, chi_m=self.chi_m, total_sz=self.total_sz
+        )
+        self.current_config = config.to(dtype=self.dtype)
+        self._current_log_pc = log_pc
+        amp = vstate.amplitude(self.current_config)
+        self.attempts += 1
+        self.accepts += 1
+        return self.current_config, amp
+
+    @torch.no_grad()
+    def sample(self, vstate, op, chain_length=1, vec_op=False, pgbar=True, **kwargs):
+        """
+        IS-weighted energy estimation (Eq. 33 of arXiv:2109.07356).
+
+        Returns op_loc_sum = chain_length * <O>_IS_local so that the
+        downstream allreduce / Ns gives the correct IS-weighted expectation.
+        """
+        assert self.equal_partition
+
+        t_burnin0 = MPI.Wtime()
+        # burn_in is a no-op for direct sampler (independent samples)
+        self.burn_in(vstate)
+        self.burn_in_time = MPI.Wtime() - t_burnin0
+
+        w_list = []
+        op_loc_list = []
+
+        for chain_step in range(chain_length):
+            psi_sigma = 0
+            while psi_sigma == 0:
+                sigma, psi_sigma = self._sample_next(vstate)
+
+            psi_sigma = vstate.amplitude(sigma, _cache=1)
+            eta, O_etasigma = op.get_conn(sigma)
+            psi_eta = vstate.amplitude(eta)
+
+            psi_sigma_np = psi_sigma.cpu().detach().numpy()
+            psi_eta_np = psi_eta.cpu().detach().numpy()
+            ratio = get_safe_ratio(psi_eta_np, psi_sigma_np)
+            op_loc = np.sum(O_etasigma * ratio, axis=-1)
+
+            # IS weight: w = |Ψ|² / p_c
+            log_w = (
+                2.0 * np.log(abs(psi_sigma_np) + 1e-300) - self._current_log_pc
+            )
+            w_list.append(np.exp(log_w))
+            op_loc_list.append(op_loc)
+
+        vstate.clear_env_cache()
+        if self.reset_chain:
+            self.reset()
+
+        w_arr = np.array(w_list)
+        op_arr = np.array(op_loc_list)
+        weight_sum = w_arr.sum()
+
+        # IS-weighted sum, normalized so downstream / Ns gives correct <O>_IS
+        op_loc_sum = float(np.sum(w_arr * op_arr) * chain_length / weight_sum)
+
+        # Variance of IS-weighted op_loc (approx)
+        op_loc_mean_local = float(np.sum(w_arr * op_arr) / weight_sum)
+        op_loc_var = float(
+            np.sum(w_arr * (op_arr - op_loc_mean_local) ** 2) / weight_sum
+        )
+
+        split_chains = np.split(op_arr, 2)
+        W_loc = np.sum([np.var(s) for s in split_chains])
+        chain_means_loc = [float(np.mean(s)) for s in split_chains]
+
+        self.attempts = 0
+        self.accepts = 0
+        return op_loc_sum, op_loc_var, W_loc, chain_means_loc
+
+    def sample_w_grad(self, vstate, op, chain_length=1):
+        """
+        IS-weighted energy + gradient (Eq. 33 + SR gradient with IS weights).
+
+        Returns the same 7-tuple as Sampler.sample_w_grad but with IS-weighted
+        sums so that downstream aggregation gives correct IS estimates.
+        """
+        assert self.equal_partition
+
+        t_burnin0 = MPI.Wtime()
+        self.burn_in(vstate)
+        self.burn_in_time = MPI.Wtime() - t_burnin0
+
+        w_list = []
+        op_loc_list = []
+        grad_list = []
+
+        for chain_step in range(chain_length):
+            psi_sigma = 0
+            while psi_sigma == 0:
+                sigma, psi_sigma = self._sample_next(vstate)
+
+            psi_sigma, logpsi_sigma_grad = vstate.amplitude_grad(sigma)
+            eta, O_etasigma = op.get_conn(sigma)
+            psi_eta = vstate.amplitude(eta)
+
+            psi_sigma_np = psi_sigma.cpu().detach().numpy()
+            psi_eta_np = psi_eta.cpu().detach().numpy()
+            logpsi_sigma_grad_np = logpsi_sigma_grad.cpu().detach().numpy()
+
+            ratio = get_safe_ratio(psi_eta_np, psi_sigma_np)
+            op_loc = np.sum(O_etasigma * ratio, axis=-1)
+
+            log_w = (
+                2.0 * np.log(abs(psi_sigma_np) + 1e-300) - self._current_log_pc
+            )
+            w_list.append(np.exp(log_w))
+            op_loc_list.append(op_loc)
+            grad_list.append(logpsi_sigma_grad_np)
+
+        vstate.clear_env_cache()
+        if self.reset_chain:
+            self.reset()
+
+        w_arr = np.array(w_list)               # (chain_length,)
+        op_arr = np.array(op_loc_list)          # (chain_length,)
+        grad_mat = np.stack(grad_list, axis=1)  # (Np, chain_length)
+        weight_sum = w_arr.sum()
+        w_norm = w_arr * chain_length / weight_sum   # normalized, sums to chain_length
+
+        # IS-weighted sums (match base-class return format)
+        op_loc_sum = float(np.dot(w_norm, op_arr))
+        logpsi_sigma_grad_sum = (grad_mat * w_norm[None, :]).sum(axis=1)
+        op_logpsi_sigma_grad_product_sum = (
+            grad_mat * (w_norm * op_arr)[None, :]
+        ).sum(axis=1)
+        logpsi_sigma_grad_mat = grad_mat * w_norm[None, :]  # IS-weighted columns
+
+        # Variance and within-chain stats (unweighted for diagnostics)
+        n = chain_length
+        op_loc_mean = op_loc_sum / n
+        op_loc_M2 = np.sum(w_norm * (op_arr - op_loc_mean) ** 2)
+        op_loc_var = float(op_loc_M2 / (n - 1)) if n > 1 else 0.0
+        op_loc_vec = op_arr   # use unweighted for split-chain diagnostic
+        split_chains = np.split(op_loc_vec, 2)
+        W_loc = np.sum([np.var(s) for s in split_chains])
+        chain_means_loc = [float(np.mean(s)) for s in split_chains]
+
+        self.attempts = 0
+        self.accepts = 0
+        return (
+            op_loc_sum,
+            logpsi_sigma_grad_sum,
+            op_logpsi_sigma_grad_product_sum,
+            op_loc_var,
+            logpsi_sigma_grad_mat,
+            W_loc,
+            chain_means_loc,
+        )

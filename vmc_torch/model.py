@@ -318,144 +318,345 @@ class circuit_TNF(wavefunctionModel):
 def _peps_sample_row_sequential(
     effective_tn, peps, x, d, rng,
     n_up_so_far=None, n_up_target=None, n_sites_total=None,
+    marginals_x=None,
 ):
     """
-    Sample one row of a PEPS site-by-site using right-canonical form + density
-    matrix.  Implements Appendix B of arXiv:2109.07356.
+    Sample row x site-by-site from the effective 1D TN. Pure quimb throughout.
 
-    At each column y, contracts all tensors tagged Y{y} in effective_tn into a
-    super-site M_y with shape (chi_L, chi_R, D_bot, d), where chi_L/chi_R are
-    compressed horizontal bonds, D_bot is the free bottom bond (chi_m=0:
-    traced over), and d is the physical dimension.
-
-    U(1) charge conservation (Sec. IV, arXiv:2109.07356):
-    When n_up_target is provided we track the total number of up-spins
-    (physical value 1) sampled so far and mask out physically forbidden
-    values at each site so that the global constraint is always satisfied.
+    t_y = effective_tn[y_tag(y)]: boundary MPS tensor at column y.
+    m_y = marginals_x[y_tag(y)]: marginal MPO tensor; D_ket shares quimb name
+      with D_bot of t_y (same PEPS bond); D_bra = D_ket + '*'.
 
     Parameters
     ----------
-    effective_tn : quimb TensorNetwork
-        compressed combined TN (boundary | PEPS row), one tensor per column.
-    peps : quimb PEPS
-    x    : int, current row index (used to find physical index k{x},{y})
-    d    : int, physical dimension
-    rng  : np.random.Generator
-    n_up_so_far  : int or None — cumulative up-spins sampled before this row
-    n_up_target  : int or None — target total number of up-spins (value==1)
-    n_sites_total: int or None — total sites in the lattice (Lx * Ly)
+    effective_tn : quimb TensorNetwork (one tensor per column after compression)
+    peps         : quimb PEPS
+    x            : int, current row index
+    d            : int, physical dimension
+    rng          : np.random.Generator
+    marginals_x  : quimb TN (boundary MPS, one tensor per column), or None
 
     Returns
     -------
     sampled_row  : list[int], length Ly
     log_prob_row : float
-    n_up_so_far  : int — updated count (unchanged if n_up_target is None)
+    n_up_so_far  : int
     """
     import numpy as np
 
     Ly = peps.Ly
 
-    # Index sets per column — used to classify M_y's external indices.
-    all_col_inds = []
+    # ── chi_m = 0: right-canonical + LTR sampling ────────────────────────────
+    #
+    # TN at site y (d=v fixed on both ket and bra via isel; right env = I):
+    #
+    #  rho_L─ t_y ─┐
+    #               │   (D_bot and chi_s_R self-contract between ket and bra)
+    #  rho_L_c─ t_y*─┘
+    #
+    # [None at y=0: no rho_L → p(v) = ||tv||^2]
+
+    if marginals_x is None:
+        # After this sweep t_y is isometric w.r.t. all inds except its left bond;
+        # right env = identity so we never need to build rho_R explicitly.
+        for y in range(Ly - 1, 0, -1):
+            effective_tn.canonize_between(peps.y_tag(y), peps.y_tag(y - 1))
+
+        sampled_row  = []
+        log_prob_row = 0.0
+        rho_L = None
+
+        for y in range(Ly):
+            phys_ind = peps.site_ind(x, y)
+            t_y      = effective_tn[peps.y_tag(y)]
+
+            left_ind = None
+            if y > 0:
+                shared = set(t_y.inds) & set(effective_tn[peps.y_tag(y - 1)].inds)
+                left_ind = next(iter(shared)) if shared else None
+
+            right_ind = None
+            if y < Ly - 1:
+                shared = set(t_y.inds) & set(effective_tn[peps.y_tag(y + 1)].inds)
+                right_ind = next(iter(shared)) if shared else None
+
+            probs = np.zeros(d)
+            for v in range(d):
+                tv = t_y.isel({phys_ind: v})
+                if rho_L is None:
+                    # y=0: p(v) = ||tv||^2; all inds of tv.H and tv are shared → scalar
+                    probs[v] = float((tv.H | tv).contract().real)
+                else:
+                    # F_v[l, l_c] = sum_{D_bot, r} tv[l,D,r] * conj(tv)[l_c,D,r]
+                    # D_bot and r self-contract (same names in tv and tv_c)
+                    tv_c = tv.conj().reindex({left_ind: left_ind + '_c'})
+                    F_v  = (tv | tv_c).contract(
+                        output_inds=[left_ind, left_ind + '_c']
+                    )
+                    probs[v] = float((rho_L | F_v).contract().real)
+
+            probs = np.maximum(probs, 0.0)
+
+            if n_up_target is not None:
+                n_left    = n_sites_total - (x * Ly + y)
+                n_up_need = n_up_target - n_up_so_far
+                if n_up_need <= 0:     probs[1] = 0.0
+                if n_up_need >= n_left: probs[0] = 0.0
+
+            total = probs.sum()
+            probs /= total if total > 1e-300 else 1.0
+            v = int(rng.choice(d, p=probs))
+            sampled_row.append(v)
+            log_prob_row += np.log(float(probs[v]) + 1e-300)
+            if n_up_target is not None:
+                n_up_so_far += int(v == 1)
+
+            # ── update rho_L for next site ───────────────────────────────────
+            #
+            #   y=0 (no left bond):          y>0:
+            #
+            #      t_y ──── r              rho_L ── t_y ──── r
+            #       |        |    (D_bot)            |        |    (D_bot)
+            #      t_y* ─── r_c             rho_L_c─ t_y* ── r_c
+            #
+            if right_ind is not None:
+                tv = t_y.isel({phys_ind: v})
+                if rho_L is None:
+                    tv_c  = tv.conj().reindex({right_ind: right_ind + '_c'})
+                    rho_L = (tv | tv_c).contract(
+                        output_inds=[right_ind, right_ind + '_c']
+                    )
+                else:
+                    tv_c  = tv.conj().reindex(
+                        {left_ind: left_ind + '_c', right_ind: right_ind + '_c'}
+                    )
+                    rho_L = (rho_L | tv | tv_c).contract(
+                        output_inds=[right_ind, right_ind + '_c']
+                    )
+                # Tr[rho_L]: rename bra → ket, then self-contract = trace
+                norm = float(
+                    rho_L.reindex({right_ind + '_c': right_ind}).contract().real
+                )
+                if norm > 1e-300:
+                    rho_L = rho_L / norm
+
+        return sampled_row, log_prob_row, n_up_so_far
+
+    # ── chi_m > 0: 3-layer quimb LTR sampling ────────────────────────────────
+    #
+    # At each site the 3-layer TN is (d=v fixed on BOTH ket and bra via isel,
+    # so neither t_y nor t_y* carries a phys leg in the actual contraction):
+    #
+    #   ─── t_y ───              d=v fixed on both layers (bra built from ket
+    #   |    |    |               after isel; phys absent from both)
+    # rho_L m_y rho_R   ← m_y = marginal MPO from rows below
+    #   |    |    |
+    #   ─── t_y* ───
+    #
+    # chi_s bonds: rho_L connects t_y left ↔ t_y* left_c;
+    #              rho_R connects t_y right ↔ t_y* right_c
+    # D bonds:     D_bot of t_y  ↔ D_ket of m_y (same quimb name, shared PEPS bond)
+    #              D_bra of m_y  ↔ D_bot of t_y* (D_bra = D_ket + '*')
+    # chi_m bonds: rho_L / rho_R chi_m legs ↔ chi_m_L / chi_m_R of m_y
+
+    # --- Precompute per-column index info ---
+    left_inds   = []
+    right_inds  = []
+    D_bot_lists = []
+    chi_m_L_list = []
+    chi_m_R_list = []
+
     for y in range(Ly):
-        col_inds = set()
-        for t in effective_tn.select_tensors(peps.y_tag(y)):
-            col_inds.update(t.inds)
-        all_col_inds.append(col_inds)
+        t_y  = effective_tn[peps.y_tag(y)]
+        m_y  = marginals_x[peps.y_tag(y)]
+        phys = peps.site_ind(x, y)
 
-    # Build M_list: one numpy array per column with shape (chi_L, chi_R, D_bot, d)
-    M_list = []
-    for y in range(Ly):
-        col_tensors = [
-            t.copy() for t in effective_tn.select_tensors(peps.y_tag(y))
-        ]
-        if len(col_tensors) == 1:
-            M_y_t = col_tensors[0]
-        else: # if contains 2 tensors from two uncontracted rows, contract them together first
-            M_y_t = qtn.TensorNetwork(col_tensors).contract()
+        l_ind = None
+        if y > 0:
+            shared = set(t_y.inds) & set(effective_tn[peps.y_tag(y - 1)].inds)
+            l_ind = next(iter(shared)) if shared else None
 
-        p_ind = peps.site_ind(x, y)
+        r_ind = None
+        if y < Ly - 1:
+            shared = set(t_y.inds) & set(effective_tn[peps.y_tag(y + 1)].inds)
+            r_ind = next(iter(shared)) if shared else None
 
-        # Classify external indices as left / right / bottom (physical excluded).
-        left_inds, right_inds, bot_inds = [], [], []
-        for ind in M_y_t.inds:
-            if ind == p_ind:
-                continue
-            in_left  = (y > 0)      and (ind in all_col_inds[y - 1])
-            in_right = (y < Ly - 1) and (ind in all_col_inds[y + 1])
-            if in_left:
-                left_inds.append(ind)
-            elif in_right:
-                right_inds.append(ind)
-            else:
-                bot_inds.append(ind)
+        # D_bots: all remaining inds of t_y (not phys, not chi_s bonds)
+        D_bots = [i for i in t_y.inds if i != phys and i != l_ind and i != r_ind]
 
-        ordered_inds = left_inds + right_inds + bot_inds + [p_ind]
-        M_y_t = M_y_t.transpose(*ordered_inds)
-        M_arr = np.asarray(M_y_t.data, dtype=complex)
+        # chi_m bonds of m_y: inds that are not D_ket or D_bra
+        cml, cmr = None, None
+        if m_y is not None:
+            D_ket_set = set(D_bots)
+            D_bra_set = {db + '*' for db in D_bots}
+            m_chi = [i for i in m_y.inds
+                     if i not in D_ket_set and i not in D_bra_set]
+            if y > 0:
+                shared_m = set(m_chi) & set(marginals_x[peps.y_tag(y - 1)].inds)
+                cml = next(iter(shared_m)) if shared_m else None
+            if y < Ly - 1:
+                shared_m = set(m_chi) & set(marginals_x[peps.y_tag(y + 1)].inds)
+                cmr = next(iter(shared_m)) if shared_m else None
 
-        chi_L = (int(np.prod([M_y_t.ind_size(i) for i in left_inds]))
-                 if left_inds else 1)
-        chi_R = (int(np.prod([M_y_t.ind_size(i) for i in right_inds]))
-                 if right_inds else 1)
-        D_bot = (int(np.prod([M_y_t.ind_size(i) for i in bot_inds]))
-                 if bot_inds else 1)
+        left_inds.append(l_ind)
+        right_inds.append(r_ind)
+        D_bot_lists.append(D_bots)
+        chi_m_L_list.append(cml)
+        chi_m_R_list.append(cmr)
 
-        M_list.append(M_arr.reshape(chi_L, chi_R, D_bot, d))
+    # --- Precompute rho_R_list via RTL trace sweep ---
+    #
+    # rho_R_list[y] = right env from sites y+1,...,Ly-1.
+    # One site absorbed per RTL step.  Unlike the sampling loop, phys is NOT
+    # fixed via isel here — it is an internal bond directly connecting t_{y+1}
+    # and t_{y+1}* (same index name → trace = sum over all d values):
+    #
+    #    l ── t_{y+1} ──-┐
+    #          |         |
+    #        m_{y+1} ───rho_R[y+1]
+    #          |         │
+    #    l_c─ t_{y+1}* ──┘
+    #
+    # output (l, l_c, chi_m_L): new rho_R[y]   shape: (chi_s, chi_s, chi_m?)
+    rho_R_list = [None] * Ly
 
-    # Right-canonicalize: LQ sweep from y=Ly-1 down to y=1.
-    # After this: Σ_{b,c,v} M_y[a,b,c,v] M_y*[a',b,c,v] = δ_{a,a'} for y > 0.
-    for y in range(Ly - 1, 0, -1):
-        chi_L, chi_R, D_bot, d_phys = M_list[y].shape
-        M_mat = M_list[y].reshape(chi_L, chi_R * D_bot * d_phys)
-        Q, R = np.linalg.qr(M_mat.conj().T, mode='reduced')
-        L = R.conj().T            # (chi_L, k)
-        k = L.shape[1]
-        M_list[y] = Q.conj().T.reshape(k, chi_R, D_bot, d_phys)
-        M_list[y - 1] = np.einsum('abcd,bk->akcd', M_list[y - 1], L)
+    for y in range(Ly - 2, -1, -1):
+        y1   = y + 1
+        t_y1 = effective_tn[peps.y_tag(y1)]
+        m_y1 = marginals_x[peps.y_tag(y1)]
+        l_y1 = left_inds[y1]
+        r_y1 = right_inds[y1]
+        D_y1 = D_bot_lists[y1]
 
-    # Left-to-right sampling with density matrix rho_L.
+        # phys NOT renamed → traces between t_y1 and t_y1_c (sum over all d values)
+        rc = {db: db + '*' for db in D_y1}
+        if l_y1: rc[l_y1] = l_y1 + '_c'
+        if r_y1: rc[r_y1] = r_y1 + '_c'
+        t_y1_c = t_y1.conj().reindex(rc)
+
+        # output = left bonds of t_{y+1} and m_{y+1} → new rho_R[y]
+        out = []
+        if l_y1: out.extend([l_y1, l_y1 + '_c'])
+        if chi_m_L_list[y1]: out.append(chi_m_L_list[y1])
+
+        tensors = [t_y1, t_y1_c]
+        if m_y1 is not None:           tensors.append(m_y1)
+        if rho_R_list[y1] is not None: tensors.append(rho_R_list[y1])
+        rho_R_new = qtn.TensorNetwork(tensors).contract(output_inds=out)
+
+        # Frobenius-norm normalisation to prevent overflow
+        norm_sq = float((rho_R_new.H | rho_R_new).contract().real)
+        if norm_sq > 1e-300:
+            rho_R_new = rho_R_new * (norm_sq ** -0.5)
+        rho_R_list[y] = rho_R_new
+
+    # --- LTR sampling ---
     sampled_row  = []
     log_prob_row = 0.0
-    rho_L = np.ones((1, 1), dtype=complex)    # trivial left boundary
+    rho_L = None
 
     for y in range(Ly):
-        M = M_list[y]                          # (chi_L, chi_R, D_bot, d)
+        t_y   = effective_tn[peps.y_tag(y)]
+        m_y   = marginals_x[peps.y_tag(y)]
+        phys  = peps.site_ind(x, y)
+        l_ind = left_inds[y]
+        r_ind = right_inds[y]
+        D_bots = D_bot_lists[y]
+        cml    = chi_m_L_list[y]
+        cmr    = chi_m_R_list[y]
+        rho_R  = rho_R_list[y]
 
-        # F_y[v, a, a'] = Σ_{b,c} M[a,b,c,v] M*[a',b,c,v]
-        F_y = np.einsum('abcv,dbcv->vad', M, M.conj())
-        probs = np.einsum('ad,vad->v', rho_L, F_y).real
+        probs = np.zeros(d)
+        for v in range(d):
+            tv = t_y.isel({phys: v})
+            rc = {db: db + '*' for db in D_bots}
+            if l_ind: rc[l_ind] = l_ind + '_c'
+            if r_ind: rc[r_ind] = r_ind + '_c'
+            tv_c = tv.conj().reindex(rc)
+            tensors = [tv, tv_c]
+            if m_y   is not None: tensors.append(m_y)
+            if rho_L is not None: tensors.append(rho_L)
+            if rho_R is not None: tensors.append(rho_R)
+            probs[v] = float(qtn.TensorNetwork(tensors).contract().real)
+
         probs = np.maximum(probs, 0.0)
 
-        # U(1) charge mask (Sec. IV, arXiv:2109.07356):
-        # Zero out values whose species has reached its bound, so the global
-        # charge constraint is guaranteed without any post-rejection.
         if n_up_target is not None:
-            site_idx   = x * Ly + y
-            n_left     = n_sites_total - site_idx   # remaining sites incl. current
-            n_up_need  = n_up_target - n_up_so_far  # up-spins still required
-            if n_up_need <= 0:
-                probs[1] = 0.0   # enough ups collected — forbid more
-            if n_up_need >= n_left:
-                probs[0] = 0.0   # must take up at every remaining site
+            n_left    = n_sites_total - (x * Ly + y)
+            n_up_need = n_up_target - n_up_so_far
+            if n_up_need <= 0:     probs[1] = 0.0
+            if n_up_need >= n_left: probs[0] = 0.0
 
-        probs /= probs.sum()
-
+        total = probs.sum()
+        probs /= total if total > 1e-300 else 1.0
         v = int(rng.choice(d, p=probs))
         sampled_row.append(v)
         log_prob_row += np.log(float(probs[v]) + 1e-300)
-
         if n_up_target is not None:
             n_up_so_far += int(v == 1)
 
-        # rho_L_new[b,b'] = Σ_{a,a',c} M_v[a,b,c] rho_L[a,a'] M_v*[a',b',c]
-        M_v   = M[:, :, :, v]                 # (chi_L, chi_R, D_bot)
-        rho_L = np.einsum('abc,ap,pdc->bd', M_v, rho_L, M_v.conj())
-        tr = np.trace(rho_L)
-        if abs(tr) > 1e-300:
-            rho_L /= tr
+        # ── update rho_L for next site ───────────────────────────────────────
+        #
+        # rho_L ── t_y ──── r
+        #          |
+        #         m_y
+        #          |
+        # rho_L_c─ t_y* ─── r_c
+        #
+        if r_ind is not None:
+            tv = t_y.isel({phys: v})
+            rc = {db: db + '*' for db in D_bots}
+            if l_ind: rc[l_ind] = l_ind + '_c'
+            rc[r_ind] = r_ind + '_c'
+            tv_c = tv.conj().reindex(rc)
+
+            out = [r_ind, r_ind + '_c']
+            if cmr: out.append(cmr)
+
+            tensors = [tv, tv_c]
+            if m_y   is not None: tensors.append(m_y)
+            if rho_L is not None: tensors.append(rho_L)
+
+            rho_L = qtn.TensorNetwork(tensors).contract(output_inds=out)
+
+            # Frobenius-norm normalisation to prevent overflow
+            norm_sq = float((rho_L.H | rho_L).contract().real)
+            if norm_sq > 1e-300:
+                rho_L = rho_L * (norm_sq ** -0.5)
 
     return sampled_row, log_prob_row, n_up_so_far
+
+
+def _peps_compute_marginals(peps, chi_m):
+    """
+    Compute bottom-up marginal environments for chi_m > 0.
+
+    Returns marginals[x] = quimb TN (boundary MPS, one tensor per column)
+    representing the contracted environment from rows x+1,...,Lx-1 below row x.
+    Index names are preserved from the original PEPS: D_ket bonds share names
+    with D_bot of effective_tn; D_bra bonds have '*' appended.
+
+    marginals[Lx-1] = None  (no rows below last row).
+    """
+    from quimb.tensor.tn1d.compress import tensor_network_1d_compress
+
+    Lx, Ly = peps.Lx, peps.Ly
+    y_tags = [peps.y_tag(y) for y in range(Ly)]
+    norm_tn = peps.make_norm(layer_tags=('KET', 'BRA'))
+    envs = norm_tn.compute_environments(
+        'xmax', xrange=(0, Lx - 1), max_bond=chi_m
+    )
+    marginals = [None] * Lx
+    for x in range(Lx - 1):
+        env = envs['xmax', x]
+        if env.num_tensors > 0:
+            # Compress into a proper MPS: one tensor per column, bond chi_m.
+            # Needed because compute_environments may return un-merged KET+BRA
+            # tensors for the single-row env (e.g. x = Lx-2).
+            marginals[x] = tensor_network_1d_compress(
+                env, max_bond=chi_m, site_tags=y_tags, cutoff=0.0, method='direct'
+            )
+    return marginals
 
 
 class PEPS_model(wavefunctionModel):
@@ -505,15 +706,20 @@ class PEPS_model(wavefunctionModel):
             return torch.stack([func(xi) for xi in x])
 
     @torch.no_grad()
-    def direct_sample(self, chi_s=None, seed=None, total_sz=None):
+    def direct_sample(self, chi_s=None, seed=None, total_sz=None, chi_m=None):
         """
         Draw one independent configuration from p_c(S) via row-by-row
-        sequential sampling (arXiv:2109.07356, chi_m=0).
+        sequential sampling (arXiv:2109.07356).
 
         At each row x:
           1. Compress B_{x-1} | row_x immediately to bond chi_s (eq 27).
-          2. Sample physical indices site-by-site (right-canonical + rho_L).
+          2. Sample physical indices site-by-site.
           3. Fix physical indices → new single-layer boundary B_x.
+
+        chi_m=None or 0: bottom bonds summed freely (chi_m=0 approximation).
+        chi_m>0: bottom bonds weighted by precomputed bottom-up marginal MPO
+                 (see _peps_compute_marginals); uses quimb LTR sampling with
+                 3-layer TN (boundary | row | marginal).
 
         U(1) symmetry (Sec. IV, arXiv:2109.07356):
         If total_sz is given, charge conservation is enforced at sampling
@@ -523,10 +729,10 @@ class PEPS_model(wavefunctionModel):
 
         Parameters
         ----------
-        chi_s    : int or None — boundary MPS bond dimension (default: max_bond)
+        chi_s    : int or None — top boundary MPS bond dimension
         seed     : int or np.random.Generator or None
-        total_sz : int or None — target total Sz (in units where each spin
-                   contributes ±1).  None = no symmetry constraint.
+        total_sz : int or None — target total Sz (±1 per spin)
+        chi_m    : int or None — bottom marginal MPO bond dimension
 
         Returns
         -------
@@ -548,17 +754,15 @@ class PEPS_model(wavefunctionModel):
         N = Lx * Ly
         y_tags = [peps.y_tag(y) for y in range(Ly)]
 
-        # U(1) charge tracking: n_up_target = number of sites with value 1
-        # For spin-1/2 with Sz = n_up - n_down and target Sz = total_sz:
-        #   n_up_target = (N + total_sz) // 2
-        n_up_target = None
+        n_up_target = (N + total_sz) // 2 if total_sz is not None else None
         n_up_so_far = 0
-        if total_sz is not None:
-            n_up_target = (N + total_sz) // 2
+
+        # Precompute marginal environments for chi_m > 0
+        marginals = _peps_compute_marginals(peps, chi_m) if (chi_m and chi_m > 0) else None
 
         config  = []
         log_p_c = 0.0
-        B = None    # single-layer boundary MPS, one tensor per column, bond chi_s
+        B = None    # single-layer top boundary MPS, one tensor per column
 
         for x in range(Lx):
             row_tn = peps.select(peps.x_tag(x)).copy()
@@ -573,13 +777,14 @@ class PEPS_model(wavefunctionModel):
             else:
                 combined_rc = combined
 
-            # Eq 28: sample physical indices from combined_rc
             sampled_row, log_prob_row, n_up_so_far = _peps_sample_row_sequential(
                 combined_rc, peps, x, d, rng,
                 n_up_so_far=n_up_so_far,
                 n_up_target=n_up_target,
                 n_sites_total=N,
+                marginals_x=marginals[x] if marginals is not None else None,
             )
+
             config.extend(sampled_row)
             log_p_c += log_prob_row
 
