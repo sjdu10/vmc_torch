@@ -89,7 +89,7 @@ def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None
                 site = skeleton.sites[i]
                 site_tag = skeleton.site_tag(site)
                 try:
-                    skeleton[site_tag].data._label = 3*tid
+                    skeleton[site_tag].data._label = 3*tid # add global ordering '.label' attribute
                     skeleton[site_tag].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1))
                 except Exception:
                     pass
@@ -264,7 +264,8 @@ class fPEPS(qtn.PEPS):
         return product_tn
     
     def product_bra_state_functional(self, config, reverse=1):
-        #XXX remember to comment out the drop_missing_blocks in tensordot_via_fused in line 2304-2305 in symmray abelian_core.py
+        # XXX: legacy codes, to be deleted in the future
+        raise NotImplementedError("Functional bra state is a legacy feature to be deleted.")
         product_tn = qtn.TensorNetwork()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
@@ -324,10 +325,16 @@ class fPEPS(qtn.PEPS):
         """Slicing to get the amplitude locally, faster than contraction with a tensor product state.
         Note here sites is a list of tuples (x, y) for the sites to be fixed, and config is a 1D array of integers representing the fermion occupation numbers at those sites."""
         peps = self if inplace else self.copy()
-        has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
-        has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
+
+        p_inds = [peps.site_ind_id.format(*site) for site in sites]
+        site_mapping = dict(zip(p_inds, config.to(torch.int64)))
+        tn = peps.isel(selectors=site_mapping)
+        return tn
+    
+        # XXX: legacy code for slicing amplitude, to be deleted in the future
+
         if isinstance(config, numpy.ndarray):
             kwargs = {'like':config, 'dtype':dtype}
         elif isinstance(config, torch.Tensor):
@@ -407,36 +414,19 @@ class fPEPS(qtn.PEPS):
             new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order+1:]
 
             # XXX: Implementation could be written more elegantly here...
-            if has_dummy_modes:
-                if int(n) == 1:
-                    new_dummy_modes = (3*tid+1)*(-1)
-                elif int(n) == 2:
-                    new_dummy_modes = (3*tid+2)*(-1)
-                elif int(n) == 3 or int(n) == 0:
-                    new_dummy_modes = ()
+            if int(n) == 1:
+                new_dummy_modes = (3*tid+1)*(-1)
+            elif int(n) == 2:
+                new_dummy_modes = (3*tid+2)*(-1)
+            elif int(n) == 3 or int(n) == 0:
+                new_dummy_modes = ()
 
-                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
-                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
-                dummy_modes = list(new_dummy_modes)[::-1]
-                
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
-                fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
-            elif has_dummy_modes:
-                if int(n) == 1:
-                    new_dummy_modes = (3*tid+1)*(-1)
-                elif int(n) == 2:
-                    new_dummy_modes = (3*tid+2)*(-1)
-                elif int(n) == 3 or int(n) == 0:
-                    new_dummy_modes = ()
-
-                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
-                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
-                dummy_modes = list(new_dummy_modes)[::-1]
-                
-                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, symmetry=self.symmetry, dummy_modes=dummy_modes)
-                fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
-            else:
-                raise ValueError("FermionicArray has neither 'dummy_modes' nor 'dummy_modes' attribute to keep track of odd parity tensor ordering.")
+            new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
+            new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
+            dummy_modes = list(new_dummy_modes)[::-1]
+            
+            new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=charge+ftsdata.charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
+            fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
         amp = qtn.PEPS(peps)
 
@@ -474,8 +464,15 @@ class fPEPS(qtn.PEPS):
     def get_amp_efficient(self, config, inplace=False):
         """Slicing to get the amplitude, faster than contraction with a tensor product state."""
         peps = self if inplace else self.copy()
-        has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
-        has_dummy_modes = hasattr(self.tensors[0].data, 'dummy_modes')
+        site_mapping = dict(zip(self.site_inds, config.to(torch.int64)))
+        try:
+            amp = self.isel(selectors=site_mapping)
+        except Exception as e:
+            raise e
+        return amp
+
+        #XXX: legacy code for slicing amplitude, to be deleted in the future
+
         backend = self.tensors[0].data.backend
         dtype = eval(backend + '.' + self.tensors[0].data.dtype)
         if isinstance(config, numpy.ndarray):
@@ -570,59 +567,30 @@ class fPEPS(qtn.PEPS):
                     new_charge_sec_data_dict[new_charge_blk] = new_data # new charge block and its corresponding data in a dictionary
 
             new_duals = ftsdata.duals[:phys_ind_order] + ftsdata.duals[phys_ind_order + 1:]
-            # if ftsdata has attibute dummy_modes:
-            if has_dummy_modes:
-                if int(n) == 1:
-                    new_dummy_modes = (3 * site_id + 1) * (-1)
-                elif int(n) == 2:
-                    new_dummy_modes = (3 * site_id + 2) * (-1)
-                elif int(n) == 3 or int(n) == 0:
-                    new_dummy_modes = ()
-                
-                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
-                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
-                dummy_modes = list(new_dummy_modes)[::-1]
-                try:
-                    if self.symmetry == 'U1':
-                        new_charge = charge + ftsdata.charge
-                    elif self.symmetry == 'Z2':
-                        new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
-                    elif self.symmetry == 'U1U1':
-                        new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
-                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
-                except Exception as e:
-                    print("Error in constructing new f-tensor data:")
-                    print(e)
-                    # Error when constructing the new f-tensor
-                    print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
-            elif has_dummy_modes:
-                if int(n) == 1:
-                    new_dummy_modes = (3 * site_id + 1) * (-1)
-                elif int(n) == 2:
-                    new_dummy_modes = (3 * site_id + 2) * (-1)
-                elif int(n) == 3 or int(n) == 0:
-                    new_dummy_modes = ()
-                
-                new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
-                new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
-                dummy_modes = list(new_dummy_modes)[::-1]
-                try:
-                    if self.symmetry == 'U1':
-                        new_charge = charge + ftsdata.charge
-                    elif self.symmetry == 'Z2':
-                        new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
-                    elif self.symmetry == 'U1U1':
-                        new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
-                    new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, symmetry=self.symmetry, dummy_modes=dummy_modes)
-                except Exception as e:
-                    print("Error in constructing new f-tensor data:")
-                    print(e)
-                    # Error when constructing the new f-tensor
-                    print(n, site, phys_ind_order, charge_sec_data_dict, new_charge_sec_data_dict)
-            else:
-                raise ValueError("FermionicArray has neither 'dummy_modes' nor 'dummy_modes' attribute to keep track of odd parity tensor ordering.")
 
-                
+            if int(n) == 1:
+                new_dummy_modes = (3 * site_id + 1) * (-1)
+            elif int(n) == 2:
+                new_dummy_modes = (3 * site_id + 2) * (-1)
+            elif int(n) == 3 or int(n) == 0:
+                new_dummy_modes = ()
+            
+            new_dummy_modes1 = FermionicOperator(new_dummy_modes, dual=True) if new_dummy_modes else ()
+            new_dummy_modes = ftsdata.dummy_modes + (new_dummy_modes1,) if isinstance(new_dummy_modes1, FermionicOperator) else ftsdata.dummy_modes
+            dummy_modes = list(new_dummy_modes)[::-1]
+            try:
+                if self.symmetry == 'U1':
+                    new_charge = charge + ftsdata.charge
+                elif self.symmetry == 'Z2':
+                    new_charge = (charge + ftsdata.charge) % 2 # Z2 symmetry, charge should be 0 or 1
+                elif self.symmetry == 'U1U1':
+                    new_charge = (charge[0] + ftsdata.charge[0], charge[1] + ftsdata.charge[1]) # U1U1 symmetry, charge should be a tuple of two integers
+                new_fts_data = sr.FermionicArray.from_blocks(new_charge_sec_data_dict, duals=new_duals, charge=new_charge, dummy_modes=dummy_modes, symmetry=self.symmetry)
+            except Exception as e:
+                print("Error in constructing new f-tensor data:")
+                print(e)
+                # Error when constructing the new f-tensor
+
             fts.modify(data=new_fts_data, inds=new_fts_inds, left_inds=None)
 
         amp = qtn.PEPS(peps)
@@ -1116,6 +1084,12 @@ class fMPS(qtn.MatrixProductState):
         mps = self if inplace else self.copy()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
+
+        site_mapping = dict(zip(self.site_inds, config.to(torch.int64)))
+        amp = mps.isel(selectors=site_mapping)
+        return amp
+    
+        # XXX: legacy code to be deleted in the future
         if isinstance(config, numpy.ndarray):
             kwargs = {'like':config, 'dtype':dtype}
         elif isinstance(config, torch.Tensor):
@@ -1186,6 +1160,14 @@ class fMPS(qtn.MatrixProductState):
         mps = self if inplace else self.copy()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
+
+        p_inds = [mps.site_ind_id.format(site) for site in sites]
+        site_mapping = dict(zip(p_inds, config.to(torch.int64)))
+        tn = mps.isel(selectors=site_mapping)
+        return tn
+    
+        # XXX: legacy code to be deleted in the future
+
         if isinstance(config, numpy.ndarray):
             kwargs = {'like':config, 'dtype':dtype}
         elif isinstance(config, torch.Tensor):
