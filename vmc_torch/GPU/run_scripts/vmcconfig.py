@@ -50,7 +50,7 @@ class VMCConfig:
                     lr_scheduler
         SR solver:  sr_diag_shift, use_min_sr, use_distributed_min_sr,
                     use_distributed_sr_minres, minres_sr_use_scipy,
-                    sr_rtol, sr_maxiter, param_chunk_size
+                    sr_rtol, sr_maxiter
         Compile:    use_export_compile, use_log_amp
         Gradient:   offload_grad_to_cpu
         Checkpoint: save_every, resume_step
@@ -78,7 +78,6 @@ class VMCConfig:
     
     use_min_sr: bool = False
     use_distributed_min_sr: bool = False
-    param_chunk_size: int = 1024
 
     # ----- SPRING (arXiv:2401.10190) -----
     # When use_spring=True the spring_variant chooses between the
@@ -160,9 +159,7 @@ def make_preconditioner(cfg):
     if getattr(cfg, 'run_sr', False):
         if getattr(cfg, 'use_min_sr', False):
             if getattr(cfg, 'use_distributed_min_sr', False):
-                return DistributedMinSRGPU(
-                    param_chunk_size=cfg.param_chunk_size,
-                )
+                return DistributedMinSRGPU()
             return MinSRGPU()
         elif getattr(cfg, 'use_distributed_sr_minres', False):
             return DistributedSRMinresGPU(

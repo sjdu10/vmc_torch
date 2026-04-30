@@ -46,9 +46,9 @@ DEFAULT_DATA_ROOT = (
 )
 
 vmc_cfg = VMCConfig(
-    batch_size=2048,
-    ns_per_rank=2048,
-    grad_batch_size=1024,
+    batch_size=64,
+    ns_per_rank=64,
+    grad_batch_size=64,
     vmc_steps=50,
     burn_in_steps=2,
     learning_rate=0.1,
@@ -57,7 +57,7 @@ vmc_cfg = VMCConfig(
     sr_rtol=1e-4,
     offload_grad_to_cpu=True,
     use_log_amp=True,
-    use_export_compile=True,
+    use_export_compile=False,
     save_every=10,
     resume_step=0,
     verbose=False,
@@ -95,7 +95,7 @@ def main():
         N_sites = Lx * Ly
         J = 1.0
         D = 4
-        chi = 8
+        chi = -1
 
         # ========== Hamiltonian ==========
         H = spin_Heisenberg_square_lattice_torch(

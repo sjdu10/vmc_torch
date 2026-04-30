@@ -644,7 +644,7 @@ def minSR_solver_gpu(
 
 
 # ===========================================================================
-# Distributed MinSR Solver (chunked Gram matrix, no full gather)
+# Distributed MinSR Solver (all_to_all column redistribution, GPU only)
 # ===========================================================================
 def distributed_minSR_solver_gpu(
     local_lpg,
@@ -653,59 +653,63 @@ def distributed_minSR_solver_gpu(
     total_samples,
     n_params,
     diag_shift=1e-4,
-    param_chunk_size=1024,
     device=None,
     do_SR=True,
 ):
-    """Distributed minSR solver with incremental Gram matrix.
+    """Distributed minSR solver via all_to_all column redistribution.
 
-    Builds G = lpg_scaled @ lpg_scaled.T by iterating over parameter chunks
-    of size C.  Supports both GPU-resident and CPU-resident
-    local_lpg:
+    Each rank starts with a (B, Np) row-block of the centered,
+    1/sqrt(Ns)-scaled log-psi gradient O.  A single
+    `dist.all_to_all_single` redistributes O so each rank holds
+    (Ns_total, Np_per_rank) — a column-block.  Each rank then forms
+    its local Gram contribution `G_local = O_cols @ O_cols.T` and a
+    single `all_reduce(SUM)` produces the global (Ns x Ns) Gram on
+    every rank.  The (Ns x Ns) Tikhonov-regularized SPD system is
+    solved via Cholesky (replicated on every rank).  `dp` is
+    reconstructed via `O_cols.T @ alpha` and an `all_gather` of the
+    Np_per_rank slices.
 
-    - GPU path: slices local_lpg[:, c:c+C] directly on GPU.
-    - CPU path (offload_cpu): local_lpg lives on CPU.  Each
-      param chunk is uploaded to GPU on the fly, used for
-      G-build and dp-reconstruction, then discarded.  Peak
-      GPU memory is O(Ns_total^2 + Ns_total * C) — the
-      (Ns_per_rank, Np) matrix never touches GPU.
+    Implements Eq. 10 + Eq. 17 of Rende et al. 2024
+    (`refs/parallel_minSR.pdf`); see also Fig. 2 there for the
+    transpose pattern.
+
+    Per-rank peak GPU memory (after `local_lpg` is freed): roughly
+    `max(Ns_total^2, Ns_total * Np_per_rank)`.
 
     Args:
-        local_lpg: (Ns_per_rank, Np) tensor — GPU or CPU.
-        local_energies: (Ns_per_rank,) tensor — GPU or CPU.
+        local_lpg: (B, Np) GPU tensor (float64). The caller must not
+            rely on it being preserved — this routine modifies it
+            in place when computing the centered/scaled O.
+        local_energies: (B,) GPU tensor (float64).
         energy_mean: global mean energy (float).
         total_samples: total samples across all ranks (Ns_total).
-        n_params: number of parameters (Np).
-        diag_shift: regularization for (G + lambda*I).
-        param_chunk_size: number of params to gather at once (C).
-        device: torch device for GPU compute.
-        do_SR: if False, return only the energy gradient.
+            Required to satisfy `Ns_total == B * world_size`.
+        n_params: number of parameters Np.
+        diag_shift: Tikhonov shift lambda added to the (Ns x Ns)
+            Gram diagonal. No singular-value cutoff is applied.
+        device: torch device for GPU compute (default cuda).
+        do_SR: if False, return only the energy gradient (no SR
+            solve, no all_to_all).
 
     Returns:
         dp: (Np,) GPU tensor, parameter update direction.
         sr_time: wall-clock time (float).
-        info: 0 if success, 1 if lstsq fallback.
+        info: 0 on Cholesky success, 1 if lstsq fallback was used.
     """
     t0 = time.time()
     if device is None:
         device = torch.device('cuda')
-
     world_size = dist.get_world_size()
-    C = param_chunk_size
 
-    # --- Detect whether local_lpg lives on CPU ---
-    if isinstance(local_lpg, torch.Tensor):
-        lpgloc_on_cpu = local_lpg.device.type == 'cpu'
-    else:
-        lpgloc_on_cpu = True  # numpy
-
-    # --- Normalize inputs ---
+    # --- Normalize inputs (GPU only) ---
     if not isinstance(local_lpg, torch.Tensor):
         local_lpg = torch.as_tensor(
-            local_lpg, dtype=torch.float64,
+            local_lpg, device=device, dtype=torch.float64,
         ).contiguous()
     else:
-        local_lpg = local_lpg.to(dtype=torch.float64).contiguous()
+        local_lpg = local_lpg.to(
+            device=device, dtype=torch.float64,
+        ).contiguous()
 
     if not isinstance(local_energies, torch.Tensor):
         local_energies = torch.tensor(
@@ -716,35 +720,12 @@ def distributed_minSR_solver_gpu(
             device=device, dtype=torch.float64,
         )
 
-    n_local = local_energies.shape[0]  # Ns_per_rank
+    n_local = local_energies.shape[0]  # B = Ns_total / world_size
 
-    # --- Compute global statistics via all_reduce on (Np,) ---
-    # When local_lpg is on CPU, chunk the sum/dot to avoid
-    # uploading the full matrix.
+    # --- Step 1: global statistics via all_reduce on (Np,) ---
     if n_local > 0:
-        if lpgloc_on_cpu:
-            local_sum_lpg = torch.zeros(
-                n_params, device=device, dtype=torch.float64,
-            )
-            local_sum_EO = torch.zeros(
-                n_params, device=device, dtype=torch.float64,
-            )
-            E_cpu = local_energies.cpu()
-            for start in range(0, n_params, C):
-                end = min(start + C, n_params)
-                chunk_gpu = local_lpg[:, start:end].to(device)
-                local_sum_lpg[start:end] = chunk_gpu.sum(dim=0)
-                local_sum_EO[start:end] = E_cpu @ local_lpg[:, start:end]
-                # sum_EO chunk: (Ns,)@(Ns,c) on CPU is fine,
-                # result is small (c,)
-            local_sum_EO = local_sum_EO.to(device)
-            del E_cpu
-        else:
-            # local_lpg already on GPU
-            if local_lpg.device != device:
-                local_lpg = local_lpg.to(device)
-            local_sum_lpg = local_lpg.sum(dim=0)
-            local_sum_EO = local_energies @ local_lpg
+        local_sum_lpg = local_lpg.sum(dim=0)             # (Np,)
+        local_sum_EO = local_energies @ local_lpg        # (Np,)
     else:
         local_sum_lpg = torch.zeros(
             n_params, device=device, dtype=torch.float64,
@@ -757,116 +738,110 @@ def distributed_minSR_solver_gpu(
         dist.all_reduce(local_sum_lpg, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
 
-    mean_lpg = local_sum_lpg / total_samples            # (Np,) GPU
-    mean_EO = local_sum_EO / total_samples          # (Np,) GPU
-    energy_grad = mean_EO - energy_mean * mean_lpg    # (Np,) GPU
+    mean_lpg = local_sum_lpg / total_samples              # (Np,)
+    mean_EO = local_sum_EO / total_samples                # (Np,)
+    energy_grad = mean_EO - energy_mean * mean_lpg        # (Np,)
 
     if not do_SR:
         t1 = time.time()
         return energy_grad, t1 - t0, None
 
-    # --- Center and scale local_lpg in-place ---
-    # lpg_scaled = (O - mean_lpg) / sqrt(Ns)
-    # Safe: caller doesn't reuse local_lpg after solver returns.
-    if lpgloc_on_cpu:
-        mean_lpg_cpu = mean_lpg.cpu()
-        local_lpg -= mean_lpg_cpu.unsqueeze(0)
-        local_lpg /= math.sqrt(total_samples)
-        del mean_lpg_cpu
-    else:
-        local_lpg -= mean_lpg.unsqueeze(0)
-        local_lpg /= math.sqrt(total_samples)
+    # --- Step 2: center & scale O = (lpg - mean) / sqrt(Ns) in place ---
+    sqrt_Ns = math.sqrt(total_samples)
+    local_lpg.sub_(mean_lpg.unsqueeze(0))
+    local_lpg.div_(sqrt_Ns)
+    # local_lpg is now O_local with shape (B, Np)
 
-    # --- Gather energies (cheap: Ns_total floats) ---
-    local_E_scaled = (
-        (local_energies - energy_mean) / math.sqrt(total_samples)
-    )  # (Ns_per_rank,) GPU
-
+    # --- Step 6 (cheap; do it before freeing local_lpg) ---
+    # Energies are tiny — gather them now so we can free buffers
+    # in the right order later.
+    local_E_scaled = (local_energies - energy_mean) / sqrt_Ns  # (B,)
     if world_size > 1:
-        total_E = torch.zeros(
+        total_E = torch.empty(
             total_samples, device=device, dtype=torch.float64,
         )
         dist.all_gather_into_tensor(total_E, local_E_scaled)
     else:
         total_E = local_E_scaled
 
-    # --- Build Gram matrix G = lpg_scaled @ lpg_scaled^T via param chunks ---
-    G = torch.zeros(
-        (total_samples, total_samples),
-        device=device, dtype=torch.float64,
-    )
-
+    # --- Steps 3-5: column redistribution and local Gram ---
     if world_size > 1:
-        gather_buf = torch.zeros(
-            (total_samples, C),
-            device=device, dtype=torch.float64,
+        # Pad Np up to a multiple of world_size for a uniform a2a.
+        np_per_rank = (n_params + world_size - 1) // world_size
+        np_pad = world_size * np_per_rank
+
+        if np_pad != n_params:
+            # Allocate a padded buffer (B, np_pad). Bulk-copy
+            # the live cols and zero the tail.
+            send_padded = torch.zeros(
+                (n_local, np_pad),
+                device=device, dtype=torch.float64,
+            )
+            send_padded[:, :n_params].copy_(local_lpg)
+            del local_lpg
+        else:
+            send_padded = local_lpg
+            local_lpg = None  # release the local handle
+
+        # Build send buffer with shape (world_size, B, np_per_rank)
+        # where slot i carries the columns destined for rank i.
+        # view->permute requires .contiguous() for all_to_all_single.
+        send_buf = (
+            send_padded
+            .view(n_local, world_size, np_per_rank)
+            .permute(1, 0, 2)
+            .contiguous()
         )
+        del send_padded  # send_buf owns the data now
 
-        for start in range(0, n_params, C):
-            end = min(start + C, n_params)
-            chunk_size = end - start
-            # Stream from CPU if needed
-            local_chunk = local_lpg[:, start:end].to(
-                device=device,
-            ).contiguous()
+        recv_buf = torch.empty_like(send_buf)
+        dist.all_to_all_single(recv_buf, send_buf)
+        del send_buf
 
-            if chunk_size < C:
-                gather_buf_cur = torch.zeros(
-                    (total_samples, chunk_size),
-                    device=device, dtype=torch.float64,
-                )
-                dist.all_gather_into_tensor(
-                    gather_buf_cur, local_chunk,
-                )
-            else:
-                dist.all_gather_into_tensor(
-                    gather_buf, local_chunk,
-                )
-                gather_buf_cur = gather_buf
+        # After a2a: recv_buf[j] is the slab from rank j.
+        # Concatenating along the sample axis gives the full
+        # (Ns_total, np_per_rank) column-block on this rank.
+        o_cols = recv_buf.reshape(world_size * n_local, np_per_rank)
+        del recv_buf
 
-            G.addmm_(gather_buf_cur, gather_buf_cur.T)
-            del local_chunk
-
-        del gather_buf
+        # Local Gram contribution and global sum.
+        g = o_cols @ o_cols.T                              # (Ns, Ns)
+        dist.all_reduce(g, op=dist.ReduceOp.SUM)
     else:
-        for start in range(0, n_params, C):
-            end = min(start + C, n_params)
-            chunk = local_lpg[:, start:end].to(device)
-            G.addmm_(chunk, chunk.T)
-            del chunk
+        # Single GPU: no redistribution needed.
+        o_cols = local_lpg                                 # (Ns, Np)
+        np_per_rank = n_params
+        g = o_cols @ o_cols.T                              # (Ns, Ns)
 
-    # --- Solve (G + lambda*I) alpha = E_s ---
-    G.diagonal().add_(diag_shift)
+    # --- Step 7: Cholesky solve on (G + lambda I) ---
+    g.diagonal().add_(diag_shift)
     info = 0
-    try:
-        alpha = torch.linalg.solve(G, total_E)
-    except RuntimeError:
-        alpha = torch.linalg.lstsq(G, total_E).solution
-        info = 1
-    del G
-
-    # --- Reconstruct dp = lpg_scaled^T @ alpha_local ---
-    if world_size > 1:
-        rank = dist.get_rank()
-        alpha_local = alpha[
-            rank * n_local:(rank + 1) * n_local
-        ]  # (Ns_per_rank,) GPU
+    L, chol_info = torch.linalg.cholesky_ex(g)
+    if (chol_info == 0).all():
+        alpha = torch.cholesky_solve(
+            total_E.unsqueeze(-1), L,
+        ).squeeze(-1)
     else:
-        alpha_local = alpha
+        # Should not trigger when diag_shift > 0; guard for
+        # numerical edge cases.
+        alpha = torch.linalg.lstsq(g, total_E).solution
+        info = 1
+    del g, L
 
-    # Chunk the dp reconstruction along params to avoid
-    # uploading full (Ns_per_rank, Np) to GPU.
-    dp = torch.zeros(
-        n_params, device=device, dtype=torch.float64,
-    )
-    for start in range(0, n_params, C):
-        end = min(start + C, n_params)
-        chunk = local_lpg[:, start:end].to(device)
-        dp[start:end] = chunk.T @ alpha_local
-        del chunk
-
+    # --- Step 8: dp = O.T @ alpha via column-distributed o_cols ---
     if world_size > 1:
-        dist.all_reduce(dp, op=dist.ReduceOp.SUM)
+        dp_local = o_cols.T @ alpha                        # (np_per_rank,)
+        del o_cols
+
+        dp_padded = torch.empty(
+            np_pad, device=device, dtype=torch.float64,
+        )
+        dist.all_gather_into_tensor(dp_padded, dp_local)
+        del dp_local
+
+        dp = dp_padded[:n_params].contiguous()
+    else:
+        dp = o_cols.T @ alpha                              # (Np,)
 
     t1 = time.time()
     return dp, t1 - t0, info
@@ -1160,26 +1135,18 @@ class MinSRGPU(PreconditionerGPU):
 
 
 class DistributedMinSRGPU(PreconditionerGPU):
-    """Distributed minSR: chunked Gram matrix, no full gather.
+    """Distributed minSR via all_to_all column redistribution.
 
-    Keeps lpg_loc on each rank's GPU and builds the (Ns x Ns) Gram
-    matrix incrementally by gathering param chunks of size C.
-    Memory: O(Ns^2 + Ns*C) instead of O(Ns*Np).
+    Each rank's (B, Np) gradient block is transposed across ranks
+    with a single `dist.all_to_all_single` so every rank holds an
+    (Ns_total, Np_per_rank) column-block.  The (Ns x Ns) Gram is
+    then assembled by a local matmul and one all_reduce SUM, and
+    the regularized SPD system is solved via Cholesky.  Per-rank
+    peak GPU memory is roughly max(Ns^2, Ns * Np / world_size).
 
-    When offload_cpu=True, VMC_GPU eagerly offloads each
-    (B_grad, Np) gradient chunk to CPU inside compute_grads_gpu,
-    so peak GPU memory is O(B_grad * Np) not O(B * Np).
-    The solver then streams param-chunks from CPU to GPU for
-    G-build and dp reconstruction.
+    Implements Eq. 10 + Eq. 17 of Rende et al. 2024 (the
+    `parallel_minSR` paper).
     """
-
-    def __init__(
-        self,
-        param_chunk_size: int = 1024,
-        offload_cpu: bool = True,
-    ):
-        self.param_chunk_size = param_chunk_size
-        self.offload_cpu = offload_cpu
 
     def solve(
         self,
@@ -1200,7 +1167,6 @@ class DistributedMinSRGPU(PreconditionerGPU):
             total_samples=total_samples,
             n_params=n_params,
             diag_shift=diag_shift,
-            param_chunk_size=self.param_chunk_size,
             device=device,
             do_SR=run_sr,
         )

@@ -1,11 +1,12 @@
-"""GPU VMC with LocalSite (finite-range) NN-fPEPS backflow model — 4x4 system.
+"""GPU VMC with LocalCluster NN-fPEPS backflow model — 4x4 system.
 
-Faithful GPU port of fTN_BFA_cluster_Model (CPU): per-site independent
-attention + 2-layer FFN with Chebyshev-radius receptive field.
+Each lattice site has its own independent embedding + self-attention + MLP.
+Input for each site is its local Chebyshev-radius-r neighborhood (OBC).
+Port of Transformer_fPEPS_Model_Cluster from the CPU vmap pipeline.
 
 Run:
-    torchrun --nproc_per_node=1 run_scripts/vmc_run_nnfpeps_finite_range.py
-    torchrun --nproc_per_node=2 run_scripts/vmc_run_nnfpeps_finite_range.py
+    torchrun --nproc_per_node=1 run_scripts/ablation/vmc_run_cluster_nnfpeps.py
+    torchrun --nproc_per_node=2 run_scripts/ablation/vmc_run_cluster_nnfpeps.py
 """
 import torch
 import torch.distributed as dist
@@ -21,7 +22,7 @@ from vmc_torch.GPU.hamiltonian import (
     spinful_Fermi_Hubbard_square_lattice_torch,
 )
 from vmc_torch.GPU.models import (
-    LocalSite_fPEPS_GPU_original,
+    LocalCluster_fPEPS_GPU,
 )
 from vmc_torch.GPU.optimizer import DecayScheduler, SGDGPU
 from vmc_torch.GPU.sampler import (
@@ -44,38 +45,30 @@ from vmc_torch.GPU.run_scripts.vmcconfig import (
 )
 
 dtype = torch.float64
-nnbackbone_dtype = torch.float64
 
 # Data paths
 DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch/GPU/data'
+    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/vmc_torch'
+    '/GPU/data'
 )
-# SU-initialized PEPS from CPU vmap pipeline
 CPU_DATA_ROOT = DEFAULT_DATA_ROOT
 
 vmc_cfg = VMCConfig(
-    batch_size=4096*2,
-    ns_per_rank=4096*2,
-    grad_batch_size=1024*2,
-    vmc_steps=500,
+    batch_size=2048,
+    ns_per_rank=2048,
+    grad_batch_size=256,
+    vmc_steps=100,
     burn_in_steps=10,
     learning_rate=0.1,
-    offload_grad_to_cpu=True,
-    use_log_amp=True,
-    use_export_compile=True,
-    save_every=10,
-    resume_step=0,
-    verbose=False,
-    # --- SR ---
-    run_sr=True,
     sr_diag_shift=5e-4,
     use_distributed_sr_minres=True,
     sr_rtol=1e-4,
-    # --- SPRING (Goldshlager et al. 2024, arXiv:2401.10190) ---
-    use_spring=False,
-    spring_variant='minres',   # 'minsr' (direct) | 'minres' (iterative)
-    spring_mu=0.99,
-    norm_constraint=None,
+    offload_grad_to_cpu=True,
+    use_log_amp=True,
+    use_export_compile=False,
+    save_every=10,
+    resume_step=0,
+    verbose=False,
 )
 vmc_cfg.lr_scheduler = DecayScheduler(
     init_lr=vmc_cfg.learning_rate,
@@ -105,7 +98,7 @@ def main():
         torch.manual_seed(42 + rank)
 
         # ========== System parameters ==========
-        Lx, Ly = 4, 2
+        Lx, Ly = 4, 4
         N_sites = Lx * Ly
         t = 1.0
         U = 8.0
@@ -114,12 +107,12 @@ def main():
         D = 4   # PEPS bond dimension
         chi = -1  # exact contraction
 
-        # NN backflow hyperparameters
+        # LocalCluster backflow hyperparameters
         nn_eta = 1.0
-        d_model = 16
+        embed_dim = 16
         n_heads = 4
-        nn_hidden_dim = D
-        radius = 1
+        hidden_dim = D
+        radius = 1  # Chebyshev receptive-field radius
 
         # ========== Hamiltonian ==========
         H = spinful_Fermi_Hubbard_square_lattice_torch(
@@ -136,7 +129,7 @@ def main():
         H.precompute_hops_gpu(device)
         graph = H.graph
 
-        # ========== Variational state (NN-fPEPS model) ==========
+        # ========== Variational state (LocalCluster NN-fPEPS model) ==========
         fpeps_base = (
             f"{CPU_DATA_ROOT}/{Lx}x{Ly}/t={t}_U={U}"
             f"/N={N_f}/Z2/D={D}/"
@@ -162,17 +155,16 @@ def main():
             print(f"ftn_params_mean={ftn_params_mean:.6e}, "
                   f"init_scale={init_scale:.6e}")
 
-        model = LocalSite_fPEPS_GPU_original(
+        model = LocalCluster_fPEPS_GPU(
             tn=peps,
             max_bond=chi,
             nn_eta=nn_eta,
-            d_model=d_model,
+            embed_dim=embed_dim,
             n_heads=n_heads,
-            nn_hidden_dim=nn_hidden_dim,
+            hidden_dim=hidden_dim,
             radius=radius,
             init_scale=init_scale,
             dtype=dtype,
-            backbone_dtype=nnbackbone_dtype,
             contract_boundary_opts={
                 'mode': 'mps',
                 'equalize_norms': 1.0,
@@ -181,41 +173,37 @@ def main():
         )
         model.to(device)
         n_params = sum(p.numel() for p in model.parameters())
-        # estimate the gpu mem needed for grad:
-        grad_mem_estimate = vmc_cfg.batch_size * n_params * 8 / 1024**3
+        grad_mem_estimate = (
+            vmc_cfg.batch_size * n_params * 8 / 1024**3
+        )
         if rank == 0:
             print(
                 f"Model has {n_params} parameters, "
-                f"estimated grad memory per batch: {grad_mem_estimate:.2f} GB"
+                f"estimated grad memory per batch: "
+                f"{grad_mem_estimate:.2f} GB"
             )
-
-        # Export + compile (optional, ~10-40s one-time cost)
-        if vmc_cfg.use_export_compile:
-            example_x = random_initial_config(
-                N_f, N_sites, seed=0,
-            ).to(device)
-            if rank == 0:
-                print("Running torch.export + compile...")
-            import time as _time
-            _t0 = _time.time()
-            model.export_and_compile(
-                example_x,
-                use_log_amp=vmc_cfg.use_log_amp,
+            ftn_params_list = list(model.parameters())[:model.n_ftn]
+            ftn_params_mean_val = torch.mean(
+                torch.cat([
+                    p.detach().cpu().flatten().abs()
+                    for p in ftn_params_list
+                ])
             )
-            if rank == 0:
-                print(
-                    f"Export + compile done in "
-                    f"{_time.time() - _t0:.1f}s"
-                )
+            print(
+                f"FTN params mean abs value: "
+                f"{ftn_params_mean_val:.3e}"
+            )
 
         # ========== Setup ==========
         model_name = (
             model._get_name()
-            + f'_d={d_model}_heads={n_heads}_hidden={nn_hidden_dim}_r={radius}'
+            + f'_embed={embed_dim}_heads={n_heads}'
+            + f'_hidden={hidden_dim}_r={radius}'
         )
         output_dir = (
             f"{DEFAULT_DATA_ROOT}/{Lx}x{Ly}/"
-            f"t={t}_U={U}/N={N_f}/Z2/D={D}/{model_name}/chi={chi}/"
+            f"t={t}_U={U}/N={N_f}/Z2/D={D}/"
+            f"{model_name}/chi={chi}/"
         )
         import os
         os.makedirs(output_dir, exist_ok=True)
@@ -231,18 +219,15 @@ def main():
             print(
                 f"Model: {model_name} | {N_params} params | "
                 f"TN: {model.n_ftn} tensors, "
-                f"NN: {sum(p.numel() for p in list(model.parameters())[-len(model._nn_param_names):])} params"
+                f"NN: {sum(p.numel() for p in list(model.parameters())[model.n_ftn:])} params"
             )
             print(
-                f"nn_eta={nn_eta}, d_model={d_model}, "
-                f"n_heads={n_heads}, nn_hidden_dim={nn_hidden_dim}, radius={radius}"
+                f"nn_eta={nn_eta}, embed={embed_dim}, "
+                f"n_heads={n_heads}, hidden={hidden_dim}, "
+                f"radius={radius}"
             )
-            print(
-                f"backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}, "
-            )
-            print(
-                f"{world_size} GPUs | {device}"
-            )
+            print(f"TN dtype={dtype}")
+            print(f"{world_size} GPUs | {device}")
 
         print_sampling_settings(
             rank,
@@ -265,9 +250,9 @@ def main():
         system_str = (
             f'{Lx}x{Ly} Fermi-Hubbard, t={t}, U={U}, '
             f'N_f={N_f}, D={D}, chi={chi}, '
-            f'nn_eta={nn_eta}, d_model={d_model}, n_heads={n_heads}, '
-            f'nn_hidden_dim={nn_hidden_dim}, radius={radius}, '
-            f'backbone_dtype={nnbackbone_dtype}, TN dtype={dtype}'
+            f'nn_eta={nn_eta}, embed={embed_dim}, '
+            f'n_heads={n_heads}, hidden={hidden_dim}, '
+            f'radius={radius}, TN dtype={dtype}'
         )
         stats_file = make_stats_file(
             output_dir, model_name,
@@ -285,12 +270,10 @@ def main():
         # ========== VMC driver ==========
         vmc = VMC_GPU(
             sampler=MetropolisExchangeSpinfulSamplerGPU(),
+            preconditioner=make_preconditioner(vmc_cfg),
             optimizer=SGDGPU(
                 learning_rate=vmc_cfg.learning_rate,
-                norm_constraint=vmc_cfg.norm_constraint,
             ),
-            # --------- SR preconditioner ---------
-            preconditioner=make_preconditioner(vmc_cfg),
         )
 
         fxs = vmc.run_warmup(

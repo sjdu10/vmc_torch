@@ -146,6 +146,41 @@ def format_fpeps_keys(peps):
         ts.modify(data=farr_sector_format(ts.data))
     return peps.copy()
 
+def _semantic_config_to_linear_selector(phys_index, user_v, symmetry, spinless):
+    """Map semantic occupation labels to the physical BlockIndex position."""
+    user_v = int(user_v)
+    if spinless:
+        charge_offset_map = {
+            0: (0, 0),
+            1: (1, 0),
+        }
+    elif symmetry == 'U1':
+        charge_offset_map = {
+            0: (0, 0),  # empty
+            1: (1, 0),  # up
+            2: (1, 1),  # down
+            3: (2, 0),  # double
+        }
+    elif symmetry == 'Z2':
+        charge_offset_map = {
+            0: (0, 0),  # empty
+            1: (1, 0),  # up
+            2: (1, 1),  # down
+            3: (0, 1),  # double
+        }
+    elif symmetry == 'U1U1':
+        charge_offset_map = {
+            0: ((0, 0), 0),  # empty
+            1: ((0, 1), 0),  # up
+            2: ((1, 0), 0),  # down
+            3: ((1, 1), 0),  # double
+        }
+    else:
+        raise NotImplementedError(f"Unsupported fTN symmetry: {symmetry!r}")
+
+    charge_offset = charge_offset_map[user_v]
+    return phys_index.linearmap.index(charge_offset)
+
 def u1arr_to_z2arr(u1array):
     """
     Convert a FermionicArray with U1 symmetry to a FermionicArray with Z2 symmetry
@@ -329,7 +364,10 @@ class fPEPS(qtn.PEPS):
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
 
         p_inds = [peps.site_ind_id.format(*site) for site in sites]
-        site_mapping = dict(zip(p_inds, config.to(torch.int64)))
+        if isinstance(config, numpy.ndarray):
+            site_mapping = dict(zip(p_inds, config.astype(numpy.int64)))
+        elif isinstance(config, torch.Tensor):
+            site_mapping = dict(zip(p_inds, config.to(torch.int64)))
         tn = peps.isel(selectors=site_mapping)
         return tn
     
@@ -464,9 +502,17 @@ class fPEPS(qtn.PEPS):
     def get_amp_efficient(self, config, inplace=False):
         """Slicing to get the amplitude, faster than contraction with a tensor product state."""
         peps = self if inplace else self.copy()
-        site_mapping = dict(zip(self.site_inds, config.to(torch.int64)))
+        site_mapping = {}
+        for site, n in zip(peps.sites, config):
+            p_ind = peps.site_ind(*site)
+            fts = peps[site]
+            phys_ind_order = fts.inds.index(p_ind)
+            phys_index = fts.data.indices[phys_ind_order]
+            site_mapping[p_ind] = _semantic_config_to_linear_selector(
+                phys_index, n, self.symmetry, self.spinless
+            )
         try:
-            amp = self.isel(selectors=site_mapping)
+            amp = peps.isel(selectors=site_mapping)
         except Exception as e:
             raise e
         return amp
@@ -1084,8 +1130,15 @@ class fMPS(qtn.MatrixProductState):
         mps = self if inplace else self.copy()
         backend = self.tensors[0].data.backend
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
-
-        site_mapping = dict(zip(self.site_inds, config.to(torch.int64)))
+        site_mapping = {}
+        for site, n in zip(mps.sites, config):
+            p_ind = mps.site_ind_id.format(site)
+            fts = mps[site]
+            phys_ind_order = fts.inds.index(p_ind)
+            phys_index = fts.data.indices[phys_ind_order]
+            site_mapping[p_ind] = _semantic_config_to_linear_selector(
+                phys_index, n, self.symmetry, self.spinless
+            )
         amp = mps.isel(selectors=site_mapping)
         return amp
     
@@ -1162,7 +1215,10 @@ class fMPS(qtn.MatrixProductState):
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
 
         p_inds = [mps.site_ind_id.format(site) for site in sites]
-        site_mapping = dict(zip(p_inds, config.to(torch.int64)))
+        if isinstance(config, numpy.ndarray):
+            site_mapping = dict(zip(p_inds, config.astype(numpy.int64)))
+        elif isinstance(config, torch.Tensor):
+            site_mapping = dict(zip(p_inds, config.to(torch.int64)))
         tn = mps.isel(selectors=site_mapping)
         return tn
     

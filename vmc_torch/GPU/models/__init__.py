@@ -26,6 +26,11 @@ from .NNfTNS import (
     Attention_Geometric_fPEPS_GPU,
     LocalSite_fPEPS_GPU,
     LocalSite_fPEPS_GPU_original,
+    LocalCluster_fPEPS_GPU,
+)
+from .LoRA_models import (
+    LoRA_fPEPS_GPU,
+    LoRA_LocalCluster_fPEPS_GPU,
 )
 from .symmetry import (
     SymmetryProjectedModel,
@@ -47,6 +52,9 @@ __all__ = [
     "Attention_Geometric_fPEPS_GPU",
     "LocalSite_fPEPS_GPU",
     "LocalSite_fPEPS_GPU_original",
+    "LocalCluster_fPEPS_GPU",
+    "LoRA_fPEPS_GPU",
+    "LoRA_LocalCluster_fPEPS_GPU",
     "PEPS_Model_GPU",
     "PEPS_Model_reuse_GPU",
     "PEPS_Model_reuse_compiled_cache_GPU",

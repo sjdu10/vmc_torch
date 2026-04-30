@@ -2857,3 +2857,240 @@ class LocalSite_fPEPS_GPU_original(NNfTNS_Model_GPU):
 
         self.nn_radius = radius
         self.max_rf_size = nn_module.max_rf_size
+
+
+# ================================================================
+#  LocalCluster Backflow (GPU port of Transformer_fPEPS_Model_Cluster)
+# ================================================================
+
+
+def _get_receptive_field_2d(Lx, Ly, r):
+    """Chebyshev receptive field for each site in an Lx x Ly lattice (OBC).
+
+    Returns:
+        dict mapping site_id -> list of neighbor site_ids (including self)
+    """
+    receptive_field = {}
+    for i in range(Lx):
+        for j in range(Ly):
+            site_id = i * Ly + j
+            receptive_field[site_id] = []
+            for ix in range(i - r, i + r + 1):
+                for jx in range(j - r, j + r + 1):
+                    if 0 <= ix < Lx and 0 <= jx < Ly:
+                        receptive_field[site_id].append(ix * Ly + jx)
+    return receptive_field
+
+
+class _LocalSiteNetwork(nn.Module):
+    """Independent network for a single lattice site.
+
+    Embeds neighbor occupations, applies self-attention, then MLP
+    to produce backflow corrections for this site's TN parameters.
+
+    Input:  (B, n_neighbors) int64
+    Output: (B, output_dim) float
+
+    Ported from experiment/vmap/models/_model_base.py::LocalSiteNetwork.
+    """
+
+    def __init__(
+        self,
+        n_neighbors,
+        num_classes,
+        embed_dim,
+        n_heads,
+        hidden_dim,
+        output_dim,
+        dtype,
+    ):
+        super().__init__()
+        self.dtype = dtype
+        self.embedding = nn.Embedding(num_classes, embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=n_heads,
+            batch_first=True,
+            dtype=dtype,
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(n_neighbors * embed_dim, hidden_dim, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim, dtype=dtype),
+        )
+
+    def forward(self, x_local):
+        """
+        Args:
+            x_local: (B, n_neighbors) int64
+
+        Returns:
+            (B, output_dim) float
+        """
+        h = self.embedding(x_local).to(self.dtype)  # (B, n_neighbors, embed_dim)
+        h_attn, _ = self.attn(h, h, h)
+        h = h + h_attn
+        B = h.shape[0]
+        return self.mlp(h.reshape(B, -1))
+
+
+class _LocalCluster_Backflow_GPU(nn.Module):
+    """N independent per-site networks for local cluster backflow.
+
+    For each site i, gathers its local neighborhood (Chebyshev radius r,
+    OBC) and runs an independent _LocalSiteNetwork to produce backflow
+    corrections for that site's TN parameters.
+
+    Input:  (B, N_sites) int64 configuration
+    Output: (B, total_ftn_params) concatenated backflow delta
+
+    Ported from experiment/vmap/models/TransformerNNfTNS.py::LocalClusterBackflow.
+    GPU change: RF index lists registered as buffers (auto .to(device));
+    param_sizes computed from tn instead of passed explicitly.
+
+    Args:
+        tn: quimb fPEPS tensor network
+        radius: Chebyshev receptive-field radius (OBC)
+        embed_dim: per-site embedding dimension
+        n_heads: number of attention heads per site
+        hidden_dim: MLP hidden dimension
+        dtype: parameter dtype
+    """
+
+    def __init__(
+        self,
+        tn,
+        radius,
+        embed_dim,
+        n_heads,
+        hidden_dim,
+        dtype,
+    ):
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        super().__init__()
+        Lx, Ly = tn.Lx, tn.Ly
+        n_sites = Lx * Ly
+        phys_dim = tn.phys_dim()
+
+        # Compute per-site TN parameter sizes from the tensor network
+        ftn_params, _ = qtn.pack(tn)
+        ftn_params_flat, _ = qu.utils.tree_flatten(
+            ftn_params, get_ref=True,
+        )
+        param_sizes = [
+            (p.numel() if isinstance(p, torch.Tensor) else p.size)
+            for p in ftn_params_flat
+        ]
+
+        # Compute Chebyshev receptive fields (OBC)
+        rf_dict = _get_receptive_field_2d(Lx, Ly, radius)
+
+        # Register RF index lists as buffers (auto .to(device))
+        for i in range(n_sites):
+            self.register_buffer(
+                f'_rf_{i}',
+                torch.tensor(rf_dict[i], dtype=torch.long),
+            )
+
+        # N independent site networks (one per lattice site)
+        self.site_networks = nn.ModuleList()
+        for i in range(n_sites):
+            n_neighbors = len(rf_dict[i])
+            self.site_networks.append(_LocalSiteNetwork(
+                n_neighbors=n_neighbors,
+                num_classes=phys_dim,
+                embed_dim=embed_dim,
+                n_heads=n_heads,
+                hidden_dim=hidden_dim,
+                output_dim=param_sizes[i],
+                dtype=dtype,
+            ))
+
+    def initialize_output_scale(self, scale):
+        """Small-init output layer so model starts near pure fPEPS."""
+        for net in self.site_networks:
+            last_layer = net.mlp[-1]
+            nn.init.normal_(last_layer.weight, mean=0.0, std=scale)
+            if last_layer.bias is not None:
+                nn.init.zeros_(last_layer.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, N_sites) int64
+
+        Returns:
+            (B, total_ftn_params) float
+        """
+        outputs = []
+        for i, net in enumerate(self.site_networks):
+            rf_buf = getattr(self, f'_rf_{i}')
+            x_local = x[:, rf_buf]  # (B, n_neighbors)
+            outputs.append(net(x_local))
+        return torch.cat(outputs, dim=1)
+
+
+class LocalCluster_fPEPS_GPU(NNfTNS_Model_GPU):
+    """NN-fPEPS with local cluster backflow for GPU VMC.
+
+    GPU port of ``Transformer_fPEPS_Model_Cluster`` from the CPU
+    vmap pipeline (experiment/vmap/models/TransformerNNfTNS.py).
+
+    Each lattice site has its **own independent** embedding, self-attention,
+    and output MLP. The input to each site's network is its local
+    neighborhood (Chebyshev radius ``radius``, OBC).
+
+    Unlike the geometry-grouped models (Conv2D/ViT_Geometric_fPEPS_GPU),
+    there is no weight sharing across sites — every site has a fully
+    independent set of parameters.
+
+    Args:
+        tn: quimb fPEPS tensor network
+        max_bond: boundary contraction bond dimension (chi)
+        nn_eta: scale factor applied to NN backflow correction
+        embed_dim: per-site token embedding dimension
+        n_heads: number of self-attention heads per site
+        hidden_dim: MLP hidden dimension per site
+        radius: Chebyshev receptive-field radius (default 1)
+        init_scale: initial scale for output layer weights (default 1e-5)
+        dtype: parameter dtype (default float64)
+        contract_boundary_opts: options forwarded to boundary contraction
+    """
+
+    def __init__(
+        self,
+        tn,
+        max_bond,
+        nn_eta,
+        embed_dim,
+        n_heads,
+        hidden_dim,
+        radius=1,
+        init_scale=1e-5,
+        dtype=torch.float64,
+        contract_boundary_opts=None,
+    ):
+        # 1. Build per-site independent backflow module
+        nn_module = _LocalCluster_Backflow_GPU(
+            tn=tn,
+            radius=radius,
+            embed_dim=embed_dim,
+            n_heads=n_heads,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+        )
+
+        # 2. Small-init output layers so model starts near pure fPEPS
+        nn_module.initialize_output_scale(init_scale)
+
+        # 3. Delegate to NNfTNS base class
+        super().__init__(
+            tn=tn,
+            nn_module=nn_module,
+            max_bond=max_bond,
+            nn_eta=nn_eta,
+            dtype=dtype,
+            contract_boundary_opts=contract_boundary_opts,
+        )
