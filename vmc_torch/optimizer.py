@@ -2,6 +2,7 @@ import os
 import numpy as np
 from mpi4py import MPI
 import time
+import functools
 # scipy
 import scipy
 from scipy.sparse import csr_matrix
@@ -293,7 +294,7 @@ def exponential_decay(t, decay_rate=0.1, decay_step=1, init_lr=5e-2, **kwargs):
 def linear_decay(t, max_iter=1000, init_lr=5e-2, **kwargs):
     return init_lr * (1 - t / max_iter)
 
-import functools
+
 class DecayScheduler(Scheduler):
     def __init__(self, init_lr=1e-3, decay_rate=0.9, patience=100, min_lr=1e-4, type='continuous_exp', **kwargs):
         super().__init__(init_lr)

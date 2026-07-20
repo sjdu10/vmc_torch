@@ -529,9 +529,12 @@ class VMC:
                 self._state.update_state(initial_param_vec) # Reload the initial parameter vector into the quantum state
             self.step_count += 1
             # Step 1: Sample the SWO dataset at the current step for current wavefunction. In this step we use MPI for the sampling.
-            # -- Dataset format: [[c1,c2,...], {c1:(x_c1,y_c1), c2:(x_c2,y_c2), ...}] where x_c=<c|Psi_(t-1)>, y_c=<c|H|Psi_(t-1)>.
-            # -- The dataset is sampled from the current wavefunction |Psi_(t-1)>.
-            SWO_dataset = self._state.collect_SWO_state_fitting_dataset_eager(target_state, message_tag=t_step, compute_energy=compute_energy, op=self._hamiltonian)
+            # -- Dataset format: [[c1,c2,...], {c1:(x_c1,y_c1), c2:(x_c2,y_c2), ...}] where x_c=<c|Psi>, y_c=<c|Phi_target>.
+            # -- The dataset is sampled from the current wavefunction |Psi>.
+            if self._state.equal_partition:
+                raise NotImplementedError("Equal partition sampling for SWO state fitting is not implemented yet! Set equal_partition to False and use n>=2 ranks for SWO state fitting.")
+            else:
+                SWO_dataset = self._state.collect_SWO_state_fitting_dataset_eager(target_state, message_tag=t_step, compute_energy=compute_energy, op=self._hamiltonian)
             # -- Compute energy estimation and record energy statistics
             local_configs = SWO_dataset[0]
             local_configs_amps_dict = SWO_dataset[1]
@@ -577,7 +580,7 @@ class VMC:
             if self.scheduler is not None:
                 learning_rate = self.scheduler(self.step_count)
                 self._optimizer.lr = learning_rate
-
+            print()
             for SWO_iter in range(SWO_max_iter):
                 # Compute the amplitude and the gradient of the amplitude for the training wavefunction
                 training_amps_grad_dict = {}
@@ -639,6 +642,8 @@ class VMC:
                     new_param_vec = new_param_vec.detach().numpy()
                     pbar.set_description(f'   SWO iter:{SWO_iter}, -log-f:{log_f}', refresh=False)
                     pbar.update(1)
+                    pbar.refresh()
+                    print()
 
                 else:
                     new_param_vec = np.empty(self._state.Np, dtype=float)

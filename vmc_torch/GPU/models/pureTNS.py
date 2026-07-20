@@ -15,6 +15,12 @@ from vmc_torch.GPU.fermion_utils import (
     get_params_ftn,
 )
 
+# Fermionic physical-state encoding for direct sampling:
+#   0=empty, 1=up, 2=down, 3=double.
+# Per-state contribution to the up / down particle counts.
+_FPEPS_DU = (0, 1, 0, 1)   # n_up contribution per state
+_FPEPS_DD = (0, 0, 1, 1)   # n_dn contribution per state
+
 
 # =================================================================
 #  fPEPS full-contraction model
@@ -42,6 +48,7 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
         contract_boundary_opts=None,
         **kwargs,
     ):
+        tn = tn.copy()  # don't modify original TN
         import quimb as qu
         import quimb.tensor as qtn
 
@@ -153,6 +160,290 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
             params = list(params)
         params = qu.utils.tree_unflatten(params, self.params_pytree)
         return params
+
+    # -----------------------------------------------------------------
+    #  Direct sampler (torch.vmap over walkers), chi_m=0, Z2.
+    #  Mirrors the CPU fermionic sampler `fTNModel.direct_sample`
+    #  (vmc_torch/model.py) but built on the flat fermionic
+    #  representation so the whole thing is vmap-traceable.
+    # -----------------------------------------------------------------
+
+    def _phys_linear(self, v):
+        """Map a semantic state v in {0,1,2,3} to the flat phys leg's
+        linear index. The model nulls the phys `_linearmap` and records
+        `_loc_basis_perm` (see __init__); the same perm `amplitude` uses.
+        For a None perm (no remap needed) semantic == linear.
+        """
+        if self._loc_basis_perm is not None:
+            return self._loc_basis_perm[v]
+        return v
+
+    @staticmethod
+    def _site_label(tns, x, y):
+        """Fermionic ordering label for site (x, y)'s physical leg.
+
+        Flat fermionic `squeeze` turns a squeezed odd-parity phys leg into a
+        dummy mode keyed by the tensor's `.label`; when several dummy modes
+        accumulate (rows below the top boundary) they are SORTED by label,
+        each reorder contributing a fermionic sign. So the label MUST sort in
+        the peps's true fermionic site order, otherwise the signs are wrong.
+        Use the original (uncompressed) site tensor's label; fall back to the
+        site coordinate.
+        """
+        lbl = tns[tns.site_tag(x, y)].data.label
+        return lbl if lbl is not None else (x, y)
+
+    @staticmethod
+    def _shared_ind(t_y, tn, y_tags, y, direction, Ly):
+        """Bond index name shared between column tensor t_y and its
+        neighbour. direction = -1 (left) / +1 (right). None at boundary.
+        """
+        if direction == -1 and y == 0:
+            return None
+        if direction == +1 and y == Ly - 1:
+            return None
+        nbr = tn[y_tags[y + direction]]
+        shared = set(t_y.inds) & set(nbr.inds)
+        return next(iter(shared)) if shared else None
+
+    @staticmethod
+    def _inverse_cdf_sample(probs, u, d):
+        """Sample v in {0,...,d-1} from probs via inverse CDF with u."""
+        cs = torch.cumsum(probs, dim=0)
+        v = (cs <= u).sum()
+        v = torch.clamp(v, max=d - 1)
+        return v
+
+    @staticmethod
+    def _apply_u1u1_mask(probs, x, y, Ly, N, n_up_so_far, n_dn_so_far,
+                         n_up_target, n_dn_target):
+        """Branchless U(1)xU(1) charge mask for the d=4 phys states.
+
+        Torch port of `_fpeps_u1u1_mask` (vmc_torch/model.py): zero out
+        states that overshoot a particle target or cannot reach it with
+        the remaining sites. `n_*_so_far` are traced int64 scalars;
+        `n_*_target` are Python ints or None (static config args, so the
+        `is None` branches are not data-dependent). Returns normalized
+        probs (4,).
+        """
+        probs = torch.clamp(probs, min=0.0)
+        if n_up_target is None and n_dn_target is None:
+            return probs / (probs.sum() + 1e-300)
+        site_idx = x * Ly + y                  # Python int
+        n_remain_after = N - site_idx - 1      # Python int
+        du = torch.tensor(_FPEPS_DU, dtype=torch.int64, device=probs.device)
+        dd = torch.tensor(_FPEPS_DD, dtype=torch.int64, device=probs.device)
+        ok = torch.ones(4, dtype=probs.dtype, device=probs.device)
+        if n_up_target is not None:
+            n_up_a = n_up_so_far + du          # (4,) traced
+            ok = ok * (n_up_a <= n_up_target).to(probs.dtype)
+            ok = ok * ((n_up_target - n_up_a) <= n_remain_after).to(probs.dtype)
+        if n_dn_target is not None:
+            n_dn_a = n_dn_so_far + dd
+            ok = ok * (n_dn_a <= n_dn_target).to(probs.dtype)
+            ok = ok * ((n_dn_target - n_dn_a) <= n_remain_after).to(probs.dtype)
+        probs = probs * ok
+        return probs / (probs.sum() + 1e-300)
+
+    def _sample_row_single(self, combined_rc, tns, x, d, u_rand,
+                           n_up_so_far, n_dn_so_far,
+                           n_up_target, n_dn_target, N):
+        """Sample row x site-by-site (LTR) on the flat fermionic TN.
+
+        chi_m=0: right-canonicalize then propagate a left density matrix
+        rho_L. Mirrors the CPU `_fpeps_sample_row` but with torch ops so
+        it is vmap-traceable. Returns
+        (sampled_row [SEMANTIC int64 scalars], log_p_row,
+         n_up_so_far, n_dn_so_far).
+        """
+        Ly = tns.Ly
+        y_tags = [tns.y_tag(y) for y in range(Ly)]
+        log_p_row = torch.zeros(
+            (), dtype=u_rand.dtype, device=u_rand.device,
+        )
+        sampled_row = []
+        du = torch.tensor(_FPEPS_DU, dtype=torch.int64, device=u_rand.device)
+        dd = torch.tensor(_FPEPS_DD, dtype=torch.int64, device=u_rand.device)
+
+        for y in range(Ly - 1, 0, -1):
+            combined_rc.canonize_between(y_tags[y], y_tags[y - 1])
+        rho_L = None
+
+        for y in range(Ly):
+            phys_ind = tns.site_ind(x, y)
+            t_y = combined_rc[y_tags[y]]
+            # Flat fermionic squeeze of an odd-parity phys leg needs an
+            # ordering .label (compression drops it); it must sort in the
+            # peps's true fermionic site order (see _site_label).
+            t_y.data._label = self._site_label(tns, x, y)
+
+            left_ind = self._shared_ind(t_y, combined_rc, y_tags, y, -1, Ly)
+            right_ind = self._shared_ind(t_y, combined_rc, y_tags, y, +1, Ly)
+
+            probs_list = []
+            for v in range(d):
+                tv = t_y.isel({phys_ind: self._phys_linear(v)})
+                if rho_L is None:
+                    p = (tv.H | tv).contract().real
+                else:
+                    tv_c = tv.conj().reindex({left_ind: left_ind + '_c'})
+                    F_v = (tv | tv_c).contract(
+                        output_inds=[left_ind, left_ind + '_c'],
+                    )
+                    p = (rho_L | F_v).contract().real
+                probs_list.append(p)
+            probs = torch.stack(probs_list)
+            probs = self._apply_u1u1_mask(
+                probs, x, y, Ly, N, n_up_so_far, n_dn_so_far,
+                n_up_target, n_dn_target,
+            )
+
+            v = self._inverse_cdf_sample(probs, u_rand[x * Ly + y], d)
+            sampled_row.append(v)
+            log_p_row = log_p_row + torch.log(probs[v] + 1e-300)
+            n_up_so_far = n_up_so_far + du[v]
+            n_dn_so_far = n_dn_so_far + dd[v]
+
+            # rho_L update for next site (uses torch-scalar v)
+            if right_ind is not None:
+                tv = t_y.isel({phys_ind: self._phys_linear(v)})
+                if rho_L is None:
+                    tv_c = tv.conj().reindex(
+                        {right_ind: right_ind + '_c'},
+                    )
+                    rho_L = (tv | tv_c).contract(
+                        output_inds=[right_ind, right_ind + '_c'],
+                    )
+                else:
+                    tv_c = tv.conj().reindex({
+                        left_ind: left_ind + '_c',
+                        right_ind: right_ind + '_c',
+                    })
+                    rho_L = (rho_L | tv | tv_c).contract(
+                        output_inds=[right_ind, right_ind + '_c'],
+                    )
+                # Normalize rho_L by the POSITIVE raw data norm (||blocks||).
+                # NOT by the fermionic inner product (rho_L.H | rho_L): that
+                # carries fermionic signs and CAN GO NEGATIVE -> rsqrt -> NaN
+                # (observed for >=3 rows). The true trace would be positive
+                # but routes to the unsupported einsum 'aa->'. Any positive
+                # scale is fine here: it cancels in the per-site probs
+                # renormalization and in log_p_c. Phases are +/-1 so the
+                # block norm is phase-independent.
+                scale = torch.linalg.vector_norm(rho_L.data.blocks)
+                rho_L = rho_L / (scale + 1e-300)
+
+        return sampled_row, log_p_row, n_up_so_far, n_dn_so_far
+
+    def direct_sample_single(self, u_rand, params, chi_s,
+                             n_up_target=None, n_dn_target=None):
+        """One walker's fermionic direct sample. vmap-traceable.
+
+        Args:
+            u_rand:      (Lx*Ly,) torch float uniforms — pre-drawn.
+            params:      quimb pytree of torch tensors (unflattened).
+            chi_s:       Python int or None, boundary MPS bond.
+            n_up_target: Python int or None, U(1) up-count constraint.
+            n_dn_target: Python int or None, U(1) down-count constraint.
+
+        Returns:
+            config:  (Lx*Ly,) int64 SEMANTIC encoding {0,1,2,3}
+            log_p_c: scalar float
+        """
+        import quimb.tensor as qtn
+        from quimb.tensor.tn1d.compress import (
+            tensor_network_1d_compress,
+        )
+
+        tns = qtn.unpack(params, self.skeleton)
+        Lx, Ly = tns.Lx, tns.Ly
+        d = tns.phys_dim()
+        N = Lx * Ly
+        y_tags = [tns.y_tag(y) for y in range(Ly)]
+
+        n_up_so_far = torch.zeros(
+            (), dtype=torch.int64, device=u_rand.device,
+        )
+        n_dn_so_far = torch.zeros(
+            (), dtype=torch.int64, device=u_rand.device,
+        )
+        config_list = []
+        log_p_c = torch.zeros(
+            (), dtype=u_rand.dtype, device=u_rand.device,
+        )
+        boundary = None
+
+        for x in range(Lx):
+            row_tn = tns.select(tns.x_tag(x)).copy()
+            combined = (
+                (boundary | row_tn) if boundary is not None else row_tn
+            )
+            if chi_s is not None and chi_s > 0:
+                combined_rc = tensor_network_1d_compress(
+                    combined, max_bond=chi_s, cutoff=0.0,
+                    method='direct', site_tags=y_tags,
+                )
+            else:
+                combined_rc = combined
+                for i in range(Ly):
+                    combined_rc.contract_tags_(y_tags[i])
+
+            sampled_row, log_p_row, n_up_so_far, n_dn_so_far = (
+                self._sample_row_single(
+                    combined_rc, tns, x, d, u_rand,
+                    n_up_so_far, n_dn_so_far,
+                    n_up_target, n_dn_target, N,
+                )
+            )
+            config_list.extend(sampled_row)
+            log_p_c = log_p_c + log_p_row
+
+            # Fix this row's phys legs (semantic -> linear) -> new boundary.
+            isel = {}
+            for y in range(Ly):
+                t_col = combined_rc[y_tags[y]]
+                t_col.data._label = self._site_label(tns, x, y)
+                isel[tns.site_ind(x, y)] = self._phys_linear(sampled_row[y])
+            boundary = combined_rc.isel(isel)
+
+        return torch.stack(config_list), log_p_c
+
+    @torch.no_grad()
+    def direct_sample_vmap(self, u_batch, chi_s=None,
+                           n_up_target=None, n_dn_target=None, chi_m=None):
+        """Vectorized fermionic direct sampler over a batch of B walkers.
+
+        Args:
+            u_batch:     (B, Lx*Ly) torch float uniforms in [0, 1).
+            chi_s:       boundary MPS bond. None -> self.chi (or no
+                compression if self.chi <= 0).
+            n_up_target: U(1) up-count constraint or None.
+            n_dn_target: U(1) down-count constraint or None.
+            chi_m:       must be None or 0 (chi_m>0 not implemented).
+
+        Returns:
+            configs: (B, Lx*Ly) int64 SEMANTIC encoding {0,1,2,3}
+            log_pcs: (B,) float
+        """
+        import quimb as qu
+
+        if chi_m is not None and chi_m > 0:
+            raise NotImplementedError(
+                "fPEPS direct sampling supports chi_m=0 only."
+            )
+        if chi_s is None:
+            chi_s = self.chi if self.chi > 0 else None
+
+        params = qu.utils.tree_unflatten(
+            list(self.params), self.params_pytree,
+        )
+
+        def _single(u, params):
+            return self.direct_sample_single(
+                u, params, chi_s, n_up_target, n_dn_target,
+            )
+
+        return torch.vmap(_single, in_dims=(0, None))(u_batch, params)
 
 
 # =================================================================
@@ -1395,7 +1686,10 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
-                return self._vmapped_compiled(x, *params_list)
+                out = self._vmapped_compiled(x, *params_list)
+                if getattr(self, '_uses_cudagraph', False):
+                    out = out.clone()  # cudagraph reuses a static buffer
+                return out
             else:
                 return self._vmapped_exported(x, *params_list)
         return self.vamp(x, self.params)

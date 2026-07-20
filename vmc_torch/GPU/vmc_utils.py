@@ -1,14 +1,31 @@
 import quimb as qu
 import torch
+import torch.distributed as dist
 import time
-import random
 from torch.utils._pytree import tree_map, tree_flatten
 import os
 
-
+"""Utility functions for GPU-accelerated VMC with PEPS wavefunctions.
+Mainly includes:
+- energy evaluation with GPU-batched get_conn and bMPS reuse
+- gradient calculation"""
 # ==========================================================
 # Utilities
 # ==========================================================
+
+def check_NaN_or_inf(tensor, name="Tensor"):
+    if torch.isnan(tensor).any():
+        tensor_nan = torch.isnan(tensor).sum().item()
+        print(f"Warning: {name} contains {tensor_nan} NaN values.")
+    if torch.isinf(tensor).any():
+        tensor_inf = torch.isinf(tensor).sum().item()
+        print(f"Warning: {name} contains {tensor_inf} Inf values.")
+
+def has_precomputed_gpu_conn(H):
+    """Return whether H is a precomputed GPU-batched Hamiltonian."""
+    from vmc_torch.hamiltonian_torch import GPUMixin
+
+    return isinstance(H, GPUMixin) and hasattr(H, '_hop_list')
 
 def cpu_mem_gb():
     """Resident memory of this process in GB."""
@@ -20,17 +37,27 @@ def cpu_mem_gb():
 
 
 def random_initial_config(N_f, N_sites, seed=None):
+    # Use a local torch.Generator so this seed doesn't pollute the
+    # global RNG. Otherwise every subsequent torch.rand* in the
+    # process inherits the state we left here.
+    #
+    # All tensor ops here are pinned to CPU explicitly: the caller
+    # (initialize_walkers) does the .to(device) transfer. Without
+    # device='cpu', a global torch.set_default_device('cuda') would
+    # make torch.randperm try to use a CUDA generator and crash with
+    # "Expected a 'cuda' device type for generator but found 'cpu'".
+    gen = torch.Generator(device='cpu')
     if seed is not None:
-        torch.manual_seed(seed)
+        gen.manual_seed(int(seed))
     half_filled_config = torch.tensor(
-        [1, 2] * (N_sites // 2)
+        [1, 2] * (N_sites // 2), device='cpu',
     )
     # Set first (Lx*Ly - N_f) sites to be empty (0)
     empty_sites = list(range(N_sites - N_f))
     doped_config = half_filled_config.clone()
     doped_config[empty_sites] = 0
-    # Randomly permute the doped_config
-    perm = torch.randperm(N_sites)
+    # Randomly permute the doped_config using the local generator
+    perm = torch.randperm(N_sites, generator=gen, device='cpu')
     doped_config = doped_config[perm]
     num_1 = torch.sum(doped_config == 1).item()
     num_2 = torch.sum(doped_config == 2).item()
@@ -69,250 +96,300 @@ def are_pytrees_equal(tree1, tree2):
 
     return True
 
+# ============================================================
+# Explicit parameter update (the step normally inside OptimizerGPU)
+# ============================================================
+def apply_update(model, direction, lr):
+    """In-place SGD step:  theta <- theta - lr * direction.
 
-# ==========================================================
-# Proposal functions (Metropolis-Hastings moves)
-# ==========================================================
+    Identical arithmetic to ``SGDGPU`` / ``OptimizerGPU.step`` in
+    optimizer.py, written out so the update is visible.  Computed in
+    float64, cast back to the model dtype, and copied IN PLACE so the
+    parameter storage (and any compiled graph) is preserved.
 
-def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25, seed=None):
-    if seed is not None:
-        random.seed(seed)
-    ind_n_map = {0: 0, 1: 1, 2: 1, 3: 2}
-    if current_config[i] == current_config[j]:
-        return current_config, 0
-    proposed_config = current_config.clone()
-    config_i = current_config[i].item()
-    config_j = current_config[j].item()
-    if random.random() < 1 - hopping_rate:
-        # exchange
-        proposed_config[i] = config_j
-        proposed_config[j] = config_i
-    else:
-        # hopping
-        n_i = ind_n_map[current_config[i].item()]
-        n_j = ind_n_map[current_config[j].item()]
-        delta_n = abs(n_i - n_j)
-        if delta_n == 1:
-            # consider only valid hopping: (0, u) -> (u, 0); (d, ud) -> (ud, d)
-            proposed_config[i] = config_j
-            proposed_config[j] = config_i
-        elif delta_n == 0:
-            # consider only valid hopping: (u, d) -> (0, ud) or (ud, 0)
-            choices = [(0, 3), (3, 0)]
-            choice = random.choice(choices)
-            proposed_config[i] = choice[0]
-            proposed_config[j] = choice[1]
-        elif delta_n == 2:
-            # consider only valid hopping: (0, ud) -> (u, d) or (d, u)
-            choices = [(1, 2), (2, 1)]
-            choice = random.choice(choices)
-            proposed_config[i] = choice[0]
-            proposed_config[j] = choice[1]
-        else:
-            raise ValueError("Invalid configuration")
-    return proposed_config, 1
-
-
-def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25):
+    ``direction`` is identical on every rank (the all_reduce happened
+    inside ``preconditioner.solve``), so applying it independently on
+    each rank keeps the replicas in sync.
     """
-    Fully vectorized propose function (GPU Friendly).
-    Processes a batch of configurations at once without CPU-GPU synchronization.
-    
-    Args:
-        i, j: (int) site indices for exchange/hopping
-        current_configs: (Batch, N_sites) Tensor, dtype=long/int
-        hopping_rate: (float) hopping probability
-        
-    Returns:
-        proposed_configs: (Batch, N_sites) new configurations
-        change_mask: (Batch,) bool Tensor indicating which samples have valid changes
+    direction = torch.as_tensor(direction, dtype=torch.float64)
+    with torch.no_grad():
+        offset = 0
+        for p in model.parameters():
+            n = p.numel()
+            step = direction[offset:offset + n].view_as(p)
+            p.data.copy_((p.data.to(torch.float64) - lr * step).to(p.dtype))
+            offset += n
+
+
+def global_energy_stats(local_energies, world_size):
+    """Mean / variance of E_loc across ALL ranks (data-parallel).
+
+    Same reduction as ``VMC_GPU.compute_global_energy_stats``.
     """
-    B = current_configs.shape[0]
-    device = current_configs.device
-    
-    # Particle number mapping: 0->0, 1->1, 2->1, 3->2
-    n_map = torch.tensor([0, 1, 1, 2], device=device, dtype=torch.long)
-    
-    # Extract column i and j (Batch,)
-    col_i = current_configs[:, i]
-    col_j = current_configs[:, j]
-    
-    # 1. Basic check: if both positions have same state, cannot exchange or hop
-    diff_mask = (col_i != col_j)
-    
-    # 2. Random decision between Exchange and Hopping
-    rand_vals = torch.rand(B, device=device)
-    
-    # Only positions with different states need processing
-    is_exchange = (rand_vals < (1 - hopping_rate)) & diff_mask
-    is_hopping = (~is_exchange) & diff_mask
-    
-    # Initialize new columns, default equals old ones
-    new_col_i = col_i.clone()
-    new_col_j = col_j.clone()
-    
-    # --- A. Handle Exchange (and delta_n=1 Hopping) ---
-    # Compute particle numbers
-    n_i = n_map[col_i]
-    n_j = n_map[col_j]
-    delta_n = (n_i - n_j).abs()
-    
-    # Original logic: simple swap when delta_n == 1
-    mask_swap = is_exchange | (is_hopping & (delta_n == 1))
-    
-    if mask_swap.any():
-        new_col_i[mask_swap] = col_j[mask_swap]
-        new_col_j[mask_swap] = col_i[mask_swap]
-        
-    # --- B. Handle Hopping (delta_n = 0 or 2) ---
-    
-    # Case: delta_n == 0 (e.g. u,d -> 0,ud)
-    # Target: randomly become (0, 3) or (3, 0)
-    mask_d0 = is_hopping & (delta_n == 0)
-    if mask_d0.any():
-        rand_bits = torch.randint(0, 2, (B,), device=device, dtype=torch.bool)
-        
-        val_0 = torch.tensor(0, device=device, dtype=col_i.dtype)
-        val_3 = torch.tensor(3, device=device, dtype=col_i.dtype)
-        
-        # rand=0 -> i=0, j=3; rand=1 -> i=3, j=0
-        target_i = torch.where(rand_bits, val_3, val_0)
-        target_j = torch.where(rand_bits, val_0, val_3)
-        
-        new_col_i[mask_d0] = target_i[mask_d0]
-        new_col_j[mask_d0] = target_j[mask_d0]
-
-    # Case: delta_n == 2 (e.g. 0,ud -> u,d)
-    # Target: randomly become (1, 2) or (2, 1)
-    mask_d2 = is_hopping & (delta_n == 2)
-    if mask_d2.any():
-        rand_bits_2 = torch.randint(0, 2, (B,), device=device, dtype=torch.bool)
-        
-        val_1 = torch.tensor(1, device=device, dtype=col_i.dtype)
-        val_2 = torch.tensor(2, device=device, dtype=col_i.dtype)
-        
-        # rand=0 -> i=1, j=2; rand=1 -> i=2, j=1
-        target_i_2 = torch.where(rand_bits_2, val_2, val_1)
-        target_j_2 = torch.where(rand_bits_2, val_1, val_2)
-        
-        new_col_i[mask_d2] = target_i_2[mask_d2]
-        new_col_j[mask_d2] = target_j_2[mask_d2]
-        
-    # 3. Assemble results
-    proposed_configs = current_configs.clone()
-    proposed_configs[:, i] = new_col_i
-    proposed_configs[:, j] = new_col_j
-    
-    return proposed_configs, diff_mask
+    total_ns = local_energies.shape[0] * world_size
+    e_sum = local_energies.sum()
+    e_sq_sum = (local_energies ** 2).sum()
+    if world_size > 1:
+        dist.all_reduce(e_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(e_sq_sum, op=dist.ReduceOp.SUM)
+    e_mean = e_sum.item() / total_ns
+    e_var = e_sq_sum.item() / total_ns - e_mean ** 2
+    return total_ns, e_mean, e_var
 
 
-# ==========================================================
-# Sampling
-# ==========================================================
+def broadcast_params(model):
+    """Copy rank-0 params to every rank (paranoid resync)."""
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+    for p in model.parameters():
+        if not p.data.is_contiguous():
+            p.data = p.data.contiguous()
+        dist.broadcast(p.data, src=0)
+        
+# # ==========================================================
+# # Proposal functions (Metropolis-Hastings moves) 
+# # XXX: legacy sampler codes. New codes moved to sampler.py
+# # ==========================================================
 
-@torch.inference_mode()
-def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, compile=False, **kwargs):
-    """One full Metropolis-Hastings sweep over all lattice edges.
+# def propose_exchange_or_hopping(i, j, current_config, hopping_rate=0.25, seed=None):
+#     if seed is not None:
+#         random.seed(seed)
+#     ind_n_map = {0: 0, 1: 1, 2: 1, 3: 2}
+#     if current_config[i] == current_config[j]:
+#         return current_config, 0
+#     proposed_config = current_config.clone()
+#     config_i = current_config[i].item()
+#     config_j = current_config[j].item()
+#     if random.random() < 1 - hopping_rate:
+#         # exchange
+#         proposed_config[i] = config_j
+#         proposed_config[j] = config_i
+#     else:
+#         # hopping
+#         n_i = ind_n_map[current_config[i].item()]
+#         n_j = ind_n_map[current_config[j].item()]
+#         delta_n = abs(n_i - n_j)
+#         if delta_n == 1:
+#             # consider only valid hopping: (0, u) -> (u, 0); (d, ud) -> (ud, d)
+#             proposed_config[i] = config_j
+#             proposed_config[j] = config_i
+#         elif delta_n == 0:
+#             # consider only valid hopping: (u, d) -> (0, ud) or (ud, 0)
+#             choices = [(0, 3), (3, 0)]
+#             choice = random.choice(choices)
+#             proposed_config[i] = choice[0]
+#             proposed_config[j] = choice[1]
+#         elif delta_n == 2:
+#             # consider only valid hopping: (0, ud) -> (u, d) or (d, u)
+#             choices = [(1, 2), (2, 1)]
+#             choice = random.choice(choices)
+#             proposed_config[i] = choice[0]
+#             proposed_config[j] = choice[1]
+#         else:
+#             raise ValueError("Invalid configuration")
+#     return proposed_config, 1
 
-    Iterates over every edge in the lattice graph. At each edge (i, j),
-    proposes an exchange or hopping for all B walkers simultaneously,
-    evaluates amplitudes on the proposed configs, and accepts/rejects
-    via the |psi'|^2 / |psi|^2 ratio.
 
-    Args:
-        fxs: Current configurations, (B, N_sites) int64. Modified in-place.
-        fpeps_model: Batched wavefunction model, (B, N_sites) -> (B,).
-        graph: Lattice graph with .row_edges and .col_edges dicts,
-            each mapping direction to list of (i, j) edge tuples.
-        hopping_rate: Probability of proposing a hopping (vs exchange)
-            when sites i, j have different occupations.
-        verbose: Print per-sweep timing breakdown.
-        compile: If True, always evaluate all B configs (no partial
-            batching), suitable for use with torch.compile.
-
-    Returns:
-        fxs: Updated configurations, (B, N_sites) int64.
-        current_amps: Amplitudes at updated configs, (B,).
-    """
-    current_amps = fpeps_model(fxs)
-    B = fxs.shape[0]
-    device = fxs.device
+# def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25):
+#     """
+#     Fully vectorized propose function (GPU Friendly).
+#     Processes a batch of configurations at once without CPU-GPU synchronization.
     
-    n_updates = 0 
-    if verbose:
-        t0 = time.time()
-        t_propose = 0.0
-        t_forward = 0.0
-    # Merge row_edges and col_edges loops to reduce duplicate code
-    all_edges = []
-    for edges in graph.row_edges.values(): 
-        all_edges.extend(edges)
-    for edges in graph.col_edges.values(): 
-        all_edges.extend(edges)
+#     Args:
+#         i, j: (int) site indices for exchange/hopping
+#         current_configs: (Batch, N_sites) Tensor, dtype=long/int
+#         hopping_rate: (float) hopping probability
+        
+#     Returns:
+#         proposed_configs: (Batch, N_sites) new configurations
+#         change_mask: (Batch,) bool Tensor indicating which samples have valid changes
+#     """
+#     B = current_configs.shape[0]
+#     device = current_configs.device
+    
+#     # Particle number mapping: 0->0, 1->1, 2->1, 3->2
+#     n_map = torch.tensor([0, 1, 1, 2], device=device, dtype=torch.long)
+    
+#     # Extract column i and j (Batch,)
+#     col_i = current_configs[:, i]
+#     col_j = current_configs[:, j]
+    
+#     # 1. Basic check: if both positions have same state, cannot exchange or hop
+#     diff_mask = (col_i != col_j)
+    
+#     # 2. Random decision between Exchange and Hopping
+#     rand_vals = torch.rand(B, device=device)
+    
+#     # Only positions with different states need processing
+#     is_exchange = (rand_vals < (1 - hopping_rate)) & diff_mask
+#     is_hopping = (~is_exchange) & diff_mask
+    
+#     # Initialize new columns, default equals old ones
+#     new_col_i = col_i.clone()
+#     new_col_j = col_j.clone()
+    
+#     # --- A. Handle Exchange (and delta_n=1 Hopping) ---
+#     # Compute particle numbers
+#     n_i = n_map[col_i]
+#     n_j = n_map[col_j]
+#     delta_n = (n_i - n_j).abs()
+    
+#     # Original logic: simple swap when delta_n == 1
+#     mask_swap = is_exchange | (is_hopping & (delta_n == 1))
+    
+#     if mask_swap.any():
+#         new_col_i[mask_swap] = col_j[mask_swap]
+#         new_col_j[mask_swap] = col_i[mask_swap]
+        
+#     # --- B. Handle Hopping (delta_n = 0 or 2) ---
+    
+#     # Case: delta_n == 0 (e.g. u,d -> 0,ud)
+#     # Target: randomly become (0, 3) or (3, 0)
+#     mask_d0 = is_hopping & (delta_n == 0)
+#     if mask_d0.any():
+#         rand_bits = torch.randint(0, 2, (B,), device=device, dtype=torch.bool)
+        
+#         val_0 = torch.tensor(0, device=device, dtype=col_i.dtype)
+#         val_3 = torch.tensor(3, device=device, dtype=col_i.dtype)
+        
+#         # rand=0 -> i=0, j=3; rand=1 -> i=3, j=0
+#         target_i = torch.where(rand_bits, val_3, val_0)
+#         target_j = torch.where(rand_bits, val_0, val_3)
+        
+#         new_col_i[mask_d0] = target_i[mask_d0]
+#         new_col_j[mask_d0] = target_j[mask_d0]
 
-    for edge in all_edges:
-        n_updates += 1
-        i, j = edge
+#     # Case: delta_n == 2 (e.g. 0,ud -> u,d)
+#     # Target: randomly become (1, 2) or (2, 1)
+#     mask_d2 = is_hopping & (delta_n == 2)
+#     if mask_d2.any():
+#         rand_bits_2 = torch.randint(0, 2, (B,), device=device, dtype=torch.bool)
         
-        # Call vectorized function directly without list comprehension
-        if verbose:
-            t00 = time.time()
-        proposed_fxs, new_flags = propose_exchange_or_hopping_vec(i, j, fxs, hopping_rate)
-        if verbose:
-            t11 = time.time()
-            t_propose += (t11 - t00)
+#         val_1 = torch.tensor(1, device=device, dtype=col_i.dtype)
+#         val_2 = torch.tensor(2, device=device, dtype=col_i.dtype)
         
-        # Quick check: if all samples have no valid update, skip
-        if not new_flags.any():
-            continue
+#         # rand=0 -> i=1, j=2; rand=1 -> i=2, j=1
+#         target_i_2 = torch.where(rand_bits_2, val_2, val_1)
+#         target_j_2 = torch.where(rand_bits_2, val_1, val_2)
         
-        # Compute Amplitudes — pad to fixed batch size B to
-        # avoid torch.compile recompilation on varying shapes
-        proposed_amps = current_amps.clone()
-        n_changed = new_flags.sum().item()
+#         new_col_i[mask_d2] = target_i_2[mask_d2]
+#         new_col_j[mask_d2] = target_j_2[mask_d2]
+        
+#     # 3. Assemble results
+#     proposed_configs = current_configs.clone()
+#     proposed_configs[:, i] = new_col_i
+#     proposed_configs[:, j] = new_col_j
+    
+#     return proposed_configs, diff_mask
 
-        if verbose:
-            t10 = time.time()
-        if compile:
-            new_proposed_amps = fpeps_model(proposed_fxs)
-            proposed_amps = new_proposed_amps
-        else:
-            if n_changed == B:
-                # All changed
-                new_proposed_amps = fpeps_model(proposed_fxs)
-                proposed_amps = new_proposed_amps
-            else:
-                changed_fxs = proposed_fxs[new_flags]
-                changed_amps = fpeps_model(changed_fxs)
-                proposed_amps[new_flags] = changed_amps
+
+# # ==========================================================
+# # Sampling
+# # ==========================================================
+
+# @torch.inference_mode()
+# def sample_next(fxs, fpeps_model, graph, hopping_rate=0.25, verbose=False, compile=False, **kwargs):
+#     """One full Metropolis-Hastings sweep over all lattice edges.
+
+#     Iterates over every edge in the lattice graph. At each edge (i, j),
+#     proposes an exchange or hopping for all B walkers simultaneously,
+#     evaluates amplitudes on the proposed configs, and accepts/rejects
+#     via the |psi'|^2 / |psi|^2 ratio.
+
+#     Args:
+#         fxs: Current configurations, (B, N_sites) int64. Modified in-place.
+#         fpeps_model: Batched wavefunction model, (B, N_sites) -> (B,).
+#         graph: Lattice graph with .row_edges and .col_edges dicts,
+#             each mapping direction to list of (i, j) edge tuples.
+#         hopping_rate: Probability of proposing a hopping (vs exchange)
+#             when sites i, j have different occupations.
+#         verbose: Print per-sweep timing breakdown.
+#         compile: If True, always evaluate all B configs (no partial
+#             batching), suitable for use with torch.compile.
+
+#     Returns:
+#         fxs: Updated configurations, (B, N_sites) int64.
+#         current_amps: Amplitudes at updated configs, (B,).
+#     """
+#     current_amps = fpeps_model(fxs)
+#     B = fxs.shape[0]
+#     device = fxs.device
+    
+#     n_updates = 0 
+#     if verbose:
+#         t0 = time.time()
+#         t_propose = 0.0
+#         t_forward = 0.0
+#     # Merge row_edges and col_edges loops to reduce duplicate code
+#     all_edges = []
+#     for edges in graph.row_edges.values(): 
+#         all_edges.extend(edges)
+#     for edges in graph.col_edges.values(): 
+#         all_edges.extend(edges)
+
+#     for edge in all_edges:
+#         n_updates += 1
+#         i, j = edge
         
-        if verbose:
-            t11 = time.time()
-            t_forward += (t11 - t10)
-            print(f' Edge ({i}, {j}): {n_changed} / {B} samples proposed changes, time for forward pass: {t11-t10:.4f}s, total forward time: {t_forward:.4f}s')
-        # Accept/Reject (fully vectorized, no .item() calls)
-        ratio = (proposed_amps.abs()**2) / (current_amps.abs()**2 + 1e-18)
+#         # Call vectorized function directly without list comprehension
+#         if verbose:
+#             t00 = time.time()
+#         proposed_fxs, new_flags = propose_exchange_or_hopping_vec(i, j, fxs, hopping_rate)
+#         if verbose:
+#             t11 = time.time()
+#             t_propose += (t11 - t00)
         
-        # Vectorized random number generation
-        probs = torch.rand(B, device=device)
+#         # Quick check: if all samples have no valid update, skip
+#         if not new_flags.any():
+#             continue
         
-        # Accept mask: only accept if new_flags is True and random < ratio
-        accept_mask = new_flags & (probs < ratio)
+#         # Compute Amplitudes — pad to fixed batch size B to
+#         # avoid torch.compile recompilation on varying shapes
+#         proposed_amps = current_amps.clone()
+#         n_changed = new_flags.sum().item()
+
+#         if verbose:
+#             t10 = time.time()
+#         if compile:
+#             new_proposed_amps = fpeps_model(proposed_fxs)
+#             proposed_amps = new_proposed_amps
+#         else:
+#             if n_changed == B:
+#                 # All changed
+#                 new_proposed_amps = fpeps_model(proposed_fxs)
+#                 proposed_amps = new_proposed_amps
+#             else:
+#                 changed_fxs = proposed_fxs[new_flags]
+#                 changed_amps = fpeps_model(changed_fxs)
+#                 proposed_amps[new_flags] = changed_amps
         
-        # Update using masking
-        if accept_mask.any():
-            fxs[accept_mask] = proposed_fxs[accept_mask]
-            current_amps[accept_mask] = proposed_amps[accept_mask]
-    if verbose:
-        t1 = time.time()
-        print(
-            f"Sample next time: {t1 - t0:.4f}s for {n_updates} edge updates" \
-            f' (avg {((t1 - t0) / n_updates):.4f}s per edge)' \
-            f' (Batch size: {B})'
-        )
-        print(f"  Propose time: {t_propose:.4f}s (avg {t_propose / n_updates:.4f}s per edge)")
-        print(f"  Forward time: {t_forward:.4f}s (avg {t_forward / n_updates:.4f}s per edge)")
-    return fxs, current_amps
+#         if verbose:
+#             t11 = time.time()
+#             t_forward += (t11 - t10)
+#             print(f' Edge ({i}, {j}): {n_changed} / {B} samples proposed changes, time for forward pass: {t11-t10:.4f}s, total forward time: {t_forward:.4f}s')
+#         # Accept/Reject (fully vectorized, no .item() calls)
+#         ratio = (proposed_amps.abs()**2) / (current_amps.abs()**2 + 1e-18)
+        
+#         # Vectorized random number generation
+#         probs = torch.rand(B, device=device)
+        
+#         # Accept mask: only accept if new_flags is True and random < ratio
+#         accept_mask = new_flags & (probs < ratio)
+        
+#         # Update using masking
+#         if accept_mask.any():
+#             fxs[accept_mask] = proposed_fxs[accept_mask]
+#             current_amps[accept_mask] = proposed_amps[accept_mask]
+#     if verbose:
+#         t1 = time.time()
+#         print(
+#             f"Sample next time: {t1 - t0:.4f}s for {n_updates} edge updates" \
+#             f' (avg {((t1 - t0) / n_updates):.4f}s per edge)' \
+#             f' (Batch size: {B})'
+#         )
+#         print(f"  Propose time: {t_propose:.4f}s (avg {t_propose / n_updates:.4f}s per edge)")
+#         print(f"  Forward time: {t_forward:.4f}s (avg {t_forward / n_updates:.4f}s per edge)")
+#     return fxs, current_amps
 
 
 # ==========================================================
@@ -332,8 +409,8 @@ def _evaluate_energy_impl(
     elements via H.get_conn, evaluates amplitudes on all connected
     configs, and assembles E_loc[b] = sum_s' H_{s,s'} psi(s')/psi(s).
 
-    Uses GPU-batched get_conn when available (H._hop_list), otherwise
-    falls back to per-sample CPU computation. Connected amplitudes
+    Uses GPU-batched get_conn when a GPUMixin Hamiltonian has been
+    precomputed, otherwise falls back to per-sample CPU computation. Connected amplitudes
     are evaluated in size-B chunks with padding on the last chunk
     to keep input shapes fixed for torch.compile.
 
@@ -357,7 +434,7 @@ def _evaluate_energy_impl(
     device = fxs.device
     
     # --- GPU-batched path: zero CPU round-trips ---
-    if hasattr(H, '_hop_list'):
+    if has_precomputed_gpu_conn(H):
         if verbose:
             t0 = time.time()
         conn_etas, conn_eta_coeffs, batch_ids = H.get_conn_batch_gpu(fxs)
@@ -631,7 +708,7 @@ def evaluate_energy_reuse(
 
     # 2. Get connected configurations
     # --- GPU-batched path: zero CPU round-trips ---
-    if hasattr(H, '_hop_list'):
+    if has_precomputed_gpu_conn(H):
         if verbose:
             t0 = time.time()
         conn_etas, conn_eta_coeffs, batch_ids = (
@@ -1030,7 +1107,7 @@ def evaluate_energy_reuse_x(
 
     # 2. Get connected configurations
     # --- GPU-batched path: zero CPU round-trips ---
-    if hasattr(H, '_hop_list'):
+    if has_precomputed_gpu_conn(H):
         if verbose:
             t0 = time.time()
         conn_etas, conn_eta_coeffs, batch_ids = (
@@ -1347,12 +1424,27 @@ def _check_grads_amps(batched_grads_vec, amps, fpeps_model, configs=None):
             f"NaN/Inf in amplitudes: {nan_count} NaN, "
             f"{inf_count} Inf out of {amps.numel()} samples"
         )
-    if torch.isnan(batched_grads_vec).any() or torch.isinf(batched_grads_vec).any():
-        nan_mask = torch.isnan(batched_grads_vec)
-        inf_mask = torch.isinf(batched_grads_vec)
-        bad_samples = (nan_mask | inf_mask).any(dim=1)
+    B = batched_grads_vec.shape[0]
+    Np = batched_grads_vec.shape[1]
+    max_check_elems = 10_000_000
+    rows_per_check = max(1, max_check_elems // max(Np, 1))
+    bad_samples = torch.zeros(
+        B, dtype=torch.bool, device=batched_grads_vec.device,
+    )
+    bad_params = torch.zeros(
+        Np, dtype=torch.bool, device=batched_grads_vec.device,
+    )
+
+    for start in range(0, B, rows_per_check):
+        stop = min(start + rows_per_check, B)
+        bad_chunk = ~torch.isfinite(batched_grads_vec[start:stop])
+        if bad_chunk.any():
+            bad_samples[start:stop] = bad_chunk.any(dim=1)
+            bad_params |= bad_chunk.any(dim=0)
+        del bad_chunk
+
+    if bad_samples.any():
         n_bad = bad_samples.sum().item()
-        bad_params = (nan_mask | inf_mask).any(dim=0)
         bad_param_ids = bad_params.nonzero(as_tuple=True)[0]
         # Print ill configs that produce NaN/Inf gradients
         if configs is not None:
@@ -1691,11 +1783,25 @@ def compute_grads_cheap_gpu(
     del leaves_p
 
     if offload_to_cpu:
-        flat_vec_chunks = []
+        pin_cpu = torch.cuda.is_available()
+        batched_grads_vec = torch.empty(
+            B, Np, dtype=dtype, device='cpu',
+            pin_memory=pin_cpu,
+        )
         if use_log_amp:
-            signs_chunks, log_abs_chunks = [], []
+            signs = torch.empty(
+                B, dtype=dtype, device='cpu',
+                pin_memory=pin_cpu,
+            )
+            log_abs = torch.empty(
+                B, dtype=dtype, device='cpu',
+                pin_memory=pin_cpu,
+            )
         else:
-            amps_chunks = []
+            amps = torch.empty(
+                B, dtype=dtype, device='cpu',
+                pin_memory=pin_cpu,
+            )
     else:
         batched_grads_vec = torch.empty(
             B, Np, dtype=dtype, device=device,
@@ -1744,12 +1850,20 @@ def compute_grads_cheap_gpu(
             )
 
         if offload_to_cpu:
-            flat_vec_chunks.append(grads_chunk.cpu())
+            batched_grads_vec[b_start:b_end].copy_(
+                grads_chunk, non_blocking=True,
+            )
             if use_log_amp:
-                signs_chunks.append(s_chunk.cpu())
-                log_abs_chunks.append(la_chunk.cpu())
+                signs[b_start:b_end].copy_(
+                    s_chunk, non_blocking=True,
+                )
+                log_abs[b_start:b_end].copy_(
+                    la_chunk, non_blocking=True,
+                )
             else:
-                amps_chunks.append(amps_chunk.cpu())
+                amps[b_start:b_end].copy_(
+                    amps_chunk, non_blocking=True,
+                )
         else:
             batched_grads_vec[b_start:b_end] = grads_chunk
             if use_log_amp:
@@ -1759,16 +1873,6 @@ def compute_grads_cheap_gpu(
                 amps[b_start:b_end] = amps_chunk
 
         del grads_chunk, amps_chunk
-
-    if offload_to_cpu:
-        batched_grads_vec = torch.cat(
-            flat_vec_chunks, dim=0,
-        )
-        if use_log_amp:
-            signs = torch.cat(signs_chunks, dim=0)
-            log_abs = torch.cat(log_abs_chunks, dim=0)
-        else:
-            amps = torch.cat(amps_chunks, dim=0)
 
     t1 = time.time()
     if verbose:
@@ -1783,3 +1887,97 @@ def compute_grads_cheap_gpu(
     if use_log_amp:
         return batched_grads_vec, (signs, log_abs)
     return batched_grads_vec, amps
+
+
+def run_config_sampling(
+    fxs,
+    model,
+    sampler,
+    graph,
+    *,
+    n_burn_in,
+    n_sweeps,
+    thin=1,
+    use_export_compile=False,
+    use_log_amp=False,
+    rank=0,
+    world_size=1,
+    verbose=False,
+):
+    """Sample-only MCMC loop for measuring diagonal observables.
+
+    Drives ``sampler`` for ``n_burn_in`` burn-in sweeps, then ``n_sweeps``
+    measurement sweeps, snapshotting the full ``(B, N_sites)`` walker batch
+    every ``thin``-th sweep. Configs are stored as ``int8`` (values in
+    ``{0, 1, 2, 3}``) on CPU to keep memory and disk footprint small.
+
+    On multi-rank runs the per-rank configs are concatenated via
+    ``dist.all_gather`` so rank 0 ends up holding the full sample.
+
+    Args:
+        fxs: ``(B, N_sites)`` int64 walker configs on the device.
+        model: nn.Module with ``forward(x) -> (B,)`` amplitudes.
+        sampler: ``SamplerGPU`` instance exposing ``step`` and ``burn_in``.
+        graph: lattice graph with ``row_edges`` / ``col_edges``.
+        n_burn_in: number of burn-in sweeps before any snapshots.
+        n_sweeps: number of measurement sweeps after burn-in.
+        thin: keep every ``thin``-th sweep snapshot. Default 1.
+        use_export_compile: pass-through to sampler (compile mode).
+        use_log_amp: pass-through to sampler (log-amplitude mode).
+        rank: torch.distributed rank.
+        world_size: torch.distributed world size.
+        verbose: print per-sweep timing.
+
+    Returns:
+        all_configs: ``(Ns_total, N_sites)`` int8 CPU tensor on rank 0,
+            ``None`` on other ranks. ``Ns_total = world_size *
+            ceil(n_sweeps / thin) * B``.
+        fxs: walker state after the final sweep (still on device).
+    """
+    sampler_kwargs = dict(
+        compile=use_export_compile,
+        use_log_amp=use_log_amp,
+    )
+
+    if n_burn_in > 0:
+        t0 = time.time()
+        fxs = sampler.burn_in(
+            fxs, model, graph, n_burn_in, **sampler_kwargs,
+        )
+        if rank == 0 and verbose:
+            print(
+                f"Burn-in: {n_burn_in} sweeps "
+                f"in {time.time() - t0:.2f}s"
+            )
+
+    local_chunks = []
+    t_loop = time.time()
+    for sweep in range(n_sweeps):
+        fxs, _ = sampler.step(
+            fxs, model, graph, verbose=verbose, **sampler_kwargs,
+        )
+        if sweep % thin == 0:
+            # int8 is enough for {0, 1, 2, 3} and 8x smaller than int64.
+            local_chunks.append(
+                fxs.detach().to('cpu', dtype=torch.int8).clone(),
+            )
+    if rank == 0 and verbose:
+        print(
+            f"Sampling: {n_sweeps} sweeps "
+            f"in {time.time() - t_loop:.2f}s"
+        )
+
+    local_configs = torch.cat(local_chunks, dim=0)
+
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        gathered = [
+            torch.zeros_like(local_configs) for _ in range(world_size)
+        ]
+        dist.all_gather(gathered, local_configs.contiguous())
+        all_configs = (
+            torch.cat(gathered, dim=0) if rank == 0 else None
+        )
+    else:
+        all_configs = local_configs
+
+    return all_configs, fxs

@@ -3197,6 +3197,167 @@ class fMPS_BFA_cluster_Model_reuse(wavefunctionModel):
             
             
 
+# -------- helpers for fermionic PEPS direct sampling --------
+# Physical state encoding: 0=empty, 1=up, 2=down, 3=double.
+
+_FPEPS_DU = (0, 1, 0, 1)   # n_up contribution per state
+_FPEPS_DD = (0, 0, 1, 1)   # n_dn contribution per state
+
+# (charge, offset) in each symmetry's phys BlockIndex linearmap
+_FPEPS_CHARGE_OFFSET = {
+    'U1':   {0: (0, 0), 1: (1, 0), 2: (1, 1), 3: (2, 0)},
+    'Z2':   {0: (0, 0), 1: (1, 0), 2: (1, 1), 3: (0, 1)},
+    'U1U1': {0: ((0, 0), 0), 1: ((0, 1), 0), 2: ((1, 0), 0), 3: ((1, 1), 0)},
+}
+
+
+def _fpeps_phys_linear_idx(phys_index_obj, user_v, symmetry):
+    """Return linear position of user state `user_v` in phys leg.
+
+    Returns None if the sector is absent (pruned by QR/SVD).
+    symmetry may be a string or a symmray symmetry object.
+    """
+    co = _FPEPS_CHARGE_OFFSET[str(symmetry)][user_v]
+    try:
+        return phys_index_obj.linearmap.index(co)
+    except ValueError:
+        return None
+
+
+def _fpeps_ensure_label(tensor, label_id):
+    """Set tensor.data._label if currently None.
+
+    symmray.FermionicArray.isel needs a .label to build dummy_modes
+    when squeezing an odd-parity phys leg. Compressed tensors may
+    have label=None after tensor_network_1d_compress.
+    """
+    data = tensor.data
+    if getattr(data, 'label', None) is None:
+        data._label = label_id
+
+
+def _fpeps_u1u1_mask(probs, x, y, Ly, N,
+                     n_up_so_far, n_dn_so_far,
+                     n_up_target, n_dn_target):
+    """Zero out physically impossible states at site (x, y)."""
+    if n_up_target is None and n_dn_target is None:
+        return probs
+    site_idx = x * Ly + y
+    n_remain_after = N - site_idx - 1
+    for v in range(4):
+        n_up_a = n_up_so_far + _FPEPS_DU[v]
+        n_dn_a = n_dn_so_far + _FPEPS_DD[v]
+        if n_up_target is not None:
+            if n_up_a > n_up_target:                     probs[v] = 0.0
+            if n_up_target - n_up_a > n_remain_after:   probs[v] = 0.0
+        if n_dn_target is not None:
+            if n_dn_a > n_dn_target:                     probs[v] = 0.0
+            if n_dn_target - n_dn_a > n_remain_after:   probs[v] = 0.0
+    return probs
+
+
+def _fpeps_sample_row(effective_tn, peps, x, d, rng,
+                      n_up_so_far, n_dn_so_far,
+                      n_up_target, n_dn_target, n_sites_total):
+    """Sample row x of the effective (compressed) TN site-by-site.
+
+    Uses right-canonical form + propagated left density matrix (chi_m=0).
+    Returns (sampled_row, log_prob_row, n_up_so_far, n_dn_so_far).
+    """
+    import numpy as _np
+    Ly = peps.Ly
+    y_tags = [peps.y_tag(y) for y in range(Ly)]
+
+    for y in range(Ly - 1, 0, -1):
+        effective_tn.canonize_between(y_tags[y], y_tags[y - 1])
+
+    sampled_row = []
+    log_prob_row = 0.0
+    rho_L = None
+
+    for y in range(Ly):
+        phys_ind = peps.site_ind(x, y)
+        t_y = effective_tn[y_tags[y]]
+
+        left_ind = None
+        if y > 0:
+            shared = set(t_y.inds) & set(effective_tn[y_tags[y - 1]].inds)
+            left_ind = next(iter(shared)) if shared else None
+        right_ind = None
+        if y < Ly - 1:
+            shared = set(t_y.inds) & set(effective_tn[y_tags[y + 1]].inds)
+            right_ind = next(iter(shared)) if shared else None
+
+        phys_axis = t_y.inds.index(phys_ind)
+        phys_idx_obj = t_y.data.indices[phys_axis]
+        v_to_lin = [
+            _fpeps_phys_linear_idx(phys_idx_obj, v, peps.symmetry)
+            for v in range(d)
+        ]
+        _fpeps_ensure_label(t_y, ('row', x, 'col', y))
+
+        probs = _np.zeros(d)
+        for v in range(d):
+            lin = v_to_lin[v]
+            if lin is None:
+                continue
+            tv = t_y.isel({phys_ind: lin})
+            if rho_L is None:
+                probs[v] = float((tv.H | tv).contract().real)
+            else:
+                tv_c = tv.conj().reindex({left_ind: left_ind + '_c'})
+                F_v = (tv | tv_c).contract(
+                    output_inds=[left_ind, left_ind + '_c']
+                )
+                probs[v] = float((rho_L | F_v).contract().real)
+
+        probs = _np.maximum(probs, 0.0)
+        probs = _fpeps_u1u1_mask(
+            probs, x, y, Ly, n_sites_total,
+            n_up_so_far, n_dn_so_far,
+            n_up_target, n_dn_target,
+        )
+        total = probs.sum()
+        if total <= 1e-300:
+            raise RuntimeError(
+                f"All probs zeroed at row {x} site {y}: "
+                f"n_up_so_far={n_up_so_far}, n_dn_so_far={n_dn_so_far}, "
+                f"n_up_target={n_up_target}, n_dn_target={n_dn_target}"
+            )
+        probs /= total
+
+        v = int(rng.choice(d, p=probs))
+        sampled_row.append(v)
+        log_prob_row += _np.log(float(probs[v]) + 1e-300)
+        n_up_so_far += _FPEPS_DU[v]
+        n_dn_so_far += _FPEPS_DD[v]
+
+        if right_ind is not None:
+            lin_v = v_to_lin[v]
+            tv = t_y.isel({phys_ind: lin_v})
+            if rho_L is None:
+                tv_c = tv.conj().reindex({right_ind: right_ind + '_c'})
+                rho_L = (tv | tv_c).contract(
+                    output_inds=[right_ind, right_ind + '_c']
+                )
+            else:
+                tv_c = tv.conj().reindex({
+                    left_ind: left_ind + '_c',
+                    right_ind: right_ind + '_c',
+                })
+                rho_L = (rho_L | tv | tv_c).contract(
+                    output_inds=[right_ind, right_ind + '_c']
+                )
+            norm = float(
+                rho_L.reindex({right_ind + '_c': right_ind})
+                .contract().real
+            )
+            if norm > 1e-300:
+                rho_L = rho_L / norm
+
+    return sampled_row, log_prob_row, n_up_so_far, n_dn_so_far
+
+
 #------------ fermionic PEPS based model ------------
 
 class fTNModel(wavefunctionModel):
@@ -3307,6 +3468,101 @@ class fTNModel(wavefunctionModel):
 
         # Return the batch of amplitudes stacked as a tensor
         return torch.stack(batch_amps)
+
+    @torch.no_grad()
+    def direct_sample(self, chi_s=None, seed=None,
+                      n_up_target=None, n_dn_target=None):
+        """Draw one config S ~ p_c(S) via row-by-row sequential sampling.
+
+        chi_m=0 only (bottom bonds summed freely). U(1)×U(1) charge
+        constraint enforced via per-site masking.
+
+        Parameters
+        ----------
+        chi_s       : int or None — top boundary MPS bond dimension
+        seed        : int or np.random.Generator or None
+        n_up_target : int or None — target number of up-fermions
+        n_dn_target : int or None — target number of down-fermions
+
+        Returns
+        -------
+        config  : torch.Tensor, shape (Lx*Ly,), dtype int64
+        log_p_c : float
+        """
+        import numpy as _np
+        from quimb.tensor.tn1d.compress import tensor_network_1d_compress
+
+        if chi_s is None:
+            chi_s = self.max_bond
+
+        params = {
+            int(tid): {
+                ast.literal_eval(sector): data
+                for sector, data in blk_array.items()
+            }
+            for tid, blk_array in self.torch_tn_params.items()
+        }
+        peps = qtn.unpack(params, self.skeleton)
+        # Sampling is pure numpy — convert torch blocks back to numpy arrays.
+        peps.apply_to_arrays(
+            lambda x: x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
+        )
+
+        rng = _np.random.default_rng(seed)
+        Lx, Ly = peps.Lx, peps.Ly
+        d = peps.phys_dim()
+        N = Lx * Ly
+        y_tags = [peps.y_tag(y) for y in range(Ly)]
+
+        n_up_so_far, n_dn_so_far = 0, 0
+        config = []
+        log_p_c = 0.0
+        B = None
+
+        for x in range(Lx):
+            row_tn = peps.select(peps.x_tag(x)).copy()
+            combined = (B | row_tn) if B is not None else row_tn
+
+            if chi_s is not None and chi_s > 0:
+                combined_rc = tensor_network_1d_compress(
+                    combined, max_bond=chi_s, cutoff=0.0,
+                    method='direct', site_tags=y_tags,
+                )
+            else:
+                # exact contraction withou truncation
+                # should contract each site in row_tn into B sequentially
+                combined_rc = combined
+                for i in range(Ly):
+                    combined_rc.contract_tags_(y_tags[i])
+                
+            sampled_row, log_p_row, n_up_so_far, n_dn_so_far = (
+                _fpeps_sample_row(
+                    combined_rc, peps, x, d, rng,
+                    n_up_so_far, n_dn_so_far,
+                    n_up_target, n_dn_target, N,
+                )
+            )
+            config.extend(sampled_row)
+            log_p_c += log_p_row
+
+            # Fix this row's physical legs → new single-layer boundary.
+            isel_dict = {}
+            for y in range(Ly):
+                p_ind = peps.site_ind(x, y)
+                t_col = combined_rc[y_tags[y]]
+                phys_axis = t_col.inds.index(p_ind)
+                phys_idx_obj = t_col.data.indices[phys_axis]
+                lin = _fpeps_phys_linear_idx(phys_idx_obj, int(sampled_row[y]), peps.symmetry)
+                if lin is None:
+                    raise RuntimeError(
+                        f"Sampled v={sampled_row[y]} at ({x},{y}) absent "
+                        f"from phys leg linearmap — sampler bug."
+                    )
+                isel_dict[p_ind] = lin
+                _fpeps_ensure_label(t_col, ('boundary_row', x, 'col', y))
+            B = combined_rc.isel(isel_dict)
+
+        return torch.tensor(config, dtype=torch.int64), log_p_c
 
 
 class fTNModel_Jastrow(wavefunctionModel):

@@ -137,6 +137,118 @@ def propose_exchange_or_hopping_vec(i, j, current_configs, hopping_rate=0.25):
     return proposed_configs, diff_mask
 
 
+#=== Ao-style (quantax) proposals: mode-occupation representation ===#
+# Our site config encodes 0=empty, 1=up, 2=down, 3=doublon. Ao works
+# in a mode-occupation vector of length 2*N (first N = spin-up modes,
+# next N = spin-down modes), each mode occupied/empty. These helpers
+# convert to/from that picture so ParticleHop matches quantax exactly.
+
+def _site_to_mode_occ(current_configs):
+    """Site config (B, N) in {0,1,2,3} -> mode occupation (B, 2N).
+
+    Returns int64 occupation with modes [up_0..up_{N-1}, dn_0..dn_{N-1}].
+    """
+    up_occ = (current_configs == 1) | (current_configs == 3)
+    dn_occ = (current_configs == 2) | (current_configs == 3)
+    return torch.cat([up_occ, dn_occ], dim=1).to(torch.int64)
+
+
+def _mode_occ_to_site(occ, N):
+    """Mode occupation (B, 2N) -> site config (B, N) in {0,1,2,3}."""
+    up_new = occ[:, :N]
+    dn_new = occ[:, N:]
+    return up_new + 2 * dn_new
+
+
+def propose_particle_hop(current_configs, mode_neighbors, pick_occupied=True):
+    """ParticleHop proposal — faithful port of quantax ParticleHop.
+
+    Picks a random occupied (or, if the lattice is more than
+    half-filled, a random empty) mode per walker, then a random
+    same-spin-sector neighbor mode, and swaps their occupations.
+    This hops a single spin-species particle by one lattice bond.
+    When the chosen neighbor is also occupied or is the -1 fill
+    (no valid neighbor), the swap is a no-op -> a null move S'=S,
+    exactly as in quantax (no skip, no resample).
+
+    Args:
+        current_configs: (B, N) int64 site configs in {0,1,2,3}.
+        mode_neighbors: (2N, max_deg) int64 same-sector neighbor mode
+            table, -1 padded.
+        pick_occupied: If True pick among occupied modes (Ntotal <=
+            Nmodes/2), else pick among empty modes (the minority set,
+            matching quantax's hopping_particle choice).
+
+    Returns:
+        proposed_configs: (B, N) int64.
+        change_mask: (B,) bool — walkers whose config actually changed.
+    """
+    B, N = current_configs.shape
+    device = current_configs.device
+    arange = torch.arange(B, device=device)
+
+    occ = _site_to_mode_occ(current_configs)   # (B, 2N)
+
+    # Pick a random mode from the minority set (uniform over its
+    # members), matching jr.choice(Nmodes, p=(spins == hopping_particle)).
+    p = occ if pick_occupied else (1 - occ)
+    particle_idx = torch.multinomial(p.float(), 1).squeeze(1)   # (B,)
+
+    # Same-sector neighbor modes, then a uniform slot (incl. -1 fill).
+    cand = mode_neighbors[particle_idx]        # (B, max_deg)
+    max_deg = cand.shape[1]
+    slot = torch.randint(0, max_deg, (B,), device=device)
+    neighbor_idx = cand[arange, slot]
+    neighbor_idx = torch.where(
+        neighbor_idx == -1, particle_idx, neighbor_idx,
+    )
+
+    # Swap occupations of the two modes.
+    val_p = occ[arange, particle_idx].clone()
+    val_n = occ[arange, neighbor_idx].clone()
+    occ[arange, particle_idx] = val_n
+    occ[arange, neighbor_idx] = val_p
+
+    proposed = _mode_occ_to_site(occ, N).to(current_configs.dtype)
+    change_mask = (proposed != current_configs).any(dim=1)
+    return proposed, change_mask
+
+
+def propose_site_exchange(current_configs, edges):
+    """SiteExchange proposal — faithful port of quantax SiteExchange.
+
+    Picks a random lattice edge per walker and swaps the full site
+    states of its two endpoints (both spin sectors at once). Equal
+    endpoints give a null move S'=S, as in quantax.
+
+    Args:
+        current_configs: (B, N) int64 site configs in {0,1,2,3}.
+        edges: (E, 2) int64 lattice edge table.
+
+    Returns:
+        proposed_configs: (B, N) int64.
+        change_mask: (B,) bool — walkers whose config actually changed.
+    """
+    B = current_configs.shape[0]
+    device = current_configs.device
+    arange = torch.arange(B, device=device)
+
+    E = edges.shape[0]
+    eidx = torch.randint(0, E, (B,), device=device)
+    chosen = edges[eidx]                        # (B, 2)
+    i = chosen[:, 0]
+    j = chosen[:, 1]
+
+    vi = current_configs[arange, i]
+    vj = current_configs[arange, j]
+    proposed = current_configs.clone()
+    proposed[arange, i] = vj
+    proposed[arange, j] = vi
+
+    change_mask = (vi != vj)
+    return proposed, change_mask
+
+
 class SamplerGPU:
     """Base sampler interface — MCMC only.
 
@@ -253,6 +365,14 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
         B = fxs.shape[0]
         device = fxs.device
 
+        # Forward the FULL (fixed-size) batch every edge when the model
+        # is exported/compiled: the default path only forwards the
+        # changed subset proposed_fxs[new_flags], whose row count varies
+        # per edge and would force torch.compile to recompile each time.
+        # Auto-detect so callers don't have to pass compile=True after
+        # model.export_and_compile().
+        compile = compile or getattr(model, '_exported', False)
+
         n_updates = 0
         if verbose:
             t0 = time.time()
@@ -265,6 +385,10 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
             all_edges.extend(edges)
         for edges in graph.col_edges.values():
             all_edges.extend(edges)
+
+        # Count effective micro-moves (accepted, config-changing) over
+        # the sweep; stored in self._last_accepted_moves for diagnostics.
+        accepted = torch.zeros((), device=device, dtype=torch.long)
 
         for edge in all_edges:
             n_updates += 1
@@ -351,6 +475,7 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
                 )
             probs = torch.rand(B, device=device)
             accept_mask = new_flags & (probs < ratio)
+            accepted += accept_mask.sum()
 
             if accept_mask.any():
                 fxs[accept_mask] = proposed_fxs[accept_mask]
@@ -365,6 +490,8 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
                     current_amps[accept_mask] = (
                         proposed_amps[accept_mask]
                     )
+
+        self._last_accepted_moves = int(accepted)
 
         if verbose:
             t1 = time.time()
@@ -381,6 +508,196 @@ class MetropolisExchangeSpinfulSamplerGPU(SamplerGPU):
             print(
                 f"  Forward: {t_forward:.4f}s "
                 f"(avg {t_forward/n_updates:.4f}s/edge)"
+            )
+
+        if use_log_amp:
+            return fxs, (cur_signs, cur_log_abs)
+        return fxs, current_amps
+
+
+class MetropolisAoMixSpinfulSamplerGPU(SamplerGPU):
+    """Faithful port of Ao's quantax ``MixSampler([ParticleHop,
+    SiteExchange])`` for spinful fermions.
+
+    Each micro-move flips one coin (shared by all walkers, matching
+    quantax's per-sweep-step sampler choice) to pick a kernel:
+
+    * with prob ``hopping_rate`` -> ParticleHop: pick a random
+      occupied mode (a particle), then a random same-spin-sector
+      neighbor mode, and swap -> a single spin hops one bond;
+    * else -> SiteExchange: pick a random lattice edge per walker
+      and swap the two full site states.
+
+    One ``step()`` runs ``n_moves_per_step`` such moves (default =
+    ``2 * N_sites``, matching Ao's ``sweep_steps = 2 * N``). Both
+    kernels conserve N_up and N_down separately and allow null moves
+    S'=S (no skip / resample), exactly as quantax does.
+
+    Args:
+        hopping_rate: Probability of a ParticleHop move per step.
+            Default 0.5 (Ao mixes ParticleHop/SiteExchange 50/50).
+        n_moves_per_step: Moves per ``step()``. None -> 2 * N_sites.
+    """
+
+    def __init__(
+        self,
+        hopping_rate: float = 0.5,
+        n_moves_per_step: int = None,
+    ):
+        self.hopping_rate = hopping_rate
+        self.n_moves_per_step = n_moves_per_step
+        self._edges = None        # (E, 2) long
+        self._mode_nb = None      # (2N, max_deg) long, -1 padded
+        self._pick_occupied = None
+
+    def _build(self, graph, N, device):
+        """Cache the edge table and the same-sector mode-neighbor
+        table on ``device`` (mirrors quantax _get_site_neighbors)."""
+        all_edges = []
+        for edges in graph.row_edges.values():
+            all_edges.extend(edges)
+        for edges in graph.col_edges.values():
+            all_edges.extend(edges)
+        self._edges = torch.tensor(
+            all_edges, dtype=torch.long, device=device,
+        )
+
+        # Site adjacency (symmetric, deduped) -> padded neighbor table.
+        adj = [set() for _ in range(N)]
+        for (i, j) in all_edges:
+            adj[i].add(j)
+            adj[j].add(i)
+        max_deg = max(len(a) for a in adj)
+        site_nb = torch.full(
+            (N, max_deg), -1, dtype=torch.long, device=device,
+        )
+        for s in range(N):
+            ns = sorted(adj[s])
+            site_nb[s, :len(ns)] = torch.tensor(
+                ns, dtype=torch.long, device=device,
+            )
+        # Spin-up modes use site neighbors; spin-down modes (s + N)
+        # use the same neighbors shifted by N (keep -1 fills as -1).
+        dn_nb = torch.where(site_nb == -1, site_nb, site_nb + N)
+        self._mode_nb = torch.cat([site_nb, dn_nb], dim=0)  # (2N,maxdeg)
+
+    @torch.inference_mode()
+    def step(
+        self,
+        fxs: torch.Tensor,
+        model,
+        graph,
+        compile: bool = False,
+        verbose: bool = False,
+        use_log_amp: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One MCMC sweep of ``n_moves_per_step`` mixed moves.
+
+        Args:
+            fxs: (B, N_sites) int64 walker configs.
+            model: nn.Module with .forward(x) -> (B,).
+            graph: Lattice graph with .row_edges, .col_edges.
+            compile: Unused (every move forwards the full batch).
+            verbose: Print acceptance-rate summary.
+            use_log_amp: If True, work in log-space and return
+                (signs, log_abs) instead of amps.
+
+        Returns:
+            fxs: (B, N_sites) int64 updated configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs) tuple when
+                use_log_amp=True.
+        """
+        device = fxs.device
+        B, N = fxs.shape
+
+        if self._edges is None or self._edges.device != device:
+            self._build(graph, N, device)
+        if self._pick_occupied is None:
+            # Pick from the minority set (matches quantax
+            # hopping_particle = 1 if 2*Ntotal <= Nmodes else -1).
+            occ = _site_to_mode_occ(fxs)
+            n_particles = int(occ[0].sum().item())
+            self._pick_occupied = (2 * n_particles <= 2 * N)
+
+        n_moves = self.n_moves_per_step or (2 * N)
+
+        if use_log_amp:
+            cur_signs, cur_log_abs = model.forward_log(fxs)
+        else:
+            current_amps = model(fxs)
+
+        # One coin per micro-step, shared by all walkers (as quantax).
+        use_hop = (
+            torch.rand(n_moves, device=device) < self.hopping_rate
+        ).tolist()
+
+        if verbose:
+            t0 = time.time()
+            n_accept = 0
+            n_propose = 0
+            n_hop = 0
+
+        # Count effective micro-moves (accepted, config-changing) over
+        # the sweep; stored in self._last_accepted_moves for diagnostics.
+        accepted = torch.zeros((), device=device, dtype=torch.long)
+
+        for hop in use_hop:
+            if hop:
+                proposed_fxs, new_flags = propose_particle_hop(
+                    fxs, self._mode_nb, self._pick_occupied,
+                )
+            else:
+                proposed_fxs, new_flags = propose_site_exchange(
+                    fxs, self._edges,
+                )
+            if not new_flags.any():
+                continue
+
+            # Proposals differ per walker, so just forward the full
+            # batch (unchanged walkers give ratio 1, harmless).
+            if use_log_amp:
+                prop_signs, prop_log_abs = model.forward_log(proposed_fxs)
+                ratio = torch.exp(
+                    2.0 * (prop_log_abs - cur_log_abs),
+                )
+            else:
+                proposed_amps = model(proposed_fxs)
+                ratio = (
+                    (proposed_amps.abs() ** 2)
+                    / (current_amps.abs() ** 2)
+                )
+
+            probs = torch.rand(B, device=device)
+            accept_mask = new_flags & (probs < ratio)
+            accepted += accept_mask.sum()
+
+            if verbose:
+                n_hop += int(hop)
+                n_propose += int(new_flags.sum().item())
+                n_accept += int(accept_mask.sum().item())
+
+            if accept_mask.any():
+                fxs[accept_mask] = proposed_fxs[accept_mask]
+                if use_log_amp:
+                    cur_signs[accept_mask] = prop_signs[accept_mask]
+                    cur_log_abs[accept_mask] = prop_log_abs[accept_mask]
+                else:
+                    current_amps[accept_mask] = (
+                        proposed_amps[accept_mask]
+                    )
+
+        self._last_accepted_moves = int(accepted)
+
+        if verbose:
+            t1 = time.time()
+            acc_rate = (
+                n_accept / n_propose if n_propose > 0 else 0.0
+            )
+            print(
+                f"AoMix sweep: {t1-t0:.4f}s, {n_moves} moves "
+                f"({n_hop} hop / {n_moves-n_hop} exchange), B={B}, "
+                f"accept {n_accept}/{n_propose} ({acc_rate:.3f})"
             )
 
         if use_log_amp:
@@ -766,6 +1083,12 @@ class MetropolisExchangeSpinSamplerGPU(SamplerGPU):
             current_amps = model(fxs)
         B = fxs.shape[0]
         device = fxs.device
+
+        # See MetropolisExchangeSpinfulSamplerGPU.step: auto-use the
+        # full-batch path when the model is exported/compiled, so the
+        # variable-length proposed_fxs[new_flags] forward doesn't force
+        # torch.compile to recompile every edge.
+        compile = compile or getattr(model, '_exported', False)
 
         n_updates = 0
         if verbose:
@@ -1872,17 +2195,22 @@ class DirectProposalMCMCSamplerSpinGPU(SamplerGPU):
         chi_s:    Boundary MPS bond for direct sampling. Defaults to model.chi.
         chi_m:    Bottom marginal MPO bond (None or 0 = chi_m=0 approx).
         total_sz: If given, enforce U(1) Sz constraint at sampling time.
+        direct_thermal_steps: Number of propose+accept/reject MH sub-steps to
+            perform per `step()` call (advances the chain by this many fresh
+            direct-sample proposals). Defaults to 1 (original behavior).
         base_seed: Unused — kept for backward compat. Per-walker randomness
             now comes from `torch.rand(B, N, device=...)` driven by
             PyTorch's RNG (seeded once in run scripts).
     """
 
     def __init__(
-        self, chi_s=None, chi_m=None, total_sz=None, base_seed=None,
+        self, chi_s=None, chi_m=None, total_sz=None,
+        direct_thermal_steps=1, base_seed=None,
     ):
         self.chi_s = chi_s
         self.chi_m = chi_m
         self.total_sz = total_sz
+        self.direct_thermal_steps = direct_thermal_steps
         self.base_seed = base_seed   # unused; kept for backward compat
         self._log_pc = None      # (B,) float64 on device, current chain state
         self._step_idx = 0       # used only for verbose-print labelling
@@ -1914,92 +2242,268 @@ class DirectProposalMCMCSamplerSpinGPU(SamplerGPU):
         device = fxs.device
         B, _N = fxs.shape
 
-        # ---- 1. Draw B fresh proposals via vectorized direct_sample_vmap ----
-        if verbose:
-            t0 = time.time()
-        u_batch = torch.rand(
-            B, fxs.shape[1], device=device, dtype=torch.float64,
-        )
-        proposed_fxs_int, proposed_log_pc = model.direct_sample_vmap(
-            u_batch,
-            chi_s=self.chi_s,
-            total_sz=self.total_sz,
-            chi_m=self.chi_m,
-        )
-        proposed_fxs = proposed_fxs_int.to(fxs.dtype)
-        if verbose:
-            t_propose = time.time() - t0
-
-        # ---- 2. Evaluate amplitudes via compiled batched forward ----
-        if verbose:
-            t0 = time.time()
+        # Evaluate current-config amplitudes once; they are kept in sync with
+        # the chain as walkers accept, so each thermalization sub-step only
+        # needs a fresh forward pass on the proposals.
         if use_log_amp:
             cur_signs, cur_log_abs = model.forward_log(fxs)
-            prop_signs, prop_log_abs = model.forward_log(proposed_fxs)
         else:
             current_amps = model(fxs)
-            proposed_amps = model(proposed_fxs)
-        if verbose:
-            t_forward = time.time() - t0
 
-        # ---- 3. MH accept/reject ----
-        # log w = 2 log|Ψ| - log p_c
-        if use_log_amp:
-            log_w_prop = 2.0 * prop_log_abs - proposed_log_pc
-        else:
-            log_w_prop = (
-                2.0 * torch.log(proposed_amps.abs() + 1e-300)
-                - proposed_log_pc
+        # `direct_thermal_steps` propose+accept/reject MH sub-steps per call.
+        for _ in range(self.direct_thermal_steps):
+            # ---- 1. Draw B fresh proposals via direct_sample_vmap ----
+            if verbose:
+                t0 = time.time()
+            u_batch = torch.rand(
+                B, fxs.shape[1], device=device, dtype=torch.float64,
             )
+            proposed_fxs_int, proposed_log_pc = model.direct_sample_vmap(
+                u_batch,
+                chi_s=self.chi_s,
+                total_sz=self.total_sz,
+                chi_m=self.chi_m,
+            )
+            proposed_fxs = proposed_fxs_int.to(fxs.dtype)
+            if verbose:
+                t_propose = time.time() - t0
 
-        if self._log_pc is None:
-            # First step: unconditional accept (no chain history yet).
-            accept_mask = torch.ones(B, dtype=torch.bool, device=device)
-        else:
+            # ---- 2. Evaluate proposal amplitudes via batched forward ----
+            if verbose:
+                t0 = time.time()
             if use_log_amp:
-                log_w_curr = 2.0 * cur_log_abs - self._log_pc
+                prop_signs, prop_log_abs = model.forward_log(proposed_fxs)
             else:
-                log_w_curr = (
-                    2.0 * torch.log(current_amps.abs() + 1e-300)
-                    - self._log_pc
+                proposed_amps = model(proposed_fxs)
+            if verbose:
+                t_forward = time.time() - t0
+
+            # ---- 3. MH accept/reject ----
+            # log w = 2 log|Ψ| - log p_c
+            if use_log_amp:
+                log_w_prop = 2.0 * prop_log_abs - proposed_log_pc
+            else:
+                log_w_prop = (
+                    2.0 * torch.log(proposed_amps.abs() + 1e-300)
+                    - proposed_log_pc
                 )
-            log_u = torch.log(torch.rand(B, device=device) + 1e-300)
-            accept_mask = log_u < (log_w_prop - log_w_curr)
 
-        # ---- 4. In-place updates for accepted walkers ----
-        fxs[accept_mask] = proposed_fxs[accept_mask]
-        if self._log_pc is None:
-            self._log_pc = proposed_log_pc.clone()
-        else:
-            self._log_pc[accept_mask] = proposed_log_pc[accept_mask]
+            if self._log_pc is None:
+                # First step: unconditional accept (no chain history yet).
+                accept_mask = torch.ones(B, dtype=torch.bool, device=device)
+            else:
+                if use_log_amp:
+                    log_w_curr = 2.0 * cur_log_abs - self._log_pc
+                else:
+                    log_w_curr = (
+                        2.0 * torch.log(current_amps.abs() + 1e-300)
+                        - self._log_pc
+                    )
+                log_u = torch.log(torch.rand(B, device=device) + 1e-300)
+                accept_mask = log_u < (log_w_prop - log_w_curr)
 
-        if verbose:
-            n_acc = int(accept_mask.sum().item())
-            print(
-                f"  DirectMH step {self._step_idx}: "
-                f"propose {t_propose:.3f}s, "
-                f"forward {t_forward:.3f}s, "
-                f"accept {n_acc}/{B}",
-            )
+            # ---- 4. In-place updates for accepted walkers ----
+            fxs[accept_mask] = proposed_fxs[accept_mask]
+            if self._log_pc is None:
+                self._log_pc = proposed_log_pc.clone()
+            else:
+                self._log_pc[accept_mask] = proposed_log_pc[accept_mask]
 
-        self._step_idx += 1
+            # Keep current-config amplitudes in sync for the next sub-step.
+            if use_log_amp:
+                cur_signs[accept_mask] = prop_signs[accept_mask]
+                cur_log_abs[accept_mask] = prop_log_abs[accept_mask]
+            else:
+                current_amps[accept_mask] = proposed_amps[accept_mask]
+
+            if verbose:
+                n_acc = int(accept_mask.sum().item())
+                print(
+                    f"  DirectMH step {self._step_idx}: "
+                    f"propose {t_propose:.3f}s, "
+                    f"forward {t_forward:.3f}s, "
+                    f"accept {n_acc}/{B}",
+                )
+            self._step_idx += 1
+
         if use_log_amp:
-            cur_signs[accept_mask] = prop_signs[accept_mask]
-            cur_log_abs[accept_mask] = prop_log_abs[accept_mask]
             return fxs, (cur_signs, cur_log_abs)
         else:
-            current_amps[accept_mask] = proposed_amps[accept_mask]
+            return fxs, current_amps
+
+
+class DirectProposalMCMCSamplerSpinfulGPU(SamplerGPU):
+    """Direct-sample-as-proposal Metropolis-Hastings sampler for fPEPS.
+
+    Spinful-fermionic analogue of `DirectProposalMCMCSamplerSpinGPU`.
+    At each step, draws B fresh proposals via `model.direct_sample_vmap(...)`
+    (vectorized over walkers) and accepts each independently with probability
+    min(1, w(S')/w(S)) where w(S) = |Ψ(S)|² / p_c(S). Targets p_Ψ.
+    Per-walker `log p_c` is cached across steps (and across `burn_in()`,
+    which calls `step()` repeatedly).
+
+    Requires `model` to have a `direct_sample_vmap(u_batch, chi_s,
+    n_up_target, n_dn_target, chi_m)` method (e.g. `fPEPS_Model_GPU`).
+
+    Args:
+        chi_s:       Boundary MPS bond for direct sampling. Defaults to
+            model.chi.
+        chi_m:       Bottom marginal MPO bond (must be None/0; chi_m>0 not
+            implemented for fermions).
+        n_up_target: If given, enforce U(1) up-count constraint at sampling.
+        n_dn_target: If given, enforce U(1) down-count constraint.
+        direct_thermal_steps: Number of propose+accept/reject MH sub-steps to
+            perform per `step()` call (advances the chain by this many fresh
+            direct-sample proposals). Defaults to 1 (original behavior).
+        base_seed:   Unused — kept for backward compat. Per-walker randomness
+            comes from `torch.rand(B, N, device=...)`.
+    """
+
+    def __init__(
+        self, chi_s=None, chi_m=None,
+        n_up_target=None, n_dn_target=None,
+        direct_thermal_steps=1, base_seed=None,
+    ):
+        self.chi_s = chi_s
+        self.chi_m = chi_m
+        self.n_up_target = n_up_target
+        self.n_dn_target = n_dn_target
+        self.direct_thermal_steps = direct_thermal_steps
+        self.base_seed = base_seed   # unused; kept for backward compat
+        self._log_pc = None      # (B,) float64 on device, current chain state
+        self._step_idx = 0       # used only for verbose-print labelling
+
+    @torch.inference_mode()
+    def step(
+        self,
+        fxs: torch.Tensor,
+        model,
+        graph,
+        compile: bool = False,
+        verbose: bool = False,
+        use_log_amp: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One MH step: B fresh direct-sample proposals + accept/reject.
+
+        Args:
+            fxs: (B, N_sites) int64 walker configs on device.
+            model: fPEPS_Model_GPU with .direct_sample_vmap(...) and
+                .forward(x) -> (B,) (or .forward_log(x) -> (signs, log_abs)
+                for use_log_amp=True).
+            graph: ignored (kept for SamplerGPU contract).
+            use_log_amp: if True, work in log-amplitude space.
+
+        Returns:
+            fxs: (B, N_sites) int64 updated configs.
+            amps_out: (B,) amplitudes, or (signs, log_abs) when use_log_amp.
+        """
+        device = fxs.device
+        B, _N = fxs.shape
+
+        # Evaluate current-config amplitudes once; they are kept in sync with
+        # the chain as walkers accept, so each thermalization sub-step only
+        # needs a fresh forward pass on the proposals.
+        if use_log_amp:
+            cur_signs, cur_log_abs = model.forward_log(fxs)
+        else:
+            current_amps = model(fxs)
+
+        # `direct_thermal_steps` propose+accept/reject MH sub-steps per call.
+        for _ in range(self.direct_thermal_steps):
+            # ---- 1. Draw B fresh proposals via direct_sample_vmap ----
+            if verbose:
+                t0 = time.time()
+            u_batch = torch.rand(
+                B, fxs.shape[1], device=device, dtype=torch.float64,
+            )
+            proposed_fxs_int, proposed_log_pc = model.direct_sample_vmap(
+                u_batch,
+                chi_s=self.chi_s,
+                n_up_target=self.n_up_target,
+                n_dn_target=self.n_dn_target,
+                chi_m=self.chi_m,
+            )
+            proposed_fxs = proposed_fxs_int.to(fxs.dtype)
+            if verbose:
+                t_propose = time.time() - t0
+
+            # ---- 2. Evaluate proposal amplitudes via batched forward ----
+            if verbose:
+                t0 = time.time()
+            if use_log_amp:
+                prop_signs, prop_log_abs = model.forward_log(proposed_fxs)
+            else:
+                proposed_amps = model(proposed_fxs)
+            if verbose:
+                t_forward = time.time() - t0
+
+            # ---- 3. MH accept/reject ----
+            # log w = 2 log|Ψ| - log p_c
+            if use_log_amp:
+                log_w_prop = 2.0 * prop_log_abs - proposed_log_pc
+            else:
+                log_w_prop = (
+                    2.0 * torch.log(proposed_amps.abs() + 1e-300)
+                    - proposed_log_pc
+                )
+
+            if self._log_pc is None:
+                # First step: unconditional accept (no chain history yet).
+                accept_mask = torch.ones(B, dtype=torch.bool, device=device)
+            else:
+                if use_log_amp:
+                    log_w_curr = 2.0 * cur_log_abs - self._log_pc
+                else:
+                    log_w_curr = (
+                        2.0 * torch.log(current_amps.abs() + 1e-300)
+                        - self._log_pc
+                    )
+                log_u = torch.log(torch.rand(B, device=device) + 1e-300)
+                accept_mask = log_u < (log_w_prop - log_w_curr)
+
+            # ---- 4. In-place updates for accepted walkers ----
+            fxs[accept_mask] = proposed_fxs[accept_mask]
+            if self._log_pc is None:
+                self._log_pc = proposed_log_pc.clone()
+            else:
+                self._log_pc[accept_mask] = proposed_log_pc[accept_mask]
+
+            # Keep current-config amplitudes in sync for the next sub-step.
+            if use_log_amp:
+                cur_signs[accept_mask] = prop_signs[accept_mask]
+                cur_log_abs[accept_mask] = prop_log_abs[accept_mask]
+            else:
+                current_amps[accept_mask] = proposed_amps[accept_mask]
+
+            if verbose:
+                n_acc = int(accept_mask.sum().item())
+                print(
+                    f"  DirectMH(spinful) step {self._step_idx}: "
+                    f"propose {t_propose:.3f}s, "
+                    f"forward {t_forward:.3f}s, "
+                    f"accept {n_acc}/{B}",
+                )
+            self._step_idx += 1
+
+        if use_log_amp:
+            return fxs, (cur_signs, cur_log_abs)
+        else:
             return fxs, current_amps
 
 
 __all__ = [
     "SamplerGPU",
     "MetropolisExchangeSpinfulSamplerGPU",
+    "MetropolisAoMixSpinfulSamplerGPU",
+    "propose_particle_hop",
+    "propose_site_exchange",
     "MetropolisExchangeSpinfulSamplerReuse_GPU",
     "MetropolisExchangeSpinfulSamplerXReuse_GPU",
     "MetropolisExchangeSpinSamplerGPU",
     "MetropolisExchangeSpinSamplerReuse_GPU",
     "MetropolisExchangeSpinSamplerXReuse_GPU",
     "DirectProposalMCMCSamplerSpinGPU",
+    "DirectProposalMCMCSamplerSpinfulGPU",
     "propose_spin_exchange_vec",
 ]

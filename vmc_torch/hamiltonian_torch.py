@@ -115,7 +115,7 @@ class SpinfulFermion(Hilbert):
             n_orbitals (int): Number of orbitals (sites) for each spin species.
             n_fermions (int, optional): Total number of fermions (default: None).
             n_fermions_per_spin (tuple, optional): Number of fermions per spin (n_up, n_down) (default: None).
-            no_u1_symmetry (bool, optional): If True, no U1 symmetry on the Hilbert space (default: False).
+            no_u1_symmetry (bool, optional): If True, no U1 symmetry (particle number conservation) on the Hilbert space (default: False).
 
         Configuration structure: [nu1,...,nuN, nd1,...,ndN]
         where nu1,...,nuN are the spin-up fermions and nd1,...,ndN are the spin-down fermions.
@@ -446,20 +446,319 @@ class Hamiltonian(Operator):
         return self._H
 
 
-# ==== GPU Mixin Classes ====
-# These provide precompute_hops_gpu() and get_conn_batch_gpu() to
-# Hamiltonian subclasses so the evaluate_energy GPU path can avoid
-# per-sample CPU get_conn loops.
+class ChoiSpinfulFermion(Hilbert):
+    """Folded Choi Hilbert space for spinful fermions.
 
-class SpinlessFermionGPUMixin:
-    """GPU-batched get_conn for spinless fermion Hamiltonians.
-
-    Config encoding: binary {0, 1} occupation numbers.
-    Hamiltonian dict keys:
-      - (i, j, 't'): hopping with Jordan-Wigner phase
-      - (i, j, 'V'): nearest-neighbor density-density interaction
-      - (i,):        on-site chemical potential
+    Each site has a folded local state in ``0..15`` representing a bra/ket
+    pair of spinful local states. Configurations are already in the local
+    selector convention used by the folded fPEPS physical index.
     """
+
+    def __init__(self, n_sites):
+        self.n_sites = n_sites
+        self.local_dim = 16
+
+    @property
+    def size(self):
+        return self.local_dim ** self.n_sites
+
+    def to_quimb_config(self, config):
+        return config
+
+    def all_states(self):
+        return do(
+            'array',
+            list(itertools.product(range(self.local_dim), repeat=self.n_sites)),
+        )
+
+    def random_state(self, key=None):
+        rng = np.random.default_rng(key)
+        return rng.integers(
+            0,
+            self.local_dim,
+            size=self.n_sites,
+            dtype=np.int64,
+        )
+
+
+# Local basis conversion used by folded Choi spinful-fermion states.
+#
+# symmray dense Z2 spinful order groups states by parity:
+#   0=empty, 1=double, 2=down, 3=up
+# vmc_torch/quimb semantic order is:
+#   0=empty, 1=down, 2=up, 3=double
+_SYMMRAY_TO_QUIMB_SPINFUL = np.array([0, 3, 1, 2], dtype=np.int64)
+_QUIMB_TO_SYMMRAY_SPINFUL = np.array([0, 2, 3, 1], dtype=np.int64)
+
+
+def folded_linear_to_bra_ket_quimb(fused):
+    """Decode a folded local selector into quimb bra/ket local states."""
+    fused = int(fused)
+    charge = fused // 8
+    offset = fused % 8
+
+    if charge == 0:
+        if offset < 4:
+            bra_charge, ket_charge = 0, 0
+            pair_offset = offset
+        else:
+            bra_charge, ket_charge = 1, 1
+            pair_offset = offset - 4
+    elif charge == 1:
+        if offset < 4:
+            bra_charge, ket_charge = 0, 1
+            pair_offset = offset
+        else:
+            bra_charge, ket_charge = 1, 0
+            pair_offset = offset - 4
+    else:
+        raise ValueError(f'folded local selector must be in [0, 15], got {fused}')
+
+    bra_offset = pair_offset // 2
+    ket_offset = pair_offset % 2
+    bra_sym = 2 * bra_charge + bra_offset
+    ket_sym = 2 * ket_charge + ket_offset
+    return (
+        int(_SYMMRAY_TO_QUIMB_SPINFUL[bra_sym]),
+        int(_SYMMRAY_TO_QUIMB_SPINFUL[ket_sym]),
+    )
+
+
+def bra_ket_quimb_to_folded_linear(bra_q, ket_q):
+    """Encode quimb bra/ket local states as a folded local selector."""
+    bra_sym = int(_QUIMB_TO_SYMMRAY_SPINFUL[int(bra_q)])
+    ket_sym = int(_QUIMB_TO_SYMMRAY_SPINFUL[int(ket_q)])
+
+    bra_charge, bra_offset = divmod(bra_sym, 2)
+    ket_charge, ket_offset = divmod(ket_sym, 2)
+    charge = (bra_charge + ket_charge) % 2
+    pair_offset = 2 * bra_offset + ket_offset
+
+    if charge == 0:
+        same_sector_offset = 0 if bra_charge == 0 else 4
+        return same_sector_offset + pair_offset
+
+    mixed_sector_offset = 0 if bra_charge == 0 else 4
+    return 8 + mixed_sector_offset + pair_offset
+
+
+class VectorizedFermiHubbard(Hamiltonian):
+    """Folded-Choi spinful FH Hamiltonian with the vmc_torch API.
+
+    This acts on configurations of shape ``(N_sites,)`` with local states in
+    ``0..15``. It applies ``H_eff = (H_bra + H_ket) / 2`` using the existing
+    single-copy spinful Fermi-Hubbard ``get_conn`` implementation, so its
+    hopping signs match the pure-state VMC path.
+    """
+
+    def __init__(self, Lx, Ly, t=1.0, U=4.0, mu=0.0, pbc=False, gpu=False):
+        if mu != 0.0:
+            raise NotImplementedError(
+                'VectorizedFermiHubbard currently follows the existing '
+                'spinful FH get_conn path, which has no mu term.'
+            )
+        if pbc:
+            raise NotImplementedError('VectorizedFermiHubbard supports OBC only')
+
+        self.Lx = Lx
+        self.Ly = Ly
+        self.N = Lx * Ly
+        self.t = t
+        self.U = U
+        self.mu = mu
+        self.gpu = gpu
+        self._side_ham = spinful_Fermi_Hubbard_square_lattice_torch(
+            Lx,
+            Ly,
+            t=t,
+            U=U,
+            N_f=0,
+            pbc=pbc,
+            n_fermions_per_spin=None,
+            no_u1_symmetry=True,
+            gpu=gpu,
+        )
+
+        H = {
+            'type': 'VectorizedFermiHubbard',
+            'Lx': Lx,
+            'Ly': Ly,
+            't': t,
+            'U': U,
+            'mu': mu,
+            'convention': 'folded Choi local selectors 0..15',
+        }
+        hi = ChoiSpinfulFermion(self.N)
+        graph = SquareLattice(Lx, Ly, pbc=pbc)
+        super().__init__(H, hi, graph)
+
+    def _split_config(self, sigma):
+        if hasattr(sigma, 'detach'):
+            sigma = sigma.detach().cpu().numpy()
+        sigma = np.asarray(sigma, dtype=np.int64)
+        bra = np.empty(self.N, dtype=np.int64)
+        ket = np.empty(self.N, dtype=np.int64)
+        for site, fused in enumerate(sigma):
+            bra[site], ket[site] = folded_linear_to_bra_ket_quimb(fused)
+        return bra, ket
+
+    def _join_config(self, bra, ket):
+        out = np.empty(self.N, dtype=np.int64)
+        for site, (bra_i, ket_i) in enumerate(zip(bra, ket)):
+            out[site] = bra_ket_quimb_to_folded_linear(bra_i, ket_i)
+        return out
+
+    def get_conn(self, sigma):
+        """Return connected folded configs and matrix elements of H_eff.
+
+        H_eff = (H ⊗ I + I ⊗ H^T) / 2 acting on the folded Choi space.
+
+        Multi-site fermionic sign correction
+        ------------------------------------
+        The single-side spinful FH ``get_conn`` returns matrix elements
+        with `calc_phase_symmray` JW signs computed over single-side
+        modes only. In the doubled Choi space, ket and bra modes are
+        BOTH part of the fold's multi-site JW string, so additional
+        cross-side signs appear. The corrections below are validated
+        against pure symmray TN reference ``Tr(ρHρ†)/Tr(ρρ†)`` on
+        2x1 and 2x2 lattices to machine precision (~1e-14):
+
+          ket-hop  i→j (i<j):
+              FLIP iff  Σ_{m=i+1}^{j} P(b_m)  ≡ 1 (mod 2)
+
+          bra-hop  i→j (i<j):
+              FLIP iff  [Σ_{m=i+1}^{j} P(k_m) ≡ 0]
+                   XOR  [P(b_i) + P(b_j) + P(k_i) + P(k_j) ≡ 1]
+
+        where ``P(b_m)`` and ``P(k_m)`` are per-site Z2 parities.
+
+        On 2x1 (single bond), Z2 global parity conservation forces
+        ``P(b_0) + P(b_1) ≡ P(k_0) + P(k_1)``, so the bra-hop endpoint
+        cross-term vanishes identically on Z2-allowed configurations
+        and the formula reduces to the simpler ``[Σ P(k_m) ≡ 0]`` rule.
+        On 2x2 and larger lattices the cross-term activates and
+        supplies the missing multi-bond fermion-reordering signs.
+
+        For lattices ≥ 2x3 the formula is conjectured to still hold
+        (same structure, same per-bond endpoint dependence) but has
+        not been explicitly verified.
+        """
+        bra, ket = self._split_config(sigma)
+        # Per-site Z2 parities for the spectator-sign correction.
+        # quimb local basis: 0=empty, 1=down, 2=up, 3=double.
+        # parities (0,1,1,0) match these states.
+        bra_parity = (bra & 1) ^ ((bra >> 1) & 1)  # n_d xor n_u
+        ket_parity = (ket & 1) ^ ((ket >> 1) & 1)
+        connected_config_coeff = dict()
+
+        # ket-side moves (H ⊗ I / 2): bra unchanged, ket moves.
+        ket_etas, ket_coeffs = self._side_ham.get_conn(ket)
+        for ket_eta, coeff in zip(ket_etas, ket_coeffs):
+            diff = np.nonzero(
+                np.asarray(ket) != np.asarray(ket_eta)
+            )[0]
+            coeff_c = float(coeff)
+            if len(diff) == 2:
+                # hopping; apply bra-spectator sign correction
+                i, j = int(diff[0]), int(diff[1])
+                if i > j:
+                    i, j = j, i
+                if int(bra_parity[i + 1:j + 1].sum()) % 2:
+                    coeff_c = -coeff_c
+            eta = self._join_config(bra, ket_eta)
+            key = tuple(eta)
+            connected_config_coeff[key] = (
+                connected_config_coeff.get(key, 0.0) + 0.5 * coeff_c
+            )
+
+        # bra-side moves (I ⊗ H^T / 2): ket unchanged, bra moves.
+        # Sign correction (verified to machine precision on 2x1 and 2x2 vs
+        # pure symmray TN reference):
+        #   FLIP iff (Σ_{m=i+1}^{j} P(k_m)) is even   [transpose -1]
+        #        XOR (P(b_i) + P(b_j) + P(k_i) + P(k_j)) is odd  [multi-bond cross]
+        # On 2x1 (Z2 forces P(b_i)+P(b_j) ≡ P(k_i)+P(k_j)), the second term
+        # vanishes, recovering the 2x1 formula.
+        bra_etas, bra_coeffs = self._side_ham.get_conn(bra)
+        for bra_eta, coeff in zip(bra_etas, bra_coeffs):
+            diff = np.nonzero(
+                np.asarray(bra) != np.asarray(bra_eta)
+            )[0]
+            coeff_c = float(coeff)
+            if len(diff) == 2:
+                i, j = int(diff[0]), int(diff[1])
+                if i > j:
+                    i, j = j, i
+                # base correction (matches 2x1):
+                # FLIP iff Σ_{m=i+1}^{j} P(k_m) is EVEN
+                flip_base = not (int(ket_parity[i + 1:j + 1].sum()) % 2)
+                # multi-bond correction (kicks in only when |i-j|>1 or extra sites):
+                # FLIP iff (P(b_i) + P(b_j) + P(k_i) + P(k_j)) is ODD
+                flip_endpoints = bool(
+                    (int(bra_parity[i]) + int(bra_parity[j])
+                     + int(ket_parity[i]) + int(ket_parity[j])) % 2
+                )
+                if flip_base ^ flip_endpoints:
+                    coeff_c = -coeff_c
+            eta = self._join_config(bra_eta, ket)
+            key = tuple(eta)
+            connected_config_coeff[key] = (
+                connected_config_coeff.get(key, 0.0) + 0.5 * coeff_c
+            )
+
+        if not connected_config_coeff:
+            return (
+                np.empty((0, self.N), dtype=np.int64),
+                np.empty((0,), dtype=np.float64),
+            )
+
+        return (
+            do('array', list(connected_config_coeff.keys())),
+            do('array', list(connected_config_coeff.values())),
+        )
+
+
+# ==== GPU Mixin Contract ====
+# GPU-capable Hamiltonians inherit GPUMixin and override
+# precompute_hops_gpu() and get_conn_batch_gpu() directly.
+
+class GPUMixin:
+    """Mixin class for GPU-accelerated get_conn.
+
+    Subclasses should implement:
+        - precompute_hops_gpu(self, device): Precompute any data structures needed for GPU get_conn.
+        - get_conn_batch_gpu(self, fxs): Batched get_conn on GPU, returning (conn_etas, conn_coeffs, batch_ids).
+    """
+    def precompute_hops_gpu(self, device):
+        raise NotImplementedError
+
+    def get_conn_batch_gpu(self, fxs):
+        raise NotImplementedError
+
+def chain_spinless_Fermi_Hubbard(L, t, V, N_f, pbc=False):
+    """Implementation of spinless free fermion model on a 1D chain"""
+    if pbc:
+        raise NotImplementedError("PBC not implemented yet")
+    N = L
+    hi = SpinlessFermion(n_orbitals=N, n_fermions=N_f)
+
+    graph = Chain(L, pbc)
+
+    H = dict()
+    for i, j in graph.edges():
+        H[(i, j, 't')] = -t
+        H[(i, j, 'V')] = V
+
+    return H, hi, graph
+
+class spinless_Fermi_Hubbard_chain_torch(GPUMixin, Hamiltonian):
+    def __init__(self, L, t, V, N_f, pbc=False):
+        """
+        Implementation of spinless free fermion model on a chain using torch.
+        Args:
+            N_f is used to restrict the Hilbert space.
+        """
+        H, hi, graph = chain_spinless_Fermi_Hubbard(L, t, V, N_f, pbc)
+        super().__init__(H, hi, graph)
 
     def precompute_hops_gpu(self, device):
         """Parse self._H into GPU-friendly lists."""
@@ -549,15 +848,231 @@ class SpinlessFermionGPUMixin:
         batch_ids = torch.cat(all_bids, dim=0)
         return conn_etas, conn_coeffs, batch_ids
 
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        sigma = np.array(sigma_quimb)
+        connected_config_coeff = dict()
+        for key, value in self._H.items():
+            i, j, term_type = key
+            if term_type == 't':
+                # hopping term
+                if sigma[i] != sigma[j]:
+                    # H|sigma> = -t * |eta>
+                    eta = sigma.copy()
+                    eta[i], eta[j] = sigma[j], sigma[i]
+                    eta_quimb = tuple(eta)
+                    # Calculate the phase correction
+                    phase = (-1)**(sum(sigma[min(i,j)+1:max(i,j)]))  # Jordan-Wigner phase
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value*phase
+                    else:
+                        connected_config_coeff[eta_quimb] += value*phase
+            elif term_type == 'V':
+                # interaction term
+                if sigma[i] == 1 and sigma[j] == 1:
+                    eta_quimb = tuple(sigma)
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value
+                    else:
+                        connected_config_coeff[eta_quimb] += value
 
-class SpinfulFermionGPUMixin:
-    """GPU-batched get_conn for spinful fermion Hamiltonians.
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
 
-    Config encoding: quimb {0=empty, 1=down, 2=up, 3=both}.
-    Hamiltonian dict keys:
-      - (i0, j0, spin): hopping (spin=+1 for up, -1 for down)
-      - (i,):           on-site Hubbard U (active when site=3)
-    """
+def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, mu, N_f, pbc=False):
+    """Implementation of spinless Fermi-Hubbard model on a square lattice"""
+    if pbc:
+        raise NotImplementedError("PBC not implemented yet")
+    N = Lx * Ly
+    hi = SpinlessFermion(n_orbitals=N, n_fermions=N_f)
+
+    graph = SquareLattice(Lx, Ly, pbc)
+
+    H = dict()
+    for i, j in graph.edges():
+        H[(i, j, 't')] = -t
+        H[(i, j, 'V')] = V
+    for i in range(N):
+        H[(i,)] = -mu
+
+    return H, hi, graph
+
+class spinless_Fermi_Hubbard_square_lattice_torch(GPUMixin, Hamiltonian):
+    def __init__(self, Lx, Ly, t=1.0, V=0.0, mu=0.0, N_f=None, pbc=False):
+        """
+        Implementation of spinless Fermi-Hubbard model on a square lattice using torch.
+        Args:
+            N_f is used to restrict the Hilbert space.
+        """
+        H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, mu, N_f, pbc)
+        super().__init__(H, hi, graph)
+
+    def precompute_hops_gpu(self, device):
+        """Parse self._H into GPU-friendly lists."""
+        hop_list = []    # (i, j, coeff)
+        diag_V_list = [] # (i, j, coeff)
+        diag_mu_list = [] # (i, coeff)
+        for key, value in self._H.items():
+            if len(key) == 3:
+                i, j, term_type = key
+                if term_type == 't':
+                    hop_list.append((i, j, value))
+                elif term_type == 'V':
+                    diag_V_list.append((i, j, value))
+            elif len(key) == 1:
+                diag_mu_list.append((key[0], value))
+        self._hop_list = hop_list
+        self._diag_V_list = diag_V_list
+        self._diag_mu_list = diag_mu_list
+        self._gpu_device = device
+
+    def get_conn_batch_gpu(self, fxs):
+        """Batched get_conn on GPU for spinless fermions.
+
+        Args:
+            fxs: (B, N_sites) int64 GPU tensor, binary {0,1}
+        Returns:
+            conn_etas:   (total_conn, N_sites) int64
+            conn_coeffs: (total_conn,) float64
+            batch_ids:   (total_conn,) int64
+        """
+        import torch
+        B, N = fxs.shape
+        device = fxs.device
+
+        all_etas, all_coeffs, all_bids = [], [], []
+
+        # --- Hopping terms ---
+        for i, j, coeff in self._hop_list:
+            valid = fxs[:, i] != fxs[:, j]  # (B,)
+            if not valid.any():
+                continue
+            idx = valid.nonzero(as_tuple=True)[0]
+
+            new_fxs = fxs[idx].clone()
+            tmp = new_fxs[:, i].clone()
+            new_fxs[:, i] = new_fxs[:, j]
+            new_fxs[:, j] = tmp
+
+            # Jordan-Wigner phase: (-1)^(sum of occupations
+            # between sites min(i,j)+1 and max(i,j))
+            lo, hi = min(i, j), max(i, j)
+            between = fxs[idx, lo + 1:hi].sum(dim=-1) % 2
+            phases = 1.0 - 2.0 * between.double()
+
+            all_etas.append(new_fxs)
+            all_coeffs.append(phases * coeff)
+            all_bids.append(idx)
+
+        # --- V interaction terms (diagonal) ---
+        for i, j, coeff in self._diag_V_list:
+            valid = (fxs[:, i] == 1) & (fxs[:, j] == 1)
+            if not valid.any():
+                continue
+            idx = valid.nonzero(as_tuple=True)[0]
+            all_etas.append(fxs[idx])
+            all_coeffs.append(torch.full(
+                (len(idx),), coeff,
+                device=device, dtype=torch.float64,
+            ))
+            all_bids.append(idx)
+
+        # --- Chemical potential terms (diagonal) ---
+        for i, coeff in self._diag_mu_list:
+            valid = fxs[:, i] == 1
+            if not valid.any():
+                continue
+            idx = valid.nonzero(as_tuple=True)[0]
+            all_etas.append(fxs[idx])
+            all_coeffs.append(torch.full(
+                (len(idx),), coeff,
+                device=device, dtype=torch.float64,
+            ))
+            all_bids.append(idx)
+
+        conn_etas = torch.cat(all_etas, dim=0)
+        conn_coeffs = torch.cat(all_coeffs, dim=0)
+        batch_ids = torch.cat(all_bids, dim=0)
+        return conn_etas, conn_coeffs, batch_ids
+
+    def get_conn(self, sigma_quimb):
+        """
+        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
+        and their corresponding coefficients <eta|H|sigma>.
+        """
+        sigma = np.array(sigma_quimb)
+        connected_config_coeff = dict()
+        for key, value in self._H.items():
+            if len(key) == 3:
+                i, j, term_type = key
+                if term_type == 't':
+                    # hopping term
+                    if sigma[i] != sigma[j]:
+                        # H|sigma> = -t * |eta>
+                        eta = sigma.copy()
+                        eta[i], eta[j] = sigma[j], sigma[i]
+                        eta_quimb = tuple(eta)
+                        # Calculate the phase correction
+                        phase = (-1)**(sum(sigma[min(i,j)+1:max(i,j)]))  # Jordan-Wigner phase
+                        if eta_quimb not in connected_config_coeff:
+                            connected_config_coeff[eta_quimb] = value*phase
+                        else:
+                            connected_config_coeff[eta_quimb] += value*phase
+                elif term_type == 'V':
+                    # interaction term
+                    if sigma[i] == 1 and sigma[j] == 1:
+                        eta_quimb = tuple(sigma)
+                        if eta_quimb not in connected_config_coeff:
+                            connected_config_coeff[eta_quimb] = value
+                        else:
+                            connected_config_coeff[eta_quimb] += value
+            elif len(key) == 1:
+                # on-site term
+                i = key[0]
+                if sigma_quimb[i] == 1:
+                    eta_quimb = tuple(sigma)
+                    if eta_quimb not in connected_config_coeff:
+                        connected_config_coeff[eta_quimb] = value * sigma[i]
+                    else:
+                        connected_config_coeff[eta_quimb] += value * sigma[i]
+
+        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
+
+
+
+def chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
+    """Implementation of spinful Fermi-Hubbard model on a 1D chain"""
+    if pbc:
+        raise NotImplementedError("PBC not implemented yet")
+    N = L
+    if n_fermions_per_spin is None:
+        hi = SpinfulFermion(n_orbitals=N, n_fermions=N_f, no_u1_symmetry=no_u1_symmetry)
+    else:
+        hi = SpinfulFermion(n_orbitals=N, n_fermions_per_spin=n_fermions_per_spin, no_u1_symmetry=no_u1_symmetry)
+
+    graph = Chain(L, pbc)
+
+    H = dict()
+    for i, j in graph.edges():
+        for spin in (1,-1):
+            H[(i, j, spin)] = -t
+
+    for i in range(N):
+        H[(i,)] = U
+
+    return H, hi, graph
+
+class spinful_Fermi_Hubbard_chain_torch(GPUMixin, Hamiltonian):
+    def __init__(self, L, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
+        """
+        Implementation of spinful Fermi-Hubbard model on a square lattice using torch.
+        Args:
+            N_f is used to restrict the Hilbert space.
+        """
+        H, hi, graph = chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc, n_fermions_per_spin, no_u1_symmetry=no_u1_symmetry)
+        super().__init__(H, hi, graph)
 
     def precompute_hops_gpu(self, device):
         """Parse self._H into GPU-friendly lists."""
@@ -649,308 +1164,33 @@ class SpinfulFermionGPUMixin:
             ))
             all_bids.append(idx)
 
-        conn_etas = torch.cat(all_etas, dim=0)
-        conn_coeffs = torch.cat(all_coeffs, dim=0)
-        batch_ids = torch.cat(all_bids, dim=0)
-        return conn_etas, conn_coeffs, batch_ids
-
-
-class SpinHeisenbergGPUMixin:
-    """GPU-batched get_conn for Heisenberg spin-1/2 Hamiltonians.
-
-    Config encoding: binary {0, 1} (spin down/up).
-    Hamiltonian dict keys: (i, j) -> J coupling.
-    H = sum_{<i,j>} J [0.5*(S+_i S-_j + S-_i S+_j) + Sz_i Sz_j]
-    """
-
-    def precompute_hops_gpu(self, device):
-        """Parse self._H into GPU-friendly edge list."""
-        hop_list = []  # (i, j, J)
-        for key, value in self._H.items():
-            i, j = key
-            hop_list.append((i, j, value))
-        self._hop_list = hop_list
-        self._gpu_device = device
-
-    def get_conn_batch_gpu(self, fxs):
-        """Batched get_conn on GPU for Heisenberg model.
-
-        Args:
-            fxs: (B, N_sites) int64 GPU tensor, binary {0,1}
-        Returns:
-            conn_etas:   (total_conn, N_sites) int64
-            conn_coeffs: (total_conn,) float64
-            batch_ids:   (total_conn,) int64
-        """
-        import torch
-        B, N = fxs.shape
-        device = fxs.device
-
-        all_etas, all_coeffs, all_bids = [], [], []
-        batch_range = torch.arange(B, device=device)
-
-        for i, j, J in self._hop_list:
-            # --- Off-diagonal: flip when sigma_i != sigma_j ---
-            diff = fxs[:, i] != fxs[:, j]  # (B,)
-            if diff.any():
-                idx = diff.nonzero(as_tuple=True)[0]
-                new_fxs = fxs[idx].clone()
-                tmp = new_fxs[:, i].clone()
-                new_fxs[:, i] = new_fxs[:, j]
-                new_fxs[:, j] = tmp
-
-                all_etas.append(new_fxs)
-                all_coeffs.append(torch.full(
-                    (len(idx),), 0.5 * J,
-                    device=device, dtype=torch.float64,
-                ))
-                all_bids.append(idx)
-
-            # --- Diagonal: Sz_i Sz_j for ALL samples ---
-            # 0.25 * J * (-1)^|sigma_i - sigma_j|
-            sign = 1.0 - 2.0 * (
-                (fxs[:, i] - fxs[:, j]).abs() % 2
-            ).double()
-            all_etas.append(fxs.clone())
-            all_coeffs.append(0.25 * J * sign)
-            all_bids.append(batch_range.clone())
+        # --- Optional pinning fields (diagonal one-body terms) ---
+        # Set from the run script to bias stripe order; leave unset
+        # (None) for the unbiased Hamiltonian. Both are (N,) tensors on
+        # the same device/dtype as the configs.
+        #   _pin_potential: charge field, couples to n_up + n_down
+        #       (e.g. period-8 cos -> favour the filled stripe).
+        #   _pin_field: staggered spin field, couples to n_up - n_down
+        #       (the AFM staggering lives in this array's sign pattern).
+        # Both are diagonal (eta = sigma), so they just add
+        # sum_i field_i * <op>_i(sigma) to the local energy.
+        pin_pot = getattr(self, '_pin_potential', None)
+        if pin_pot is not None:
+            n_occ = (spin_up + spin_down).double()        # (B, N)
+            all_etas.append(fxs)
+            all_coeffs.append((n_occ * pin_pot).sum(dim=1))
+            all_bids.append(torch.arange(B, device=device))
+        pin_field = getattr(self, '_pin_field', None)
+        if pin_field is not None:
+            m_spin = (spin_up - spin_down).double()       # (B, N)
+            all_etas.append(fxs)
+            all_coeffs.append((m_spin * pin_field).sum(dim=1))
+            all_bids.append(torch.arange(B, device=device))
 
         conn_etas = torch.cat(all_etas, dim=0)
         conn_coeffs = torch.cat(all_coeffs, dim=0)
         batch_ids = torch.cat(all_bids, dim=0)
         return conn_etas, conn_coeffs, batch_ids
-
-
-class SpinTransverseIsingGPUMixin:
-    """GPU-batched get_conn for transverse-field Ising Hamiltonians.
-
-    Config encoding: binary {0, 1} (spin down/up).
-    Hamiltonian dict keys:
-      - ((i,j), 'zz'): ZZ interaction
-      - (i, 'x'):      transverse field
-    H = sum_{<i,j>} J Sz_i Sz_j + sum_i h Sx_i
-    """
-
-    def precompute_hops_gpu(self, device):
-        """Parse self._H into GPU-friendly lists."""
-        zz_list = []   # (i, j, J)
-        flip_list = []  # (i, h)
-        for key, value in self._H.items():
-            if len(key) == 2 and key[1] == 'zz':
-                i, j = key[0]
-                zz_list.append((i, j, value))
-            elif len(key) == 2 and key[1] == 'x':
-                i = key[0]
-                flip_list.append((i, value))
-        self._hop_list = zz_list  # set _hop_list for hasattr check
-        self._zz_list = zz_list
-        self._flip_list = flip_list
-        self._gpu_device = device
-
-    def get_conn_batch_gpu(self, fxs):
-        """Batched get_conn on GPU for transverse-field Ising.
-
-        Args:
-            fxs: (B, N_sites) int64 GPU tensor, binary {0,1}
-        Returns:
-            conn_etas:   (total_conn, N_sites) int64
-            conn_coeffs: (total_conn,) float64
-            batch_ids:   (total_conn,) int64
-        """
-        import torch
-        B, N = fxs.shape
-        device = fxs.device
-
-        all_etas, all_coeffs, all_bids = [], [], []
-        batch_range = torch.arange(B, device=device)
-
-        # --- ZZ diagonal terms ---
-        for i, j, J in self._zz_list:
-            sign = 1.0 - 2.0 * (
-                (fxs[:, i] - fxs[:, j]).abs() % 2
-            ).double()
-            all_etas.append(fxs.clone())
-            all_coeffs.append(0.25 * J * sign)
-            all_bids.append(batch_range.clone())
-
-        # --- Transverse field (spin flip) terms ---
-        for i, h in self._flip_list:
-            new_fxs = fxs.clone()
-            new_fxs[:, i] = 1 - fxs[:, i]
-            all_etas.append(new_fxs)
-            all_coeffs.append(torch.full(
-                (len(fxs),), 0.5 * h,
-                device=device, dtype=torch.float64,
-            ))
-            all_bids.append(batch_range.clone())
-
-        conn_etas = torch.cat(all_etas, dim=0)
-        conn_coeffs = torch.cat(all_coeffs, dim=0)
-        batch_ids = torch.cat(all_bids, dim=0)
-        return conn_etas, conn_coeffs, batch_ids
-
-
-def chain_spinless_Fermi_Hubbard(L, t, V, N_f, pbc=False):
-    """Implementation of spinless free fermion model on a 1D chain"""
-    if pbc:
-        raise NotImplementedError("PBC not implemented yet")
-    N = L
-    hi = SpinlessFermion(n_orbitals=N, n_fermions=N_f)
-    
-    graph = Chain(L, pbc)
-
-    H = dict()
-    for i, j in graph.edges():
-        H[(i, j, 't')] = -t
-        H[(i, j, 'V')] = V
-
-    return H, hi, graph
-
-class spinless_Fermi_Hubbard_chain_torch(SpinlessFermionGPUMixin, Hamiltonian):
-    def __init__(self, L, t, V, N_f, pbc=False):
-        """
-        Implementation of spinless free fermion model on a chain using torch.
-        Args:
-            N_f is used to restrict the Hilbert space.
-        """
-        H, hi, graph = chain_spinless_Fermi_Hubbard(L, t, V, N_f, pbc)
-        super().__init__(H, hi, graph)
-    def get_conn(self, sigma_quimb):
-        """
-        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
-        and their corresponding coefficients <eta|H|sigma>.
-        """
-        sigma = np.array(sigma_quimb)
-        connected_config_coeff = dict()
-        for key, value in self._H.items():
-            i, j, term_type = key
-            if term_type == 't':
-                # hopping term
-                if sigma[i] != sigma[j]:
-                    # H|sigma> = -t * |eta>
-                    eta = sigma.copy()
-                    eta[i], eta[j] = sigma[j], sigma[i]
-                    eta_quimb = tuple(eta)
-                    # Calculate the phase correction
-                    phase = (-1)**(sum(sigma[min(i,j)+1:max(i,j)]))  # Jordan-Wigner phase
-                    if eta_quimb not in connected_config_coeff:
-                        connected_config_coeff[eta_quimb] = value*phase
-                    else:
-                        connected_config_coeff[eta_quimb] += value*phase
-            elif term_type == 'V':
-                # interaction term
-                if sigma[i] == 1 and sigma[j] == 1:
-                    eta_quimb = tuple(sigma)
-                    if eta_quimb not in connected_config_coeff:
-                        connected_config_coeff[eta_quimb] = value
-                    else:
-                        connected_config_coeff[eta_quimb] += value
-        
-        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
-
-def square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, mu, N_f, pbc=False):
-    """Implementation of spinless Fermi-Hubbard model on a square lattice"""
-    if pbc:
-        raise NotImplementedError("PBC not implemented yet")
-    N = Lx * Ly
-    hi = SpinlessFermion(n_orbitals=N, n_fermions=N_f)
-    
-    graph = SquareLattice(Lx, Ly, pbc)
-
-    H = dict()
-    for i, j in graph.edges():
-        H[(i, j, 't')] = -t
-        H[(i, j, 'V')] = V
-    for i in range(N):
-        H[(i,)] = -mu
-    
-    return H, hi, graph
-
-class spinless_Fermi_Hubbard_square_lattice_torch(SpinlessFermionGPUMixin, Hamiltonian):
-    def __init__(self, Lx, Ly, t=1.0, V=0.0, mu=0.0, N_f=None, pbc=False):
-        """
-        Implementation of spinless Fermi-Hubbard model on a square lattice using torch.
-        Args:
-            N_f is used to restrict the Hilbert space.
-        """
-        H, hi, graph = square_lattice_spinless_Fermi_Hubbard(Lx, Ly, t, V, mu, N_f, pbc)
-        super().__init__(H, hi, graph)
-    def get_conn(self, sigma_quimb):
-        """
-        Return the connected configurations <eta| by the Hamiltonian to the state |sigma>,
-        and their corresponding coefficients <eta|H|sigma>.
-        """
-        sigma = np.array(sigma_quimb)
-        connected_config_coeff = dict()
-        for key, value in self._H.items():
-            if len(key) == 3:
-                i, j, term_type = key
-                if term_type == 't':
-                    # hopping term
-                    if sigma[i] != sigma[j]:
-                        # H|sigma> = -t * |eta>
-                        eta = sigma.copy()
-                        eta[i], eta[j] = sigma[j], sigma[i]
-                        eta_quimb = tuple(eta)
-                        # Calculate the phase correction
-                        phase = (-1)**(sum(sigma[min(i,j)+1:max(i,j)]))  # Jordan-Wigner phase
-                        if eta_quimb not in connected_config_coeff:
-                            connected_config_coeff[eta_quimb] = value*phase
-                        else:
-                            connected_config_coeff[eta_quimb] += value*phase
-                elif term_type == 'V':
-                    # interaction term
-                    if sigma[i] == 1 and sigma[j] == 1:
-                        eta_quimb = tuple(sigma)
-                        if eta_quimb not in connected_config_coeff:
-                            connected_config_coeff[eta_quimb] = value
-                        else:
-                            connected_config_coeff[eta_quimb] += value
-            elif len(key) == 1:
-                # on-site term
-                i = key[0]
-                if sigma_quimb[i] == 1:
-                    eta_quimb = tuple(sigma)
-                    if eta_quimb not in connected_config_coeff:
-                        connected_config_coeff[eta_quimb] = value * sigma[i]
-                    else:
-                        connected_config_coeff[eta_quimb] += value * sigma[i]
-        
-        return do('array', list(connected_config_coeff.keys())), do('array', list(connected_config_coeff.values()))
-
-
-
-def chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
-    """Implementation of spinful Fermi-Hubbard model on a 1D chain"""
-    if pbc:
-        raise NotImplementedError("PBC not implemented yet")
-    N = L
-    if n_fermions_per_spin is None:
-        hi = SpinfulFermion(n_orbitals=N, n_fermions=N_f, no_u1_symmetry=no_u1_symmetry)
-    else:
-        hi = SpinfulFermion(n_orbitals=N, n_fermions_per_spin=n_fermions_per_spin, no_u1_symmetry=no_u1_symmetry)
-    
-    graph = Chain(L, pbc)
-
-    H = dict()
-    for i, j in graph.edges():
-        for spin in (1,-1):
-            H[(i, j, spin)] = -t
-
-    for i in range(N):
-        H[(i,)] = U
-    
-    return H, hi, graph
-
-class spinful_Fermi_Hubbard_chain_torch(SpinfulFermionGPUMixin, Hamiltonian):
-    def __init__(self, L, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
-        """
-        Implementation of spinful Fermi-Hubbard model on a square lattice using torch.
-        Args:
-            N_f is used to restrict the Hilbert space.
-        """
-        H, hi, graph = chain_spinful_Fermi_Hubbard(L, t, U, N_f, pbc, n_fermions_per_spin, no_u1_symmetry=no_u1_symmetry)
-        super().__init__(H, hi, graph)
 
     def get_conn(self, sigma_quimb):
         """
@@ -993,9 +1233,17 @@ class spinful_Fermi_Hubbard_chain_torch(SpinfulFermionGPUMixin, Hamiltonian):
 
 
 def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False):
-    """Implementation of spinful Fermi-Hubbard model on a square lattice"""
-    if pbc:
-        raise NotImplementedError("PBC not implemented yet")
+    """Implementation of spinful Fermi-Hubbard model on a square lattice.
+
+    Notes on PBC:
+        The Jordan-Wigner phase for a hop ``(i, j)`` is computed via
+        the universal formula ``(-1)^(sum(config[min+1:max]))`` over
+        the chosen 1D site ordering, with no boundary special-casing.
+        Wrap-around hops added by ``SquareLattice(..., pbc=True)`` are
+        treated as ordinary hops with longer JW strings — physically
+        consistent because the JW ordering is a property of the
+        labelling, not of the lattice geometry.
+    """
     N = Lx * Ly
     if n_fermions_per_spin is None:
         hi = SpinfulFermion(n_orbitals=N, n_fermions=N_f, no_u1_symmetry=no_u1_symmetry)
@@ -1014,7 +1262,7 @@ def square_lattice_spinful_Fermi_Hubbard(Lx, Ly, t, U, N_f, pbc=False, n_fermion
         
     return H, hi, graph
 
-class spinful_Fermi_Hubbard_square_lattice_torch(SpinfulFermionGPUMixin, Hamiltonian):
+class spinful_Fermi_Hubbard_square_lattice_torch(GPUMixin, Hamiltonian):
     def __init__(self, Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=None, no_u1_symmetry=False, gpu=False):
         """
         Implementation of spinful Fermi-Hubbard model on a square lattice using torch.
@@ -1033,6 +1281,124 @@ class spinful_Fermi_Hubbard_square_lattice_torch(SpinfulFermionGPUMixin, Hamilto
         )
         super().__init__(H, hi, graph)
         self.gpu = gpu
+
+    def precompute_hops_gpu(self, device):
+        """Parse self._H into GPU-friendly lists."""
+        N = self.hilbert.n_orbitals // 2  # N_sites
+        hop_list = []
+        diag_list = []
+        for key, value in self._H.items():
+            if len(key) == 3:
+                i0, j0, spin = key
+                i_net = i0 if spin == 1 else i0 + N
+                j_net = j0 if spin == 1 else j0 + N
+                # symmray ordering: [d0, u0, d1, u1, ...]
+                p_sym = 2 * i0 + (1 if spin == 1 else 0)
+                q_sym = 2 * j0 + (1 if spin == 1 else 0)
+                if p_sym > q_sym:
+                    p_sym, q_sym = q_sym, p_sym
+                hop_list.append(
+                    (i_net, j_net, value, p_sym, q_sym)
+                )
+            elif len(key) == 1:
+                diag_list.append((key[0], value))
+        self._hop_list = hop_list
+        self._diag_list = diag_list
+        self._gpu_device = device
+
+    def get_conn_batch_gpu(self, fxs):
+        """Batched get_conn on GPU for spinful fermions.
+
+        Args:
+            fxs: (B, N_sites) int64 GPU tensor (quimb encoding)
+        Returns:
+            conn_etas:   (total_conn, N_sites) int64
+            conn_coeffs: (total_conn,) float64
+            batch_ids:   (total_conn,) int64
+        """
+        import torch
+        B, N = fxs.shape
+        device = fxs.device
+
+        # Build netket representation: (B, 2*N)
+        spin_up = ((fxs == 2) | (fxs == 3)).long()
+        spin_down = ((fxs == 1) | (fxs == 3)).long()
+        netket = torch.cat([spin_up, spin_down], dim=1)
+
+        # Build symmray representation: [d0, u0, d1, u1, ...]
+        symmray = torch.stack(
+            [spin_down, spin_up], dim=-1
+        ).reshape(B, 2 * N)
+
+        all_etas, all_coeffs, all_bids = [], [], []
+
+        # --- Hopping terms ---
+        for i_net, j_net, coeff, p_sym, q_sym in self._hop_list:
+            valid = netket[:, i_net] != netket[:, j_net]
+            if not valid.any():
+                continue
+            idx = valid.nonzero(as_tuple=True)[0]
+
+            new_netket = netket[idx].clone()
+            tmp = new_netket[:, i_net].clone()
+            new_netket[:, i_net] = new_netket[:, j_net]
+            new_netket[:, j_net] = tmp
+
+            # Convert back to quimb encoding
+            su = new_netket[:, :N]
+            sd = new_netket[:, N:]
+            new_fxs = su * 2 + sd
+
+            # Fermionic phase via symmray convention
+            between = (
+                symmray[idx, p_sym + 1:q_sym].sum(dim=-1) % 2
+            )
+            phases = 1.0 - 2.0 * between.double()
+
+            all_etas.append(new_fxs)
+            all_coeffs.append(phases * coeff)
+            all_bids.append(idx)
+
+        # --- Diagonal (on-site U) terms ---
+        for site, coeff in self._diag_list:
+            valid = fxs[:, site] == 3
+            if not valid.any():
+                continue
+            idx = valid.nonzero(as_tuple=True)[0]
+            all_etas.append(fxs[idx])
+            all_coeffs.append(torch.full(
+                (len(idx),), coeff,
+                device=device, dtype=torch.float64,
+            ))
+            all_bids.append(idx)
+
+        # --- Optional pinning fields (diagonal one-body terms) ---
+        # Set from the run script to bias stripe order; leave unset
+        # (None) for the unbiased Hamiltonian. Both are (N,) tensors on
+        # the same device/dtype as the configs.
+        #   _pin_potential: charge field, couples to n_up + n_down
+        #       (e.g. period-8 cos -> favour the filled stripe).
+        #   _pin_field: staggered spin field, couples to n_up - n_down
+        #       (the AFM staggering lives in this array's sign pattern).
+        # Both are diagonal (eta = sigma), so they just add
+        # sum_i field_i * <op>_i(sigma) to the local energy.
+        pin_pot = getattr(self, '_pin_potential', None)
+        if pin_pot is not None:
+            n_occ = (spin_up + spin_down).double()        # (B, N)
+            all_etas.append(fxs)
+            all_coeffs.append((n_occ * pin_pot).sum(dim=1))
+            all_bids.append(torch.arange(B, device=device))
+        pin_field = getattr(self, '_pin_field', None)
+        if pin_field is not None:
+            m_spin = (spin_up - spin_down).double()       # (B, N)
+            all_etas.append(fxs)
+            all_coeffs.append((m_spin * pin_field).sum(dim=1))
+            all_bids.append(torch.arange(B, device=device))
+
+        conn_etas = torch.cat(all_etas, dim=0)
+        conn_coeffs = torch.cat(all_coeffs, dim=0)
+        batch_ids = torch.cat(all_bids, dim=0)
+        return conn_etas, conn_coeffs, batch_ids
 
     def get_conn(self, sigma_quimb):
         """
@@ -1142,7 +1508,7 @@ def square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=False, total_sz=None):
     
     return H, hi, graph
 
-class spin_Heisenberg_square_lattice_torch(SpinHeisenbergGPUMixin, Hamiltonian):
+class spin_Heisenberg_square_lattice_torch(GPUMixin, Hamiltonian):
     def __init__(self, Lx, Ly, J, pbc=False, total_sz=None):
         """
         Implementation of spin-1/2 Heisenberg model on a square lattice using torch.
@@ -1152,6 +1518,63 @@ class spin_Heisenberg_square_lattice_torch(SpinHeisenbergGPUMixin, Hamiltonian):
         """
         H, hi, graph = square_lattice_spin_Heisenberg(Lx, Ly, J, pbc=pbc, total_sz=total_sz)
         super().__init__(H, hi, graph)
+
+    def precompute_hops_gpu(self, device):
+        """Parse self._H into GPU-friendly edge list."""
+        hop_list = []  # (i, j, J)
+        for key, value in self._H.items():
+            i, j = key
+            hop_list.append((i, j, value))
+        self._hop_list = hop_list
+        self._gpu_device = device
+
+    def get_conn_batch_gpu(self, fxs):
+        """Batched get_conn on GPU for Heisenberg model.
+
+        Args:
+            fxs: (B, N_sites) int64 GPU tensor, binary {0,1}
+        Returns:
+            conn_etas:   (total_conn, N_sites) int64
+            conn_coeffs: (total_conn,) float64
+            batch_ids:   (total_conn,) int64
+        """
+        import torch
+        B, N = fxs.shape
+        device = fxs.device
+
+        all_etas, all_coeffs, all_bids = [], [], []
+        batch_range = torch.arange(B, device=device)
+
+        for i, j, J in self._hop_list:
+            # --- Off-diagonal: flip when sigma_i != sigma_j ---
+            diff = fxs[:, i] != fxs[:, j]  # (B,)
+            if diff.any():
+                idx = diff.nonzero(as_tuple=True)[0]
+                new_fxs = fxs[idx].clone()
+                tmp = new_fxs[:, i].clone()
+                new_fxs[:, i] = new_fxs[:, j]
+                new_fxs[:, j] = tmp
+
+                all_etas.append(new_fxs)
+                all_coeffs.append(torch.full(
+                    (len(idx),), 0.5 * J,
+                    device=device, dtype=torch.float64,
+                ))
+                all_bids.append(idx)
+
+            # --- Diagonal: Sz_i Sz_j for ALL samples ---
+            # 0.25 * J * (-1)^|sigma_i - sigma_j|
+            sign = 1.0 - 2.0 * (
+                (fxs[:, i] - fxs[:, j]).abs() % 2
+            ).double()
+            all_etas.append(fxs.clone())
+            all_coeffs.append(0.25 * J * sign)
+            all_bids.append(batch_range.clone())
+
+        conn_etas = torch.cat(all_etas, dim=0)
+        conn_coeffs = torch.cat(all_coeffs, dim=0)
+        batch_ids = torch.cat(all_bids, dim=0)
+        return conn_etas, conn_coeffs, batch_ids
     
     def to_dense(self):
         """Convert the Hamiltonian to a dense matrix representation."""
@@ -1225,7 +1648,7 @@ def chain_spin_Heisenberg(L, J, pbc=False, total_sz=None):
     
     return H, hi, graph
 
-class spin_Heisenberg_chain_torch(SpinHeisenbergGPUMixin, Hamiltonian):
+class spin_Heisenberg_chain_torch(GPUMixin, Hamiltonian):
     def __init__(self, L, J, pbc=False, total_sz=None):
         """
         Implementation of spin-1/2 Heisenberg model on a chain using torch.
@@ -1235,6 +1658,63 @@ class spin_Heisenberg_chain_torch(SpinHeisenbergGPUMixin, Hamiltonian):
         """
         H, hi, graph = chain_spin_Heisenberg(L, J, pbc=pbc, total_sz=total_sz)
         super().__init__(H, hi, graph)
+
+    def precompute_hops_gpu(self, device):
+        """Parse self._H into GPU-friendly edge list."""
+        hop_list = []  # (i, j, J)
+        for key, value in self._H.items():
+            i, j = key
+            hop_list.append((i, j, value))
+        self._hop_list = hop_list
+        self._gpu_device = device
+
+    def get_conn_batch_gpu(self, fxs):
+        """Batched get_conn on GPU for Heisenberg model.
+
+        Args:
+            fxs: (B, N_sites) int64 GPU tensor, binary {0,1}
+        Returns:
+            conn_etas:   (total_conn, N_sites) int64
+            conn_coeffs: (total_conn,) float64
+            batch_ids:   (total_conn,) int64
+        """
+        import torch
+        B, N = fxs.shape
+        device = fxs.device
+
+        all_etas, all_coeffs, all_bids = [], [], []
+        batch_range = torch.arange(B, device=device)
+
+        for i, j, J in self._hop_list:
+            # --- Off-diagonal: flip when sigma_i != sigma_j ---
+            diff = fxs[:, i] != fxs[:, j]  # (B,)
+            if diff.any():
+                idx = diff.nonzero(as_tuple=True)[0]
+                new_fxs = fxs[idx].clone()
+                tmp = new_fxs[:, i].clone()
+                new_fxs[:, i] = new_fxs[:, j]
+                new_fxs[:, j] = tmp
+
+                all_etas.append(new_fxs)
+                all_coeffs.append(torch.full(
+                    (len(idx),), 0.5 * J,
+                    device=device, dtype=torch.float64,
+                ))
+                all_bids.append(idx)
+
+            # --- Diagonal: Sz_i Sz_j for ALL samples ---
+            # 0.25 * J * (-1)^|sigma_i - sigma_j|
+            sign = 1.0 - 2.0 * (
+                (fxs[:, i] - fxs[:, j]).abs() % 2
+            ).double()
+            all_etas.append(fxs.clone())
+            all_coeffs.append(0.25 * J * sign)
+            all_bids.append(batch_range.clone())
+
+        conn_etas = torch.cat(all_etas, dim=0)
+        conn_coeffs = torch.cat(all_coeffs, dim=0)
+        batch_ids = torch.cat(all_bids, dim=0)
+        return conn_etas, conn_coeffs, batch_ids
     
     def to_dense(self):
         """Convert the Hamiltonian to a dense matrix representation."""
@@ -1310,7 +1790,7 @@ def chain_spin_transverse_Ising(L, J, h, pbc=False, total_sz=None):
     
     return H, hi, graph
 
-class spin_transverse_Ising_chain_torch(SpinTransverseIsingGPUMixin, Hamiltonian):
+class spin_transverse_Ising_chain_torch(GPUMixin, Hamiltonian):
     def __init__(self, L, J, h, pbc=False, total_sz=None):
         """
         Implementation of spin-1/2 transverse field Ising model on a chain using torch.
@@ -1322,6 +1802,64 @@ class spin_transverse_Ising_chain_torch(SpinTransverseIsingGPUMixin, Hamiltonian
         """
         H, hi, graph = chain_spin_transverse_Ising(L, J, h, pbc=pbc, total_sz=total_sz)
         super().__init__(H, hi, graph)
+
+    def precompute_hops_gpu(self, device):
+        """Parse self._H into GPU-friendly lists."""
+        zz_list = []   # (i, j, J)
+        flip_list = []  # (i, h)
+        for key, value in self._H.items():
+            if len(key) == 2 and key[1] == 'zz':
+                i, j = key[0]
+                zz_list.append((i, j, value))
+            elif len(key) == 2 and key[1] == 'x':
+                i = key[0]
+                flip_list.append((i, value))
+        self._hop_list = zz_list  # set _hop_list for hasattr check
+        self._zz_list = zz_list
+        self._flip_list = flip_list
+        self._gpu_device = device
+
+    def get_conn_batch_gpu(self, fxs):
+        """Batched get_conn on GPU for transverse-field Ising.
+
+        Args:
+            fxs: (B, N_sites) int64 GPU tensor, binary {0,1}
+        Returns:
+            conn_etas:   (total_conn, N_sites) int64
+            conn_coeffs: (total_conn,) float64
+            batch_ids:   (total_conn,) int64
+        """
+        import torch
+        B, N = fxs.shape
+        device = fxs.device
+
+        all_etas, all_coeffs, all_bids = [], [], []
+        batch_range = torch.arange(B, device=device)
+
+        # --- ZZ diagonal terms ---
+        for i, j, J in self._zz_list:
+            sign = 1.0 - 2.0 * (
+                (fxs[:, i] - fxs[:, j]).abs() % 2
+            ).double()
+            all_etas.append(fxs.clone())
+            all_coeffs.append(0.25 * J * sign)
+            all_bids.append(batch_range.clone())
+
+        # --- Transverse field (spin flip) terms ---
+        for i, h in self._flip_list:
+            new_fxs = fxs.clone()
+            new_fxs[:, i] = 1 - fxs[:, i]
+            all_etas.append(new_fxs)
+            all_coeffs.append(torch.full(
+                (len(fxs),), 0.5 * h,
+                device=device, dtype=torch.float64,
+            ))
+            all_bids.append(batch_range.clone())
+
+        conn_etas = torch.cat(all_etas, dim=0)
+        conn_coeffs = torch.cat(all_coeffs, dim=0)
+        batch_ids = torch.cat(all_bids, dim=0)
+        return conn_etas, conn_coeffs, batch_ids
 
     def get_conn(self, sigma_quimb):
         """
@@ -1378,7 +1916,7 @@ def square_lattice_spin_transverse_Ising(Lx, Ly, J, h, pbc=False, total_sz=None)
     
     return H, hi, graph
 
-class spin_transverse_Ising_square_lattice_torch(SpinTransverseIsingGPUMixin, Hamiltonian):
+class spin_transverse_Ising_square_lattice_torch(GPUMixin, Hamiltonian):
     def __init__(self, Lx, Ly, J, h, pbc=False, total_sz=None):
         """
         Implementation of spin-1/2 transverse field Ising model on a square lattice using torch.
@@ -1390,6 +1928,64 @@ class spin_transverse_Ising_square_lattice_torch(SpinTransverseIsingGPUMixin, Ha
         """
         H, hi, graph = square_lattice_spin_transverse_Ising(Lx, Ly, J, h, pbc=pbc, total_sz=total_sz)
         super().__init__(H, hi, graph)
+
+    def precompute_hops_gpu(self, device):
+        """Parse self._H into GPU-friendly lists."""
+        zz_list = []   # (i, j, J)
+        flip_list = []  # (i, h)
+        for key, value in self._H.items():
+            if len(key) == 2 and key[1] == 'zz':
+                i, j = key[0]
+                zz_list.append((i, j, value))
+            elif len(key) == 2 and key[1] == 'x':
+                i = key[0]
+                flip_list.append((i, value))
+        self._hop_list = zz_list  # set _hop_list for hasattr check
+        self._zz_list = zz_list
+        self._flip_list = flip_list
+        self._gpu_device = device
+
+    def get_conn_batch_gpu(self, fxs):
+        """Batched get_conn on GPU for transverse-field Ising.
+
+        Args:
+            fxs: (B, N_sites) int64 GPU tensor, binary {0,1}
+        Returns:
+            conn_etas:   (total_conn, N_sites) int64
+            conn_coeffs: (total_conn,) float64
+            batch_ids:   (total_conn,) int64
+        """
+        import torch
+        B, N = fxs.shape
+        device = fxs.device
+
+        all_etas, all_coeffs, all_bids = [], [], []
+        batch_range = torch.arange(B, device=device)
+
+        # --- ZZ diagonal terms ---
+        for i, j, J in self._zz_list:
+            sign = 1.0 - 2.0 * (
+                (fxs[:, i] - fxs[:, j]).abs() % 2
+            ).double()
+            all_etas.append(fxs.clone())
+            all_coeffs.append(0.25 * J * sign)
+            all_bids.append(batch_range.clone())
+
+        # --- Transverse field (spin flip) terms ---
+        for i, h in self._flip_list:
+            new_fxs = fxs.clone()
+            new_fxs[:, i] = 1 - fxs[:, i]
+            all_etas.append(new_fxs)
+            all_coeffs.append(torch.full(
+                (len(fxs),), 0.5 * h,
+                device=device, dtype=torch.float64,
+            ))
+            all_bids.append(batch_range.clone())
+
+        conn_etas = torch.cat(all_etas, dim=0)
+        conn_coeffs = torch.cat(all_coeffs, dim=0)
+        batch_ids = torch.cat(all_bids, dim=0)
+        return conn_etas, conn_coeffs, batch_ids
     
     def to_dense(self):
         """Convert the Hamiltonian to a dense matrix representation."""

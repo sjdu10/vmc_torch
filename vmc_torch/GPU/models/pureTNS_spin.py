@@ -1670,9 +1670,12 @@ class PEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
-                return self._vmapped_compiled(
+                out = self._vmapped_compiled(
                     x, *params_list,
                 )
+                if getattr(self, '_uses_cudagraph', False):
+                    out = out.clone()  # cudagraph reuses a static buffer
+                return out
             else:
                 return self._vmapped_exported(
                     x, *params_list,

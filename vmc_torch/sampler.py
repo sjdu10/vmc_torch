@@ -2238,97 +2238,97 @@ class MetropolisMPSSamplerSpinful(Sampler):
         return self.current_config, self.current_amp
 
 
-class DirectProposalMCMCSamplerPEPS(Sampler):
-    """
-    MCMC sampler using direct samples as Metropolis-Hastings proposals.
+# class DirectProposalMCMCSamplerPEPS(Sampler):
+#     """
+#     MCMC sampler using direct samples as Metropolis-Hastings proposals.
 
-    At each step, draws a fresh config S' ~ p_c(S') via PEPS_model.direct_sample,
-    then accepts with probability min(1, w(S')/w(S)), w(S) = |Ψ(S)|² / p_c(S).
-    The chain targets p_Ψ, so the inherited sample() and sample_w_grad() methods
-    work correctly without IS reweighting.
+#     At each step, draws a fresh config S' ~ p_c(S') via PEPS_model.direct_sample,
+#     then accepts with probability min(1, w(S')/w(S)), w(S) = |Ψ(S)|² / p_c(S).
+#     The chain targets p_Ψ, so the inherited sample() and sample_w_grad() methods
+#     work correctly without IS reweighting.
 
-    Parameters
-    ----------
-    chi_s : int or None
-        Bond dimension for top boundary MPS. Defaults to vstate.vstate_func.max_bond.
-    chi_m : int or None
-        Bond dimension for bottom marginal MPO (None = chi_m=0 approximation).
-    """
+#     Parameters
+#     ----------
+#     chi_s : int or None
+#         Bond dimension for top boundary MPS. Defaults to vstate.vstate_func.max_bond.
+#     chi_m : int or None
+#         Bond dimension for bottom marginal MPO (None = chi_m=0 approximation).
+#     """
 
-    def __init__(
-        self,
-        hi,
-        graph,
-        N_samples=2**8,
-        burn_in_steps=10,
-        reset_chain=False,
-        equal_partition=True,
-        chi_s=None,
-        chi_m=None,
-        total_sz=None,
-        dtype=torch.float32,
-        device=None,
-        debug=False,
-    ):
-        super().__init__(
-            hi,
-            graph,
-            N_samples=N_samples,
-            burn_in_steps=burn_in_steps,
-            reset_chain=reset_chain,
-            equal_partition=equal_partition,
-            dtype=dtype,
-            device=device,
-            debug=debug,
-        )
-        self.chi_s = chi_s
-        self.chi_m = chi_m
-        self.total_sz = total_sz
-        self._current_log_pc = None
-        self._current_amp = None
+#     def __init__(
+#         self,
+#         hi,
+#         graph,
+#         N_samples=2**8,
+#         burn_in_steps=10,
+#         reset_chain=False,
+#         equal_partition=True,
+#         chi_s=None,
+#         chi_m=None,
+#         total_sz=None,
+#         dtype=torch.float32,
+#         device=None,
+#         debug=False,
+#     ):
+#         super().__init__(
+#             hi,
+#             graph,
+#             N_samples=N_samples,
+#             burn_in_steps=burn_in_steps,
+#             reset_chain=reset_chain,
+#             equal_partition=equal_partition,
+#             dtype=dtype,
+#             device=device,
+#             debug=debug,
+#         )
+#         self.chi_s = chi_s
+#         self.chi_m = chi_m
+#         self.total_sz = total_sz
+#         self._current_log_pc = None
+#         self._current_amp = None
 
-    def reset(self):
-        super().reset()
-        self._current_log_pc = None
-        self._current_amp = None
+#     def reset(self):
+#         super().reset()
+#         self._current_log_pc = None
+#         self._current_amp = None
 
-    @torch.no_grad()
-    def _sample_next(self, vstate, **kwargs):
-        """MH step with direct sample as proposal."""
-        chi_s = self.chi_s if self.chi_s is not None else vstate.vstate_func.max_bond
+#     @torch.no_grad()
+#     def _sample_next(self, vstate, **kwargs):
+#         """MH step with direct sample as proposal."""
+#         chi_s = self.chi_s if self.chi_s is not None else vstate.vstate_func.max_bond
 
-        proposed_config, proposed_log_pc = vstate.vstate_func.direct_sample(
-            chi_s=chi_s, chi_m=self.chi_m, total_sz=self.total_sz
-        )
-        proposed_config = proposed_config.to(dtype=self.dtype)
-        proposed_amp = vstate.amplitude(proposed_config)
+#         proposed_config, proposed_log_pc = vstate.vstate_func.direct_sample(
+#             chi_s=chi_s, chi_m=self.chi_m, total_sz=self.total_sz
+#         )
+#         proposed_config = proposed_config.to(dtype=self.dtype)
+#         proposed_amp = vstate.amplitude(proposed_config)
 
-        self.attempts += 1
+#         self.attempts += 1
 
-        # First step: unconditional accept
-        if self._current_amp is None or self._current_amp == 0:
-            self.current_config = proposed_config
-            self._current_amp = proposed_amp
-            self._current_log_pc = proposed_log_pc
-            self.accepts += 1
-            return self.current_config, self._current_amp
+#         # First step: unconditional accept
+#         if self._current_amp is None or self._current_amp == 0:
+#             self.current_config = proposed_config
+#             self._current_amp = proposed_amp
+#             self._current_log_pc = proposed_log_pc
+#             self.accepts += 1
+#             return self.current_config, self._current_amp
 
-        # log w = 2 log|Ψ| - log p_c
-        log_w_prop = (
-            2.0 * np.log(abs(proposed_amp.item()) + 1e-300) - proposed_log_pc
-        )
-        log_w_curr = (
-            2.0 * np.log(abs(self._current_amp.item()) + 1e-300)
-            - self._current_log_pc
-        )
+#         # log w = 2 log|Ψ| - log p_c
+#         log_w_prop = (
+#             2.0 * np.log(abs(proposed_amp.item()) + 1e-300) - proposed_log_pc
+#         )
+#         log_w_curr = (
+#             2.0 * np.log(abs(self._current_amp.item()) + 1e-300)
+#             - self._current_log_pc
+#         )
 
-        if np.log(random.random() + 1e-300) < log_w_prop - log_w_curr:
-            self.current_config = proposed_config
-            self._current_amp = proposed_amp
-            self._current_log_pc = proposed_log_pc
-            self.accepts += 1
+#         if np.log(random.random() + 1e-300) < log_w_prop - log_w_curr:
+#             self.current_config = proposed_config
+#             self._current_amp = proposed_amp
+#             self._current_log_pc = proposed_log_pc
+#             self.accepts += 1
 
-        return self.current_config, self._current_amp
+#         return self.current_config, self._current_amp
 
 
 class DirectSamplerPEPS(Sampler):
@@ -2539,3 +2539,100 @@ class DirectSamplerPEPS(Sampler):
             W_loc,
             chain_means_loc,
         )
+
+
+class DirectProposalMCMCSamplerSpinful(Sampler):
+    """MCMC sampler for spinful fermionic PEPS using direct samples as proposals.
+
+    At each step, draws S' ~ p_c(S') via fTNModel.direct_sample, then
+    accepts with min(1, w(S')/w(S)) where w(S) = |Ψ(S)|² / p_c(S).
+    The chain targets p_Ψ, so inherited sample() and sample_w_grad() work
+    without IS reweighting.
+
+    Parameters
+    ----------
+    chi_s        : int or None — top boundary MPS bond; defaults to model.max_bond
+    n_up_target  : int or None — target number of up-fermions
+    n_dn_target  : int or None — target number of down-fermions
+    """
+
+    def __init__(
+        self,
+        hi,
+        graph,
+        N_samples=2**8,
+        burn_in_steps=10,
+        reset_chain=False,
+        equal_partition=True,
+        chi_s=None,
+        n_up_target=None,
+        n_dn_target=None,
+        direct_thermal_steps=1,
+        dtype=torch.float32,
+        device=None,
+        debug=False,
+    ):
+        super().__init__(
+            hi,
+            graph,
+            N_samples=N_samples,
+            burn_in_steps=burn_in_steps,
+            reset_chain=reset_chain,
+            equal_partition=equal_partition,
+            dtype=dtype,
+            device=device,
+            debug=debug,
+        )
+        self.chi_s = chi_s
+        self.n_up_target = n_up_target
+        self.n_dn_target = n_dn_target
+        self.direct_thermal_steps = direct_thermal_steps
+        self._current_log_pc = None
+        self._current_amp = None
+
+    def reset(self):
+        super().reset()
+        self._current_log_pc = None
+        self._current_amp = None
+
+    @torch.no_grad()
+    def _sample_next(self, vstate, **kwargs):
+        """MH step: propose from p_c, accept with min(1, w_prop/w_curr)."""
+        chi_s = (
+            self.chi_s if self.chi_s is not None
+            else vstate.vstate_func.max_bond
+        )
+        for _ in range(self.direct_thermal_steps):
+            proposed_config, proposed_log_pc = vstate.vstate_func.direct_sample(
+                chi_s=chi_s,
+                n_up_target=self.n_up_target,
+                n_dn_target=self.n_dn_target,
+            )
+            proposed_config = proposed_config.to(dtype=self.dtype)
+            proposed_amp = vstate.amplitude(proposed_config)
+
+            self.attempts += 1
+
+            # First step: unconditionally accept
+            if self._current_amp is None or self._current_amp == 0:
+                self.current_config = proposed_config
+                self._current_amp = proposed_amp
+                self._current_log_pc = proposed_log_pc
+                self.accepts += 1
+                continue
+
+            log_w_prop = (
+                2.0 * np.log(abs(proposed_amp.item()) + 1e-300) - proposed_log_pc
+            )
+            log_w_curr = (
+                2.0 * np.log(abs(self._current_amp.item()) + 1e-300)
+                - self._current_log_pc
+            )
+
+            if np.log(random.random() + 1e-300) < log_w_prop - log_w_curr:
+                self.current_config = proposed_config
+                self._current_amp = proposed_amp
+                self._current_log_pc = proposed_log_pc
+                self.accepts += 1
+
+        return self.current_config, self._current_amp

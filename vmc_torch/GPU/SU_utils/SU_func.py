@@ -1,5 +1,8 @@
 import os
-from vmc_torch.fermion_utils import generate_random_fpeps_symmray
+from vmc_torch.fermion_utils import (
+    generate_random_fpeps_symmray,
+    make_pbc_dual_uniform,
+)
 import quimb.tensor as qtn
 import symmray as sr
 import pickle
@@ -154,8 +157,8 @@ def fermi_hubbard_local_array_w_spf(
         ( spfb/2/coordinations[1], (bd.dag, bd)),
     ]
 
-    basis_a = ((), (ad.dag,), (au.dag,), (au.dag, ad.dag))
-    basis_b = ((), (bd.dag,), (bu.dag,), (bu.dag, bd.dag))
+    basis_a = ((), (ad.dag,), (au.dag,), (ad.dag, au.dag))
+    basis_b = ((), (bd.dag,), (bu.dag,), (bd.dag, bu.dag))
     bases = [basis_a, basis_b]
     indexmap = get_spinful_charge_indexmap(symmetry)
 
@@ -176,9 +179,27 @@ def spf_f(sitea, siteb, target_sites: dict, spf=0):
         return 0
     return (spf*target_sites.get(sitea, 0), spf*target_sites.get(siteb, 0))
 
-def run_u1SU_w_pinning_field(
-    Lx, Ly, D, N_f, t, U, mu, cpf, cpf_target_sites, spf, spf_target_sites, pwd, seed, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)],
-    rfpeps_kwargs={'subsizes':'maximal'}, **su_kwargs
+def run_SU_w_pinning_field(
+    Lx,
+    Ly,
+    D,
+    N_f,
+    t,
+    U,
+    mu,
+    cpf,
+    cpf_target_sites,
+    spf,
+    spf_target_sites,
+    pwd,
+    seed=42,
+    symmetry='U1',
+    save_file=True,
+    run_su=True,
+    su_evolve_schedule=[(100, 0.01)],
+    rfpeps_kwargs={"subsizes": "maximal"},
+    pbc=False,
+    **su_kwargs,
 ):
     """
     Lx : int
@@ -215,18 +236,21 @@ def run_u1SU_w_pinning_field(
         Additional kwargs for SimpleUpdateGen, by default {}.
     """
     print('\n ===================================')
-    print('Running U1 SU with pinning fields:')
+    print(f'Running {symmetry} SU with pinning fields:')
     print(f'Hamiltonian parameters: t={t}, U={U}, mu={mu}')
-    print(f'fPEPS parameters: Lx={Lx}, Ly={Ly}, D={D}, N_f={N_f}, seed={seed}')
+    print(f'fPEPS parameters: Lx={Lx}, Ly={Ly}, D={D}, N_f={N_f}, seed={seed}, pbc={pbc}')
     print(f'Chemical potential: {mu}')
     print(f'Charge pinning field {cpf} on sites: {cpf_target_sites}')
     print(f'Spin pinning field {spf} on sites: {spf_target_sites}\n')
 
+    bc_subdir = 'PBC/' if pbc else ''
+    base_dir = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/{symmetry}/D={D}/{bc_subdir}'
+
     if not run_su:
         print('Just loading potentially existing SU fPEPS state...')
         # check if the file exists
-        params_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params_cpf={cpf}_spf={spf}.pkl'
-        skeleton_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_skeleton_cpf={cpf}_spf={spf}.pkl'
+        params_file = base_dir+f'peps_su_params_cpf={cpf}_spf={spf}.pkl'
+        skeleton_file = base_dir+f'peps_skeleton_cpf={cpf}_spf={spf}.pkl'
         if os.path.exists(params_file) and os.path.exists(skeleton_file):
             print('Found existing files, loading...')
             skeleton = pickle.load(open(skeleton_file, 'rb'))
@@ -241,9 +265,18 @@ def run_u1SU_w_pinning_field(
     spinless = False
 
     # SU in quimb
-    # rpeps = generate_random_fpeps(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless)[0]
-    rpeps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless, **rfpeps_kwargs)
-    edges = qtn.edges_2d_square(Lx, Ly)
+    rpeps = generate_random_fpeps_symmray(
+        Lx,
+        Ly,
+        D=D,
+        seed=seed,
+        symmetry=symmetry,
+        Nf=N_f,
+        spinless=spinless,
+        cyclic=pbc,
+        **rfpeps_kwargs,
+    )
+    edges = qtn.edges_2d_square(Lx, Ly, cyclic=pbc)
     site_info = sr.parse_edges_to_site_info(
         edges,
         D,
@@ -252,13 +285,13 @@ def run_u1SU_w_pinning_field(
         site_tag_id="I{},{}",
     )
     
-    u1_terms = {
+    ham_terms = {
         (sitea, siteb): fermi_hubbard_local_array_w_spf(
             t=t,
             U=U,
             mu=mu_f(sitea, siteb, cpf_target_sites, cpf=cpf, mu=mu),
             spf=spf_f(sitea, siteb, spf_target_sites, spf=spf),
-            symmetry="U1",
+            symmetry=symmetry,
             coordinations=(
                 site_info[sitea]["coordination"],
                 site_info[siteb]["coordination"],
@@ -267,42 +300,62 @@ def run_u1SU_w_pinning_field(
         for (sitea, siteb) in edges
     }
 
-    u1ham = qtn.LocalHam2D(Lx, Ly, H2=u1_terms)
-    u1su = qtn.SimpleUpdateGen(
-        rpeps, 
-        u1ham, 
-        D=D, 
+    # PBC SU requires LocalHamGen (quimb's LocalHam2D + cyclic path
+    # currently has a shape-mismatch bug during gate application).
+    if pbc:
+        ham = qtn.LocalHamGen(ham_terms)
+    else:
+        ham = qtn.LocalHam2D(Lx, Ly, H2=ham_terms, cyclic=pbc)
+    su = qtn.SimpleUpdateGen(
+        rpeps,
+        ham,
+        D=D,
         **su_kwargs
     )
     print('Starting SU evolution with pinning fields...')
     # Evolve the U1-fPEPS
     for n_steps, tau in su_evolve_schedule:
-        u1su.evolve(n_steps, tau=tau)
+        su.evolve(n_steps, tau=tau)
     
     
 
-    u1peps = u1su.get_state()
-    u1peps.equalize_norms_(value=1)
-    u1peps.exponent = 0.0
-    u1peps = format_fpeps_keys(u1peps)
+    peps = su.get_state()
+    peps.equalize_norms_(value=1)
+    peps.exponent = 0.0
+    peps = format_fpeps_keys(peps)
     # save the state
-    params, skeleton = qtn.pack(u1peps)
+    params, skeleton = qtn.pack(peps)
     if save_file:
-        os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}', exist_ok=True)
-        with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_skeleton_cpf={cpf}_spf={spf}.pkl', 'wb') as f:
+        os.makedirs(base_dir, exist_ok=True)
+        with open(base_dir+f'peps_skeleton_cpf={cpf}_spf={spf}.pkl', 'wb') as f:
             pickle.dump(skeleton, f)
-        with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params_cpf={cpf}_spf={spf}.pkl', 'wb') as f:
+        with open(base_dir+f'peps_su_params_cpf={cpf}_spf={spf}.pkl', 'wb') as f:
             pickle.dump(params, f)
-        fig, _ = u1su.plot()
+        fig, _ = su.plot()
         if fig is not None:
-            fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution_cpf={cpf}_spf={spf}.png')
+            fig.savefig(base_dir+f'su_evolution_cpf={cpf}_spf={spf}.png')
     print('===================================')
-    return u1peps
+    return peps
 
 
 def run_u1SU(
-    Lx, Ly, D, N_f, t, U, mu, pwd, seed=42, initial_peps=None, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)],
-    **su_kwargs
+    Lx,
+    Ly,
+    D,
+    N_f,
+    t,
+    U,
+    mu,
+    pwd,
+    seed=42,
+    initial_peps=None,
+    rfpeps_kwargs={'subsizes':'equal', 'u1_all_even':True},
+    save_file=True,
+    saved_peps_name='peps',
+    run_su=True,
+    su_evolve_schedule=[(100, 0.01)],
+    pbc=False,
+    **su_kwargs,
 ):
     """
     Lx : int
@@ -333,14 +386,17 @@ def run_u1SU(
     print('\n ===================================')
     print('Running U1 SU:')
     print(f'Hamiltonian parameters: t={t}, U={U}, mu={mu}')
-    print(f'fPEPS parameters: Lx={Lx}, Ly={Ly}, D={D}, N_f={N_f}, seed={seed}')
+    print(f'fPEPS parameters: Lx={Lx}, Ly={Ly}, D={D}, N_f={N_f}, seed={seed}, pbc={pbc}')
     print(f'Chemical potential: {mu}\n')
-    
+
+    bc_subdir = 'PBC/' if pbc else ''
+    base_dir = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/{bc_subdir}'
+
     if not run_su:
         print('Just loading potentially existing SU fPEPS state...')
         # check if the file exists
-        params_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params.pkl'
-        skeleton_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_skeleton.pkl'
+        params_file = base_dir+'peps_su_params.pkl'
+        skeleton_file = base_dir+'peps_skeleton.pkl'
         if os.path.exists(params_file) and os.path.exists(skeleton_file):
             print('Found existing files, loading...')
             skeleton = pickle.load(open(skeleton_file, 'rb'))
@@ -357,9 +413,19 @@ def run_u1SU(
         # Define the lattice shape
         spinless = False
         # SU in quimb
-        peps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='U1', Nf=N_f, spinless=spinless, subsizes='equal')
-    
-    edges = qtn.edges_2d_square(Lx, Ly)
+        peps = generate_random_fpeps_symmray(
+            Lx,
+            Ly,
+            D=D,
+            seed=seed,
+            symmetry="U1",
+            Nf=N_f,
+            spinless=spinless,
+            cyclic=pbc,
+            **rfpeps_kwargs,
+        )
+
+    edges = qtn.edges_2d_square(Lx, Ly, cyclic=pbc)
     site_info = sr.parse_edges_to_site_info(
         edges,
         D,
@@ -380,11 +446,16 @@ def run_u1SU(
         )
         for (sitea, siteb) in edges
     }
-    u1ham = qtn.LocalHam2D(Lx, Ly, H2=u1_terms)
+    # PBC SU requires LocalHamGen (quimb's LocalHam2D + cyclic path
+    # currently has a shape-mismatch bug during gate application).
+    if pbc:
+        u1ham = qtn.LocalHamGen(u1_terms)
+    else:
+        u1ham = qtn.LocalHam2D(Lx, Ly, H2=u1_terms, cyclic=pbc)
     u1su = qtn.SimpleUpdateGen(
-        peps, 
-        u1ham, 
-        D=D, 
+        peps,
+        u1ham,
+        D=D,
         **su_kwargs
     )
     # Evolve the U1-fPEPS
@@ -401,22 +472,39 @@ def run_u1SU(
     # save the state
     params, skeleton = qtn.pack(u1peps)
     if save_file:
-        os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}', exist_ok=True)
-        with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_skeleton.pkl', 'wb') as f:
+        os.makedirs(base_dir, exist_ok=True)
+        params_file = base_dir+f'{saved_peps_name}_su_params.pkl'
+        skeleton_file = base_dir+f'{saved_peps_name}_skeleton.pkl'
+
+        with open(skeleton_file, 'wb') as f:
             pickle.dump(skeleton, f)
-        with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params.pkl', 'wb') as f:
+        with open(params_file, 'wb') as f:
             pickle.dump(params, f)
         try:
             fig, _ = u1su.plot()
-            fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/su_evolution.png')
+            fig.savefig(base_dir+'su_evolution.png')
         except Exception as e:
             ...
     print('===================================')
     return u1peps
 
 def run_z2SU(
-    Lx, Ly, D, N_f, t, U, mu, pwd, seed=42, initial_peps=None, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)],
-    **su_kwargs
+    Lx,
+    Ly,
+    D,
+    N_f,
+    t,
+    U,
+    mu,
+    pwd,
+    seed=42,
+    initial_peps=None,
+    save_file=True,
+    saved_peps_name='peps',
+    run_su=True,
+    su_evolve_schedule=[(100, 0.01)],
+    pbc=False,
+    **su_kwargs,
 ):
     """
     Run SU on a Z2-fPEPS.
@@ -447,14 +535,17 @@ def run_z2SU(
     print('\n ===================================')
     print('Running Z2 SU:')
     print(f'Hamiltonian parameters: t={t}, U={U}, mu={mu}')
-    print(f'fPEPS parameters: Lx={Lx}, Ly={Ly}, D={D}, N_f={N_f}, seed={seed}')
+    print(f'fPEPS parameters: Lx={Lx}, Ly={Ly}, D={D}, N_f={N_f}, seed={seed}, pbc={pbc}')
     print(f'Chemical potential: {mu}\n')
+
+    bc_subdir = 'PBC/' if pbc else ''
+    base_dir = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/{bc_subdir}'
 
     if not run_su:
         print('Just loading potentially existing SU fPEPS state...')
         # check if the file exists
-        params_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_su_params.pkl'
-        skeleton_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_skeleton.pkl'
+        params_file = base_dir+'peps_su_params.pkl'
+        skeleton_file = base_dir+'peps_skeleton.pkl'
         if os.path.exists(params_file) and os.path.exists(skeleton_file):
             print('Found existing files, loading...')
             skeleton = pickle.load(open(skeleton_file, 'rb'))
@@ -471,9 +562,9 @@ def run_z2SU(
         # Define the lattice shape
         spinless = False
         # SU in quimb
-        peps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='Z2', Nf=N_f, spinless=spinless)[0]
+        peps = generate_random_fpeps_symmray(Lx, Ly, D=D, seed=seed, symmetry='Z2', Nf=N_f, spinless=spinless, cyclic=pbc)[0]
 
-    edges = qtn.edges_2d_square(Lx, Ly)
+    edges = qtn.edges_2d_square(Lx, Ly, cyclic=pbc)
     site_info = sr.parse_edges_to_site_info(
         edges,
         D,
@@ -494,18 +585,23 @@ def run_z2SU(
         )
         for (sitea, siteb) in edges
     }
-    z2ham = qtn.LocalHam2D(Lx, Ly, H2=z2_terms)
+    # PBC SU requires LocalHamGen (quimb's LocalHam2D + cyclic path
+    # currently has a shape-mismatch bug during gate application).
+    if pbc:
+        z2ham = qtn.LocalHamGen(z2_terms)
+    else:
+        z2ham = qtn.LocalHam2D(Lx, Ly, H2=z2_terms, cyclic=pbc)
     z2su = qtn.SimpleUpdateGen(
-        peps, 
-        z2ham, 
-        D=D, 
+        peps,
+        z2ham,
+        D=D,
         **su_kwargs
     )
     # Evolve the Z2-fPEPS
     for n_steps, tau in su_evolve_schedule:
         z2su.evolve(n_steps, tau=tau)
-    
-    
+
+
 
     z2peps = z2su.get_state()
     z2peps.equalize_norms_(value=1)
@@ -513,20 +609,37 @@ def run_z2SU(
     # save the state
     params, skeleton = qtn.pack(z2peps)
     if save_file:
-        os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}', exist_ok=True)
-        with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_skeleton.pkl', 'wb') as f:
+        os.makedirs(base_dir, exist_ok=True)
+        params_file = base_dir+f'{saved_peps_name}_su_params.pkl'
+        skeleton_file = base_dir+f'{saved_peps_name}_skeleton.pkl'
+        with open(skeleton_file, 'wb') as f:
             pickle.dump(skeleton, f)
-        with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_su_params.pkl', 'wb') as f:
+        with open(params_file, 'wb') as f:
             pickle.dump(params, f)
         fig, _ = z2su.plot()
         if fig is not None:
-            fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution.png')
+            fig.savefig(base_dir+f'{saved_peps_name}_su_evolution.png')
     print('===================================')
     return z2peps
 
 def run_z2SU_from_u1SU(
-    Lx, Ly, D, N_f, t, U, mu, pwd, u1peps=None, save_file=True, run_su=True, su_evolve_schedule=[(100, 0.01)], save_every=None, random_init=False,
-    **su_kwargs
+    Lx,
+    Ly,
+    D,
+    N_f,
+    t,
+    U,
+    mu,
+    pwd,
+    u1peps=None,
+    save_file=True,
+    saved_peps_name='peps',
+    run_su=True,
+    su_evolve_schedule=[(100, 0.01)],
+    save_every=None,
+    random_init=False,
+    pbc=False,
+    **su_kwargs,
 ):
     """
     Convert a U1-fPEPS to Z2-fPEPS and run SU on the Z2-fPEPS.
@@ -557,43 +670,55 @@ def run_z2SU_from_u1SU(
     print('\n ===================================')
     print('Running Z2 SU from U1-fPEPS:')
     print(f'Hamiltonian parameters: t={t}, U={U}, mu={mu}')
-    print(f'fPEPS parameters: Lx={Lx}, Ly={Ly}, D={D}, N_f={N_f}')
+    print(f'fPEPS parameters: Lx={Lx}, Ly={Ly}, D={D}, N_f={N_f}, pbc={pbc}')
     print(f'Chemical potential: {mu}\n')
+
+    bc_subdir = 'PBC/' if pbc else ''
+    z2_base_dir = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/{bc_subdir}'
+    u1_base_dir = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/{bc_subdir}'
 
     if not run_su:
         print('Just loading potentially existing SU fPEPS state...')
         # check if the file exists
-        params_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_su_params.pkl'
-        skeleton_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_skeleton.pkl'
+        params_file = z2_base_dir+f'{saved_peps_name}_su_params.pkl'
+        skeleton_file = z2_base_dir+f'{saved_peps_name}_skeleton.pkl'
         if os.path.exists(params_file) and os.path.exists(skeleton_file):
             print('Found existing files, loading...')
             skeleton = pickle.load(open(skeleton_file, 'rb'))
             peps_params = pickle.load(open(params_file, 'rb'))
             peps = qtn.unpack(peps_params, skeleton)
             return peps
-    
+
     if u1peps is not None:
         peps = u1peps_to_z2peps(u1peps)
     else:
         if random_init:
             print('Use random initialization instead.')
-            peps = generate_random_fpeps_symmray(Lx, Ly, D, symmetry='U1', Nf=N_f, subsizes='equal', seed=42)
+            peps = generate_random_fpeps_symmray(Lx, Ly, D, symmetry='U1', Nf=N_f, subsizes='equal', seed=42, cyclic=pbc)
             # peps = generate_random_fpeps(Lx, Ly, D=D, seed=42, symmetry='U1', Nf=N_f, spinless=False)[0]
             peps = u1peps_to_z2peps(peps)
         else:
             # try loading existing U1-fPEPS
             print('Loading existing U1-fPEPS state...')
-            params_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_su_params.pkl'
-            skeleton_file = pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/U1/D={D}/peps_skeleton.pkl'
+            params_file = u1_base_dir+f'{saved_peps_name}_su_params.pkl'
+            skeleton_file = u1_base_dir+f'{saved_peps_name}_skeleton.pkl'
             if os.path.exists(params_file) and os.path.exists(skeleton_file):
                 print('Found existing U1-fPEPS files, loading...')
                 skeleton = pickle.load(open(skeleton_file, 'rb'))
                 peps_params = pickle.load(open(params_file, 'rb'))
                 u1peps = qtn.unpack(peps_params, skeleton)
                 peps = u1peps_to_z2peps(u1peps)
-        
-    
-    edges = qtn.edges_2d_square(Lx, Ly)
+
+    # For PBC, force canonical (T, T, F, F, F) dual pattern on the Z2
+    # PEPS before Z2 SU runs. U1 SU output is necessarily non-canonical
+    # (we can't dual-flip U1 without breaking charge conservation), so
+    # the U1->Z2 conversion inherits that. Z2 SU preserves canonical
+    # patterns, so re-normalizing once here is enough.
+    if pbc:
+        peps = make_pbc_dual_uniform(peps)
+
+
+    edges = qtn.edges_2d_square(Lx, Ly, cyclic=pbc)
     site_info = sr.parse_edges_to_site_info(
         edges,
         D,
@@ -614,25 +739,30 @@ def run_z2SU_from_u1SU(
         )
         for (sitea, siteb) in edges
     }
-    z2ham = qtn.LocalHam2D(Lx, Ly, H2=z2_terms)
-    
+    # PBC SU requires LocalHamGen (quimb's LocalHam2D + cyclic path
+    # currently has a shape-mismatch bug during gate application).
+    if pbc:
+        z2ham = qtn.LocalHamGen(z2_terms)
+    else:
+        z2ham = qtn.LocalHam2D(Lx, Ly, H2=z2_terms, cyclic=pbc)
+
     def save_state(su, save_every):
         if su.n%save_every==0:
             z2peps = su.get_state()
             z2peps.equalize_norms_(value=1)
             z2peps.exponent = 0.0
             params, skeleton = qtn.pack(z2peps)
-            os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/u1su_intermediates', exist_ok=True)
-            with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/u1su_intermediates/peps_skeleton_step{su.n}.pkl', 'wb') as f:
+            os.makedirs(z2_base_dir+'u1su_intermediates', exist_ok=True)
+            with open(z2_base_dir+f'u1su_intermediates/{saved_peps_name}_skeleton_step{su.n}.pkl', 'wb') as f:
                 pickle.dump(skeleton, f)
-            with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/u1su_intermediates/peps_su_params_step{su.n}.pkl', 'wb') as f:
+            with open(z2_base_dir+f'u1su_intermediates/{saved_peps_name}_su_params_step{su.n}.pkl', 'wb') as f:
                 pickle.dump(params, f)
             print(f'Saved intermediate state at step {su.n}')
-    
+
     z2su = qtn.SimpleUpdateGen(
-        peps, 
-        z2ham, 
-        D=D, 
+        peps,
+        z2ham,
+        D=D,
         callback=(lambda su: save_state(su, save_every)) if save_every is not None else None,
         **su_kwargs
     )
@@ -662,14 +792,14 @@ def run_z2SU_from_u1SU(
         assert ts.data._phases == {}
 
     if save_file:
-        os.makedirs(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}', exist_ok=True)
-        with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_skeleton_U1SU.pkl', 'wb') as f:
+        os.makedirs(z2_base_dir, exist_ok=True)
+        with open(z2_base_dir+f'{saved_peps_name}_skeleton_U1SU.pkl', 'wb') as f:
             pickle.dump(skeleton, f)
-        with open(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/peps_su_params_U1SU.pkl', 'wb') as f:
+        with open(z2_base_dir+f'{saved_peps_name}_su_params_U1SU.pkl', 'wb') as f:
             pickle.dump(params, f)
         try:
             fig, _ = z2su.plot()
-            fig.savefig(pwd+f'/{Lx}x{Ly}/t={t}_U={U}/N={N_f}/Z2/D={D}/su_evolution_U1SU.png')
+            fig.savefig(z2_base_dir+f'{saved_peps_name}_su_evolution_U1SU.png')
         except Exception:
             ...
     

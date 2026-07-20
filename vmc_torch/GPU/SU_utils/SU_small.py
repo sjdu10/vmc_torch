@@ -8,7 +8,7 @@ from SU_func import (
 
 Lx, Ly = 3, 2
 D0 = 4
-N_f = Lx*Ly-2
+N_f = Lx*Ly
 t = 1.0
 U = 8.0
 mu = 0.0
@@ -28,7 +28,10 @@ su_kwargs = {
 D1 = 4
 beta = 5
 su_evolve_schedule = [
-    (50, 0.01),
+    (100, 0.05),
+    (100, 0.01),
+    # (100, 0.005),
+    (100, 0.001),
 ]
 u1peps = run_u1SU(
     Lx=Lx,
@@ -39,6 +42,7 @@ u1peps = run_u1SU(
     pwd=pwd,
     seed=seed,
     initial_peps=None,
+    rfpeps_kwargs={'subsizes':'equal', 'u1_all_even':True},
     save_file=True,
     run_su=True,
     su_evolve_schedule=su_evolve_schedule,
@@ -113,7 +117,7 @@ su_kwargs = {
 D2 = 4
 beta = 5
 su_evolve_schedule = [
-    (100, 0.001),
+    (10, 0.001),
 ]
 z2peps = run_z2SU_from_u1SU(
     Lx=Lx,

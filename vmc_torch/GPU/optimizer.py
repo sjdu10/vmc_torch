@@ -11,13 +11,6 @@ from vmc_torch.GPU.torch_utils import (
     torch_minres,
 )
 
-# from vmc_torch.GPU.vmc_modules import (
-#     distributed_minres_solver_gpu,
-#     distributed_minSR_solver_gpu,
-#     minSR_solver_gpu,
-# )
-
-
 # ============================================================
 #  Learning rate schedulers
 # ============================================================
@@ -130,8 +123,23 @@ class DecayScheduler(Scheduler):
 class OptimizerGPU:
     """Base optimizer interface for updating model parameters from a direction."""
 
+    # Subclasses with persistent state (momenta, step counter, etc.)
+    # override this tuple to list the attribute names that should be
+    # round-tripped through checkpoints. Stateless optimizers (e.g.
+    # plain SGD) leave it empty and ``state_dict()`` returns ``{}``.
+    _STATE_ATTRS: tuple = ()
+
     def __init__(self, learning_rate: float = 1e-3):
         self.lr = learning_rate
+
+    def state_dict(self) -> dict:
+        """Snapshot stateful attributes for checkpointing."""
+        return {a: getattr(self, a) for a in self._STATE_ATTRS}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore stateful attributes from a snapshot."""
+        for a, v in state.items():
+            setattr(self, a, v)
 
     def compute_update(
         self,
@@ -149,18 +157,28 @@ class OptimizerGPU:
         learning_rate: Optional[float] = None,
     ) -> None:
         with torch.no_grad():
-            current = torch.nn.utils.parameters_to_vector(model.parameters())
+            # reshape(-1) (not parameters_to_vector, whose .view(-1)
+            # fails on non-contiguous params) so symmray-backed TN
+            # params (train_tn=True) flatten without error.
+            current = torch.cat(
+                [p.reshape(-1) for p in model.parameters()]
+            )
+            model_dtype = current.dtype
             target_device = current.device if device is None else device
+            # Compute update in float64 for numerical accuracy,
+            # then cast result back to model dtype (no-op for f64 models).
+            current_f64 = current.to(torch.float64)
             direction_t = torch.as_tensor(
                 direction,
                 device=target_device,
-                dtype=current.dtype,
+                dtype=torch.float64,
             )
-            updated = self.compute_update(
-                current,
+            updated_f64 = self.compute_update(
+                current_f64,
                 direction_t,
                 learning_rate=learning_rate,
             )
+            updated = updated_f64.to(model_dtype)
             # Copy values in-place to preserve storage identity.
             # vector_to_parameters replaces .data with views of one
             # big tensor, which changes storage layout and triggers
@@ -216,6 +234,8 @@ class SGDGPU(OptimizerGPU):
 
 
 class AdamGPU(OptimizerGPU):
+    _STATE_ATTRS = ('t', 'm', 'v')
+
     def __init__(
         self,
         learning_rate: float = 1e-3,
@@ -262,816 +282,333 @@ class AdamGPU(OptimizerGPU):
         self.v = None
 
 
+def _two_term_shift(trace_gram, n, rshift, ashift):
+    """Two-term Tikhonov shift for an (n, n) Gram matrix.
+
+    ``shift = rshift * trace(Gram) / sqrt(n) + ashift``
+
+    ``rshift`` scales with the magnitude of the Gram (relative
+    term); ``ashift`` is an absolute floor. ``trace_gram`` must be
+    the trace of the matrix actually being shifted.
+    """
+    return rshift * trace_gram / math.sqrt(n) + ashift
+
+
 class PreconditionerGPU:
-    """Base SR/preconditioner interface for solving update directions."""
+    """Base preconditioner interface for solving gradient update directions."""
+
+    # See OptimizerGPU._STATE_ATTRS for semantics. Stateful subclasses
+    # (SPRING/MARCH/AdamSR variants) list their momentum buffers here
+    # so checkpoints can round-trip them.
+    _STATE_ATTRS: tuple = ()
+
+    # Absolute-value outlier mask threshold on local energies. When
+    # set, samples with ``|E_loc| > local_E_clip`` are entirely
+    # masked from the SR solve: both their E_loc AND their O_loc row
+    # are zeroed, the global mean is recomputed from clean samples,
+    # and the effective sample count drops accordingly. ``None``
+    # disables. The outer VMC main loop is NOT affected -- the
+    # energy displayed / saved to stats is still the unclipped MC
+    # mean (outliers are signal about the wavefunction, not noise
+    # to be hidden).
+    local_E_clip: Optional[float] = None
+
+    # Populated by :meth:`_mask_outlier_samples` on each ``solve``
+    # call when ``local_E_clip`` is set. ``None`` if clip disabled
+    # or no samples were masked.
+    _last_mask_info: Optional[dict] = None
+
+    def state_dict(self) -> dict:
+        """Snapshot stateful attributes for checkpointing."""
+        return {a: getattr(self, a) for a in self._STATE_ATTRS}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore stateful attributes from a snapshot."""
+        for a, v in state.items():
+            setattr(self, a, v)
+
+    def _mask_outlier_samples(self, E_loc, O_loc, E_mean, Ns):
+        """Zero out (E_loc, O_loc) rows that are non-finite, or — when
+        ``local_E_clip`` is set — have ``|E_loc| > clip``.
+
+        Non-finite masking (NaN/Inf in E, or any NaN/Inf entry in the
+        O row) is ALWAYS on: fp32 forward/backward can emit NaN/Inf
+        gradients that would otherwise poison the whole Ns x Ns Gram
+        (T = O Oᵀ goes all-NaN, and the diagonal shift — applied after
+        T — cannot rescue it). It also fixes an ``E_mean`` that was
+        already NaN-poisoned upstream, by recomputing the clean mean.
+        ``local_E_clip`` is an additional opt-in energy-outlier filter.
+
+        Returns ``(E_loc_clean, O_loc_clean, E_mean_clean, Ns_clean)``.
+        Masked samples contribute 0 to ``<E*O>``, ``<O>``, and to the
+        QGT ``<O O>``, so direction and centering stay self-consistent
+        over the clean subset. ``E_mean_clean`` and ``Ns_clean`` are
+        aggregated across MPI ranks; ``self._last_mask_info`` carries
+        ``n_masked`` (global) and ``E_mean_clean`` for downstream
+        diagnostic printing (``None`` when nothing is masked).
+        """
+        clip = getattr(self, 'local_E_clip', None)
+
+        # Local mask (per-rank): always drop non-finite rows; optionally
+        # also drop |E| > clip outliers. A non-finite entry anywhere in
+        # an O row makes its sum(dim=1) non-finite.
+        E_t = E_loc if isinstance(E_loc, torch.Tensor) else (
+            torch.as_tensor(E_loc, dtype=torch.float64)
+        )
+        # O_loc may be offloaded to a different device than E_loc (e.g.
+        # CPU when offload_grad_to_cpu=True); align its finiteness check
+        # to E_t's device before combining to avoid a device mismatch.
+        o_nonfinite = (~torch.isfinite(O_loc.sum(dim=1))).to(E_t.device)
+        nonfinite = ~torch.isfinite(E_t) | o_nonfinite
+        mask = nonfinite if clip is None else (
+            nonfinite | (E_t.abs() > clip)
+        )
+
+        # Aggregate (total masked, non-finite) counts globally in one
+        # all_reduce; bail early if nothing was masked (common case).
+        counts = torch.stack([mask.sum(), nonfinite.sum()]).long()
+        if self._world_size() > 1:
+            counts = counts.to(E_t.device if E_t.is_cuda else 'cpu')
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        n_masked_global, n_nonfinite_global = counts.tolist()
+
+        if n_masked_global == 0:
+            self._last_mask_info = None
+            return E_loc, O_loc, E_mean, Ns
+
+        # Zero out masked entries on E_loc and the matching O_loc rows.
+        E_clean_t = E_t.clone()
+        E_clean_t[mask] = 0.0
+
+        O_loc[mask.to(O_loc.device)] = 0.0
+        O_clean = O_loc
+
+        # Globally recompute clean mean / sample count
+        sum_E_clean_local = E_clean_t.sum()
+        if self._world_size() > 1:
+            sum_E_clean_t = sum_E_clean_local.to(
+                E_t.device if E_t.is_cuda else 'cpu',
+            )
+            dist.all_reduce(sum_E_clean_t, op=dist.ReduceOp.SUM)
+            sum_E_clean = float(sum_E_clean_t.item())
+        else:
+            sum_E_clean = float(sum_E_clean_local.item())
+        Ns_clean = Ns - n_masked_global
+        E_mean_clean = (
+            sum_E_clean / Ns_clean if Ns_clean > 0 else float(E_mean)
+        )
+
+        self._last_mask_info = {
+            'n_masked': n_masked_global,
+            'n_nonfinite': n_nonfinite_global,
+            'Ns_clean': Ns_clean,
+            'Ns_total': Ns,
+            'E_mean_clean': E_mean_clean,
+            'clip': clip,
+        }
+
+        # Preserve container type for E_loc.
+        if isinstance(E_loc, torch.Tensor):
+            out_E = E_clean_t
+        else:
+            out_E = E_clean_t.cpu().numpy()
+        return out_E, O_clean, E_mean_clean, Ns_clean
 
     def solve(
         self,
         *,
-        local_o,
-        local_energies,
-        energy_mean: float,
-        total_samples: int,
-        n_params: int,
-        diag_shift: float,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
         device: torch.device,
-        run_sr: bool,
+    ) -> Tuple[Any, float, Any]:
+        """Public entry: optionally mask outlier samples (when
+        ``local_E_clip`` is set) and then delegate to subclass
+        :meth:`_solve`. Subclasses should override ``_solve`` only.
+
+        ``O_loc`` may be a tensor, or a 1-element "ownership box"
+        ``[tensor]`` (handed down by ``run_vmc_loop`` for
+        preconditioners with ``_supports_ownership_box``). When a box
+        is given we unwrap it for masking, then forward a *fresh* box
+        to ``_solve`` and drop the tensor reference from this frame —
+        so ``_solve`` can free the (Ns, Np) Jacobian internally
+        instead of it lingering here for the whole solve. Plain-tensor
+        callers are forwarded unchanged.
+        """
+        received_box = isinstance(O_loc, list)
+        O_tensor = O_loc[0] if received_box else O_loc
+        if received_box:
+            O_loc[0] = None  # drop the incoming box's reference
+
+        # Masking zeroes outlier rows in-place but keeps the tensor
+        # lengths, so the *physical* sample count ``Ns`` is unchanged —
+        # only the statistics use the clean count (recorded in
+        # ``_last_mask_info`` for reporting). We keep ``Ns`` physical so
+        # the distributed gather / Gram dimension stays consistent
+        # (sizing by the clean count would mismatch the full-length
+        # E_scaled rows), and use the clean ``E_mean`` for centering.
+        E_loc, O_tensor, E_mean, _Ns_clean = self._mask_outlier_samples(
+            E_loc, O_tensor, E_mean, Ns,
+        )
+
+        if received_box:
+            O_arg = [O_tensor]
+            del O_tensor  # this frame no longer references the tensor
+        else:
+            O_arg = O_tensor
+
+        return self._solve(
+            O_loc=O_arg,
+            E_loc=E_loc,
+            E_mean=E_mean,
+            Ns=Ns,
+            Np=Np,
+            rshift=rshift,
+            ashift=ashift,
+            device=device,
+        )
+
+    def _solve(
+        self,
+        *,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
+        device: torch.device,
     ) -> Tuple[Any, float, Any]:
         raise NotImplementedError
 
+    @staticmethod
+    def _rank() -> int:
+        return dist.get_rank() if dist.is_initialized() else 0
 
-# ===========================================================================
-# Distributed MINRES SR Solver (via torch.distributed.all_reduce)
-# ===========================================================================
-def distributed_minres_solver_gpu(
-    local_lpg,
-    local_energies,
-    energy_mean,
-    total_samples,
-    n_params,
-    diag_shift,
-    rtol=1e-4,
-    maxiter=100,
-    run_SR=True,
-    use_scipy=False,
-    device=None,
-):
-    """
-    Distributed SR solver using MINRES with torch.distributed.all_reduce.
+    @staticmethod
+    def _world_size() -> int:
+        return dist.get_world_size() if dist.is_initialized() else 1
 
-    Each rank holds its local log_psi_grad chunk. The matrix-vector
-    products for S = (1/N) O^T O - mean_lpg @ mean_lpg^T + diag_shift * I
-    are computed distributedly via matvec (no Np x Np matrix built).
+    @staticmethod
+    def _device(device: Optional[torch.device]) -> torch.device:
+        return torch.device('cuda') if device is None else device
 
-    By default uses pure-PyTorch MINRES (torch_minres) so everything
-    stays on GPU.  Set use_scipy=True to fall back to the old CPU
-    scipy.sparse.linalg.minres path (for debugging / validation).
-
-    Args:
-        local_lpg: (n_local, Np) GPU tensor or numpy array.
-        local_energies: (n_local,) GPU tensor or numpy array.
-        energy_mean: global mean energy (float).
-        total_samples: total samples across all ranks.
-        n_params: number of parameters.
-        diag_shift: diagonal regularization.
-        rtol: MINRES tolerance.
-        maxiter: max MINRES iterations.
-        run_SR: if False, return only the energy gradient.
-        use_scipy: if True, use scipy MINRES on CPU (fallback).
-
-    Returns:
-        dp: (Np,) GPU tensor (or numpy if use_scipy), param update.
-        sr_time: wall-clock time.
-        info: MINRES convergence flag.
-    """
-    t0 = time.time()
-    world_size = dist.get_world_size()
-    if device is None:
-        device = torch.device('cuda')
-
-    # --- Check if lpg_loc is already on CPU ---
-    lpgloc_on_cpu = (
-        isinstance(local_lpg, torch.Tensor)
-        and local_lpg.device.type == 'cpu'
-    ) or isinstance(local_lpg, np.ndarray)
-
-    if use_scipy:
-        assert lpgloc_on_cpu, "use_scipy=True requires local_lpg on CPU"
-        # --- Fast path: lpg_loc already on CPU ---
-        # Compute stats on CPU, only briefly use GPU for
-        # all_reduce of (Np,) vectors.
-        if isinstance(local_lpg, torch.Tensor):
-            local_lpg_np = local_lpg.numpy()
+    @staticmethod
+    def _to_f64_tensor(
+        x,
+        device: torch.device,
+        *,
+        contiguous: bool = False,
+        dtype: torch.dtype = torch.float64,
+    ) -> torch.Tensor:
+        # Ownership box: a 1-element list ``[tensor]`` handed down by
+        # solve() so the Jacobian can be released inside _solve.
+        # Unwrap and null the box here so this becomes the only
+        # remaining reference to the underlying tensor.
+        # ``dtype`` defaults to fp64 (existing callers unchanged); pass
+        # fp32 to keep the tensor in single precision (e.g. to do the
+        # communication in fp32 and upcast only afterwards).
+        if isinstance(x, list):
+            t = x[0]
+            x[0] = None
+            x = t
+        if isinstance(x, torch.Tensor):
+            y = x.to(device=device, dtype=dtype)
         else:
-            local_lpg_np = np.asarray(
-                local_lpg, dtype=np.float64,
-            )
+            y = torch.as_tensor(x, device=device, dtype=dtype)
+        return y.contiguous() if contiguous else y
 
-        if isinstance(local_energies, torch.Tensor):
-            local_E_np = local_energies.cpu().numpy()
-        else:
-            local_E_np = np.asarray(
-                local_energies, dtype=np.float64,
-            )
-        n_local = local_E_np.shape[0]
-
+    def _energy_gradient(
+        self,
+        O_loc: torch.Tensor,
+        E_loc: torch.Tensor,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        n_local = E_loc.shape[0]
         if n_local > 0:
-            local_sum_lpg_np = local_lpg_np.sum(axis=0)
-            local_sum_EO_np = local_E_np @ local_lpg_np
+            O_sum = O_loc.sum(dim=0)
+            EO_sum = E_loc @ O_loc
         else:
-            local_sum_lpg_np = np.zeros(
-                n_params, dtype=np.float64,
-            )
-            local_sum_EO_np = np.zeros(
-                n_params, dtype=np.float64,
-            )
+            O_sum = torch.zeros(Np, device=device, dtype=torch.float64)
+            EO_sum = torch.zeros(Np, device=device, dtype=torch.float64)
 
-        # all_reduce requires GPU tensors (NCCL)
-        if world_size > 1:
-            sum_lpg_gpu = torch.tensor(
-                local_sum_lpg_np, device=device,
-            )
-            sum_EO_gpu = torch.tensor(
-                local_sum_EO_np, device=device,
-            )
-            dist.all_reduce(
-                sum_lpg_gpu, op=dist.ReduceOp.SUM,
-            )
-            dist.all_reduce(
-                sum_EO_gpu, op=dist.ReduceOp.SUM,
-            )
-            local_sum_lpg_np = sum_lpg_gpu.cpu().numpy()
-            local_sum_EO_np = sum_EO_gpu.cpu().numpy()
-            del sum_lpg_gpu, sum_EO_gpu
+        if self._world_size() > 1:
+            dist.all_reduce(O_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(EO_sum, op=dist.ReduceOp.SUM)
 
-        mean_lpg_np = local_sum_lpg_np / total_samples
-        mean_EO_np = local_sum_EO_np / total_samples
-        energy_grad_np = (
-            mean_EO_np - energy_mean * mean_lpg_np
-        )
+        O_mean = O_sum / Ns
+        EO_mean = EO_sum / Ns
+        return EO_mean - E_mean * O_mean, O_mean, n_local
 
-        if not run_SR:
-            t1 = time.time()
-            return energy_grad_np, t1 - t0, None
+    def _O_mean(
+        self,
+        O_loc: torch.Tensor,
+        Ns: int,
+    ):
+        O_sum = O_loc.sum(dim=0)
+        if self._world_size() > 1:
+            dist.all_reduce(O_sum, op=dist.ReduceOp.SUM)
+        return O_sum / Ns
 
-        # scipy MINRES on CPU (lpg_loc stays on CPU)
-        if world_size == 1:
-            def matvec(x):
-                inner = local_lpg_np.dot(x)
-                Sx = local_lpg_np.T.dot(inner)
-                Sx /= total_samples
-                Sx -= np.dot(mean_lpg_np, x) * mean_lpg_np
-                return Sx + diag_shift * x
-        else:
-            def matvec(x):
-                if n_local > 0:
-                    inner = local_lpg_np.dot(x)
-                    local_Sx = local_lpg_np.T.dot(inner)
-                else:
-                    local_Sx = np.zeros_like(x)
-                Sx_t = torch.tensor(
-                    local_Sx, device=device,
-                )
-                dist.all_reduce(
-                    Sx_t, op=dist.ReduceOp.SUM,
-                )
-                Sx = Sx_t.cpu().numpy()
-                Sx /= total_samples
-                Sx -= np.dot(mean_lpg_np, x) * mean_lpg_np
-                return Sx + diag_shift * x
+    def _solve_cholesky(
+        self,
+        T: torch.Tensor,
+        rhs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int]:
+        """Solve the SPD system T alpha = rhs by Cholesky.
 
-        A = spla.LinearOperator(
-            (n_params, n_params), matvec=matvec,
-            dtype=np.float64,
-        )
-        dp, info = spla.minres(
-            A, energy_grad_np,
-            rtol=rtol, maxiter=maxiter,
-        )
-        t1 = time.time()
-        return dp, t1 - t0, info
+        No PD check / fallback: T is assumed positive definite after the
+        diagonal shift (matches Ao's ``solve(assume_a="pos")``). The
+        returned int is always 0, kept only for caller-signature
+        compatibility.
+        """
+        L, _ = torch.linalg.cholesky_ex(T)
+        alpha = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)
+        return alpha, 0
+    
+class TrivialPreconditionerGPU(PreconditionerGPU):
+    """No preconditioning: return the raw energy gradient as the update direction."""
 
-    # --- Standard path: ensure inputs are GPU tensors ---
-    assert isinstance(local_lpg, torch.Tensor), "local_lpg must be a torch.Tensor"
-    assert isinstance(local_energies, torch.Tensor), "local_energies must be a torch.Tensor"
-    if lpgloc_on_cpu:
-      t0 = time.time()
-      local_lpg = local_lpg.to(device=device, dtype=torch.float64)
-      if dist.get_rank() == 0:
-          print(f'SR: reload lpg from cpu to gpu, time = {time.time() - t0:.2f}s')
-
-    n_local = local_energies.shape[0]
-
-    # --- Compute global statistics via all_reduce on GPU ---
-    if n_local > 0:
-        local_sum_lpg = local_lpg.sum(dim=0)              # (Np,)
-        local_sum_EO = local_energies @ local_lpg       # (Np,)
-    else:
-        local_sum_lpg = torch.zeros(
-            n_params, device=device, dtype=torch.float64,
-        )
-        local_sum_EO = torch.zeros(
-            n_params, device=device, dtype=torch.float64,
-        )
-
-    if world_size > 1:
-        dist.all_reduce(local_sum_lpg, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
-
-    mean_lpg = local_sum_lpg / total_samples
-    mean_EO = local_sum_EO / total_samples
-    energy_grad = mean_EO - energy_mean * mean_lpg  # (Np,) GPU
-
-    if not run_SR:
-        t1 = time.time()
-        return energy_grad, t1 - t0, None
-
-    # --- Pure-GPU MINRES via torch_minres ---
-    if world_size == 1:
-        def gpu_matvec(x):
-            inner = local_lpg @ x               # (n_local,)
-            Sx = local_lpg.T @ inner             # (Np,)
-            Sx /= total_samples
-            Sx -= torch.dot(mean_lpg, x) * mean_lpg
-            return Sx + diag_shift * x
-    else:
-        def gpu_matvec(x):
-            if n_local > 0:
-                inner = local_lpg @ x
-                local_Sx = local_lpg.T @ inner
-            else:
-                local_Sx = torch.zeros_like(x)
-            dist.all_reduce(local_Sx, op=dist.ReduceOp.SUM)
-            local_Sx /= total_samples
-            local_Sx -= torch.dot(mean_lpg, x) * mean_lpg
-            return local_Sx + diag_shift * x
-
-    dp, info = torch_minres(
-        gpu_matvec, energy_grad, rtol=rtol, maxiter=maxiter,
-    )
-
-    t1 = time.time()
-    return dp, t1 - t0, info
-
-
-# ===========================================================================
-# MinSR Direct Solver (gather to rank 0, GPU linear algebra)
-# ===========================================================================
-def minSR_solver_gpu(
-    local_lpg,
-    local_energies,
-    energy_mean,
-    total_samples,
-    n_params,
-    diag_shift=1e-4,
-    device=None,
-    do_SR=True,
-):
-    """
-    MinSR direct solver: gather lpg_loc to rank 0, solve in sample space.
-
-    Efficient when Total_Ns < Np (common for NN-based VMC).
-    Uses GPU linear algebra for the (Ns x Ns) solve.
-
-    Args:
-        local_lpg: (n_local, Np) numpy array
-        local_energies: (n_local,) numpy array
-        energy_mean: global mean energy
-        total_samples: total across all ranks
-        n_params: number of parameters
-        diag_shift: regularization
-        device: torch device for GPU solve
-
-    Returns:
-        dp: (Np,) numpy array
-        sr_time: float
-        info: 0 (success) or error flag
-    """
-    if do_SR:
+    def _solve(
+        self,
+        *,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
+        device: torch.device,
+    ) -> Tuple[Any, float, Any]:
         t0 = time.time()
-        if device is None:
-            device = torch.device('cuda')
-
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-
-        # Accept GPU tensors — skip re-upload if already on device
-        if isinstance(local_lpg, torch.Tensor):
-            local_lpg_t = local_lpg.to(
-                device=device, dtype=torch.float64
-            ).contiguous()
-            local_E_t = local_energies.to(
-                device=device, dtype=torch.float64
-            ).contiguous()
-        else:
-            local_lpg_t = torch.tensor(
-                local_lpg, device=device, dtype=torch.float64
-            ).contiguous()
-            local_E_t = torch.tensor(
-                local_energies, device=device, dtype=torch.float64
-            ).contiguous()
-
-        if world_size > 1:
-            # Gather lpg_loc and energies across ranks
-            total_lpg_t = torch.zeros(
-                (total_samples, n_params),
-                device=device, dtype=torch.float64,
-            )
-            total_E_t = torch.zeros(
-                total_samples, device=device, dtype=torch.float64,
-            )
-            dist.all_gather_into_tensor(total_lpg_t, local_lpg_t)
-            dist.all_gather_into_tensor(total_E_t, local_E_t)
-        else:
-            total_lpg_t = local_lpg_t
-            total_E_t = local_E_t
-
-        info = 0
-        dp_t = torch.zeros(
-            n_params, device=device, dtype=torch.float64
+        device = self._device(device)
+        O_loc = self._to_f64_tensor(O_loc, device)
+        E_loc = self._to_f64_tensor(E_loc, device)
+        energy_grad, _, _ = self._energy_gradient(
+            O_loc, E_loc, E_mean, Ns, Np, device,
         )
-
-        if rank == 0:
-            lpg_mean = torch.mean(total_lpg_t, dim=0)
-            lpg_centered = total_lpg_t - lpg_mean.unsqueeze(0)
-            lpg_scaled = lpg_centered / np.sqrt(total_samples)
-            E_s = (total_E_t - energy_mean) / np.sqrt(total_samples)
-
-            # Gram matrix T = lpg_scaled @ lpg_scaled^T  (Ns x Ns)
-            T = lpg_scaled @ lpg_scaled.T
-            T += diag_shift * torch.eye(
-                total_samples, device=device, dtype=torch.float64,
-            )
-
-            try:
-                x = torch.linalg.solve(T, E_s)
-            except RuntimeError:
-                x = torch.linalg.lstsq(T, E_s).solution
-                info = 1
-
-            dp_t = lpg_scaled.T @ x
-
-        if world_size > 1:
-            dist.broadcast(dp_t, src=0)
-
-        dp = dp_t.cpu().numpy()
-        t1 = time.time()
-        return dp, t1 - t0, info
-    else:
-        # Compute energy gradient only (no SR solve)
-        t0 = time.time()
-        if device is None:
-            device = torch.device('cuda')
-
-        # Accept GPU tensors
-        if isinstance(local_lpg, torch.Tensor):
-            local_lpg = local_lpg.to(device=device, dtype=torch.float64)
-            local_energies = local_energies.to(
-                device=device, dtype=torch.float64
-            )
-        else:
-            local_lpg = torch.tensor(
-                local_lpg, device=device, dtype=torch.float64
-            )
-            local_energies = torch.tensor(
-                local_energies, device=device, dtype=torch.float64
-            )
-
-        world_size = dist.get_world_size()
-        n_local = local_energies.shape[0]
-
-        if n_local > 0:
-            local_sum_lpg = local_lpg.sum(dim=0)                      # (Np,)
-            local_sum_EO = local_energies @ local_lpg               # (Np,)
-        else:
-            local_sum_lpg = torch.zeros(
-                n_params, device=device, dtype=torch.float64
-            )
-            local_sum_EO = torch.zeros(
-                n_params, device=device, dtype=torch.float64
-            )
-
-        if world_size > 1:
-            dist.all_reduce(local_sum_lpg, op=dist.ReduceOp.SUM)
-            dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
-
-        mean_lpg = local_sum_lpg / total_samples
-        mean_EO = local_sum_EO / total_samples
-        energy_grad = (mean_EO - energy_mean * mean_lpg).cpu().numpy()
-
-        t1 = time.time()
-        return energy_grad, t1 - t0, None
+        return energy_grad, time.time() - t0, None
 
 
-# ===========================================================================
-# Distributed MinSR Solver (all_to_all column redistribution, GPU only)
-# ===========================================================================
-def distributed_minSR_solver_gpu(
-    local_lpg,
-    local_energies,
-    energy_mean,
-    total_samples,
-    n_params,
-    diag_shift=1e-4,
-    device=None,
-    do_SR=True,
-):
-    """Distributed minSR solver via all_to_all column redistribution.
+class IterSRGPU(PreconditionerGPU):
+    """Distributed SR in Np-form using MINRES.
 
-    Each rank starts with a (B, Np) row-block of the centered,
-    1/sqrt(Ns)-scaled log-psi gradient O.  A single
-    `dist.all_to_all_single` redistributes O so each rank holds
-    (Ns_total, Np_per_rank) — a column-block.  Each rank then forms
-    its local Gram contribution `G_local = O_cols @ O_cols.T` and a
-    single `all_reduce(SUM)` produces the global (Ns x Ns) Gram on
-    every rank.  The (Ns x Ns) Tikhonov-regularized SPD system is
-    solved via Cholesky (replicated on every rank).  `dp` is
-    reconstructed via `O_cols.T @ alpha` and an `all_gather` of the
-    Np_per_rank slices.
-
-    Implements Eq. 10 + Eq. 17 of Rende et al. 2024
-    (`refs/parallel_minSR.pdf`); see also Fig. 2 there for the
-    transpose pattern.
-
-    Per-rank peak GPU memory (after `local_lpg` is freed): roughly
-    `max(Ns_total^2, Ns_total * Np_per_rank)`.
-
-    Args:
-        local_lpg: (B, Np) GPU tensor (float64). The caller must not
-            rely on it being preserved — this routine modifies it
-            in place when computing the centered/scaled O.
-        local_energies: (B,) GPU tensor (float64).
-        energy_mean: global mean energy (float).
-        total_samples: total samples across all ranks (Ns_total).
-            Required to satisfy `Ns_total == B * world_size`.
-        n_params: number of parameters Np.
-        diag_shift: Tikhonov shift lambda added to the (Ns x Ns)
-            Gram diagonal. No singular-value cutoff is applied.
-        device: torch device for GPU compute (default cuda).
-        do_SR: if False, return only the energy gradient (no SR
-            solve, no all_to_all).
-
-    Returns:
-        dp: (Np,) GPU tensor, parameter update direction.
-        sr_time: wall-clock time (float).
-        info: 0 on Cholesky success, 1 if lstsq fallback was used.
+    Matrix-vector products for
+    ``S = O.T @ O / Ns - O_mean O_mean.T + shift I`` are formed
+    locally and summed with ``all_reduce``; the dense ``Np x Np``
+    matrix is never built. The Tikhonov shift is two-term:
+    ``shift = rshift * trace(S)/sqrt(Np) + ashift``.
     """
-    t0 = time.time()
-    if device is None:
-        device = torch.device('cuda')
-    world_size = dist.get_world_size()
 
-    # --- Normalize inputs (GPU only) ---
-    if not isinstance(local_lpg, torch.Tensor):
-        local_lpg = torch.as_tensor(
-            local_lpg, device=device, dtype=torch.float64,
-        ).contiguous()
-    else:
-        local_lpg = local_lpg.to(
-            device=device, dtype=torch.float64,
-        ).contiguous()
-
-    if not isinstance(local_energies, torch.Tensor):
-        local_energies = torch.tensor(
-            local_energies, device=device, dtype=torch.float64,
-        )
-    else:
-        local_energies = local_energies.to(
-            device=device, dtype=torch.float64,
-        )
-
-    n_local = local_energies.shape[0]  # B = Ns_total / world_size
-
-    # --- Step 1: global statistics via all_reduce on (Np,) ---
-    if n_local > 0:
-        local_sum_lpg = local_lpg.sum(dim=0)             # (Np,)
-        local_sum_EO = local_energies @ local_lpg        # (Np,)
-    else:
-        local_sum_lpg = torch.zeros(
-            n_params, device=device, dtype=torch.float64,
-        )
-        local_sum_EO = torch.zeros(
-            n_params, device=device, dtype=torch.float64,
-        )
-
-    if world_size > 1:
-        dist.all_reduce(local_sum_lpg, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
-
-    mean_lpg = local_sum_lpg / total_samples              # (Np,)
-    mean_EO = local_sum_EO / total_samples                # (Np,)
-    energy_grad = mean_EO - energy_mean * mean_lpg        # (Np,)
-
-    if not do_SR:
-        t1 = time.time()
-        return energy_grad, t1 - t0, None
-
-    # --- Step 2: center & scale O = (lpg - mean) / sqrt(Ns) in place ---
-    sqrt_Ns = math.sqrt(total_samples)
-    local_lpg.sub_(mean_lpg.unsqueeze(0))
-    local_lpg.div_(sqrt_Ns)
-    # local_lpg is now O_local with shape (B, Np)
-
-    # --- Step 6 (cheap; do it before freeing local_lpg) ---
-    # Energies are tiny — gather them now so we can free buffers
-    # in the right order later.
-    local_E_scaled = (local_energies - energy_mean) / sqrt_Ns  # (B,)
-    if world_size > 1:
-        total_E = torch.empty(
-            total_samples, device=device, dtype=torch.float64,
-        )
-        dist.all_gather_into_tensor(total_E, local_E_scaled)
-    else:
-        total_E = local_E_scaled
-
-    # --- Steps 3-5: column redistribution and local Gram ---
-    if world_size > 1:
-        # Pad Np up to a multiple of world_size for a uniform a2a.
-        np_per_rank = (n_params + world_size - 1) // world_size
-        np_pad = world_size * np_per_rank
-
-        if np_pad != n_params:
-            # Allocate a padded buffer (B, np_pad). Bulk-copy
-            # the live cols and zero the tail.
-            send_padded = torch.zeros(
-                (n_local, np_pad),
-                device=device, dtype=torch.float64,
-            )
-            send_padded[:, :n_params].copy_(local_lpg)
-            del local_lpg
-        else:
-            send_padded = local_lpg
-            local_lpg = None  # release the local handle
-
-        # Build send buffer with shape (world_size, B, np_per_rank)
-        # where slot i carries the columns destined for rank i.
-        # view->permute requires .contiguous() for all_to_all_single.
-        send_buf = (
-            send_padded
-            .view(n_local, world_size, np_per_rank)
-            .permute(1, 0, 2)
-            .contiguous()
-        )
-        del send_padded  # send_buf owns the data now
-
-        recv_buf = torch.empty_like(send_buf)
-        dist.all_to_all_single(recv_buf, send_buf)
-        del send_buf
-
-        # After a2a: recv_buf[j] is the slab from rank j.
-        # Concatenating along the sample axis gives the full
-        # (Ns_total, np_per_rank) column-block on this rank.
-        o_cols = recv_buf.reshape(world_size * n_local, np_per_rank)
-        del recv_buf
-
-        # Local Gram contribution and global sum.
-        g = o_cols @ o_cols.T                              # (Ns, Ns)
-        dist.all_reduce(g, op=dist.ReduceOp.SUM)
-    else:
-        # Single GPU: no redistribution needed.
-        o_cols = local_lpg                                 # (Ns, Np)
-        np_per_rank = n_params
-        g = o_cols @ o_cols.T                              # (Ns, Ns)
-
-    # --- Step 7: Cholesky solve on (G + lambda I) ---
-    g.diagonal().add_(diag_shift)
-    info = 0
-    L, chol_info = torch.linalg.cholesky_ex(g)
-    if (chol_info == 0).all():
-        alpha = torch.cholesky_solve(
-            total_E.unsqueeze(-1), L,
-        ).squeeze(-1)
-    else:
-        # Should not trigger when diag_shift > 0; guard for
-        # numerical edge cases.
-        alpha = torch.linalg.lstsq(g, total_E).solution
-        info = 1
-    del g, L
-
-    # --- Step 8: dp = O.T @ alpha via column-distributed o_cols ---
-    if world_size > 1:
-        dp_local = o_cols.T @ alpha                        # (np_per_rank,)
-        del o_cols
-
-        dp_padded = torch.empty(
-            np_pad, device=device, dtype=torch.float64,
-        )
-        dist.all_gather_into_tensor(dp_padded, dp_local)
-        del dp_local
-
-        dp = dp_padded[:n_params].contiguous()
-    else:
-        dp = o_cols.T @ alpha                              # (Np,)
-
-    t1 = time.time()
-    return dp, t1 - t0, info
-
-
-# ===========================================================================
-# SPRING Iterative Solver (Np-form, mirrors distributed_minres_solver_gpu)
-# ===========================================================================
-def spring_minres_solver_gpu(
-    local_lpg,
-    local_energies,
-    energy_mean,
-    total_samples,
-    n_params,
-    diag_shift,
-    phi_prev,
-    mu,
-    rtol=1e-4,
-    maxiter=100,
-    run_SR=True,
-    device=None,
-):
-    """SPRING iterative solver (Np-form).
-
-    Kaczmarz-inspired extension of distributed_minres_solver_gpu.
-    Via Sherman-Morrison-Woodbury, the full-Np form of SPRING is a
-    *single RHS modification* of the MinSR/MINRES linear system:
-
-        phi_k = (S + lam I)^-1 (g + mu * lam * phi_{k-1})
-
-    where g is the centered gradient, S = O^T O the centered Gram,
-    and lam = diag_shift.  With mu=0 this reduces to plain MINRES.
-
-    See the derivation in
-    vmc_torch/GPU/models/theory/spring_derivation.ipynb.
-
-    Args mirror distributed_minres_solver_gpu, plus:
-        phi_prev: (Np,) torch.float64 GPU tensor — persistent state.
-        mu: Kaczmarz decay factor.
-    """
-    t0 = time.time()
-    world_size = dist.get_world_size()
-    if device is None:
-        device = torch.device('cuda')
-
-    assert isinstance(local_lpg, torch.Tensor), \
-        "local_lpg must be a torch.Tensor"
-    assert isinstance(local_energies, torch.Tensor), \
-        "local_energies must be a torch.Tensor"
-
-    local_lpg = local_lpg.to(device=device, dtype=torch.float64)
-    local_energies = local_energies.to(
-        device=device, dtype=torch.float64,
-    )
-    n_local = local_energies.shape[0]
-
-    if n_local > 0:
-        local_sum_lpg = local_lpg.sum(dim=0)
-        local_sum_EO = local_energies @ local_lpg
-    else:
-        local_sum_lpg = torch.zeros(
-            n_params, device=device, dtype=torch.float64,
-        )
-        local_sum_EO = torch.zeros(
-            n_params, device=device, dtype=torch.float64,
-        )
-
-    if world_size > 1:
-        dist.all_reduce(local_sum_lpg, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_sum_EO, op=dist.ReduceOp.SUM)
-
-    mean_lpg = local_sum_lpg / total_samples
-    mean_EO = local_sum_EO / total_samples
-    energy_grad = mean_EO - energy_mean * mean_lpg  # (Np,) GPU
-
-    if not run_SR:
-        t1 = time.time()
-        return energy_grad, t1 - t0, None
-
-    # Pure-GPU MINRES with identical matvec to the MINRES baseline.
-    if world_size == 1:
-        def gpu_matvec(x):
-            inner = local_lpg @ x
-            Sx = local_lpg.T @ inner
-            Sx /= total_samples
-            Sx -= torch.dot(mean_lpg, x) * mean_lpg
-            return Sx + diag_shift * x
-    else:
-        def gpu_matvec(x):
-            if n_local > 0:
-                inner = local_lpg @ x
-                local_Sx = local_lpg.T @ inner
-            else:
-                local_Sx = torch.zeros_like(x)
-            dist.all_reduce(local_Sx, op=dist.ReduceOp.SUM)
-            local_Sx /= total_samples
-            local_Sx -= torch.dot(mean_lpg, x) * mean_lpg
-            return local_Sx + diag_shift * x
-
-    # SPRING: the only change vs. MINRES is the right-hand side.
-    phi_prev_t = phi_prev.to(device=device, dtype=torch.float64)
-    rhs = energy_grad + (mu * diag_shift) * phi_prev_t
-
-    dp, info = torch_minres(
-        gpu_matvec, rhs, rtol=rtol, maxiter=maxiter,
-    )
-
-    t1 = time.time()
-    return dp, t1 - t0, info
-
-
-# ===========================================================================
-# SPRING Direct Solver (Ns-form, mirrors minSR_solver_gpu)
-# ===========================================================================
-def spring_minsr_solver_gpu(
-    local_lpg,
-    local_energies,
-    energy_mean,
-    total_samples,
-    n_params,
-    diag_shift,
-    phi_prev,
-    mu,
-    device=None,
-    do_SR=True,
-):
-    """SPRING direct Cholesky solver (Ns-form).
-
-    Kaczmarz-inspired extension of minSR_solver_gpu.  In our sign
-    convention e = +(E_L - <E>)/sqrt(Ns), the update is
-
-        phi_k = O^T (O O^T + lam I)^-1 (e - mu O phi_{k-1})
-                + mu phi_{k-1}
-
-    where O is the centered, 1/sqrt(Ns)-scaled log-psi gradient
-    matrix.  See paper Eq. 33 (Goldshlager et al. 2024,
-    arXiv:2401.10190).  With mu=0 this collapses to minSR.
-
-    Args mirror minSR_solver_gpu, plus:
-        phi_prev: (Np,) torch.float64 tensor — persistent state.
-        mu: Kaczmarz decay factor.
-    """
-    if not do_SR:
-        return minSR_solver_gpu(
-            local_lpg=local_lpg,
-            local_energies=local_energies,
-            energy_mean=energy_mean,
-            total_samples=total_samples,
-            n_params=n_params,
-            diag_shift=diag_shift,
-            device=device,
-            do_SR=False,
-        )
-
-    t0 = time.time()
-    if device is None:
-        device = torch.device('cuda')
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    if isinstance(local_lpg, torch.Tensor):
-        local_lpg_t = local_lpg.to(
-            device=device, dtype=torch.float64
-        ).contiguous()
-        local_E_t = local_energies.to(
-            device=device, dtype=torch.float64
-        ).contiguous()
-    else:
-        local_lpg_t = torch.tensor(
-            local_lpg, device=device, dtype=torch.float64
-        ).contiguous()
-        local_E_t = torch.tensor(
-            local_energies, device=device, dtype=torch.float64
-        ).contiguous()
-
-    if world_size > 1:
-        total_lpg_t = torch.zeros(
-            (total_samples, n_params),
-            device=device, dtype=torch.float64,
-        )
-        total_E_t = torch.zeros(
-            total_samples, device=device, dtype=torch.float64,
-        )
-        dist.all_gather_into_tensor(total_lpg_t, local_lpg_t)
-        dist.all_gather_into_tensor(total_E_t, local_E_t)
-    else:
-        total_lpg_t = local_lpg_t
-        total_E_t = local_E_t
-
-    phi_prev_t = phi_prev.to(device=device, dtype=torch.float64)
-
-    info = 0
-    dp_t = torch.zeros(
-        n_params, device=device, dtype=torch.float64
-    )
-
-    if rank == 0:
-        lpg_mean = torch.mean(total_lpg_t, dim=0)
-        lpg_centered = total_lpg_t - lpg_mean.unsqueeze(0)
-        lpg_scaled = lpg_centered / np.sqrt(total_samples)
-        E_s = (total_E_t - energy_mean) / np.sqrt(total_samples)
-
-        # SPRING: subtract projection of previous iterate onto the
-        # current minibatch's row-space (Kaczmarz step).
-        rhs = E_s - mu * (lpg_scaled @ phi_prev_t)
-
-        T = lpg_scaled @ lpg_scaled.T
-        T += diag_shift * torch.eye(
-            total_samples, device=device, dtype=torch.float64,
-        )
-
-        try:
-            alpha = torch.linalg.solve(T, rhs)
-        except RuntimeError:
-            alpha = torch.linalg.lstsq(T, rhs).solution
-            info = 1
-
-        # SPRING: lift Ns-form solution to the Np-form iterate.
-        dp_t = lpg_scaled.T @ alpha + mu * phi_prev_t
-
-    if world_size > 1:
-        dist.broadcast(dp_t, src=0)
-
-    dp = dp_t.cpu().numpy()
-    t1 = time.time()
-    return dp, t1 - t0, info
-
-
-class DistributedSRMinresGPU(PreconditionerGPU):
     def __init__(
         self,
         rtol: float = 5e-5,
@@ -1082,60 +619,217 @@ class DistributedSRMinresGPU(PreconditionerGPU):
         self.maxiter = maxiter
         self.use_scipy = use_scipy
 
-    def solve(
+    def _matvec(
+        self,
+        x: torch.Tensor,
+        O_loc: torch.Tensor,
+        O_mean: torch.Tensor,
+        Ns: int,
+        n_local: int,
+        shift: float,
+    ) -> torch.Tensor:
+        if n_local > 0:
+            Sx = O_loc.T @ (O_loc @ x)
+        else:
+            Sx = torch.zeros_like(x)
+        if self._world_size() > 1:
+            dist.all_reduce(Sx, op=dist.ReduceOp.SUM)
+        Sx /= Ns
+        Sx -= torch.dot(O_mean, x) * O_mean
+        return Sx + shift * x
+
+    def _np_gram_trace(
+        self,
+        O_loc: torch.Tensor,
+        O_mean: torch.Tensor,
+        Ns: int,
+    ) -> float:
+        """Trace of the implicit Np-form Gram
+        ``S = O^T O / Ns - O_mean O_mean^T`` (matvec form, the
+        matrix is never built)."""
+        tr = O_loc.pow(2).sum()
+        if self._world_size() > 1:
+            dist.all_reduce(tr, op=dist.ReduceOp.SUM)
+        return tr.item() / Ns - O_mean.pow(2).sum().item()
+
+    def _rhs(
+        self,
+        energy_grad: torch.Tensor,
+        *,
+        shift: float,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return energy_grad
+
+    def _solve_scipy(
         self,
         *,
-        local_o,
-        local_energies,
-        energy_mean: float,
-        total_samples: int,
-        n_params: int,
-        diag_shift: float,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
         device: torch.device,
-        run_sr: bool,
+        t0: float,
     ) -> Tuple[Any, float, Any]:
-        return distributed_minres_solver_gpu(
-            local_lpg=local_o,
-            local_energies=local_energies,
-            energy_mean=energy_mean,
-            total_samples=total_samples,
-            n_params=n_params,
-            diag_shift=diag_shift,
+        # The scipy path builds its RHS from the bare energy gradient and
+        # does NOT apply the self._rhs hook. Momentum variants (SPRING)
+        # override _rhs to inject their momentum term, which would be
+        # silently dropped here -- warn if a subclass overrode it.
+        if type(self)._rhs is not IterSRGPU._rhs and self._rank() == 0:
+            print(
+                f"Warning: {type(self).__name__} with use_scipy=True "
+                f"ignores the _rhs momentum hook; the momentum term is "
+                f"NOT applied on the scipy MINRES path.",
+                flush=True,
+            )
+        if isinstance(O_loc, torch.Tensor):
+            assert O_loc.device.type == 'cpu', (
+                "use_scipy=True requires O_loc on CPU"
+            )
+            O_np = O_loc.numpy()
+        else:
+            O_np = np.asarray(O_loc, dtype=np.float64)
+
+        E_np = (
+            E_loc.cpu().numpy()
+            if isinstance(E_loc, torch.Tensor)
+            else np.asarray(E_loc, dtype=np.float64)
+        )
+        n_local = E_np.shape[0]
+        if n_local > 0:
+            O_sum = O_np.sum(axis=0)
+            EO_sum = E_np @ O_np
+        else:
+            O_sum = np.zeros(Np, dtype=np.float64)
+            EO_sum = np.zeros(Np, dtype=np.float64)
+
+        if self._world_size() > 1:
+            O_sum_t = torch.tensor(O_sum, device=device)
+            EO_sum_t = torch.tensor(EO_sum, device=device)
+            dist.all_reduce(O_sum_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(EO_sum_t, op=dist.ReduceOp.SUM)
+            O_sum = O_sum_t.cpu().numpy()
+            EO_sum = EO_sum_t.cpu().numpy()
+
+        O_mean = O_sum / Ns
+        energy_grad = EO_sum / Ns - E_mean * O_mean
+
+        # Two-term Tikhonov shift from the implicit Gram trace:
+        # trace(S) = ||O||_F^2 / Ns - ||O_mean||^2.
+        tr_local = float((O_np ** 2).sum())
+        if self._world_size() > 1:
+            tr_t = torch.tensor(tr_local, device=device)
+            dist.all_reduce(tr_t, op=dist.ReduceOp.SUM)
+            tr_local = tr_t.item()
+        trace_S = tr_local / Ns - float(O_mean @ O_mean)
+        shift = _two_term_shift(trace_S, Np, rshift, ashift)
+
+        def matvec(x):
+            if n_local > 0:
+                Sx_local = O_np.T.dot(O_np.dot(x))
+            else:
+                Sx_local = np.zeros_like(x)
+            if self._world_size() > 1:
+                Sx_t = torch.tensor(Sx_local, device=device)
+                dist.all_reduce(Sx_t, op=dist.ReduceOp.SUM)
+                Sx = Sx_t.cpu().numpy()
+            else:
+                Sx = Sx_local
+            Sx /= Ns
+            Sx -= np.dot(O_mean, x) * O_mean
+            return Sx + shift * x
+
+        A = spla.LinearOperator((Np, Np), matvec=matvec, dtype=np.float64)
+        dp, info = spla.minres(
+            A, energy_grad, rtol=self.rtol, maxiter=self.maxiter,
+        )
+        return dp, time.time() - t0, info
+
+    def _solve(
+        self,
+        *,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
+        device: torch.device,
+    ) -> Tuple[Any, float, Any]:
+        t0 = time.time()
+        device = self._device(device)
+        if self.use_scipy:
+            return self._solve_scipy(
+                O_loc=O_loc,
+                E_loc=E_loc,
+                E_mean=E_mean,
+                Ns=Ns,
+                Np=Np,
+                rshift=rshift,
+                ashift=ashift,
+                device=device,
+                t0=t0,
+            )
+
+        O_loc = self._to_f64_tensor(O_loc, device)
+        E_loc = self._to_f64_tensor(E_loc, device)
+        
+        O_bar_T_E_bar, O_mean, n_local = self._energy_gradient(
+            O_loc, E_loc, E_mean, Ns, Np, device,
+        )
+        
+        O_loc.sub_(O_mean.unsqueeze(0)).div_(math.sqrt(Ns))
+        O_bar_loc = O_loc
+        # E_bar_loc = (E_loc - E_mean) / math.sqrt(Ns)
+
+        # Two-term Tikhonov shift; the matvec Gram is
+        # S = Obar^T Obar (Np x Np), trace(S) = ||Obar||_F^2.
+        tr = O_bar_loc.pow(2).sum()
+        if self._world_size() > 1:
+            dist.all_reduce(tr, op=dist.ReduceOp.SUM)
+        shift = _two_term_shift(tr.item(), Np, rshift, ashift)
+
+        # RHS via the polymorphic hook: plain IterSR returns the bare
+        # energy gradient; SPRING adds its mu*shift*phi_prev momentum
+        # term (Goldshlager et al. 2024). shift is needed here, so this
+        # must come after the shift computation above.
+        rhs = self._rhs(O_bar_T_E_bar, shift=shift, device=device)
+
+        def matvec(x):
+            if n_local > 0:
+                Sx_local = O_bar_loc.T @ (O_bar_loc @ x)
+            else:
+                Sx_local = torch.zeros_like(x)
+            Sx = Sx_local
+            if self._world_size() > 1:
+                dist.all_reduce(Sx, op=dist.ReduceOp.SUM)
+            Rx = Sx + shift * x
+            return Rx
+        
+        dp, info = torch_minres(
+            matvec,
+            b = rhs,
             rtol=self.rtol,
             maxiter=self.maxiter,
-            run_SR=run_sr,
-            use_scipy=self.use_scipy,
-            device=device,
         )
+        return dp, time.time() - t0, info
 
 
 class MinSRGPU(PreconditionerGPU):
-    def solve(
-        self,
-        *,
-        local_o,
-        local_energies,
-        energy_mean: float,
-        total_samples: int,
-        n_params: int,
-        diag_shift: float,
-        device: torch.device,
-        run_sr: bool,
-    ) -> Tuple[Any, float, Any]:
-        return minSR_solver_gpu(
-            local_lpg=local_o,
-            local_energies=local_energies,
-            energy_mean=energy_mean,
-            total_samples=total_samples,
-            n_params=n_params,
-            diag_shift=diag_shift,
-            device=device,
-            do_SR=run_sr,
-        )
-
-
-class DistributedMinSRGPU(PreconditionerGPU):
-    """Distributed minSR via all_to_all column redistribution.
+    r"""
+    
+    MinSR <https://www.nature.com/articles/s41567-024-02566-1>
+    
+    Solves :math:`\bar O \dot \theta = \bar \epsilon` in the N_s-form,
+    
+    where :math:`\bar O = \frac{1}{\sqrt{N_s}}(\frac{1}{\psi} \frac{\partial \psi}{\partial \theta} - \left< \frac{1}{\psi} \frac{\partial \psi}{\partial \theta} \right>)`.
+    
+    
+    Distributed via all_to_all column redistribution.
 
     Each rank's (B, Np) gradient block is transposed across ranks
     with a single `dist.all_to_all_single` so every rank holds an
@@ -1148,139 +842,1181 @@ class DistributedMinSRGPU(PreconditionerGPU):
     `parallel_minSR` paper).
     """
 
-    def solve(
+    def _solve(
         self,
         *,
-        local_o,
-        local_energies,
-        energy_mean: float,
-        total_samples: int,
-        n_params: int,
-        diag_shift: float,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
         device: torch.device,
-        run_sr: bool,
     ) -> Tuple[Any, float, Any]:
-        return distributed_minSR_solver_gpu(
-            local_lpg=local_o,
-            local_energies=local_energies,
-            energy_mean=energy_mean,
-            total_samples=total_samples,
-            n_params=n_params,
-            diag_shift=diag_shift,
-            device=device,
-            do_SR=run_sr,
+        """Solve the MinSR linear system in the Ns-form (Eq. 17 of
+        Rende et al. 2024) and return a parameter-update direction.
+
+        Args:
+            O_loc: (n_local, Np) per-sample log-derivative matrix
+                ``d log psi / d theta`` for this rank's samples,
+                uncentered. Will be centered and scaled by
+                ``1/sqrt(Ns)`` in place to form ``Obar``. Use case:
+                - VMC: ``O_loc[s] = d log psi(x_s) / d theta``
+                - Supervised SWO: same, with x_s drawn from |psi_A|^2
+            E_loc: (n_local,) per-sample "signal" values for this
+                rank, uncentered. Will be centered against
+                ``E_mean`` and scaled by ``1/sqrt(Ns)`` to form
+                ``Ebar``. Use case:
+                - VMC: local energies ``E_loc(x_s)``
+            E_mean: globally reduced mean of ``E_loc`` across ALL
+                ranks. The caller is responsible for this reduction.
+            Ns: total number of samples across all ranks
+                (``sum_r n_local_r``). Used for the ``1/sqrt(Ns)``
+                normalization and for the all_gather sizing.
+            Np: total number of model parameters. Must match
+                ``O_loc.shape[1]``. Used to pad columns to a
+                multiple of ``world_size`` for the all_to_all
+                column redistribution.
+            rshift: relative Tikhonov regularization; together
+                with ``ashift`` the diagonal of the Ns x Ns Gram
+                is shifted by
+                ``rshift * trace(T)/sqrt(Ns) + ashift`` before
+                the Cholesky solve. Stabilizes ill-conditioned
+                systems.
+            ashift: absolute Tikhonov shift (see ``rshift``).
+            device: target device for all tensors. ``None`` defaults
+                to ``cuda``.
+
+        Returns:
+            (dp, elapsed_time, info) tuple:
+                dp: (Np,) float64 update direction on ``device``.
+                elapsed_time: wall-clock time of the solve, seconds.
+                info: Cholesky info code from
+                    ``_solve_cholesky`` (always 0; kept for
+                    caller-signature compatibility).
+        """
+        t0 = time.time()
+        device = self._device(device)
+        world_size = self._world_size()
+        O_loc = self._to_f64_tensor(O_loc, device, contiguous=True)
+        E_loc = self._to_f64_tensor(E_loc, device)
+
+        O_mean = self._O_mean(O_loc, Ns)
+        n_local = E_loc.shape[0]
+
+        sqrt_Ns = math.sqrt(Ns)
+        O_loc.sub_(O_mean.unsqueeze(0)).div_(sqrt_Ns)
+        E_scaled = (E_loc - E_mean) / sqrt_Ns
+        
+        if world_size > 1:
+            E_bar = torch.empty(Ns, device=device, dtype=torch.float64)
+            dist.all_gather_into_tensor(E_bar, E_scaled)
+        else:
+            E_bar = E_scaled
+
+        if world_size > 1:
+            np_per_rank = (Np + world_size - 1) // world_size
+            np_pad = world_size * np_per_rank
+            if np_pad != Np:
+                O_padded = torch.zeros(
+                    (n_local, np_pad),
+                    device=device,
+                    dtype=torch.float64,
+                )
+                O_padded[:, :Np].copy_(O_loc)
+                del O_loc
+            else:
+                O_padded = O_loc
+                O_loc = None
+
+            send_buf = (
+                O_padded
+                .view(n_local, world_size, np_per_rank)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            del O_padded
+
+            recv_buf = torch.empty_like(send_buf)
+            dist.all_to_all_single(recv_buf, send_buf)
+            del send_buf
+
+            O_bar = recv_buf.reshape(
+                world_size * n_local, np_per_rank,
+            )  # shape (Ns, np_per_rank)
+            del recv_buf
+            T = O_bar @ O_bar.T
+            dist.all_reduce(T, op=dist.ReduceOp.SUM)  # T shape (Ns, Ns)
+        else:
+            np_pad = Np
+            np_per_rank = Np
+            O_bar = O_loc
+            T = O_bar @ O_bar.T  # shape (Ns, Ns) T = O@O.T
+        
+        # Solve  alpha = (T + shift I)^{-1} E_bar
+        shift = _two_term_shift(
+            T.trace().item(), T.shape[0], rshift, ashift,
         )
+        T_shifted = T + shift * torch.eye(T.shape[0], device=device)
+        alpha, info = self._solve_cholesky(T_shifted, E_bar)
+        del T
+
+        dp_local = O_bar.T @ alpha  # shape (np_per_rank,)
+
+        if world_size > 1:
+            del O_bar
+            dp_padded = torch.empty(np_pad, device=device, dtype=torch.float64)
+            dist.all_gather_into_tensor(dp_padded, dp_local)
+            dp = dp_padded[:Np].contiguous()
+        else:
+            dp = dp_local
+        return dp, time.time() - t0, info
 
 
-class SPRINGMinresGPU(PreconditionerGPU):
+class SPRINGIterGPU(IterSRGPU):
     """SPRING preconditioner using iterative MINRES on the full Np
     operator (N_p-form).
 
     Holds a persistent ``phi_prev`` iterate between calls that
     implements the Kaczmarz-style recurrence from
     Goldshlager et al. 2024 (arXiv:2401.10190).  With ``mu=0`` this is
-    bit-equivalent to ``DistributedSRMinresGPU``.
+    bit-equivalent to ``IterSRGPU``.
     """
 
-    def __init__(
-        self,
-        mu: float = 0.99,
-        rtol: float = 5e-5,
-        maxiter: int = 100,
-    ):
+    _STATE_ATTRS = ('phi_prev',)
+
+    def __init__(self, mu: float = 0.99, rtol: float = 5e-5, maxiter: int = 100):
+        super().__init__(rtol=rtol, maxiter=maxiter, use_scipy=False)
         self.mu = mu
-        self.rtol = rtol
-        self.maxiter = maxiter
         self.phi_prev: Optional[torch.Tensor] = None
 
-    def solve(
+    def _rhs(
+        self,
+        energy_grad: torch.Tensor,
+        *,
+        shift: float,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return energy_grad + (self.mu * shift) * self.phi_prev
+
+    def _solve(
         self,
         *,
-        local_o,
-        local_energies,
-        energy_mean: float,
-        total_samples: int,
-        n_params: int,
-        diag_shift: float,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
         device: torch.device,
-        run_sr: bool,
     ) -> Tuple[Any, float, Any]:
+        device = self._device(device)
         if self.phi_prev is None:
             self.phi_prev = torch.zeros(
-                n_params, device=device, dtype=torch.float64,
+                Np, device=device, dtype=torch.float64,
             )
-        dp, t_sr, info = spring_minres_solver_gpu(
-            local_lpg=local_o,
-            local_energies=local_energies,
-            energy_mean=energy_mean,
-            total_samples=total_samples,
-            n_params=n_params,
-            diag_shift=diag_shift,
-            phi_prev=self.phi_prev,
-            mu=self.mu,
-            rtol=self.rtol,
-            maxiter=self.maxiter,
-            run_SR=run_sr,
+        # Call the parent IterSRGPU._solve directly (NOT super().solve):
+        # the outer PreconditionerGPU.solve already ran outlier masking
+        # before dispatching here, and super().solve would re-dispatch
+        # self._solve -> this method -> infinite recursion. IterSR's
+        # _solve builds its RHS via self._rhs, which is overridden above
+        # to inject the SPRING momentum term.
+        dp, t_sr, info = super()._solve(
+            O_loc=O_loc,
+            E_loc=E_loc,
+            E_mean=E_mean,
+            Ns=Ns,
+            Np=Np,
+            rshift=rshift,
+            ashift=ashift,
             device=device,
         )
-        if run_sr:
-            self.phi_prev = torch.as_tensor(
-                dp, device=device, dtype=torch.float64,
-            ).clone()
+        self.phi_prev = torch.as_tensor(
+            dp, device=device, dtype=torch.float64,
+        ).clone()
         return dp, t_sr, info
 
     def reset(self) -> None:
         self.phi_prev = None
 
 
+class MARCHIterGPU(IterSRGPU):
+    r"""MARCH preconditioner using iterative MINRES on the full Np
+    operator (N_p-form).
+
+    Bit-equivalent to ``MARCHMinSRGPU`` in exact arithmetic, but
+    never forms the (Ns, Ns) Gram matrix and never performs an
+    ``all_to_all`` redistribution of ``O``.
+
+    Derivation (see ``refs/theory/MARCH_derivation.ipynb``).  The
+    Ns-form MARCH update is
+
+    .. code-block:: text
+
+        alpha = ((Obar/V)(Obar/V).T + lambda I)^{-1} (Ebar - mu Obar phi_prev)
+        step  = (Obar/V).T alpha / V + mu phi_prev
+
+    With ``c = step - mu phi_prev = (Obar.T alpha) / V^2``, the
+    push-through identity ``A.T (A A.T + lambda I)^{-1} =
+    (A.T A + lambda I)^{-1} A.T`` plus the substitution ``z = V c``
+    converts the Ns-form solve into the Np-form
+
+    .. code-block:: text
+
+        (S + lambda V^2) step = grad + mu * lambda * V^2 * phi_prev
+
+    where ``S = Obar.T Obar`` (matvec-only, no Ns x Ns matrix) and
+    ``grad = Obar.T Ebar`` is the energy gradient.  Structurally
+    identical to ``SPRINGIterGPU`` with the scalar Tikhonov shift
+    ``lambda`` replaced by the diagonal ``lambda V^2``.
+
+    With ``t = 0`` (so ``V = ones``), one step reduces exactly to
+    ``SPRINGIterGPU(mu=mu)``.
+
+    Args:
+        mu: first-moment momentum (matches MARCHMinSRGPU.mu).
+        beta: second-moment EMA rate (matches MARCHMinSRGPU.beta).
+        rtol, maxiter: forwarded to ``torch_minres``.
+    """
+
+    _STATE_ATTRS = ('t', 'phi_prev', 'v_prev')
+
+    def __init__(
+        self,
+        mu: float = 0.95,
+        beta: float = 0.995,
+        rtol: float = 5e-5,
+        maxiter: int = 100,
+    ):
+        super().__init__(rtol=rtol, maxiter=maxiter, use_scipy=False)
+        self.mu = mu
+        self.beta = beta
+        self.phi_prev: Optional[torch.Tensor] = None
+        self.v_prev: Optional[torch.Tensor] = None
+        self.t: int = 0
+
+    def _solve(
+        self,
+        *,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
+        device: torch.device,
+    ) -> Tuple[Any, float, Any]:
+        t0 = time.time()
+        device = self._device(device)
+        if self.phi_prev is None:
+            self.phi_prev = torch.zeros(
+                Np, device=device, dtype=torch.float64,
+            )
+            self.v_prev = torch.zeros(
+                Np, device=device, dtype=torch.float64,
+            )
+
+        O_loc = self._to_f64_tensor(O_loc, device)
+        E_loc = self._to_f64_tensor(E_loc, device)
+        energy_grad, O_mean, n_local = self._energy_gradient(
+            O_loc, E_loc, E_mean, Ns, Np, device,
+        )
+
+        # Two-term scalar shift from the implicit Gram trace.
+        shift = _two_term_shift(
+            self._np_gram_trace(O_loc, O_mean, Ns),
+            Np, rshift, ashift,
+        )
+
+        # V: first iter -> ones; subsequent -> v_prev^0.25 + eps.
+        if self.t == 0:
+            V = torch.ones(Np, device=device, dtype=torch.float64)
+        else:
+            V = self.v_prev.pow(0.25) + 1e-8
+        shift_vec = shift * V * V  # shape (Np,)
+
+        # Absorbed rhs: (S + lambda V^2) step = grad + mu lambda V^2 phi_prev
+        rhs = energy_grad + self.mu * shift_vec * self.phi_prev
+
+        # _matvec adds shift * x elementwise, so a (Np,) shift_vec gives
+        # the diagonal Tikhonov shift lambda*V^2 (no separate matvec).
+        dp, info = torch_minres(
+            lambda x: self._matvec(
+                x, O_loc, O_mean, Ns, n_local, shift_vec,
+            ),
+            rhs,
+            rtol=self.rtol,
+            maxiter=self.maxiter,
+        )
+
+        # v_new = beta * v_old + |step - phi_old|^2; phi_prev <- step.
+        step_t = torch.as_tensor(
+            dp, device=device, dtype=torch.float64,
+        )
+        self.v_prev = (
+            self.beta * self.v_prev
+            + (step_t - self.phi_prev).abs() ** 2
+        )
+        self.phi_prev = step_t.clone()
+        self.t += 1
+        return dp, time.time() - t0, info
+
+    def reset(self) -> None:
+        self.phi_prev = None
+        self.v_prev = None
+        self.t = 0
+
+
+class AdamSRIterGPU(IterSRGPU):
+    r"""AdamSR preconditioner using iterative MINRES on the full Np
+    operator (N_p-form).
+
+    Bit-equivalent to ``AdamSRMinSRGPU`` in exact arithmetic, but
+    never forms the (Ns, Ns) Gram matrix and never performs an
+    ``all_to_all`` redistribution of ``O``.
+
+    Per step it performs two MINRES solves:
+
+    1. **Raw SR direction** (plain MinSR, scalar Tikhonov):
+
+       .. code-block:: text
+
+           (S + lambda I) g = grad
+
+    2. **Column-preconditioned step** (after Adam moments):
+
+       .. code-block:: text
+
+           t      += 1
+           m       = mu   * m + (1 - mu)   * g
+           v       = beta * v + (1 - beta) * |g|^2
+           mhat    = m / (1 - mu**t)
+           vhat    = v / (1 - beta**t)
+           V       = vhat^{1/4} + eps
+           (S + lambda V^2) step = grad + lambda V^2 * mhat
+
+    Note: unlike MARCH, the moment ``v`` is updated **with the
+    current step's** ``g`` (after the 1st solve) before computing
+    ``V`` — that is why two solves are needed.  The bias-correction
+    factors ``1/(1 - mu**t)`` and ``1/(1 - beta**t)`` follow the
+    Adam convention.
+
+    Derivation of the 2nd solve is identical to MARCH (see
+    ``refs/theory/MARCH_derivation.ipynb``) with ``mhat`` in place
+    of ``mu * phi_prev``.
+
+    Args:
+        mu: first-moment EMA rate.
+        beta: second-moment EMA rate.
+        norm_clip: if not None, clip ``||g||_2`` after the 1st solve.
+        rtol, maxiter: forwarded to ``torch_minres`` (shared between
+            both solves).
+    """
+
+    _STATE_ATTRS = ('t', 'm', 'v')
+
+    def __init__(
+        self,
+        mu: float = 0.95,
+        beta: float = 0.995,
+        norm_clip: Optional[float] = None,
+        rtol: float = 5e-5,
+        maxiter: int = 100,
+    ):
+        super().__init__(rtol=rtol, maxiter=maxiter, use_scipy=False)
+        self.mu = mu
+        self.beta = beta
+        self.norm_clip = norm_clip
+        self.m: Optional[torch.Tensor] = None
+        self.v: Optional[torch.Tensor] = None
+        self.t: int = 0
+
+    def _solve(
+        self,
+        *,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
+        device: torch.device,
+    ) -> Tuple[Any, float, Any]:
+        t0 = time.time()
+        device = self._device(device)
+        if self.m is None:
+            self.m = torch.zeros(
+                Np, device=device, dtype=torch.float64,
+            )
+            self.v = torch.zeros(
+                Np, device=device, dtype=torch.float64,
+            )
+
+        O_loc = self._to_f64_tensor(O_loc, device)
+        E_loc = self._to_f64_tensor(E_loc, device)
+        energy_grad, O_mean, n_local = self._energy_gradient(
+            O_loc, E_loc, E_mean, Ns, Np, device,
+        )
+
+        # Two-term scalar shift from the implicit Gram trace.
+        shift = _two_term_shift(
+            self._np_gram_trace(O_loc, O_mean, Ns),
+            Np, rshift, ashift,
+        )
+
+        # ---- 1st solve: g = (S + lambda I)^{-1} energy_grad ----
+        g, _ = torch_minres(
+            lambda x: self._matvec(
+                x, O_loc, O_mean, Ns, n_local, shift,
+            ),
+            energy_grad,
+            rtol=self.rtol,
+            maxiter=self.maxiter,
+        )
+
+        if self.norm_clip is not None:
+            g_norm = torch.linalg.vector_norm(g)
+            # branchless renorm: scale = min(clip/||g||, 1)
+            scale = (
+                self.norm_clip / g_norm.clamp(min=1e-30)
+            ).clamp(max=1.0)
+            g = g * scale
+
+        # ---- Adam moment updates (current g enters now) ----
+        self.t += 1
+        self.m = self.mu * self.m + (1.0 - self.mu) * g
+        self.v = self.beta * self.v + (1.0 - self.beta) * g.abs() ** 2
+        mhat = self.m / (1.0 - self.mu ** self.t)
+        vhat = self.v / (1.0 - self.beta ** self.t)
+        V = vhat.pow(0.25)
+        shift_vec = shift * V * V  # (Np,)
+
+        # ---- 2nd solve: (S + lambda V^2) step = grad + lambda V^2 mhat ----
+        rhs2 = energy_grad + shift_vec * mhat
+        step, info = torch_minres(
+            lambda x: self._matvec(
+                x, O_loc, O_mean, Ns, n_local, shift_vec,
+            ),
+            rhs2,
+            rtol=self.rtol,
+            maxiter=self.maxiter,
+        )
+        # If the 2nd solve did not converge, `step` may not be a descent
+        # direction. Fall back to the raw SR direction `g` (already
+        # computed and norm-clipped above), which is a valid descent
+        # direction, instead of risking a bad parameter update.
+        if info != 0:
+            if self._rank() == 0:
+                print(
+                    f"Warning: AdamSRIterGPU MINRES did not converge "
+                    f"(info={info}). Falling back to the raw SR direction.",
+                    flush=True,
+                )
+            return g, time.time() - t0, info
+
+        if self.norm_clip is not None:
+            g_norm = torch.linalg.vector_norm(step)
+            # branchless renorm: scale = min(clip/||step||, 1)
+            scale = (
+                self.norm_clip / g_norm.clamp(min=1e-30)
+            ).clamp(max=1.0)
+            step = step * scale
+
+        return step, time.time() - t0, info
+
+    def reset(self) -> None:
+        self.m = None
+        self.v = None
+        self.t = 0
+
+
 class SPRINGMinSRGPU(PreconditionerGPU):
-    """SPRING preconditioner using the direct Cholesky minSR solve
-    (N_s-form).
+    """SPRING preconditioner using the Tikhonov minSR solve (N_s-form).
 
     Holds a persistent ``phi_prev`` iterate between calls.  With
     ``mu=0`` this is bit-equivalent to ``MinSRGPU``.
     """
 
-    def __init__(self, mu: float = 0.99):
+    _STATE_ATTRS = ('phi_prev',)
+
+    def __init__(
+        self,
+        mu: float = 0.99,
+        mixed_precision: bool = False,
+    ):
         self.mu = mu
+        # If True, the Ns x Ns Gram matmul is done in fp32 (then
+        # cast back to fp64). Big speedup on cards with weak fp64
+        # throughput (consumer / RTX class); diag_shift dominates
+        # the fp32 roundoff. Default False keeps the full Gram in
+        # fp64 (recommended on A100/H100 where fp64 is fast).
+        self.mixed_precision = mixed_precision
         self.phi_prev: Optional[torch.Tensor] = None
 
-    def solve(
+    def _solve(
         self,
         *,
-        local_o,
-        local_energies,
-        energy_mean: float,
-        total_samples: int,
-        n_params: int,
-        diag_shift: float,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
         device: torch.device,
-        run_sr: bool,
     ) -> Tuple[Any, float, Any]:
+        t0 = time.time()
+        device = self._device(device)
+        rank = self._rank()
+        world_size = self._world_size()
+        # Mixed precision: fp64 everywhere except the Gram matmul
+        # ``T = O_bar @ O_bar.T`` which is cast to fp32 locally.
+        # Tikhonov diag_shift dominates the fp32 roundoff.
         if self.phi_prev is None:
             self.phi_prev = torch.zeros(
-                n_params, device=device, dtype=torch.float64,
+                Np, device=device, dtype=torch.float64,
             )
-        dp, t_sr, info = spring_minsr_solver_gpu(
-            local_lpg=local_o,
-            local_energies=local_energies,
-            energy_mean=energy_mean,
-            total_samples=total_samples,
-            n_params=n_params,
-            diag_shift=diag_shift,
-            phi_prev=self.phi_prev,
-            mu=self.mu,
-            device=device,
-            do_SR=run_sr,
-        )
-        if run_sr:
-            self.phi_prev = torch.as_tensor(
-                dp, device=device, dtype=torch.float64,
-            ).clone()
-        return dp, t_sr, info
+
+        # O_loc (Ns per rank, Np), E_loc (Ns per rank, )
+        O_loc = self._to_f64_tensor(O_loc, device, contiguous=True)
+        E_loc = self._to_f64_tensor(E_loc, device)
+
+        # minSR builds its force from Obar.T @ alpha, so only the column
+        # means of O are needed -- use _O_mean (1 all_reduce) instead of
+        # _energy_gradient (which also does the discarded E@O matmul +
+        # a 2nd all_reduce). O_mean shape (Np,), n_local = Ns per rank.
+        n_local = E_loc.shape[0]
+        O_mean = self._O_mean(O_loc, Ns)
+
+        # Get Obar and Ebar by centering and scaling O_loc, E_loc in place.
+        sqrt_Ns = math.sqrt(Ns)
+        O_loc.sub_(O_mean.unsqueeze(0)).div_(sqrt_Ns)
+        E_scaled = (E_loc - E_mean) / sqrt_Ns
+        E_all = torch.empty(Ns, device=device, dtype=torch.float64)
+        dist.all_gather_into_tensor(E_all, E_scaled)
+
+        if world_size > 1:
+            # Column-redistribute O across ranks via all_to_all so each
+            # rank holds (Ns, Np/world_size). Peak per-rank memory during
+            # this step is ~2 x |O_loc_local|.
+            np_per_rank = (Np + world_size - 1) // world_size
+            np_pad = world_size * np_per_rank
+            col_offset = rank * np_per_rank
+            if np_pad != Np:
+                O_padded = torch.zeros(
+                    (n_local, np_pad),
+                    device=device,
+                    dtype=torch.float64,
+                )
+                O_padded[:, :Np].copy_(O_loc)
+                del O_loc
+            else:
+                O_padded = O_loc
+                O_loc = None
+
+            send_buf = (
+                O_padded
+                .view(n_local, world_size, np_per_rank)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            del O_padded
+            recv_buf = torch.empty_like(send_buf)
+            dist.all_to_all_single(recv_buf, send_buf)
+            del send_buf
+            O_bar = recv_buf.reshape(
+                world_size * n_local, np_per_rank,
+            )  # shape (Ns, np_per_rank)
+            del recv_buf
+        else:
+            # Single GPU: skip the all_to_all entirely (it is identity
+            # but allocates 2 x |O_loc| of transient buffers).
+            np_per_rank = Np
+            np_pad = Np
+            col_offset = 0
+            O_bar = O_loc
+            O_loc = None
+
+        if self.mixed_precision:
+            # Gram matmul in fp32, stored back in fp64.
+            O_bar_f32 = O_bar.to(torch.float32)
+            T = (O_bar_f32 @ O_bar_f32.T).to(torch.float64)
+            del O_bar_f32
+        else:
+            T = O_bar @ O_bar.T
+        dist.all_reduce(T, op=dist.ReduceOp.SUM)  # T shape (Ns, Ns)
+
+        phi_cols = torch.zeros(
+            np_per_rank, device=device, dtype=torch.float64,
+        )  # phi_prev slice for this rank, shape (np_per_rank,)
+        stop = min(col_offset + np_per_rank, Np)
+        if stop > col_offset:
+            n_live = stop - col_offset
+            phi_cols[:n_live].copy_(
+                self.phi_prev[col_offset:stop].to(
+                    device=device, dtype=torch.float64,
+                )
+            )
+
+        projection = O_bar @ phi_cols  # local contribution to O_k @ phi_prev, shape (Ns,)
+        dist.all_reduce(projection, op=dist.ReduceOp.SUM)
+        rhs = E_all - self.mu * projection  # shape (Ns,)
+
+        T.diagonal().add_(_two_term_shift(
+            T.trace().item(), T.shape[0], rshift, ashift,
+        ))
+
+        # Direct Cholesky solve of the (already-shifted) SPD Gram,
+        # matching MinSRGPU. alpha shape (Ns,), alpha = T^{-1} rhs.
+        alpha, info = self._solve_cholesky(T, rhs)
+        del T
+
+        dp_local = O_bar.T @ alpha + self.mu * phi_cols  # shape (np_per_rank,)
+        del O_bar
+        dp_padded = torch.empty(np_pad, device=device, dtype=torch.float64)
+        dist.all_gather_into_tensor(dp_padded, dp_local) # concatenate dp_local from all ranks into dp_padded
+        dp = dp_padded[:Np].contiguous()
+
+        self.phi_prev = dp.detach().clone()
+        return dp, time.time() - t0, info
 
     def reset(self) -> None:
         self.phi_prev = None
+
+
+class MARCHMinSRGPU(PreconditionerGPU):
+    r"""MARCH optimizer (arXiv:2507.02644) in the N_s-form MinSR.
+
+    Adds first/second-order momentum on top of MinSR (Adam-like
+    column preconditioning).  With default ``mu=0.95, beta=0.995``,
+    the learning rate should be ~1/5 of plain MinSR.
+
+    Per-iter algorithm (matching quantax MARCH):
+
+    .. code-block:: text
+
+        Ebar -= mu * (Obar @ phi_prev)
+        V    = ones (first iter) else v_prev**0.25 + eps
+        T    = (Obar/V) @ (Obar/V).T;  T += shift * I
+        alpha = T^{-1} Ebar
+        step = (Obar/V).T @ alpha / V + mu * phi_prev
+        v_new = beta * v_prev + |step - phi_prev|**2
+        phi_new = step
+
+    Notes:
+        - ``v`` is a pure beta-weighted accumulation (no ``(1-beta)``
+          factor), matching the reference implementation.
+        - No bias correction is applied (MARCH-specific).
+    """
+
+    _STATE_ATTRS = ('t', 'phi_prev', 'v_prev')
+
+    def __init__(
+        self,
+        mu: float = 0.95,
+        beta: float = 0.995,
+        mixed_precision: bool = False,
+    ):
+        self.mu = mu
+        self.beta = beta
+        # fp32 Gram matmul; see SPRINGMinSRGPU for details.
+        self.mixed_precision = mixed_precision
+        self.phi_prev: Optional[torch.Tensor] = None
+        self.v_prev: Optional[torch.Tensor] = None
+        self.t: int = 0
+
+    def _solve(
+        self,
+        *,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
+        device: torch.device,
+    ) -> Tuple[Any, float, Any]:
+        t0 = time.time()
+        device = self._device(device)
+        rank = self._rank()
+        world_size = self._world_size()
+        # Mixed precision: fp64 everywhere except the Gram matmul
+        # ``T = O_pre @ O_pre.T`` which is cast to fp32 locally.
+        if self.phi_prev is None:
+            self.phi_prev = torch.zeros(
+                Np, device=device, dtype=torch.float64,
+            )
+            self.v_prev = torch.zeros(
+                Np, device=device, dtype=torch.float64,
+            )
+
+        O_loc = self._to_f64_tensor(O_loc, device, contiguous=True)
+        E_loc = self._to_f64_tensor(E_loc, device)
+
+        # Only O's column means are needed (force = Obar.T @ alpha); use
+        # _O_mean (1 all_reduce) rather than _energy_gradient (extra E@O
+        # matmul + 2nd all_reduce whose gradient output is discarded).
+        n_local = E_loc.shape[0]
+        O_mean = self._O_mean(O_loc, Ns)
+
+        sqrt_Ns = math.sqrt(Ns)
+        O_loc.sub_(O_mean.unsqueeze(0)).div_(sqrt_Ns)
+        E_scaled = (E_loc - E_mean) / sqrt_Ns
+        E_all = torch.empty(Ns, device=device, dtype=torch.float64)
+        dist.all_gather_into_tensor(E_all, E_scaled)
+
+        if world_size > 1:
+            # Column-redistribute O across ranks via all_to_all.
+            np_per_rank = (Np + world_size - 1) // world_size
+            np_pad = world_size * np_per_rank
+            col_offset = rank * np_per_rank
+            if np_pad != Np:
+                O_padded = torch.zeros(
+                    (n_local, np_pad),
+                    device=device,
+                    dtype=torch.float64,
+                )
+                O_padded[:, :Np].copy_(O_loc)
+                del O_loc
+            else:
+                O_padded = O_loc
+                O_loc = None
+
+            send_buf = (
+                O_padded
+                .view(n_local, world_size, np_per_rank)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            del O_padded
+            recv_buf = torch.empty_like(send_buf)
+            dist.all_to_all_single(recv_buf, send_buf)
+            del send_buf
+            O_bar = recv_buf.reshape(
+                world_size * n_local, np_per_rank,
+            )
+            del recv_buf
+        else:
+            # Single GPU: skip the identity all_to_all to avoid the
+            # 2 x |O_loc| transient memory spike.
+            np_per_rank = Np
+            np_pad = Np
+            col_offset = 0
+            O_bar = O_loc
+            O_loc = None
+
+        # Slice phi_prev and v_prev for this rank's column block.
+        phi_cols = torch.zeros(
+            np_per_rank, device=device, dtype=torch.float64,
+        )
+        v_cols = torch.zeros(
+            np_per_rank, device=device, dtype=torch.float64,
+        )
+        stop = min(col_offset + np_per_rank, Np)
+        if stop > col_offset:
+            n_live = stop - col_offset
+            phi_cols[:n_live].copy_(
+                self.phi_prev[col_offset:stop].to(
+                    device=device, dtype=torch.float64,
+                )
+            )
+            v_cols[:n_live].copy_(
+                self.v_prev[col_offset:stop].to(
+                    device=device, dtype=torch.float64,
+                )
+            )
+
+        # V: first iter -> ones; subsequent -> v^0.25 + eps.
+        if self.t == 0:
+            V_cols = torch.ones_like(v_cols)
+        else:
+            V_cols = v_cols.pow(0.25) + 1e-8
+
+        # rhs = E_all - mu * (Obar @ phi_prev).
+        proj = O_bar @ phi_cols  # local contribution, shape (Ns,)
+        dist.all_reduce(proj, op=dist.ReduceOp.SUM)
+        rhs = E_all - self.mu * proj
+
+        # Column-precondition Obar.
+        # In-place: O_bar is not needed in raw form after this point,
+        # so divide in place instead of allocating another full
+        # (Ns, np_per_rank) copy of the Jacobian.
+        O_bar.div_(V_cols.unsqueeze(0))
+        O_pre = O_bar
+        if self.mixed_precision:
+            O_pre_f32 = O_pre.to(torch.float32)
+            T = (O_pre_f32 @ O_pre_f32.T).to(torch.float64)
+            del O_pre_f32
+        else:
+            T = O_pre @ O_pre.T
+        dist.all_reduce(T, op=dist.ReduceOp.SUM)
+        T.diagonal().add_(_two_term_shift(
+            T.trace().item(), T.shape[0], rshift, ashift,
+        ))
+
+        # Direct Cholesky solve of the (already-shifted) SPD Gram,
+        # matching MinSRGPU.
+        alpha, info = self._solve_cholesky(T, rhs)
+        del T
+
+        # step in original parameter space:
+        #   (Obar/V).T @ alpha / V + mu * phi_prev.
+        step_pre_local = O_pre.T @ alpha  # shape (np_per_rank,)
+        del O_pre, O_bar
+        step_local = step_pre_local / V_cols + self.mu * phi_cols
+
+        step_padded = torch.empty(
+            np_pad, device=device, dtype=torch.float64,
+        )
+        dist.all_gather_into_tensor(step_padded, step_local)
+        dp = step_padded[:Np].contiguous()
+
+        # Buffer update: v_new = beta * v_old + |step - phi_old|^2.
+        new_v = self.beta * self.v_prev + (dp - self.phi_prev).abs() ** 2
+        self.phi_prev = dp.detach().clone()
+        self.v_prev = new_v
+        self.t += 1
+        return dp, time.time() - t0, info
+
+    def reset(self) -> None:
+        self.phi_prev = None
+        self.v_prev = None
+        self.t = 0
+
+
+class AdamSRMinSRGPU(PreconditionerGPU):
+    r"""AdamSR optimizer in the N_s-form MinSR.
+
+    Adam-style first/second-moment momentum on top of MinSR.  The
+    cost per step is roughly twice that of plain MinSR (two SR
+    solves, both Ns x Ns Cholesky/eigh on the column-distributed
+    Gram).
+
+    Per-iter algorithm (matching quantax AdamSR):
+
+    .. code-block:: text
+
+        # 1st solve: raw SR direction
+        T1 = Obar @ Obar.T
+        g  = Obar.T @ solve_gram(T1, Ebar)
+        (optional clip ||g|| <= norm_clip)
+
+        # Adam moment updates
+        t += 1
+        m  = mu * m  + (1-mu)   * g
+        v  = beta * v + (1-beta) * |g|^2
+        mhat = m / (1 - mu**t);  vhat = v / (1 - beta**t)
+        V    = vhat**0.25 + eps
+
+        # 2nd solve: with mhat correction & V column preconditioning
+        rhs  = Ebar - Obar @ mhat
+        T2   = (Obar/V) @ (Obar/V).T
+        step = (Obar/V).T @ solve_gram(T2, rhs) / V + mhat
+
+    where ``solve_gram`` is selected by ``solver`` (``rshift`` and
+    ``ashift`` are handed in per solve by the VMC loop):
+
+      - ``'direct'``: direct solve of ``(T + shift*I) x = b`` with
+        the two-term shift
+        ``shift = rshift * trace(T)/sqrt(Ns) + ashift``.
+      - ``'pinv_eig'``: eigendecomposition pseudo-inverse with a
+        smooth relative eigenvalue cutoff (``rtol = rshift``):
+        ``1/lam -> 1/(lam * (1 + (rtol*lam_max/|lam|)**6))``.
+        ``ashift`` is IGNORED in this mode.
+
+    Args:
+        mu, beta: first/second moment decay rates.
+        norm_clip: if not None, clip the raw direction g to this
+            Euclidean norm before the moment updates.
+        solver: ``'direct'`` (default) or ``'pinv_eig'`` — how the
+            two Ns x Ns Gram systems are solved (see above).
+    """
+
+    _STATE_ATTRS = ('t', 'm', 'v')
+    # run_vmc_loop hands the Jacobian over via an ownership box so it
+    # can be freed inside _solve (right after the all_to_all copy)
+    # rather than lingering in the caller's frame for the whole solve.
+    _supports_ownership_box = True
+
+    def __init__(
+        self,
+        mu: float = 0.95,
+        beta: float = 0.995,
+        norm_clip: Optional[float] = None,
+        mixed_precision: bool = False,
+        solver: str = 'direct',
+    ):
+        if solver not in ('direct', 'pinv_eig'):
+            raise ValueError(
+                f"unknown solver {solver!r}; expected "
+                "'direct' or 'pinv_eig'"
+            )
+        self.mu = mu
+        self.beta = beta
+        self.norm_clip = norm_clip
+        # The all_to_all reshard is always done in fp32 and O_bar is
+        # upcast to fp64 afterwards.  mixed_precision only controls the
+        # two Gram matmuls (T1, T2): default False keeps them in fp64
+        # (matches Ao); True casts O_bar to fp32 just for the matmul.
+        self.mixed_precision = mixed_precision
+        self.solver = solver
+        self.m: Optional[torch.Tensor] = None
+        self.v: Optional[torch.Tensor] = None
+        self.t: int = 0
+
+    def _solve_gram(
+        self,
+        T: torch.Tensor,
+        b: torch.Tensor,
+        rshift: float,
+        ashift: float,
+    ) -> torch.Tensor:
+        """Solve the Ns x Ns Gram system ``T x = b``.
+
+        Dispatches on ``self.solver``:
+
+          - ``'direct'``: in-place diagonal shift
+            ``rshift * trace(T)/sqrt(Ns) + ashift``
+            followed by a direct solve (``T`` is mutated).
+          - ``'pinv_eig'``: eigh pseudo-inverse with a smooth
+            relative eigenvalue cutoff
+            (``rtol = rshift``, ``atol = 0``); ``ashift`` is
+            ignored.
+
+        Args:
+            T: (Ns, Ns) symmetric PSD Gram matrix (all-reduced,
+                identical on every rank).
+            b: (Ns,) right-hand side.
+            rshift, ashift: relative / absolute shift terms.
+
+        Returns:
+            (Ns,) solution vector.
+        """
+        if self.solver == 'pinv_eig':
+            # Smooth suppression of eigenvalues below
+            # rtol * lam_max instead of a hard truncation.
+            evals, U = torch.linalg.eigh(T)
+            evals_abs = evals.abs()
+            cutoff = rshift * evals_abs.max()
+            inv_factor = 1.0 + (cutoff / evals_abs) ** 6
+            evals_inv = 1.0 / (evals * inv_factor)
+            evals_inv = torch.where(
+                evals_abs > 0.0,
+                evals_inv,
+                torch.zeros_like(evals_inv),
+            )
+            return U @ (evals_inv * (U.T @ b))
+        # 'direct': trace-scaled relative shift + absolute shift, then a
+        # Cholesky solve (T is SPD after the shift; ~2x fewer flops than
+        # LU and matches Ao's `solve(..., assume_a="pos")`).
+        T.diagonal().add_(_two_term_shift(
+            T.trace().item(), T.shape[0], rshift, ashift,
+        ))
+        return self._solve_cholesky(T, b)[0]
+
+    def _solve(
+        self,
+        *,
+        O_loc,
+        E_loc,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
+        device: torch.device,
+    ) -> Tuple[Any, float, Any]:
+        t0 = time.time()
+        device = self._device(device)
+        rank = self._rank()
+        world_size = self._world_size()
+
+        # Unwrap the ownership box from solve() so this frame holds the
+        # only reference (lets the fp32 Jacobian be freed in here).
+        if isinstance(O_loc, list):
+            box = O_loc
+            O_loc = box[0]
+            box[0] = None
+        jac_dtype = O_loc.dtype
+        # Keep the Jacobian in its native (fp32) dtype for the cheap
+        # all_to_all; it must be contiguous for the later .view().
+        # Energies stay in their native (fp64) dtype so the centering
+        # (E_loc - E_mean) keeps full precision, like Ao.
+        O_loc = O_loc.to(device).contiguous()
+        E_loc = E_loc.to(device)
+
+        # (Non-finite sample rows are already zeroed and E_mean made
+        # clean by solve() -> _mask_outlier_samples, before _solve.)
+
+        # minSR only needs the column means of O (the kernel-form force
+        # is built from Obar.T @ alpha, not the explicit E@O gradient),
+        # so use _O_mean and skip the discarded (Ns x Np) E@O matmul.
+        n_local = E_loc.shape[0]
+        O_mean = self._O_mean(O_loc, Ns)
+
+        O_loc.sub_(O_mean.unsqueeze(0)).div_(math.sqrt(Ns))
+        E_scaled = (E_loc - E_mean) / math.sqrt(Ns)
+
+        E_all = torch.empty(Ns, device=device, dtype=E_scaled.dtype)
+        dist.all_gather_into_tensor(E_all, E_scaled)
+
+        if world_size > 1:
+            # Column-redistribute O across ranks via all_to_all (fp32).
+            np_per_rank = (Np + world_size - 1) // world_size
+            np_pad = world_size * np_per_rank
+            col_offset = rank * np_per_rank
+            if np_pad != Np:
+                O_padded = torch.zeros(
+                    (n_local, np_pad),
+                    device=device,
+                    dtype=jac_dtype,
+                )
+                O_padded[:, :Np].copy_(O_loc)
+                del O_loc
+            else:
+                O_padded = O_loc
+                O_loc = None
+
+            send_buf = (
+                O_padded
+                .view(n_local, world_size, np_per_rank)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            del O_padded
+            recv_buf = torch.empty_like(send_buf)
+            dist.all_to_all_single(recv_buf, send_buf)
+            del send_buf
+            O_bar = recv_buf.reshape(
+                world_size * n_local, np_per_rank,
+            )
+            del recv_buf
+        else:
+            # Single GPU: skip the identity all_to_all to avoid the
+            # 2 x |O_loc| transient memory spike.
+            np_per_rank = Np
+            np_pad = Np
+            col_offset = 0
+            O_bar = O_loc
+            O_loc = None
+
+        # ---- O reshard done in fp32; upcast for the fp64 linear
+        # algebra (Gram matmul / Cholesky solve / back-projection).
+        # E_all is already fp64 (energies kept full precision). ----
+        O_bar = O_bar.to(torch.float64)
+
+        stop = min(col_offset + np_per_rank, Np)
+
+        # ---- 1st solve: raw SR direction g = Obar.T @ T1^{-1} Ebar ----
+        T1 = O_bar @ O_bar.T
+
+        dist.all_reduce(T1, op=dist.ReduceOp.SUM)
+        alpha1 = self._solve_gram(T1, E_all, rshift, ashift)
+        del T1
+        g_local = O_bar.T @ alpha1  # shape (np_per_rank,)
+
+        g_padded = torch.empty(
+            np_pad, device=device, dtype=torch.float64,
+        )
+        dist.all_gather_into_tensor(g_padded, g_local)
+        g = g_padded[:Np].contiguous()
+
+        # clip the solved g
+        if self.norm_clip is not None:
+            g_norm = torch.linalg.vector_norm(g)
+            # branchless renorm: scale = min(clip/||g||, 1)
+            scale = (
+                self.norm_clip / g_norm.clamp(min=1e-30)
+            ).clamp(max=1.0)
+            if scale != 1.0 and self._rank() == 0:
+                print(
+                    f"Clipping AdamSRMinSRGPU raw direction from {g_norm:.4e} "
+                    f"to {self.norm_clip:.4e} (scale factor {scale:.4e})",
+                    flush=True,
+                )
+            g = g * scale
+
+        # ---- Adam moment updates (full Np vectors) ----
+        if self.m is None:
+            self.m = torch.zeros(
+                Np, device=device, dtype=torch.float64,
+            )
+            self.v = torch.zeros(
+                Np, device=device, dtype=torch.float64,
+            )
+        self.t += 1
+        self.m = self.mu * self.m + (1.0 - self.mu) * g
+        self.v = self.beta * self.v + (1.0 - self.beta) * g.abs() ** 2
+        mhat = self.m / (1.0 - self.mu ** self.t)
+        vhat = self.v / (1.0 - self.beta ** self.t)
+        V = vhat.pow(0.25) + 1e-8
+
+        # Slice mhat, V for this rank's columns.
+        mhat_cols = torch.zeros(
+            np_per_rank, device=device, dtype=torch.float64,
+        )
+        V_cols = torch.ones(
+            np_per_rank, device=device, dtype=torch.float64,
+        )
+        if stop > col_offset:
+            n_live = stop - col_offset
+            mhat_cols[:n_live].copy_(mhat[col_offset:stop])
+            V_cols[:n_live].copy_(V[col_offset:stop])
+
+        # ---- 2nd solve: rhs = Ebar - Obar @ mhat, Obar_pre = Obar / V ----
+        proj = O_bar @ mhat_cols  # local contribution, shape (Ns,)
+        dist.all_reduce(proj, op=dist.ReduceOp.SUM)
+        rhs2 = E_all - proj
+
+        # In-place: O_bar is not needed in raw form after this point,
+        # so divide in place instead of allocating another full
+        # (Ns, np_per_rank) copy of the Jacobian.
+        O_bar.div_(V_cols.unsqueeze(0))
+        O_pre = O_bar
+        T2 = O_pre @ O_pre.T
+        dist.all_reduce(T2, op=dist.ReduceOp.SUM)
+        alpha2 = self._solve_gram(T2, rhs2, rshift, ashift)
+        info2 = 0  # direct solve, so no convergence info
+        del T2
+
+        step_pre_local = O_pre.T @ alpha2  # (np_per_rank,) not complete yet
+        del O_pre, O_bar
+        step_local = step_pre_local / V_cols + mhat_cols
+
+        step_padded = torch.empty(
+            np_pad, device=device, dtype=torch.float64,
+        )
+        dist.all_gather_into_tensor(step_padded, step_local)
+        dp = step_padded[:Np].contiguous()
+        
+        # clip the solved g
+        if self.norm_clip is not None:
+            dp_norm = torch.linalg.vector_norm(dp)
+            # branchless renorm: scale = min(clip/||dp||, 1)
+            scale = (
+                self.norm_clip / dp_norm.clamp(min=1e-30)
+            ).clamp(max=1.0)
+            if scale != 1.0 and self._rank() == 0:
+                print(
+                    f"Clipping AdamSRMinSRGPU step from {dp_norm:.4e} to "
+                    f"{self.norm_clip:.4e} (scale factor {scale:.4e})",
+                    flush=True,
+                )
+            dp = dp * scale
+
+        # Cast the step back to the Jacobian (model param) dtype.
+        dp = dp.to(jac_dtype)
+        return dp, time.time() - t0, info2
+
+    def reset(self) -> None:
+        self.m = None
+        self.v = None
+        self.t = 0
 
 
 __all__ = [
@@ -1291,9 +2027,12 @@ __all__ = [
     "SGDGPU",
     "AdamGPU",
     "PreconditionerGPU",
-    "DistributedSRMinresGPU",
+    "IterSRGPU",
     "MinSRGPU",
-    "DistributedMinSRGPU",
-    "SPRINGMinresGPU",
+    "SPRINGIterGPU",
+    "MARCHIterGPU",
+    "AdamSRIterGPU",
     "SPRINGMinSRGPU",
+    "MARCHMinSRGPU",
+    "AdamSRMinSRGPU",
 ]

@@ -10,6 +10,11 @@ from vmc_torch.GPU.torch_utils import (
     size_aware_svd,
     qr_via_cholesky,
 )
+from vmc_torch.fermion_utils import (
+    standardize_pbc_peps_leg_order,
+    make_pbc_dual_uniform,
+)
+
 DEFAULT_DATA_ROOT = (
     '/home/sijingdu/TNVMC/VMC_code/vmc_torch/'
     'vmc_torch/experiment/vmap/data'
@@ -79,12 +84,39 @@ def setup_linalg_hooks(
 
 
 def load_or_generate_peps(
-    Lx, Ly, t, U, N_f, D, seed=42, dtype=torch.float64, scale_factor=4,
-    data_root=DEFAULT_DATA_ROOT, file_path=None, 
+    Lx,
+    Ly,
+    t,
+    U,
+    N_f,
+    D,
+    seed=42,
+    dtype=torch.float64,
+    scale_factor=4,
+    data_root=DEFAULT_DATA_ROOT,
+    file_path=None,
+    random_init=False,
+    pbc=False,
+    saved_peps_name="peps",
+    appendix="_U1SU", # for GPU workflow, by default we use U1SU peps
 ):
-    """Load a pre-trained Z2-fPEPS from disk, or generate a random one."""
+    """Load a pre-trained Z2-fPEPS from disk, or generate a random one.
+
+    Args:
+        pbc: if True, the random-init branch produces a cyclic
+            (torus) PEPS via ``PEPS_fermionic_rand(cyclic=True, ...)``;
+            the disk-load branch is structure-agnostic (whatever was
+            pickled — OBC or PBC — is returned as-is). When the
+            returned PEPS is cyclic (in either branch),
+            :func:`standardize_pbc_peps_leg_order` is applied so all
+            site tensors share a uniform (UP, LEFT, RIGHT, DOWN, PHYS)
+            leg order — required by uniform-channel NN backflows.
+    """
     try:
-        appendix = '_U1SU'
+        if random_init:
+            raise ValueError("random_init=True: skipping loading from disk.")
+
+        
         if file_path is not None:
             base = file_path
         else:
@@ -92,8 +124,8 @@ def load_or_generate_peps(
                 f"{data_root}/{Lx}x{Ly}/t={t}_U={U}"
                 f"/N={N_f}/Z2/D={D}/"
             )
-        params_path = base + f"peps_su_params{appendix}.pkl"
-        skeleton_path = base + f"peps_skeleton{appendix}.pkl"
+        params_path = base + f"{saved_peps_name}_su_params{appendix}.pkl"
+        skeleton_path = base + f"{saved_peps_name}_skeleton{appendix}.pkl"
 
         with open(params_path, 'rb') as f:
             params_pkl = pickle.load(f)
@@ -104,6 +136,8 @@ def load_or_generate_peps(
 
         for ts in peps.tensors:
             ts.modify(data=ts.data.to_flat() * scale_factor)
+            sorted_data = ts.data.sort_stack(inplace=False)
+            ts.modify(data=sorted_data)
         for site in peps.sites:
             peps[site].data._label = site
             peps[site].data.indices[-1]._linearmap = (
@@ -131,7 +165,40 @@ def load_or_generate_peps(
             flat=True,
             seed=seed,
             dtype=str(dtype).split(".")[-1],
+            cyclic=pbc,
         )
+        # Defense-in-depth: sort sectors on every tensor right at
+        # generation so the returned PEPS is in canonical form from
+        # the source. The disk-load branch above and the PBC post-
+        # processing below also sort_stack; this ensures the random-
+        # init path is symmetric and consumers that bypass the model
+        # (e.g. direct symmray exact contraction for ED comparison)
+        # always see a consistent sector layout across sites.
+        for ts in peps.tensors:
+            ts.modify(data=ts.data.sort_stack(inplace=False))
+
+    # For PBC, normalize:
+    #   1) leg order -> (UP, LEFT, RIGHT, DOWN, PHYS), required so
+    #      uniform NN backflows map flat output to consistent legs;
+    #   2) dual pattern -> (T, T, F, F, F) everywhere, so the
+    #      parametrization is manifestly translation-equivariant
+    #      (otherwise wrap-affected sites carry site-dependent
+    #      fermion phases);
+    #   3) sort_stack after the leg transpose: standardize_..._leg_order
+    #      permutes leg axes differently per site (each site needed a
+    #      different transpose to reach ULRD), which permutes the
+    #      stored _sectors array per site. Without re-sorting, two sites
+    #      end up with the same SET of sectors but in different stored
+    #      ORDER. Uniform NN backflows assume sector index k means the
+    #      same (charge tuple) on every site -- sort_stack restores
+    #      that by putting every site's _sectors in canonical lex order.
+    if pbc:
+        peps = standardize_pbc_peps_leg_order(peps)
+        peps = make_pbc_dual_uniform(peps)
+        for ts in peps.tensors:
+            ts.modify(data=ts.data.sort_stack(inplace=False))
+            ts.data.phase_sync(inplace=True)
+
     return peps
 
 
@@ -231,6 +298,8 @@ def random_spin_config_sz0(N_sites, seed=None):
 __all__ = [
     'setup_linalg_hooks',
     'load_or_generate_peps',
+    'standardize_pbc_peps_leg_order',
+    'make_pbc_dual_uniform',
     'initialize_walkers',
     'ensure_output_dir',
     'generate_random_spin_peps',

@@ -314,10 +314,14 @@ def svd_via_eigh(
     Args:
         A: (..., M, N)
         epsilon: threshold for reciprocal of S
-        jitter: regularization added to A^T A (not to A itself),
-            preserving eigenvector orthogonality from eigh
-        nonuniform_diag: if True, jitter * diag(1,2,...,K)/K
-            to lift degeneracies; else jitter * I
+        jitter: *relative* regularization strength. The actual shift
+            added to P = A^T A (or A A^T) is
+            diag_shift = jitter * trace(P)/K = jitter * ||A||_F^2 / K,
+            i.e. jitter times the mean eigenvalue of P. This keeps the
+            shift meaningful regardless of A's overall scale, while
+            preserving eigenvector orthogonality from eigh.
+        nonuniform_diag: if True, diag_shift * diag(1,2,...,K)/K
+            to lift degeneracies; else diag_shift * I
     Returns:
         U, S, Vh
     """
@@ -327,17 +331,23 @@ def svd_via_eigh(
     if M >= N:
         P = A.mT @ A
 
-        # Add jitter to P = A^T A, not to A
+        # Add a relative jitter to P = A^T A, not to A.
+        # diag_shift = jitter * trace(P)/K (mean eigenvalue of P).
         K = N
+        # detach: diag_shift is a constant regularizer, no grad to A
+        trace_P = torch.diagonal(
+            P, dim1=-2, dim2=-1,
+        ).sum(-1).real.detach()
+        diag_shift = (jitter * trace_P / K)[..., None, None]  # (..., 1, 1)
         if nonuniform_diag:
             diag_vals = torch.arange(
                 1, K + 1, device=A.device, dtype=A.dtype,
             ) / K
-            P = P + jitter * torch.diag_embed(
+            P = P + diag_shift * torch.diag_embed(
                 diag_vals.expand(P.shape[:-1]),
             )
         else:
-            P = P + jitter * torch.eye(
+            P = P + diag_shift * torch.eye(
                 K, device=A.device, dtype=A.dtype,
             )
 
@@ -364,16 +374,22 @@ def svd_via_eigh(
     else:
         P = A @ A.mT
 
+        # diag_shift = jitter * trace(P)/K (mean eigenvalue of P).
         K = M
+        # detach: diag_shift is a constant regularizer, no grad to A
+        trace_P = torch.diagonal(
+            P, dim1=-2, dim2=-1,
+        ).sum(-1).real.detach()
+        diag_shift = (jitter * trace_P / K)[..., None, None]  # (..., 1, 1)
         if nonuniform_diag:
             diag_vals = torch.arange(
                 1, K + 1, device=A.device, dtype=A.dtype,
             ) / K
-            P = P + jitter * torch.diag_embed(
+            P = P + diag_shift * torch.diag_embed(
                 diag_vals.expand(P.shape[:-1]),
             )
         else:
-            P = P + jitter * torch.eye(
+            P = P + diag_shift * torch.eye(
                 K, device=A.device, dtype=A.dtype,
             )
 
@@ -498,13 +514,15 @@ def robust_svd_err_catcher_wrapper(
 def _cholesky_qr_forward(A, rel_jitter):
     """Cholesky QR forward: fast but no autograd.
 
+    The Gram shift is *relative*: jitter = rel_jitter * ||A||_F^2.
+
     Tall/square (M >= N):
       G = A^T A + jitter*I, cholesky(G)=L, R=L^T, Q=A R^{-1}
     Wide (M < N):
       Cholesky QR on A[:,:M] → Q, then R = Q^T A
     """
-    scale = (A * A).sum(dim=(-2, -1))
-    scale.detach()
+    # detach: the shift is a constant regularizer, no grad to A
+    scale = (A * A).sum(dim=(-2, -1)).detach()
     jitter = rel_jitter * scale.amax()  # scalar
     M, N = A.shape[-2:]
     if M >= N:
@@ -540,23 +558,21 @@ def _solve_R_inv_T(R, A, rel_jitter=0.0) -> torch.Tensor:
     torch.linalg.svd to avoid the batched SVD performance cliff.
     Singular values of R below rel_jitter get 1/S → 0.
 
-    The jitter passed to svd_via_eigh is scaled by tr(R) so
-    it stays meaningful relative to R's scale,
-    even when R is ill-conditioned.
+    rel_jitter is passed straight through as svd_via_eigh's relative
+    jitter, which internally scales it by trace(R^T R)/K so the shift
+    stays meaningful relative to R's scale even when R is
+    ill-conditioned.
 
     Args:
         R: (..., K, K) upper triangular
         A: (..., M, K)
-        rel_jitter: used as relative jitter scale for svd_via_eigh.
+        rel_jitter: relative jitter scale for svd_via_eigh.
     Returns:
         A @ R^{-T}: (..., M, K)
     """
     # R = U_R @ diag(S_R) @ Vh_R
     # R^{-T} = U_R @ diag(1/S_R) @ Vh_R
-    # Scale jitter by tr(R) so it's meaningful relative to R's scale.
-    tr_R = torch.diagonal(R, dim1=-2, dim2=-1).sum(-1).max().detach()
-    adaptive_jitter = rel_jitter * tr_R
-    U_R, S_R, Vh_R = svd_via_eigh(R, jitter=adaptive_jitter)
+    U_R, S_R, Vh_R = svd_via_eigh(R, jitter=rel_jitter)
     S_inv = safe_inverse(S_R)
     return (A @ U_R) * S_inv.unsqueeze(-2) @ Vh_R
 
@@ -634,14 +650,15 @@ def qr_via_cholesky(x, jitter=1e-16, adaptive_jitter=False, forward_only=False):
 
     Args:
         x: (..., M, N) tensor.
-        jitter: scalar added to Gram diagonal for regularization.
-        adaptive_jitter: if True, scale jitter by ||A||_F^2.
+        jitter: *relative* regularization strength. _cholesky_qr_forward
+            always scales it by ||x||_F^2 before adding to the Gram
+            diagonal, so the shift tracks x's scale automatically.
+        adaptive_jitter: deprecated and ignored. The jitter is always
+            relative (scaled inside _cholesky_qr_forward); kept only so
+            existing call sites don't break.
         forward_only: if True, only compute the forward pass (no backward).
     """
-    if adaptive_jitter:
-        scale = (x * x).sum(dim=(-2, -1))
-        scale.detach()
-        jitter = jitter * scale.amax()  # scalar
+    del adaptive_jitter  # always relative; arg kept for compatibility
     if forward_only:
         Q, R = _cholesky_qr_forward(x, jitter)
         return Q, R
@@ -771,7 +788,6 @@ def torch_minres(matvec, b, rtol=1e-5, maxiter=100):
         return torch.zeros_like(b), 0
 
     # Lanczos init: r1 = b, beta1 = ||b||
-    n = b.shape[0]
     x = torch.zeros_like(b)
     r1 = b.clone()
     r2 = b.clone()
@@ -788,7 +804,6 @@ def torch_minres(matvec, b, rtol=1e-5, maxiter=100):
 
     # Estimates of ||A|| and ||x|| (following scipy MINRES)
     Anorm2 = 0.0
-    ynorm2 = 0.0
 
     # w vectors for solution update
     w = torch.zeros_like(b)

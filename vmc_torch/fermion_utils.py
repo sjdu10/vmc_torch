@@ -667,7 +667,115 @@ class fPEPS(qtn.PEPS):
         )
         return amp
 
-def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=False, spinless=False, subsizes=None):
+def standardize_pbc_peps_leg_order(peps):
+    """Transpose every PBC fPEPS tensor's legs to ``(UP, LEFT, RIGHT,
+    DOWN, PHYS)`` order (ulrd).
+
+    Why: quimb names bonds ``b((a,b))-((c,d))`` with ``(a,b) < (c,d)``
+    in lex order, and each tensor's leg order follows bond-name lex
+    sort. For OBC bulk sites the four neighbors naturally sort to
+    ``UP, LEFT, RIGHT, DOWN, PHYS``. For PBC, wrap-around bonds
+    connect to a neighbor with a coordinate that lex-sorts AFTER all
+    direct neighbors, so e.g. site ``(0,0)`` ends up with legs in
+    ``RIGHT, LEFT-wrap, DOWN, UP-wrap, PHYS`` order. Uniform-channel
+    NN backflows output the same flat vector per site and require a
+    consistent leg semantics across all sites; otherwise the same NN
+    entry maps to different TN legs on different sites.
+
+    Restriction: requires ``Lx, Ly >= 3``. Length-2 axes have
+    degenerate wrap (``UP == DOWN`` or ``LEFT == RIGHT``) and a
+    uniform 5-leg layout is impossible — in that case the helper is
+    a no-op (with a warning print) so raw contraction still works.
+    """
+    Lx, Ly = peps.Lx, peps.Ly
+    if Lx < 3 or Ly < 3:
+        print(
+            f"[standardize_pbc_peps_leg_order] Lx={Lx}, Ly={Ly} < 3 "
+            "in some axis -- wrap is degenerate, skipping leg-order "
+            "normalization. Uniform NN backflows require Lx,Ly>=3."
+        )
+        return peps
+
+    def bond_name(a, b):
+        a, b = sorted([tuple(a), tuple(b)])
+        return f"b{a}-{b}"
+
+    for site in peps.sites:
+        x, y = site
+        target = (
+            bond_name(site, ((x - 1) % Lx, y)),         # UP
+            bond_name(site, (x, (y - 1) % Ly)),         # LEFT
+            bond_name(site, (x, (y + 1) % Ly)),         # RIGHT
+            bond_name(site, ((x + 1) % Lx, y)),         # DOWN
+            peps.site_ind(site),                        # PHYS
+        )
+        peps[site].transpose_(*target)
+    return peps
+
+
+def make_pbc_dual_uniform(peps, canonical=(True, True, False, False, False)):
+    """Force every PBC fPEPS tensor's dual pattern to ``canonical``.
+
+    Default canonical pattern ``(T, T, F, F, F)`` = (UP, LEFT, RIGHT,
+    DOWN, PHYS) with UP/LEFT incoming and RIGHT/DOWN outgoing, matching
+    OBC bulk-site convention.
+
+    Why: quimb names bonds by lex-sorted endpoint coords and gives
+    dual=False to the smaller side. For OBC bulk this always yields
+    ``(T, T, F, F, F)``. For PBC, wrap-around bonds connect to a
+    neighbor whose coord sorts AFTER the site, so the wrap leg gets
+    the "flipped" dual. Sites near the wrap end up with non-canonical
+    dual patterns even after :func:`standardize_pbc_peps_leg_order`
+    puts the legs in ULRD order. CNN backflows that assume site-
+    uniform leg semantics lose translation equivariance.
+
+    Implementation: for each tensor, flip the ``dual`` flag on every
+    axis where it differs from ``canonical``. Flat block storage is
+    unchanged. For Z2 PEPS this produces a different but valid Z2
+    fPEPS (effectively flips signs on some sectors). For random-init
+    use cases (PEPS is just a starting point for SU / VMC), the
+    different amplitude is fine.
+
+    Bond consistency: since every site wants the same canonical
+    pattern, any shared bond's two endpoints either both stay or
+    both flip — "opposite dual on shared bond" is preserved
+    automatically.
+
+    Pre-conditions:
+        - PEPS in ULRD + PHYS leg order. Run
+          :func:`standardize_pbc_peps_leg_order` first.
+        - For Lx<3 or Ly<3 (degenerate wrap), no-op with a warning.
+        - Z2 symmetry. For U1 PEPS, flipping duals would change
+          allowed sectors (because U1 conservation has sign), so the
+          naive flip would silently break charge balance — currently
+          the helper does NOT enforce this; if you call it on U1 you
+          are on your own.
+    """
+    Lx, Ly = peps.Lx, peps.Ly
+    if Lx < 3 or Ly < 3:
+        print(
+            f"[make_pbc_dual_uniform] Lx={Lx}, Ly={Ly} < 3 in some "
+            "axis -- wrap is degenerate, skipping dual normalization."
+        )
+        return peps
+
+    for site in peps.sites:
+        ts = peps[site]
+        data = ts.data
+        wrong = [
+            i for i in range(len(data.indices))
+            if data.duals[i] != canonical[i]
+        ]
+        if not wrong:
+            continue
+        new_indices = list(data.indices)
+        for ax in wrong:
+            new_indices[ax] = new_indices[ax].conj()
+        data._indices = tuple(new_indices)
+    return peps
+
+
+def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=False, spinless=False, subsizes=None, u1_all_even=False):
     edges = qtn.edges_2d_square(Lx, Ly, cyclic=False)
     site_info = parse_edges_to_site_info(
         edges,
@@ -678,11 +786,16 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
     )
     sites = list(site_info.keys())
 
-    # generate random binary string with Nf ones and Lx*Ly-Nf zeros
+    # generate random charge configs with total u1 charge==Nf for U1 fPEPS
     def generate_initial_config(Nf, Lx, Ly):
         np.random.seed(seed)
-        total_sites = Lx * Ly
-        config = np.array([1] * Nf + [0] * (total_sites - Nf))
+        if not u1_all_even:
+            total_sites = Lx * Ly
+            config = np.array([1] * Nf + [0] * (total_sites - Nf))
+        else:
+            # charge 2 at Nf//2 sites and charge 0 at the rest sites for even Nf
+            total_sites = Lx * Ly
+            config = np.array([2] * (Nf // 2) + [0] * (total_sites - Nf // 2))
         np.random.shuffle(config)
         return config
 
@@ -723,6 +836,16 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
         if ts.data.dummy_modes:
             x, y = ts.data.dummy_modes[0].label
             ts.data._dummy_modes[0]._label = 3*(x*Ly + y) # 3*tid
+
+    # For PBC, normalize leg ordering to (UP, LEFT, RIGHT, DOWN, PHYS)
+    # so downstream SU evolution / save / load all carry a consistent
+    # layout that uniform NN backflows can map onto. Then flip wrap-leg
+    # duals so every site shares the OBC-bulk dual pattern (T,T,F,F,F),
+    # restoring manifest translation equivariance of the parametrization.
+    if cyclic:
+        peps = standardize_pbc_peps_leg_order(peps)
+        if symmetry == 'Z2':
+            peps = make_pbc_dual_uniform(peps)
     return peps
 
 
