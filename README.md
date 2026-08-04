@@ -1,4 +1,4 @@
-# ⚛️ vmc_torch: Flexible Variational Monte Carlo with PyTorch
+# ⚛️ vmc_torch: Flexible Variational Monte Carlo for Quantum Many-Body Systems with PyTorch
 
 ## Overview
 
@@ -69,7 +69,7 @@ If you find this code useful, please consider citing it:
 ```bibtex
 @software{vmc_torch,
   author = {Du, Si-Jing},
-  title = {vmc\_torch: Flexible Variational Monte Carlo with PyTorch},
+  title = {vmc\_torch: Flexible Variational Monte Carlo for Quantum Many-Body Systems with PyTorch},
   url = {https://github.com/sjdu10/vmc_torch},
   year = {2025}
 }
