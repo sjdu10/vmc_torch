@@ -1,0 +1,101 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite both the software itself and the
+  accompanying research publication (Du, Chen and Chan, Phys. Rev. B 113,
+  085134).
+title: >-
+  vmc_torch: Flexible Variational Monte Carlo for Quantum Many-Body
+  Systems with PyTorch
+abstract: >-
+  A scalable PyTorch implementation of Variational Monte Carlo (VMC) for
+  ground-state properties of quantum many-body lattice Hamiltonians, with
+  flexible support for Neural Quantum States (NQS), bosonic and fermionic
+  Tensor Network States (MPS/PEPS), hybrid neuralized fermionic tensor
+  networks (NN-fTNS), and Tensor Network Functions (TNF). Markov chain
+  Monte Carlo sampling is distributed via MPI for large-scale HPC
+  deployment, and optimization uses PyTorch automatic differentiation
+  with Stochastic Reconfiguration and standard machine-learning
+  optimizers.
+type: software
+authors:
+  - family-names: Du
+    given-names: Si-Jing
+    email: sdu2@caltech.edu
+    affiliation: California Institute of Technology
+    orcid: "https://orcid.org/0000-0002-4737-9308"
+version: 0.1.0
+license: Apache-2.0
+repository-code: "https://github.com/sjdu10/vmc_torch"
+url: "https://github.com/sjdu10/vmc_torch"
+# Uncomment and fill in after archiving a GitHub release on Zenodo.
+# Use the *concept* DOI so the citation always resolves to the latest
+# version.
+# doi: 10.5281/zenodo.XXXXXXX
+keywords:
+  - variational Monte Carlo
+  - tensor networks
+  - neural quantum states
+  - fermionic tensor networks
+  - quantum many-body physics
+  - PyTorch
+# Once the technical/software paper is released, add it here as
+# `preferred-citation` so that GitHub's "Cite this repository" button and
+# downstream tools emit that paper instead of the software entry above.
+# preferred-citation:
+#   type: article
+#   title: ...
+#   authors: ...
+#   journal: ...
+#   year: ...
+#   doi: ...
+references:
+  - type: article
+    title: >-
+      Neuralized fermionic tensor networks for quantum many-body systems
+    authors:
+      - family-names: Du
+        given-names: Si-Jing
+      - family-names: Chen
+        given-names: Ao
+      - family-names: Chan
+        given-names: Garnet Kin-Lic
+    journal: Physical Review B
+    volume: 113
+    issue: 8
+    start: "085134"
+    year: 2026
+    doi: 10.1103/x8vl-qf14
+  - type: article
+    title: >-
+      Tensor network computations that capture strict variationality,
+      volume law behavior, and the efficient representation of neural
+      network states
+    authors:
+      - family-names: Liu
+        given-names: Wen-Yuan
+      - family-names: Du
+        given-names: Si-Jing
+      - family-names: Peng
+        given-names: Ruojing
+      - family-names: Gray
+        given-names: Johnnie
+      - family-names: Chan
+        given-names: Garnet Kin-Lic
+    journal: Physical Review Letters
+    volume: 133
+    issue: 26
+    start: "260404"
+    year: 2024
+    doi: 10.1103/PhysRevLett.133.260404
+  - type: software
+    title: quimb
+    authors:
+      - family-names: Gray
+        given-names: Johnnie
+    repository-code: "https://github.com/jcmgray/quimb"
+  - type: software
+    title: symmray
+    authors:
+      - family-names: Gray
+        given-names: Johnnie
+    repository-code: "https://github.com/jcmgray/symmray"
