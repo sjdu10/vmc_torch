@@ -71,7 +71,7 @@ If you find this code useful, please consider citing it:
   author = {Du, Si-Jing},
   title = {vmc\_torch: Flexible Variational Monte Carlo for Quantum Many-Body Systems with PyTorch},
   url = {https://github.com/sjdu10/vmc_torch},
-  year = {2025}
+  year = {2026}
 }
 
 @article{du2025neuralized,
