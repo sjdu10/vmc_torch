@@ -1,205 +1,21 @@
-import os
-import pickle
+"""VMC run setup: walker initialization.
 
-import autoray as ar
-import quimb.tensor as qtn
+TN-specific setup moved to ``tensor_network/utils.py`` (``setup_linalg_hooks``,
+``load_or_generate_peps``, ``generate_random_spin_peps``); it is
+re-exported below so existing imports keep working.  New code should
+take those from ``vmc_torch.GPU.tensor_network.utils``.
+"""
 import torch
 
-from vmc_torch.GPU.torch_utils import (
-    size_aware_qr,
-    size_aware_svd,
-    qr_via_cholesky,
+from vmc_torch.GPU.tensor_network.utils import (  # noqa: F401  (re-export)
+    generate_random_spin_peps,
+    load_or_generate_peps,
+    setup_linalg_hooks,
 )
-from vmc_torch.fermion_utils import (
+from vmc_torch.fermion_utils import (  # noqa: F401  (re-export)
     standardize_pbc_peps_leg_order,
     make_pbc_dual_uniform,
 )
-
-DEFAULT_DATA_ROOT = (
-    '/home/sijingdu/TNVMC/VMC_code/vmc_torch/'
-    'vmc_torch/experiment/vmap/data'
-)
-
-
-def setup_linalg_hooks(
-    random_truncated_svd=False,
-    jitter=1e-16, 
-    driver=None,
-    
-    qr_via_eigh=True, 
-    cholesky_qr=False,
-    cholesky_qr_adaptive_jitter=False,
-    nonuniform_diag=False,
-):
-    """Register autoray hooks for SVD and QR dispatch.
-
-    Args:
-        nonuniform_diag: if True, use non-uniform diagonal jitter (instead of
-            identity) in EIG-based SVD/QR to lift singular value
-            degeneracies.  Stabilizes backward for matrices with
-            repeated or near-degenerate singular values.
-    """
-    if random_truncated_svd:
-        from symmray.linalg import svd_rand_truncated
-        from functools import partial
-        svd_rand_truncated_new = partial(
-            svd_rand_truncated,
-            seed=42,
-        )
-        ar.register_function("symmray", "svd_truncated", svd_rand_truncated_new)
-    else:
-        ar.register_function(
-            'torch',
-            'linalg.svd',
-            lambda x: size_aware_svd(
-                x, jitter=jitter, driver=driver,
-                nonuniform_diag=nonuniform_diag,
-            ),
-        )
-    if qr_via_eigh and cholesky_qr:
-        raise ValueError(
-            "Cannot use both qr_via_eigh and cholesky_qr."
-        )
-    if cholesky_qr:
-        ar.register_function(
-            "torch",
-            "linalg.qr",
-            lambda x: qr_via_cholesky(
-                x, jitter=jitter,
-                adaptive_jitter=cholesky_qr_adaptive_jitter,
-            ),
-        )
-    elif qr_via_eigh:
-        ar.register_function(
-            'torch',
-            'linalg.qr',
-            lambda x: size_aware_qr(
-                x, via_eigh=True, jitter=jitter,
-                nonuniform_diag=nonuniform_diag,
-            ),
-        )
-    else: # both False: use default torch.linalg.qr
-        # Use default torch.linalg.qr
-        pass
-
-
-def load_or_generate_peps(
-    Lx,
-    Ly,
-    t,
-    U,
-    N_f,
-    D,
-    seed=42,
-    dtype=torch.float64,
-    scale_factor=4,
-    data_root=DEFAULT_DATA_ROOT,
-    file_path=None,
-    random_init=False,
-    pbc=False,
-    saved_peps_name="peps",
-    appendix="_U1SU", # for GPU workflow, by default we use U1SU peps
-):
-    """Load a pre-trained Z2-fPEPS from disk, or generate a random one.
-
-    Args:
-        pbc: if True, the random-init branch produces a cyclic
-            (torus) PEPS via ``PEPS_fermionic_rand(cyclic=True, ...)``;
-            the disk-load branch is structure-agnostic (whatever was
-            pickled — OBC or PBC — is returned as-is). When the
-            returned PEPS is cyclic (in either branch),
-            :func:`standardize_pbc_peps_leg_order` is applied so all
-            site tensors share a uniform (UP, LEFT, RIGHT, DOWN, PHYS)
-            leg order — required by uniform-channel NN backflows.
-    """
-    try:
-        if random_init:
-            raise ValueError("random_init=True: skipping loading from disk.")
-
-        
-        if file_path is not None:
-            base = file_path
-        else:
-            base = (
-                f"{data_root}/{Lx}x{Ly}/t={t}_U={U}"
-                f"/N={N_f}/Z2/D={D}/"
-            )
-        params_path = base + f"{saved_peps_name}_su_params{appendix}.pkl"
-        skeleton_path = base + f"{saved_peps_name}_skeleton{appendix}.pkl"
-
-        with open(params_path, 'rb') as f:
-            params_pkl = pickle.load(f)
-        with open(skeleton_path, 'rb') as f:
-            skeleton = pickle.load(f)
-
-        peps = qtn.unpack(params_pkl, skeleton)
-
-        for ts in peps.tensors:
-            ts.modify(data=ts.data.to_flat() * scale_factor)
-            sorted_data = ts.data.sort_stack(inplace=False)
-            ts.modify(data=sorted_data)
-        for site in peps.sites:
-            peps[site].data._label = site
-            peps[site].data.indices[-1]._linearmap = (
-                (0, 0), (1, 0), (1, 1), (0, 1)
-            )
-    except Exception as e:
-        import symmray as sr
-
-        print(
-            f'Could not load Z2-fPEPS from pickle: {e}. '
-            f'Generating random Z2-fPEPS instead.'
-        )
-        peps = sr.networks.PEPS_fermionic_rand(
-            "Z2",
-            Lx,
-            Ly,
-            D,
-            phys_dim=[
-                (0, 0),
-                (1, 1),
-                (1, 0),
-                (0, 1),
-            ],
-            subsizes="equal",
-            flat=True,
-            seed=seed,
-            dtype=str(dtype).split(".")[-1],
-            cyclic=pbc,
-        )
-        # Defense-in-depth: sort sectors on every tensor right at
-        # generation so the returned PEPS is in canonical form from
-        # the source. The disk-load branch above and the PBC post-
-        # processing below also sort_stack; this ensures the random-
-        # init path is symmetric and consumers that bypass the model
-        # (e.g. direct symmray exact contraction for ED comparison)
-        # always see a consistent sector layout across sites.
-        for ts in peps.tensors:
-            ts.modify(data=ts.data.sort_stack(inplace=False))
-
-    # For PBC, normalize:
-    #   1) leg order -> (UP, LEFT, RIGHT, DOWN, PHYS), required so
-    #      uniform NN backflows map flat output to consistent legs;
-    #   2) dual pattern -> (T, T, F, F, F) everywhere, so the
-    #      parametrization is manifestly translation-equivariant
-    #      (otherwise wrap-affected sites carry site-dependent
-    #      fermion phases);
-    #   3) sort_stack after the leg transpose: standardize_..._leg_order
-    #      permutes leg axes differently per site (each site needed a
-    #      different transpose to reach ULRD), which permutes the
-    #      stored _sectors array per site. Without re-sorting, two sites
-    #      end up with the same SET of sectors but in different stored
-    #      ORDER. Uniform NN backflows assume sector index k means the
-    #      same (charge tuple) on every site -- sort_stack restores
-    #      that by putting every site's _sectors in canonical lex order.
-    if pbc:
-        peps = standardize_pbc_peps_leg_order(peps)
-        peps = make_pbc_dual_uniform(peps)
-        for ts in peps.tensors:
-            ts.modify(data=ts.data.sort_stack(inplace=False))
-            ts.data.phase_sync(inplace=True)
-
-    return peps
 
 
 def initialize_walkers(
@@ -224,45 +40,6 @@ def initialize_walkers(
         configs.append(torch.as_tensor(state, dtype=torch.int64))
     return torch.stack(configs).to(device)
 
-
-def ensure_output_dir(
-    Lx, Ly, t, U, N_f, D, data_root=DEFAULT_DATA_ROOT,
-):
-    """Create output directory and return its path."""
-    output_dir = (
-        f"{data_root}/GPU/{Lx}x{Ly}/"
-        f"t={t}_U={U}/N={N_f}/Z2/D={D}"
-    )
-    os.makedirs(output_dir, exist_ok=True)
-    return output_dir
-
-
-def generate_random_spin_peps(
-    Lx, Ly, D, seed=42, dtype=torch.float64,
-):
-    """Generate a random PEPS for spin-1/2 systems.
-
-    Creates a quimb PEPS with physical dimension 2 (spin
-    states {0, 1}) and bond dimension D.
-
-    Args:
-        Lx, Ly: lattice dimensions.
-        D: bond dimension.
-        seed: random seed.
-        dtype: torch dtype.
-
-    Returns:
-        quimb PEPS tensor network.
-    """
-    dtype_str = str(dtype).split('.')[-1]
-    peps = qtn.PEPS.rand(
-        Lx, Ly,
-        bond_dim=D,
-        phys_dim=2,
-        dtype=dtype_str,
-        seed=seed,
-    )
-    return peps
 
 
 def random_spin_config_sz0(N_sites, seed=None):
@@ -301,7 +78,6 @@ __all__ = [
     'standardize_pbc_peps_leg_order',
     'make_pbc_dual_uniform',
     'initialize_walkers',
-    'ensure_output_dir',
     'generate_random_spin_peps',
     'random_spin_config_sz0',
 ]

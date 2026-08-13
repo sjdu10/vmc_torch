@@ -850,7 +850,10 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
 
 
 def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=False):
-    """Generate a random spinless/spinful fermionic square PEPS of shape (Lx, Ly)."""
+    """
+    (Stale)
+    Generate a random spinless/spinful fermionic square PEPS of shape (Lx, Ly).
+    """
 
     assert symmetry in ['Z2', 'U1', 'U1U1'], "Only Z2 ,U1 and U1U1 symmetries are supported."
     
