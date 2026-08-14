@@ -842,6 +842,64 @@ class MinSRGPU(PreconditionerGPU):
     `parallel_minSR` paper).
     """
 
+    def __init__(self, solver: str = 'direct'):
+        """
+        Args:
+            solver: how the Ns x Ns Gram system is solved.
+
+              - ``'direct'`` (default): shift the diagonal by
+                ``rshift * trace(T)/sqrt(Ns) + ashift`` and run a
+                Cholesky solve.  Every direction is inverted down to
+                that shift, including ones whose eigenvalue is pure
+                sampling noise.
+              - ``'pinv_eig'``: eigendecomposition pseudo-inverse with
+                a SMOOTH relative eigenvalue cutoff at
+                ``rtol = rshift``; ``ashift`` is ignored.  Directions
+                below the cutoff are suppressed instead of amplified,
+                which is the robust choice when the Gram is
+                rank-deficient (``Ns > Np``) or its small eigenvalues
+                are noise-dominated.
+
+            Same formula and semantics as
+            ``AdamSRMinSRGPU(solver=...)``.
+        """
+        if solver not in ('direct', 'pinv_eig'):
+            raise ValueError(
+                f"unknown solver {solver!r}; expected "
+                "'direct' or 'pinv_eig'"
+            )
+        self.solver = solver
+
+    @staticmethod
+    def _solve_pinv_eig(T, b, rtol):
+        """Pseudo-inverse solve of a symmetric PSD Gram via ``eigh``.
+
+        Eigenvalues below ``rtol * lam_max`` are damped smoothly by
+        ``1 + (cutoff/lam)**6`` rather than hard-truncated, so the
+        update direction varies continuously as the spectrum drifts
+        between VMC steps.  Exact zeros map to zero (the ``where``
+        guard; the unselected NaN branch is discarded).
+
+        Args:
+            T: (Ns, Ns) symmetric PSD Gram matrix.
+            b: (Ns,) right-hand side.
+            rtol: relative eigenvalue cutoff (``rshift``).
+
+        Returns:
+            (Ns,) solution vector.
+        """
+        evals, U = torch.linalg.eigh(T)
+        evals_abs = evals.abs()
+        cutoff = rtol * evals_abs.max()
+        inv_factor = 1.0 + (cutoff / evals_abs) ** 6
+        evals_inv = 1.0 / (evals * inv_factor)
+        evals_inv = torch.where(
+            evals_abs > 0.0,
+            evals_inv,
+            torch.zeros_like(evals_inv),
+        )
+        return U @ (evals_inv * (U.T @ b))
+
     def _solve(
         self,
         *,
@@ -883,8 +941,11 @@ class MinSRGPU(PreconditionerGPU):
                 is shifted by
                 ``rshift * trace(T)/sqrt(Ns) + ashift`` before
                 the Cholesky solve. Stabilizes ill-conditioned
-                systems.
+                systems. Under ``solver='pinv_eig'`` it instead
+                means the RELATIVE eigenvalue cutoff
+                (``rtol``) of the pseudo-inverse.
             ashift: absolute Tikhonov shift (see ``rshift``).
+                Ignored when ``solver='pinv_eig'``.
             device: target device for all tensors. ``None`` defaults
                 to ``cuda``.
 
@@ -954,12 +1015,17 @@ class MinSRGPU(PreconditionerGPU):
             O_bar = O_loc
             T = O_bar @ O_bar.T  # shape (Ns, Ns) T = O@O.T
         
-        # Solve  alpha = (T + shift I)^{-1} E_bar
-        shift = _two_term_shift(
-            T.trace().item(), T.shape[0], rshift, ashift,
-        )
-        T_shifted = T + shift * torch.eye(T.shape[0], device=device)
-        alpha, info = self._solve_cholesky(T_shifted, E_bar)
+        # Solve  alpha = (T + shift I)^{-1} E_bar, or the eigh
+        # pseudo-inverse of T when solver='pinv_eig'.
+        if getattr(self, 'solver', 'direct') == 'pinv_eig':
+            alpha = self._solve_pinv_eig(T, E_bar, rshift)
+            info = 0
+        else:
+            shift = _two_term_shift(
+                T.trace().item(), T.shape[0], rshift, ashift,
+            )
+            T_shifted = T + shift * torch.eye(T.shape[0], device=device)
+            alpha, info = self._solve_cholesky(T_shifted, E_bar)
         del T
 
         dp_local = O_bar.T @ alpha  # shape (np_per_rank,)
