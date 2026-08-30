@@ -46,7 +46,7 @@ Optional extras: `mpi4py` for the CPU/MPI sampling path, `cotengra` for contract
 
 ### GPU tutorial notebook (start here)
 
-[`examples/vmc_gpu_tutorial.ipynb`](./examples/vmc_gpu_tutorial.ipynb) is a step-by-step tutorial that optimizes a dense PEPS, a fermionic (Z₂) PEPS, and a neural fTNS on a single GPU with one shared VMC loop. It is committed with its outputs, so it renders on GitHub directly.
+[`examples/vmc_gpu_tutorial.ipynb`](./examples/vmc_gpu_tutorial.ipynb) is a step-by-step tutorial that optimizes a dense PEPS, a fermionic (Z₂) PEPS, and a neural fTNS on a single GPU.
 
 ### GPU script
 
