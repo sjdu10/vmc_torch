@@ -167,13 +167,13 @@ def panel_neural(ax, Lx=3, Ly=3, D=3):
         boxstyle='round,pad=0.02', facecolor=C_NN,
         edgecolor='0.2', lw=1.2, alpha=0.95, zorder=6,
     ))
-    ax.text(xmid, box_y, r'$f_\phi(x)$', ha='center', va='center',
+    ax.text(xmid, box_y, r'$NN_\phi(x)$', ha='center', va='center',
             fontsize=11, zorder=7)
 
     # The configuration feeding in from above.
     label_y = box_y + 0.20 * span
     ax.annotate(
-        r'configuration $x$',
+        r'physical configuration $x$',
         xy=(xmid, box_y + box_h), xytext=(xmid, label_y),
         ha='center', va='bottom', fontsize=9,
         arrowprops=dict(arrowstyle='-|>', lw=1.1, color='0.3'),
@@ -185,7 +185,7 @@ def panel_neural(ax, Lx=3, Ly=3, D=3):
     ax.set_ylim(ymin, label_y + 0.12 * span)
 
     ax.set_title('(c)  neural tensor network state\n'
-                 r'$T(x) = T + \eta\, f_\phi(x)$',
+                 r'$T(x) = T + \eta\, NN_\phi(x)$',
                  fontsize=10.5, pad=8)
 
 
