@@ -28,7 +28,7 @@ N_f = int(Lx*Ly) # half-filling
 n_fermions_per_spin = (N_f//2, N_f//2) # spin balanced
 H = spinful_Fermi_Hubbard_square_lattice_torch(Lx, Ly, t, U, N_f, pbc=False, n_fermions_per_spin=n_fermions_per_spin)
 graph = H.graph
-dtype=torch.float64
+dtype=torch.float32
 
 """Choose the torch model (you can create your own model of course)"""
 model = SlaterDeterminant(H.hilbert, param_dtype=dtype)
@@ -56,19 +56,21 @@ if init_step != 0:
 
 
 """Set VMC sample size"""
-N_samples = int(5e3)
+N_samples = int(512)
 N_samples = N_samples - N_samples % SIZE + SIZE - 1
 
 
 """Choose the sampler""" 
-sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=False, equal_partition=False, dtype=dtype)
+sampler = MetropolisExchangeSamplerSpinful(H.hilbert, graph, N_samples=N_samples, burn_in_steps=20, reset_chain=False, random_edge=False, equal_partition=True, dtype=dtype)
+if sampler.equal_partition is False and SIZE==1:
+    raise ValueError("If you want to use a single MPI process, please set `equal_partition=True` in the sampler.")
 # sampler = None
 
 
 """Choose the optimizer and preconditioner"""
 # optimizer = SignedSGD(learning_rate=1e-2)
-optimizer = SGD(learning_rate=1e-2)
-preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-4, rtol=1e-5, iter_step=1e3, dtype=dtype)
+optimizer = SGD(learning_rate=5e-2)
+preconditioner = SR(dense=False, exact=True if sampler is None else False, use_MPI4Solver=True, diag_eta=1e-5, rtol=1e-5, iter_step=1e3, dtype=dtype)
 # preconditioner = TrivialPreconditioner()
 
 
