@@ -10,6 +10,7 @@ from .pureTNS import (
     fPEPS_Model_GPU,
     fPEPS_Model_HOTRG_GPU,
     fPEPS_Model_reuse_GPU,
+    strip_phys_linearmap,
 )
 from .pureTNS_spin import (
     PEPS_Model_GPU,
@@ -46,6 +47,7 @@ from .symmetry import (
 )
 
 __all__ = [
+    'strip_phys_linearmap',
     "WavefunctionModel_GPU",
     "fPEPS_Model_GPU",
     "fPEPS_Model_HOTRG_GPU",

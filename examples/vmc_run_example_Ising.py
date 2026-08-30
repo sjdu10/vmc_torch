@@ -13,7 +13,7 @@ import torch
 import quimb.tensor as qtn
 import autoray as ar
 
-from vmc_torch.experiment.tn_model import PEPS_model, PEPS_NN_Model, init_weights_to_zero, PEPS_NNproj_Model, PEPS_delocalized_Model
+from vmc_torch.model import PEPS_model, PEPS_NN_Model, init_weights_to_zero, PEPS_NNproj_Model, PEPS_delocalized_Model
 from vmc_torch.sampler import MetropolisSamplerSpinless
 from vmc_torch.variational_state import Variational_State
 from vmc_torch.optimizer import SGD, SR

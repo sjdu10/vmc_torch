@@ -23,6 +23,7 @@ from .utils import (  # noqa: F401
     load_or_generate_peps,
     pack_ftn,
     setup_linalg_hooks,
+    strip_phys_linearmap,
     unpack_ftn,
 )
 

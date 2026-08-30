@@ -12,6 +12,7 @@ from vmc_torch.GPU.tensor_network.utils import (  # noqa: F401
     get_params_ftn,
     load_or_generate_peps,
     pack_ftn,
+    strip_phys_linearmap,
     unpack_ftn,
 )
 
@@ -20,4 +21,5 @@ __all__ = [
     'unpack_ftn',
     'get_params_ftn',
     'load_or_generate_peps',
+    'strip_phys_linearmap',
 ]

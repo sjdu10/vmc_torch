@@ -27,6 +27,8 @@ the Khatri-Rao product:
 implemented as a single torch.einsum.
 """
 import torch
+
+from vmc_torch.GPU.tensor_network import strip_phys_linearmap
 import torch.nn as nn
 
 from ._base import WavefunctionModel_GPU
@@ -77,16 +79,7 @@ class LoRA_fPEPS_GPU(WavefunctionModel_GPU):
             contract_boundary_opts = {}
 
         # Handle linearmap (matches NNfTNS_Model_GPU convention)
-        if tn.tensors[0].data.indices[-1]._linearmap is not None:
-            for ts in tn.tensors:
-                ts_data = ts.data
-                ts_data.indices[-1]._linearmap = None
-                ts.modify(data=ts_data)
-            self._loc_basis_perm = torch.tensor(
-                [0, 2, 3, 1], dtype=torch.long,
-            )
-        else:
-            self._loc_basis_perm = None
+        self._loc_basis_perm = strip_phys_linearmap(tn)
 
         self.dtype = dtype
         self.chi = max_bond

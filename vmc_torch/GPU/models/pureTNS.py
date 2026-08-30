@@ -13,6 +13,7 @@ from vmc_torch.GPU.fermion_utils import (
     pack_ftn,
     unpack_ftn,
     get_params_ftn,
+    strip_phys_linearmap,
 )
 
 # Fermionic physical-state encoding for direct sampling:
@@ -55,17 +56,8 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
         if contract_boundary_opts is None:
             contract_boundary_opts = {}
         
-        if tn.tensors[0].data.indices[-1]._linearmap is not None:
-            for ts in tn.tensors:
-                ts_data = ts.data
-                ts_data.indices[-1]._linearmap = None
-                ts.modify(data=ts_data)
-            # config value k -> physical index perm[k]
-            self._loc_basis_perm = torch.tensor(
-                [0, 2, 3, 1], dtype=torch.long
-            )
-        else:
-            self._loc_basis_perm = None
+        # config value k -> physical index perm[k]
+        self._loc_basis_perm = strip_phys_linearmap(tn)
 
         params, skeleton = qtn.pack(tn)
         self.dtype = dtype
@@ -475,16 +467,8 @@ class fPEPS_Model_HOTRG_GPU(WavefunctionModel_GPU):
         if contract_hotrg_opts is None:
             contract_hotrg_opts = {}
 
-        if tn.tensors[0].data.indices[-1]._linearmap is not None:
-            for ts in tn.tensors:
-                ts_data = ts.data
-                ts_data.indices[-1]._linearmap = None
-                ts.modify(data=ts_data)
-            self._loc_basis_perm = torch.tensor(
-                [0, 2, 3, 1], dtype=torch.long
-            )
-        else:
-            self._loc_basis_perm = None
+        # config value k -> physical index perm[k]
+        self._loc_basis_perm = strip_phys_linearmap(tn)
 
         params, skeleton = qtn.pack(tn)
         self.dtype = dtype
@@ -598,16 +582,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         if contract_boundary_opts is None:
             contract_boundary_opts = {}
 
-        if tn.tensors[0].data.indices[-1]._linearmap is not None:
-            for ts in tn.tensors:
-                ts_data = ts.data
-                ts_data.indices[-1]._linearmap = None
-                ts.modify(data=ts_data)
-            self._loc_basis_perm = torch.tensor(
-                [0, 2, 3, 1], dtype=torch.long
-            )
-        else:
-            self._loc_basis_perm = None
+        # config value k -> physical index perm[k]
+        self._loc_basis_perm = strip_phys_linearmap(tn)
 
         params, skeleton = qtn.pack(tn)
         self.dtype = dtype

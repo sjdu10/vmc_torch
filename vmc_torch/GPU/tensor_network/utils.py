@@ -8,6 +8,9 @@ high-level and TN-agnostic:
     fermionic TN pack   pack_ftn, unpack_ftn, get_params_ftn
     TN construction     load_or_generate_peps (Z2-fPEPS),
                         generate_random_spin_peps (dense spin PEPS)
+    phys-leg encoding   strip_phys_linearmap (linearmap -> explicit
+                        config permutation; inverse of the linearmap
+                        installed by load_or_generate_peps)
 
 The boundary-MPS *environment reuse* machinery is deliberately NOT
 here -- it lives in ``reuse.py``, which is a subsystem rather than a
@@ -299,6 +302,56 @@ def load_or_generate_peps(
             ts.data.phase_sync(inplace=True)
 
     return peps
+
+
+def strip_phys_linearmap(tn):
+    """Move the physical-leg ``_linearmap`` into an explicit permutation.
+
+    A spinful fermionic physical index carries a ``_linearmap``: a list of
+    ``(charge, offset)`` pairs saying where each local state lives inside
+    the block-sparse storage.  Selecting a state through it costs a
+    lookup, which is awkward under ``vmap`` / ``torch.export``, so instead
+    we drop the linearmap -- after which ``get_charge_offset`` falls back
+    to the default sorted mapping ``(i // charge_size, i % charge_size)``
+    -- and pre-apply the equivalent permutation to the sampled config.
+
+    The permutation is DERIVED from the linearmap rather than hardcoded.
+    For the usual spinful encoding (0=empty, 1=up, 2=down, 3=double) with
+    ``linearmap = ((0,0),(1,0),(1,1),(0,1))`` and ``charge_size = 2`` this
+    yields ``[0, 2, 3, 1]``; for a spinless leg it correctly yields the
+    identity instead.
+
+    The linearmap is nulled on *copies* of the indices.  ``tn.copy()`` and
+    ``array.copy()`` are both shallow -- they share the underlying index
+    objects -- so mutating one in place would silently corrupt every other
+    model built from the same network.
+
+    Args:
+        tn: a fermionic tensor network (modified in place; pass a copy).
+
+    Returns:
+        A ``(4,)`` long tensor mapping config value -> physical index, or
+        None if the physical leg carries no linearmap.
+    """
+    phys_ix = tn.tensors[0].data.indices[-1]
+    if phys_ix._linearmap is None:
+        return None
+
+    charge_size = phys_ix._charge_size
+    perm = [c * charge_size + o for c, o in phys_ix._linearmap]
+
+    for ts in tn.tensors:
+        ts_data = ts.data.copy()
+        indices = list(ts_data.indices)
+        # copy_with() cannot null a linearmap (None means "unchanged"),
+        # so null it on the fresh copy it hands back.
+        phys = indices[-1].copy_with()
+        phys._linearmap = None
+        indices[-1] = phys
+        ts_data.modify(indices=tuple(indices))
+        ts.modify(data=ts_data)
+
+    return torch.tensor(perm, dtype=torch.long)
 
 
 def generate_random_spin_peps(

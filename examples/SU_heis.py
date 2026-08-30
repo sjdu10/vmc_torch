@@ -6,7 +6,7 @@ import quimb as qu
 
 ndim = 2
 Lx = 4
-Ly = 2
+Ly = 4
 pbc = False
 D = 2
 
@@ -16,7 +16,7 @@ J=1.0
 ham = qtn.ham_2d_heis(Lx=Lx, Ly=Ly, j=J)
 
 # ED
-if Lx*Ly <= 16:
+if Lx*Ly <= 8:
     ham_dense =  qu.ham_heis_2D(Lx, Ly, j=J, cyclic=pbc)
     evals, evecs = scipy.linalg.eigh(ham_dense)
     exact_energy = evals[0]/(Lx*Ly)
