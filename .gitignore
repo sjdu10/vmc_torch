@@ -27,3 +27,8 @@ vmc_torch/GPU/data
 CLAUDE.md
 notebook.md
 test_scripts/
+
+# packaging artefacts -- never commit; a stale build/lib gets swept into wheels
+build/
+dist/
+*.egg-info/
