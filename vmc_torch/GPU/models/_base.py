@@ -352,8 +352,16 @@ class WavefunctionModel_GPU(nn.Module):
 
         # --- Export or load from cache ---
         if cache_path is not None and os.path.exists(cache_path):
-            print(f"Loading cached ExportedProgram from {cache_path}")
-            exported = torch.export.load(cache_path)
+            try:
+                # torch>=2.14: pt2 loader allocates with torch.empty(0) (default
+                # device) then set_()s a CPU storage -> breaks under a cuda
+                # default device. FIX: Load on cpu
+                with torch.device('cpu'):
+                    exported = torch.export.load(cache_path)
+            except Exception as e:
+                warnings.warn(f"cached ExportedProgram unusable ({e!r}); re-exporting")
+                os.remove(cache_path)
+                exported = None
         else:
             if use_log_amp:
                 export_fn = self._log_amplitude_for_export
