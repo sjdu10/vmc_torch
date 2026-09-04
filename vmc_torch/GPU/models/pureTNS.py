@@ -239,7 +239,7 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
 
     def _sample_row_single(self, combined_rc, tns, x, d, u_rand,
                            n_up_so_far, n_dn_so_far,
-                           n_up_target, n_dn_target, N):
+                           n_up_target, n_dn_target, N, forced=None):
         """Sample row x site-by-site (LTR) on the flat fermionic TN.
 
         chi_m=0: right-canonicalize then propagate a left density matrix
@@ -290,7 +290,12 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
                 n_up_target, n_dn_target,
             )
 
-            v = self._inverse_cdf_sample(probs, u_rand[x * Ly + y], d)
+            if forced is not None:
+                v = forced[x * Ly + y]
+            else:
+                v = self._inverse_cdf_sample(
+                    probs, u_rand[x * Ly + y], d,
+                )
             sampled_row.append(v)
             log_p_row = log_p_row + torch.log(probs[v] + 1e-300)
             n_up_so_far = n_up_so_far + du[v]
@@ -328,7 +333,8 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
         return sampled_row, log_p_row, n_up_so_far, n_dn_so_far
 
     def direct_sample_single(self, u_rand, params, chi_s,
-                             n_up_target=None, n_dn_target=None):
+                             n_up_target=None, n_dn_target=None,
+                             forced=None):
         """One walker's fermionic direct sample. vmap-traceable.
 
         Args:
@@ -337,6 +343,10 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
             chi_s:       Python int or None, boundary MPS bond.
             n_up_target: Python int or None, U(1) up-count constraint.
             n_dn_target: Python int or None, U(1) down-count constraint.
+            forced:      (Lx*Ly,) int64 SEMANTIC config or None. If given,
+                no sampling: site values are taken from ``forced`` and
+                ``log_p_c`` is the direct-sampler log-probability of that
+                config (``u_rand`` only sets dtype/device).
 
         Returns:
             config:  (Lx*Ly,) int64 SEMANTIC encoding {0,1,2,3}
@@ -384,7 +394,7 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
                 self._sample_row_single(
                     combined_rc, tns, x, d, u_rand,
                     n_up_so_far, n_dn_so_far,
-                    n_up_target, n_dn_target, N,
+                    n_up_target, n_dn_target, N, forced,
                 )
             )
             config_list.extend(sampled_row)
@@ -402,7 +412,8 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
 
     @torch.no_grad()
     def direct_sample_vmap(self, u_batch, chi_s=None,
-                           n_up_target=None, n_dn_target=None, chi_m=None):
+                           n_up_target=None, n_dn_target=None, chi_m=None,
+                           forced_configs=None):
         """Vectorized fermionic direct sampler over a batch of B walkers.
 
         Args:
@@ -412,6 +423,10 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
             n_up_target: U(1) up-count constraint or None.
             n_dn_target: U(1) down-count constraint or None.
             chi_m:       must be None or 0 (chi_m>0 not implemented).
+            forced_configs: (B, Lx*Ly) int64 SEMANTIC configs or None.
+                If given, return them unchanged with ``log p_c`` of each
+                under the current parameters (no sampling; ``u_batch``
+                only sets dtype/device). Used to refresh the MH cache.
 
         Returns:
             configs: (B, Lx*Ly) int64 SEMANTIC encoding {0,1,2,3}
@@ -430,12 +445,15 @@ class fPEPS_Model_GPU(WavefunctionModel_GPU):
             list(self.params), self.params_pytree,
         )
 
-        def _single(u, params):
+        def _single(u, params, forced):
             return self.direct_sample_single(
-                u, params, chi_s, n_up_target, n_dn_target,
+                u, params, chi_s, n_up_target, n_dn_target, forced,
             )
 
-        return torch.vmap(_single, in_dims=(0, None))(u_batch, params)
+        forced_in_dim = None if forced_configs is None else 0
+        return torch.vmap(_single, in_dims=(0, None, forced_in_dim))(
+            u_batch, params, forced_configs,
+        )
 
 
 # =================================================================
@@ -467,6 +485,7 @@ class fPEPS_Model_HOTRG_GPU(WavefunctionModel_GPU):
         if contract_hotrg_opts is None:
             contract_hotrg_opts = {}
 
+        tn = tn.copy()  # don't modify original TN
         # config value k -> physical index perm[k]
         self._loc_basis_perm = strip_phys_linearmap(tn)
 
@@ -582,6 +601,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         if contract_boundary_opts is None:
             contract_boundary_opts = {}
 
+        tn = tn.copy()  # don't modify original TN
         # config value k -> physical index perm[k]
         self._loc_basis_perm = strip_phys_linearmap(tn)
 
@@ -1387,6 +1407,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         """
         import quimb as qu
         from torch.export import export
+        mode = self._reject_cudagraph_mode(mode, 'environment reuse')
 
         self._compiled_reuse = {}
         self._compiled_reuse_log_amp = use_log_amp
@@ -1662,6 +1683,7 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
+                self._maybe_mark_cudagraph_step()
                 out = self._vmapped_compiled(x, *params_list)
                 if getattr(self, '_uses_cudagraph', False):
                     out = out.clone()  # cudagraph reuses a static buffer
@@ -2329,6 +2351,8 @@ class fPEPS_Model_reuse_GPU(WavefunctionModel_GPU):
         """
         import torch.nn as nn_mod
         from torch.export import export
+
+        mode = self._reject_cudagraph_mode(mode, 'the bMPS cache path')
 
         device = example_x.device
         params_list = list(self.params)

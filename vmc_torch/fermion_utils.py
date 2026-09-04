@@ -13,6 +13,19 @@ from vmc_torch.global_var import DEBUG
 import ast
 import pickle
 
+# Physical-leg basis order for spinful Z2 fPEPS: linear index k maps to
+# (Z2 charge, slot within that charge sector).
+#   0 -> (0, 0) empty     1 -> (1, 0) up
+#   2 -> (1, 1) down      3 -> (0, 1) doubly occupied
+# symmray builds phys indices with the *canonical* order
+# ((0,0), (0,1), (1,0), (1,1)) instead, so every producer of a spinful
+# Z2 fPEPS must install this map or `fPEPS.fix_phys_inds` (which hands
+# raw config integers to `isel`) silently selects the wrong sector --
+# charge 0 for a spin-up site, giving amplitude 0 and a zero-block
+# contraction downstream. Keep the convention here only, so the
+# producers cannot drift apart.
+FPEPS_PHYS_LINEARMAP = ((0, 0), (1, 0), (1, 1), (0, 1))
+
 # ------Read fPEPS from fTN model------
 def get_psi_from_fTN(fTN_model):
     """
@@ -90,7 +103,7 @@ def unpack_ftns(params_path=None, skeleton_path=None, params=None, skeleton=None
                 site_tag = skeleton.site_tag(site)
                 try:
                     skeleton[site_tag].data._label = 3*tid # add global ordering '.label' attribute
-                    skeleton[site_tag].data.indices[-1]._linearmap = ((0, 0), (1, 0), (1, 1), (0, 1))
+                    skeleton[site_tag].data.indices[-1]._linearmap = FPEPS_PHYS_LINEARMAP
                 except Exception:
                     pass
                 try:
@@ -364,6 +377,11 @@ class fPEPS(qtn.PEPS):
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
 
         p_inds = [peps.site_ind_id.format(*site) for site in sites]
+        if len(config) != len(p_inds):
+            raise ValueError(
+                f"config has {len(config)} entries but {len(p_inds)} physical "
+                f"indices were requested; zip would silently truncate"
+            )
         if isinstance(config, numpy.ndarray):
             site_mapping = dict(zip(p_inds, config.astype(numpy.int64)))
         elif isinstance(config, torch.Tensor):
@@ -804,7 +822,7 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
     def site_charge(site):
         if symmetry == 'U1':
             charge_dict = dict(zip(sites, rcharge_config))
-            return charge_dict[site]
+            return int(charge_dict[site])
         elif symmetry == 'Z2':
             # all zero parity for random Z2 fPEPS
             return 0
@@ -836,6 +854,10 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
         if ts.data.dummy_modes:
             x, y = ts.data.dummy_modes[0].label
             ts.data._dummy_modes[0]._label = 3*(x*Ly + y) # 3*tid
+    if symmetry == 'Z2':
+        for site in peps.sites:
+            ts = peps[peps.site_tag_id.format(*site)]
+            ts.data.indices[-1]._linearmap = FPEPS_PHYS_LINEARMAP
 
     # For PBC, normalize leg ordering to (UP, LEFT, RIGHT, DOWN, PHYS)
     # so downstream SU evolution / save / load all carry a consistent
@@ -850,10 +872,7 @@ def generate_random_fpeps_symmray(Lx, Ly, D, seed, symmetry='U1', Nf=0, cyclic=F
 
 
 def generate_random_fpeps(Lx, Ly, D, seed, symmetry='Z2', Nf=0, cyclic=False, spinless=False):
-    """
-    (Stale)
-    Generate a random spinless/spinful fermionic square PEPS of shape (Lx, Ly).
-    """
+    """Generate a random spinless/spinful fermionic square PEPS of shape (Lx, Ly)."""
 
     assert symmetry in ['Z2', 'U1', 'U1U1'], "Only Z2 ,U1 and U1U1 symmetries are supported."
     
@@ -1341,6 +1360,11 @@ class fMPS(qtn.MatrixProductState):
         dtype = eval(backend+'.'+self.tensors[0].data.dtype)
 
         p_inds = [mps.site_ind_id.format(site) for site in sites]
+        if len(config) != len(p_inds):
+            raise ValueError(
+                f"config has {len(config)} entries but {len(p_inds)} physical "
+                f"indices were requested; zip would silently truncate"
+            )
         if isinstance(config, numpy.ndarray):
             site_mapping = dict(zip(p_inds, config.astype(numpy.int64)))
         elif isinstance(config, torch.Tensor):

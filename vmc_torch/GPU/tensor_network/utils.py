@@ -7,7 +7,8 @@ high-level and TN-agnostic:
     linalg dispatch     setup_linalg_hooks
     fermionic TN pack   pack_ftn, unpack_ftn, get_params_ftn
     TN construction     load_or_generate_peps (Z2-fPEPS),
-                        generate_random_spin_peps (dense spin PEPS)
+                        generate_random_spin_peps (dense spin PEPS),
+                        generate_random_spin_mps (dense spin MPS)
     phys-leg encoding   strip_phys_linearmap (linearmap -> explicit
                         config permutation; inverse of the linearmap
                         installed by load_or_generate_peps)
@@ -184,7 +185,7 @@ def load_or_generate_peps(
     seed=42,
     dtype=torch.float64,
     scale_factor=4,
-    data_root='./',
+    data_root='.',
     file_path=None,
     random_init=False,
     pbc=False,
@@ -241,8 +242,6 @@ def load_or_generate_peps(
                 (0, 0), (1, 0), (1, 1), (0, 1)
             )
     except Exception as e:
-        import symmray as sr
-
         print(
             f'Could not load Z2-fPEPS from pickle: {e}. '
             f'Generating random Z2-fPEPS instead.'
@@ -253,10 +252,17 @@ def load_or_generate_peps(
             Ly,
             D,
             # Same (Z2 charge, slot-in-sector) order as the phys-leg
-            # `_linearmap` of the SU-loaded PEPS above, so that both
-            # branches need the SAME basis permutation downstream
-            # (fPEPS_Model_GPU hardcodes one for both).  Swapping the
-            # middle two entries relabels up <-> down.
+            # `_linearmap` the disk-load branch installs above, so both
+            # branches declare the same convention instead of this one
+            # being the lone outlier in the repo.
+            #
+            # Numerically inert, and verified as such: the chargemap is
+            # built by COUNTING charges, so both orderings give {0:2, 1:2}
+            # and the same seed draws byte-identical tensor data; and
+            # fPEPS_Model_GPU nulls `_linearmap`, applying a permutation
+            # derived from canonical sector storage order instead. The
+            # `linearmap.index(...)` consumers resolve through the very map
+            # they query, so they are self-consistent either way.
             phys_dim=[
                 (0, 0),
                 (1, 0),
@@ -382,6 +388,39 @@ def generate_random_spin_peps(
     return peps
 
 
+
+def generate_random_spin_mps(
+    L, D, seed=42, pbc=False, dtype=torch.float64,
+):
+    """Generate a random MPS for 1D spin-1/2 chains.
+
+    Creates a quimb MatrixProductState with physical dimension 2
+    (spin states {0, 1}) and bond dimension D.
+
+    Args:
+        L: chain length.
+        D: bond dimension.
+        seed: random seed.
+        pbc: if True, build a cyclic (ring) MPS.
+        dtype: torch dtype.
+
+    Returns:
+        quimb MatrixProductState.
+    """
+    dtype_str = str(dtype).split('.')[-1]
+    # MPS_rand_state has no `seed` kwarg — it draws from quimb's
+    # global RNG, so seed that instead.
+    qu.seed_rand(seed)
+    mps = qtn.MPS_rand_state(
+        L,
+        bond_dim=D,
+        phys_dim=2,
+        cyclic=pbc,
+        dtype=dtype_str,
+    )
+    return mps
+
+
 __all__ = [
     'setup_linalg_hooks',
     'pack_ftn',
@@ -389,4 +428,5 @@ __all__ = [
     'get_params_ftn',
     'load_or_generate_peps',
     'generate_random_spin_peps',
+    'generate_random_spin_mps',
 ]

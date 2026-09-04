@@ -78,6 +78,7 @@ class LoRA_fPEPS_GPU(WavefunctionModel_GPU):
         if contract_boundary_opts is None:
             contract_boundary_opts = {}
 
+        tn = tn.copy()  # don't modify original TN
         # Handle linearmap (matches NNfTNS_Model_GPU convention)
         self._loc_basis_perm = strip_phys_linearmap(tn)
 

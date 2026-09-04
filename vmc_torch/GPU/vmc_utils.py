@@ -462,6 +462,48 @@ def compute_grads_gpu(
     if use_exported_grad:
         exported_grad_fn = fpeps_model._exported_grad_fn
         params_list = list(fpeps_model.params)
+
+        # Lazy CUDA-graph capture of the grad fn (first call only).
+        # Deferred to here because the captured shape must be the
+        # padded chunk (B_grad, N_sites) — exactly what every chunk
+        # below is padded to, so all chunks replay. Removes the
+        # per-kernel launch overhead of the eager fwd+bwd execution
+        # (~13x measured); see torch_utils.GraphedGradFn.
+        from vmc_torch.GPU.torch_utils import GraphedGradFn
+        if (
+            getattr(fpeps_model, '_grad_graph_capture', False)
+            and not isinstance(exported_grad_fn, GraphedGradFn)
+            and fxs.is_cuda
+        ):
+            example = fxs[:B_grad]
+            if example.shape[0] < B_grad:
+                pad = example[0:1].expand(
+                    B_grad - example.shape[0], -1,
+                )
+                example = torch.cat([example, pad], dim=0)
+            try:
+                exported_grad_fn = GraphedGradFn(
+                    exported_grad_fn, example, params_list,
+                    clone_outputs=False,  # chunks consumed below
+                )
+                fpeps_model._exported_grad_fn = exported_grad_fn
+                print(
+                    "[compute_grads] grad fn captured into a CUDA "
+                    f"graph (chunk shape {tuple(example.shape)}); "
+                    "subsequent calls replay. NOTE: calls with a "
+                    "different grad_batch_size fall back to eager."
+                )
+            except Exception as e:
+                import warnings
+                torch.cuda.synchronize()
+                exported_grad_fn = fpeps_model._exported_grad_fn
+                warnings.warn(
+                    "CUDA-graph capture of the grad fn failed "
+                    f"({type(e).__name__}: {e}); falling back to "
+                    "the uncaptured exported grad fn. chi > 0 "
+                    "graphs need capture-safe linalg hooks."
+                )
+                fpeps_model._grad_graph_capture = False
     else:
         # Eager path: build vmap(grad(vamp)) function
         params_pytree = (

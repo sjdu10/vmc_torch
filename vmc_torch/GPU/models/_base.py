@@ -15,6 +15,7 @@ WavefunctionModel_GPU also provides:
   - export_and_compile / export_only / compile_model
 """
 import os
+import warnings
 
 import torch
 import torch.nn as nn
@@ -124,11 +125,67 @@ class WavefunctionModel_GPU(nn.Module):
         params = self._vamp_params_preprocess(params)
         return self._vmapped_log_amplitude(x, params)
 
+    @staticmethod
+    def _reject_cudagraph_mode(mode, what):
+        """Downgrade a cudagraph compile mode to 'default', loudly.
+
+        The environment-reuse and bMPS-cache compile paths do NOT set
+        ``_uses_cudagraph``, so their dispatch neither clones the
+        compiled outputs nor calls ``_maybe_mark_cudagraph_step``.
+        Worse, those paths CACHE boundary-MPS tensors across forwards
+        (``cache_bMPS_params_*``): a cached cudagraph output buffer is
+        overwritten by the next replay, which would silently corrupt
+        every amplitude for the rest of the sweep.  So refuse the mode
+        instead of accepting it unsafely.
+
+        Returns the mode to actually compile with.
+        """
+        if mode in ('reduce-overhead', 'max-autotune'):
+            warnings.warn(
+                f"torch.compile mode {mode!r} requests CUDA graphs, "
+                f"which {what} does not support yet: its cached "
+                f"boundary-MPS tensors would alias a graph output "
+                f"buffer and be overwritten by the next replay. "
+                f"Falling back to mode='default'.",
+                RuntimeWarning, stacklevel=3,
+            )
+            return 'default'
+        return mode
+
+    def _maybe_mark_cudagraph_step(self):
+        """Signal a new iteration to inductor, if a graph was captured.
+
+        Only does anything when ``export_and_compile`` was given a
+        cudagraph mode ('reduce-overhead' / 'max-autotune'), which is
+        what sets ``_uses_cudagraph`` -- so enabling CUDA graphs is
+        auto-detected from the compile mode, with nothing for the caller
+        to remember.
+
+        Without this call the captured graph is NEVER replayed:
+        inductor's ``CUDAGraphTreeManager.try_end_curr_warmup`` only
+        leaves its WARMUP state when a new generation starts or the
+        previous node's outputs are all dead, and a plain inference loop
+        satisfies neither, so every call silently falls through to
+        ``run_eager``.  There is no warning on that path.  Measured on
+        4x8 D=4 chi=-1, B=256: 9.24 ms/forward without the mark vs
+        1.65 ms with it (GPU utilisation 9.4% -> 68.6%, median
+        inter-kernel gap 37 us -> 0 us).
+
+        Safe here because forward/forward_log clone the compiled outputs
+        below, so nothing the caller keeps still lives in the graph's
+        static output buffer.  Callers that hold model outputs across
+        later forwards -- e.g. the Metropolis samplers, which compare a
+        proposal against a stored log|psi| -- therefore stay correct.
+        """
+        if getattr(self, '_uses_cudagraph', False):
+            torch.compiler.cudagraph_mark_step_begin()
+
     def forward_log(self, x):
         """Dispatch: compiled -> exported -> eager for log-amplitude."""
         if self._exported and self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
+                self._maybe_mark_cudagraph_step()
                 out = self._vmapped_compiled(x, *params_list)
                 if getattr(self, '_uses_cudagraph', False):
                     # cudagraph static buffer; (sign, log_abs) tuple
@@ -144,6 +201,7 @@ class WavefunctionModel_GPU(nn.Module):
         if self._exported and not self._exported_log_amp:
             params_list = list(self.params)
             if self._compiled:
+                self._maybe_mark_cudagraph_step()
                 out = self._vmapped_compiled(x, *params_list)
                 if getattr(self, '_uses_cudagraph', False):
                     out = out.clone()  # cudagraph reuses a static buffer
@@ -209,9 +267,11 @@ class WavefunctionModel_GPU(nn.Module):
         gm.recompile()
 
     def export_and_compile(
-        self, example_x, mode='default',
-        use_log_amp=False, cache_dir=None,
-         **compile_kwargs,
+        self, example_x, mode='reduce-overhead',
+        use_log_amp=True, cache_dir=None,
+        export_grad_fn=True, grad_graph_capture=True,
+        capture_safe_linalg=True,
+        **compile_kwargs,
     ):
         """Export + compile the amplitude function for GPU speedup.
 
@@ -233,8 +293,31 @@ class WavefunctionModel_GPU(nn.Module):
             cache_dir: if provided, save/load the ExportedProgram
                 to/from this directory (alongside checkpoints).
                 Avoids re-running torch.export on restarts.
+            export_grad_fn: if True (default), also build the
+                vmap(grad) function over the exported graph
+                (``export_grad``) so ``compute_grads_gpu`` uses the
+                exported gradient path instead of the eager vamp
+                fallback. For chi > 0 contractions pair this with
+                capture-safe linalg hooks (aten eigh backward is
+                nan-prone on rank-deficient truncation Grams).
+            grad_graph_capture: if True (default), mark the grad fn
+                for lazy CUDA-graph capture on its first
+                ``compute_grads_gpu`` call (see
+                ``torch_utils.GraphedGradFn``).
+            capture_safe_linalg: if True (default), ensure the
+                capture-safe Jacobi linalg hooks are installed
+                BEFORE tracing (torch.export bakes the registered
+                svd/qr implementation into the graph). A prior
+                manual ``install_capture_safe_linalg`` call with
+                custom settings wins.
         """
         from torch.export import export
+
+        if capture_safe_linalg:
+            from vmc_torch.GPU.torch_utils import (
+                ensure_capture_safe_linalg,
+            )
+            ensure_capture_safe_linalg()
 
         params_list = list(self.params)
         n_params = len(params_list)
@@ -319,6 +402,12 @@ class WavefunctionModel_GPU(nn.Module):
         # cudagraph modes return outputs in a static buffer that the
         # next forward call overwrites in-place -> must clone outputs.
         self._uses_cudagraph = mode in ('reduce-overhead', 'max-autotune')
+
+        if export_grad_fn:
+            self.export_grad(use_log_amp=use_log_amp)
+            # lazy capture happens on the first compute_grads_gpu
+            # call (only there is the grad chunk shape known)
+            self._grad_graph_capture = grad_graph_capture
 
 
     def save_compiler_artifacts(self):

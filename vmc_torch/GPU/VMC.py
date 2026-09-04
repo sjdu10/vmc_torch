@@ -1,6 +1,12 @@
+from __future__ import annotations
+
 import os
 import time
-from typing import Any, Callable, Dict, Optional
+import warnings
+from dataclasses import dataclass, fields
+from typing import (  # noqa: UP035
+    TYPE_CHECKING, Any, Callable, Dict, Optional,
+)
 
 import numpy as np
 import torch
@@ -10,26 +16,34 @@ from tqdm import tqdm
 from vmc_torch.GPU.optimizer import (
     OptimizerGPU,
     PreconditionerGPU,
+    TrivialPreconditionerGPU,
 )
 from vmc_torch.GPU.sampler import SamplerGPU
+from vmc_torch.GPU.swo_utils import (
+    SWOBatch,
+    collect_swo_dataset,
+    save_swo_checkpoint,
+    swo_energy,
+    swo_fidelity,
+    swo_fidelity_gradient,
+    swo_sr_terms,
+    weighted_minsr_step,
+)
 from vmc_torch.GPU.vmc_utils import (
+    check_NaN_or_inf,
     compute_grads_gpu,
     evaluate_energy,
     evaluate_energy_grad,
-    check_NaN_or_inf,
-)
-from vmc_torch.GPU.swo_utils import (
-    accumulate_fidelity_terms,
-    accumulate_supervised_sr_terms,
-    collect_swo_dataset,
-    compute_swo_direction,
-    fidelity_from_model_on_configs,
-    fidelity_stats_from_log_amps,
-    save_swo_checkpoint,
 )
 
+if TYPE_CHECKING:
+    # Annotation-only imports: keep the heavy models package and the
+    # quimb-backed Hamiltonian module out of the runtime import graph.
+    from vmc_torch.GPU.models._base import WavefunctionModel_GPU
+    from vmc_torch.hamiltonian_torch import Graph, Hamiltonian
 
-def _find_free_port():
+
+def _find_free_port() -> int:
     """Find a free TCP port on localhost."""
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -37,7 +51,25 @@ def _find_free_port():
         return s.getsockname()[1]
 
 
-def setup_distributed(cuda_rank: Optional[int] = None, cpu: bool = False):
+def setup_distributed(
+    cuda_rank: Optional[int] = None, cpu: bool = False,
+) -> tuple[int, int, torch.device]:
+    """Initialise ``torch.distributed`` and pick this rank's device.
+
+    Under ``torchrun`` the RANK / WORLD_SIZE / LOCAL_RANK / MASTER_*
+    environment variables are already set and used as-is. Without
+    torchrun a single-process group is created on a free local port.
+
+    Args:
+        cuda_rank: GPU index to use in the single-process (no torchrun)
+            case; None -> ``cuda:0``. Ignored under torchrun, where
+            LOCAL_RANK decides.
+        cpu: if True, use the gloo backend and return a CPU device
+            (NCCL has no CPU support).
+
+    Returns:
+        (rank, world_size, device)
+    """
     if "RANK" not in os.environ:
         print("Warning: Not using torchrun. Single device.")
         os.environ["RANK"] = "0"
@@ -49,8 +81,10 @@ def setup_distributed(cuda_rank: Optional[int] = None, cpu: bool = False):
         else:
             os.environ["LOCAL_RANK"] = str(cuda_rank)
 
+    # NCCL has no CPU support -> use gloo for CPU runs.
     dist.init_process_group(
-        backend="nccl", init_method="env://",
+        backend="gloo" if cpu else "nccl",
+        init_method="env://",
     )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -64,9 +98,19 @@ def setup_distributed(cuda_rank: Optional[int] = None, cpu: bool = False):
 
 
 def print_sampling_settings(
-    rank, world_size, batch_size, ns_per_rank,
-    grad_batch_size,
-):
+    rank: int, world_size: int, batch_size: int, ns_per_rank: int,
+    grad_batch_size: int,
+) -> None:
+    """Print the per-rank sampling plan (rank 0 only).
+
+    Args:
+        rank, world_size: distributed info from ``setup_distributed``.
+        batch_size: number of parallel Markov chains (walkers) per rank.
+        ns_per_rank: samples collected per rank per VMC step; the
+            sampling phase runs ceil(ns_per_rank / batch_size) sweeps.
+        grad_batch_size: chunk size of the per-sample gradient
+            computation (memory knob only, no effect on results).
+    """
     if rank == 0:
         total_ns_expected = ns_per_rank * world_size
         n_sweeps = int(np.ceil(ns_per_rank / batch_size))
@@ -77,6 +121,172 @@ def print_sampling_settings(
             f"grad_batch={grad_batch_size}"
         )
 
+_VALID_PRECONDITIONERS = ('sr', 'spring', 'march', 'adamsr')
+@dataclass
+class VMCConfig:
+    """VMC numerical / training settings.
+
+    Groups:
+        Sampling:    batch_size, ns_per_rank, grad_batch_size,
+                     burn_in_steps
+        Training:    vmc_steps, learning_rate, lr_scheduler
+        Preconditioner: preconditioner, sr_iter_solver,
+                     sr_rshift, sr_ashift, sr_iter_rtol,
+                     sr_maxiter, minres_sr_use_scipy, spring_mu,
+                     march_mu/beta, adamsr_mu/beta/norm_clip
+        Compile:     use_export_compile, use_log_amp
+        Gradient:    offload_grad_to_cpu
+        Checkpoint:  save_every, resume_step
+        Debug:       debug, verbose
+        Warmup:      run_sampling, run_locE, run_grad
+        Log-variance: logvar_gamma, logvar_lr, logvar_weight_decay
+    """
+
+    # ----- Sampling -----
+    batch_size: int = 1024
+    ns_per_rank: int = 1024
+    grad_batch_size: int = 1024
+    burn_in_steps: int = 0
+
+    # ----- Training -----
+    vmc_steps: int = 100
+    learning_rate: float = 0.1
+    lr_scheduler: object = None
+
+    # ----- Preconditioner -----
+    # ``preconditioner`` selects the gradient-update scheme:
+    #   None      -> pure SGD on the energy gradient (no SR solve).
+    #   'sr'      -> plain Stochastic Reconfiguration.
+    #   'spring'  -> SPRING (arXiv:2401.10190), SR + Kaczmarz
+    #                one-iteration momentum.
+    #   'march'   -> MARCH (arXiv:2507.02644), SR + Adam-like
+    #                first/second-moment momentum.
+    #   'adamsr'  -> AdamSR, Adam-style moments on top of SR.
+    # ``sr_iter_solver`` picks the linear-system solver shape:
+    #   True  -> iterative Np-form MINRES on the SR matrix.
+    #   False -> direct Ns-form MinSR (Cholesky/eigh on Ns x Ns).
+    # All four (sr/spring/march/adamsr) support both shapes.
+    preconditioner: Optional[str] = None
+    sr_iter_solver: bool = True
+    # Two-term Tikhonov regularization of the SR Gram matrix:
+    #   shift = sr_rshift * trace(T)/sqrt(n) + sr_ashift
+    # sr_rshift scales with the Gram magnitude (relative term);
+    # sr_ashift is an absolute floor. rshift=0 recovers the old
+    # pure-absolute behavior (sr_ashift = old sr_diag_shift).
+    sr_rshift: float = 0.0
+    sr_ashift: float = 1e-4
+    # If True, the Ns-form preconditioners (spring/march/adamsr at
+    # sr_iter_solver=False) compute the Ns x Ns Gram matmul in fp32
+    # and cast back to fp64. Big speedup on consumer GPUs where
+    # fp64 is slow; on A100/H100 leave False to keep full fp64.
+    # No effect when sr_iter_solver=True (Np-form doesn't form
+    # a Gram).
+    sr_mixed_precision: bool = False
+
+    # ----- Iterative (Np-form MINRES) options -----
+    sr_iter_rtol: float = 1e-4
+    sr_maxiter: int = 100
+    minres_sr_use_scipy: bool = False
+
+    # ----- SPRING -----
+    # Setting mu=0 recovers plain MINRES / MinSR exactly.
+    # ``norm_constraint`` enforces the paper's Eq. 37 Euclidean
+    # bound ||d_theta|| <= sqrt(C) via the SGD optimizer; leave
+    # None to disable.
+    spring_mu: float = 0.99
+    norm_constraint: Optional[float] = None
+
+    # ----- MARCH (arXiv:2507.02644) -----
+    march_mu: float = 0.95
+    march_beta: float = 0.995
+
+    # ----- AdamSR -----
+    adamsr_mu: float = 0.95
+    adamsr_beta: float = 0.995
+    adamsr_norm_clip: Optional[float] = None
+    # Gram solver for the dense MinSR form (regularization comes
+    # from the global sr_rshift / sr_ashift above):
+    #   'direct': solve of T + shift*I.
+    #   'pinv_eig': eigh pinv with smooth relative cutoff
+    #     rtol = sr_rshift (sr_ashift ignored).
+    adamsr_solver: str = 'direct'
+
+    # ----- Compile -----
+    use_export_compile: bool = False
+
+    # ----- Warmup -----
+    # Which phases ``run_warmup`` exercises: the sampling sweep, the
+    # local energies, the gradients. ``run_locE`` needs ``run_sampling``
+    # (it consumes the sampler's amplitudes).
+    run_sampling: bool = True
+    run_locE: bool = True
+    run_grad: bool = True
+
+    # ----- Log-amp -----
+    use_log_amp: bool = True
+
+    # ----- Gradient -----
+    offload_grad_to_cpu: bool = False
+
+    # ----- Checkpoint -----
+    save_every: int = 50
+    resume_step: int = 0
+
+    # ----- Debug / UI -----
+    debug: bool = False
+    verbose: bool = False
+    # Per-step diagnostic logging: prints distribution statistics of
+    # local energies, log|psi|, and the SR gradient (RHS of S*dp=g).
+    # Useful for catching outlier-driven blowups in early VMC steps.
+    # Independent of `debug` (which is noisier and per-iteration);
+    # `diagnostics` adds one extra forward per step (cheap).
+    diagnostics: bool = False
+    show_progress: bool = True
+
+    # Outlier mask on raw local energies, applied ONLY inside the
+    # SR solve (PreconditionerGPU._mask_outlier_samples): samples
+    # with ``|E_loc| > local_E_clip`` (absolute threshold) have
+    # their E_loc entry and O_loc row zeroed before the solve, and
+    # the clean mean / masked count are recorded in
+    # ``_last_mask_info`` for the ``[SR clip]`` report. The
+    # reported step energy_mean / energy_var are NOT affected.
+    # Typical value: ~1e3 (units of t). Default None disables.
+    local_E_clip: Optional[float] = None
+
+    # ----- Log-variance (arXiv:2603.15853) -----
+    logvar_gamma: float = 1e-3
+    logvar_lr: float = 1e-3
+    logvar_weight_decay: float = 0.0
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Set declared fields from kwargs; attach extras as attributes.
+
+        Every dataclass field takes its value from ``kwargs`` or its
+        default; any remaining kwargs become ad-hoc attributes, so
+        callers can do ``VMCConfig(batch_size=256, my_extra_flag=True)``
+        without subclassing.
+        """
+        for f in fields(self):
+            setattr(self, f.name, kwargs.pop(f.name, f.default))
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        self.__post_init__()
+
+    def __repr__(self) -> str:
+        """Repr including declared fields AND ad-hoc extra attributes."""
+        declared = [f.name for f in fields(self)]
+        extras = [k for k in self.__dict__ if k not in declared]
+        parts = [f"{k}={getattr(self, k)!r}" for k in declared + extras]
+        return f"{type(self).__name__}({', '.join(parts)})"
+
+    def __post_init__(self) -> None:
+        """Validate ``preconditioner`` against ``_VALID_PRECONDITIONERS``."""
+        if (self.preconditioner is not None
+                and self.preconditioner not in _VALID_PRECONDITIONERS):
+            raise ValueError(f"preconditioner must be one of "
+                             f"{_VALID_PRECONDITIONERS} or None, got "
+                             f"{self.preconditioner!r}")
+
 
 class VMC_GPU:
     """GPU VMC driver.
@@ -85,6 +295,33 @@ class VMC_GPU:
     accepting/rejecting). This driver orchestrates the
     full sample -> energy -> gradient loop, SR solve,
     and parameter update.
+
+    Args:
+        sampler: MCMC sampler providing ``step`` (one sweep over all
+            walkers, returns updated configs + amplitudes) and
+            ``burn_in``.
+        preconditioner: SR / MinSR solver mapping (O_loc, E_loc) to a
+            flat update direction ``dp``. None ->
+            ``TrivialPreconditionerGPU`` (plain SGD: ``dp`` is the raw
+            energy gradient). Ignored by the logvar / SWO drivers.
+        optimizer: ``OptimizerGPU`` applying
+            ``theta <- theta - lr * dp``. Required by ``run_vmc_loop``
+            and the SWO driver.
+        evaluate_energy_fn: callable with the ``evaluate_energy``
+            signature ``(fxs, model, hamiltonian, amps, ...)`` returning
+            ``(amps, local_E)`` or, for the boundary-MPS reuse variants,
+            ``(amps, local_E, bMPS_x[, bMPS_y])``; the extra
+            environments are forwarded to ``compute_grads_fn``.
+        compute_grads_fn: per-sample gradient function with the
+            ``compute_grads_gpu`` signature, returning
+            ``(grads (B, Np), aux)`` where ``aux`` is the raw amplitudes
+            (``use_log_amp=False``, grads are then divided by them) or
+            ``(sign, log_abs)`` (``use_log_amp=True``, grads are already
+            d log|psi| / d theta).
+        mixed_precision: if True the model must be float32; it is
+            switched to float64 around every gradient computation and
+            back to float32 for sampling / energies. Cuts sampling cost
+            on GPUs with slow fp64 while keeping O_loc for SR in fp64.
     """
 
     def __init__(
@@ -95,8 +332,12 @@ class VMC_GPU:
         evaluate_energy_fn: Callable = evaluate_energy,
         compute_grads_fn: Callable = compute_grads_gpu,
         mixed_precision: bool = False,
-    ):
+    ) -> None:
+        """Store the components; see the class docstring for each."""
         self.sampler = sampler
+        if preconditioner is None:
+            # Plain SGD: the direction is the raw energy gradient.
+            preconditioner = TrivialPreconditionerGPU()
         self.preconditioner = preconditioner
         self.optimizer = optimizer
         self.evaluate_energy_fn = evaluate_energy_fn
@@ -108,7 +349,7 @@ class VMC_GPU:
     # ==========================================================
 
     @staticmethod
-    def _sync_params(model):
+    def _sync_params(model: WavefunctionModel_GPU) -> None:
         """Broadcast model params from rank 0 to all ranks."""
         if not dist.is_initialized():
             return
@@ -120,7 +361,9 @@ class VMC_GPU:
             dist.broadcast(p.data, src=0)
 
     @staticmethod
-    def _allreduce_grads(model, world_size):
+    def _allreduce_grads(
+        model: WavefunctionModel_GPU, world_size: int,
+    ) -> None:
         """Average param.grad across all ranks."""
         if world_size <= 1:
             return
@@ -134,8 +377,20 @@ class VMC_GPU:
                 p.grad /= world_size
 
     @staticmethod
-    def _count_nan_inf_tensor(tensor, max_check_elems=10_000_000):
-        """Count NaN/Inf without materializing full-size bool masks."""
+    def _count_nan_inf_tensor(
+        tensor: torch.Tensor, max_check_elems: int = 10_000_000,
+    ) -> tuple[int, int]:
+        """Count NaN/Inf without materializing full-size bool masks.
+
+        Args:
+            tensor: any tensor; 2-D tensors are scanned row-block-wise,
+                others in flat chunks along dim 0.
+            max_check_elems: max elements per scanned chunk (bounds the
+                temporary bool mask size).
+
+        Returns:
+            (n_nan, n_inf) as Python ints.
+        """
         if tensor.numel() == 0:
             return 0, 0
 
@@ -163,7 +418,9 @@ class VMC_GPU:
         return n_nan, n_inf
 
     @staticmethod
-    def _copy_vector_to_model(model, vec) -> None:
+    def _copy_vector_to_model(
+        model: WavefunctionModel_GPU, vec: torch.Tensor,
+    ) -> None:
         """Copy a flat parameter vector into ``model`` in place."""
         with torch.no_grad():
             offset = 0
@@ -175,25 +432,54 @@ class VMC_GPU:
     def _swo_line_search_step(
         self,
         *,
-        configs,
-        sign_B,
-        log_abs_B,
-        training_model,
-        direction,
-        old_log_f,
-        grad_batch_size,
-        n_total,
-        max_backtracks,
-        shrink,
-        min_lr,
-        rank,
-    ):
-        """Backtracking line search on the fixed SWO sample set."""
-        current = torch.nn.utils.parameters_to_vector(
-            training_model.parameters(),
+        batch: SWOBatch,
+        training_model: WavefunctionModel_GPU,
+        direction: torch.Tensor,
+        grad_batch_size: int,
+        max_backtracks: int,
+        shrink: float,
+        min_lr: float,
+        rank: int,
+    ) -> dict[str, Any]:
+        """Backtracking line search on the frozen SWO sample set.
+
+        Tries ``theta - lr * direction`` with
+        ``lr = optimizer.lr * shrink**k``, k = 0..max_backtracks, and
+        accepts the first trial that does not increase the reweighted
+        ``-log F`` on ``batch`` -- the very objective ``direction``
+        descends. Both sides of the comparison are measured here on the
+        same code path (the reference value is not passed in). On
+        rejection the parameters AND the optimizer state are restored
+        (``optimizer.step`` advances Adam / SPRING momenta, which would
+        otherwise be corrupted by rejected trials); ``optimizer.lr``
+        itself is never written, so a shrunk trial lr does not ratchet
+        the base lr down.
+
+        On return ``batch`` is refreshed at whatever theta ends up
+        installed, so the caller can use it immediately.
+
+        Args:
+            batch: frozen ``SWOBatch`` (importance-reweighted dataset).
+            training_model: model being fitted (updated in place).
+            direction: flat (Np,) update direction ``dp``.
+            grad_batch_size: chunk size for ``batch.refresh_from_model``.
+            max_backtracks: maximum number of lr shrinks to try.
+            shrink: multiplicative lr factor per backtrack.
+            min_lr: give up once the trial ``lr < min_lr``.
+            rank: distributed rank (rank 0 prints the rejection notice).
+
+        Returns:
+            dict with ``accepted`` (bool), ``lr`` (accepted lr, 0.0 on
+            rejection), ``n_backtrack`` (shrinks used; max_backtracks+1
+            on rejection) and ``neg_log_f`` (objective at the installed
+            theta).
+        """
+        current = torch.cat(
+            [p.reshape(-1) for p in training_model.parameters()]
         ).detach().clone()
+        opt_state = self.optimizer.state_dict()
+        old_log_f = float(swo_fidelity(batch)['neg_log_f'])
         base_lr = float(self.optimizer.lr)
-        best_log_f = old_log_f
 
         for n_backtrack in range(max_backtracks + 1):
             lr = base_lr * (shrink ** n_backtrack)
@@ -201,39 +487,34 @@ class VMC_GPU:
                 break
 
             self.optimizer.step(
-                training_model,
-                direction,
-                learning_rate=lr,
+                training_model, direction, learning_rate=lr,
             )
-            _, new_log_f = fidelity_from_model_on_configs(
-                configs,
-                training_model,
-                sign_B,
-                log_abs_B,
-                n_total,
-                grad_batch_size,
-            )
-            if float(new_log_f) <= float(old_log_f):
-                self.optimizer.lr = lr
+            batch.refresh_from_model(training_model, grad_batch_size)
+            new_log_f = float(swo_fidelity(batch)['neg_log_f'])
+            if new_log_f <= old_log_f:
                 return {
                     'accepted': True,
                     'lr': lr,
                     'n_backtrack': n_backtrack,
-                    'log_f': new_log_f,
+                    'neg_log_f': new_log_f,
                 }
 
             self._copy_vector_to_model(training_model, current)
+            self.optimizer.load_state_dict(opt_state)
 
+        self._copy_vector_to_model(training_model, current)
+        self.optimizer.load_state_dict(opt_state)
+        batch.refresh_from_model(training_model, grad_batch_size)
         if rank == 0:
             print(
                 "[SWO line search] rejected update: no fixed-sample "
-                f"decrease from -logF={float(old_log_f):.6e}"
+                f"decrease from -logF={old_log_f:.6e}"
             )
         return {
             'accepted': False,
             'lr': 0.0,
             'n_backtrack': max_backtracks + 1,
-            'log_f': best_log_f,
+            'neg_log_f': old_log_f,
         }
 
     # ==========================================================
@@ -242,13 +523,39 @@ class VMC_GPU:
 
     def run_warmup(
         self,
-        fxs,
-        model,
-        graph,
-        hamiltonian,
-        rank,
-        config,
-    ):
+        fxs: torch.Tensor,
+        model: WavefunctionModel_GPU,
+        graph: Graph,
+        hamiltonian: Hamiltonian,
+        rank: int,
+        config: VMCConfig,
+    ) -> torch.Tensor:
+        """One sampling / energy / gradient sweep before the VMC loop.
+
+        Triggers all lazy one-off costs (torch.compile codegen, CUDA
+        graph capture of the gradient fn, allocator growth) and prints
+        per-phase timings, so the first real VMC step is representative.
+        No parameters are updated; energies and gradients are discarded.
+
+        Args:
+            fxs: (B, N_sites) int64 initial walker configurations.
+            model: wavefunction ``nn.Module`` (float32 if
+                ``self.mixed_precision``).
+            graph: lattice graph consumed by the sampler's proposals.
+            hamiltonian: Hamiltonian providing connected configurations
+                and matrix elements for ``evaluate_energy_fn``.
+            rank: distributed rank; only rank 0 prints.
+            config: ``VMCConfig``-like object; reads ``run_sampling`` /
+                ``run_locE`` / ``run_grad`` (which phases to exercise;
+                ``run_locE`` requires ``run_sampling`` since it needs
+                the sampler's amplitudes), ``use_export_compile``,
+                ``use_log_amp``, ``grad_batch_size``, ``verbose`` and
+                ``offload_grad_to_cpu``.
+
+        Returns:
+            fxs: (B, N_sites) walker configs after the sweep (unchanged
+                if ``run_sampling`` is False).
+        """
         if self.mixed_precision:
             param_dtype = next(model.parameters()).dtype
             assert param_dtype == torch.float32, (
@@ -362,20 +669,23 @@ class VMC_GPU:
 
     def _run_sampling_phase(
         self,
-        fxs,
-        model,
-        hamiltonian,
-        graph,
-        ns_per_rank,
-        grad_batch_size,
-        burn_in=False,
-        burn_in_steps=0,
-        use_export_compile=False,
-        debug=False,
-        offload_lpg_loc_cpu=False,
-        use_log_amp=False,
-        verbose=False,
-    ):
+        fxs: torch.Tensor,
+        model: WavefunctionModel_GPU,
+        hamiltonian: Hamiltonian,
+        graph: Graph,
+        ns_per_rank: int,
+        grad_batch_size: int,
+        burn_in: bool = False,
+        burn_in_steps: int = 0,
+        use_export_compile: bool = False,
+        debug: bool = False,
+        offload_lpg_loc_cpu: bool = False,
+        use_log_amp: bool = False,
+        verbose: bool = False,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor], torch.Tensor, float,
+        dict[str, float],
+    ]:
         """Run MCMC sampling, energy eval, and gradient
         computation for one VMC step.
 
@@ -384,15 +694,36 @@ class VMC_GPU:
         compute_grads_fn directly.
 
         Args:
+            fxs: (B, N_sites) int64 walker configurations; B is the
+                number of parallel Markov chains.
+            model: wavefunction model.
+            hamiltonian: Hamiltonian for the local energies.
+            graph: lattice graph consumed by the sampler's proposals.
+            ns_per_rank: samples to collect on this rank (Ns). The
+                loop runs ceil(Ns / B) sweeps and keeps only the first
+                ``Ns - collected`` walkers of the last one.
+            grad_batch_size: chunk size for ``compute_grads_fn``
+                (memory knob only).
+            burn_in: if True, run ``burn_in_steps`` sampler sweeps
+                first (the caller does this on VMC step 0 only).
+            burn_in_steps: number of burn-in sweeps.
+            use_export_compile: forwarded to the sampler as
+                ``compile`` -- use the exported + compiled forward.
+            debug: rank-0 prints of amplitude / gradient statistics
+                for every chunk.
             offload_lpg_loc_cpu: if True, move log_psi_grad chunks
                 to CPU immediately after GPU computation.
             use_log_amp: if True, work in log-amplitude
                 space throughout (sampler, energy, grads).
+            verbose: forwarded to the sampler / energy / gradient
+                functions for their own timing prints.
 
         Returns:
-            (local_energies, local_log_psi_grad): tensors
-                of shapes (Ns,) and (Ns, Np).
+            (local_energies, local_log_psi_grad): (Ns,) local
+                energies and (Ns, Np) log-derivatives
+                O_loc = d log|psi| / d theta, Ns = ns_per_rank.
             fxs: (B, N_sites) updated walker configs.
+            sample_time: t_samp + t_locE + t_grad in seconds.
             phase_times: dict with t_samp, t_locE, t_grad.
         """
         B = fxs.shape[0]
@@ -576,8 +907,25 @@ class VMC_GPU:
         )
 
     def compute_global_energy_stats(
-        self, local_energies, world_size,
-    ):
+        self, local_energies: torch.Tensor, world_size: int,
+    ) -> tuple[int, float, float]:
+        """All-reduce local energies into the global mean and variance.
+
+        Requires an initialised process group (``setup_distributed``).
+
+        Args:
+            local_energies: (Ns_local,) local energies on this rank.
+            world_size: number of ranks; all are assumed to hold the
+                same Ns_local.
+
+        Returns:
+            total_ns: Ns_local * world_size.
+            energy_mean: global <E_loc>.
+            energy_var: global population variance
+                <E_loc^2> - <E_loc>^2 (NOT the variance of the mean;
+                the statistical error of the mean is
+                sqrt(energy_var / total_ns)).
+        """
         n_local = local_energies.shape[0]
         total_ns = n_local * world_size
 
@@ -600,20 +948,32 @@ class VMC_GPU:
 
     def _compute_step_diagnostics(
         self,
-        local_energies,
-        local_lpg,
-        fxs,
-        model,
-        energy_mean,
-        use_log_amp,
-        world_size,
-        rank,
-    ):
+        local_energies: torch.Tensor,
+        local_lpg: torch.Tensor,
+        fxs: torch.Tensor,
+        model: WavefunctionModel_GPU,
+        energy_mean: float,
+        use_log_amp: bool,
+        world_size: int,
+        rank: int,
+    ) -> dict[str, Any]:
         """Collect distributional stats for one VMC step.
 
         Cheap (one extra forward + a few all-gathers); call only when
         ``config.diagnostics`` is set. Returns a dict (only meaningful
         on rank 0; other ranks get an empty dict).
+
+        Args:
+            local_energies: (Ns_local,) local energies on this rank.
+            local_lpg: (Ns_local, Np) log-derivatives on this rank.
+            fxs: (B, N_sites) current walkers (for the log|psi|
+                forward).
+            model: wavefunction model.
+            energy_mean: global <E_loc> from
+                ``compute_global_energy_stats``.
+            use_log_amp: use ``model.forward_log`` rather than
+                ``log|model(fxs)|``.
+            world_size, rank: distributed info.
 
         Diagnostics:
           - E_loc: min, max, median, std, count of outliers
@@ -700,15 +1060,38 @@ class VMC_GPU:
 
     def solve_sr_step(
         self,
-        O_loc,
-        E_loc,
-        E_mean,
-        Ns,
-        Np,
-        rshift,
-        ashift,
-        device,
-    ):
+        O_loc: torch.Tensor | list[torch.Tensor],
+        E_loc: torch.Tensor,
+        E_mean: float,
+        Ns: int,
+        Np: int,
+        rshift: float,
+        ashift: float,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, float, Any]:
+        """Solve the SR / MinSR system for the update direction.
+
+        Thin wrapper around ``self.preconditioner.solve``.
+
+        Args:
+            O_loc: (Ns_local, Np) log-derivatives, or a 1-element list
+                wrapping them ("ownership box") when the preconditioner
+                supports freeing the Jacobian early.
+            E_loc: (Ns_local,) local energies.
+            E_mean: global energy mean.
+            Ns: GLOBAL sample count (all ranks).
+            Np: number of parameters.
+            rshift, ashift: Tikhonov regularisation of the Gram matrix,
+                shift = rshift * trace(T)/sqrt(n) + ashift
+                (see ``VMCConfig``).
+            device: device on which the solve runs.
+
+        Returns:
+            dp: (Np,) update direction (S + shift)^-1 F.
+            t_sr: wall time of the solve in seconds.
+            info: solver-specific convergence info (e.g. iteration
+                count); printed in the step log.
+        """
         return self.preconditioner.solve(
             O_loc=O_loc,
             E_loc=E_loc,
@@ -721,8 +1104,20 @@ class VMC_GPU:
         )
 
     def apply_parameter_update(
-        self, model, dp, learning_rate, device,
-    ):
+        self,
+        model: WavefunctionModel_GPU,
+        dp: torch.Tensor,
+        learning_rate: float,
+        device: torch.device,
+    ) -> None:
+        """Apply ``theta <- theta - learning_rate * dp`` in place.
+
+        Args:
+            model: model whose parameters are updated.
+            dp: (Np,) flat update direction from ``solve_sr_step``.
+            learning_rate: step size.
+            device: device on which the update is computed.
+        """
         self.optimizer.step(
             model=model,
             direction=dp,
@@ -734,27 +1129,46 @@ class VMC_GPU:
 
     def run_vmc_loop(
         self,
-        fxs,
-        model,
-        hamiltonian,
-        graph,
-        rank,
-        world_size,
-        config,
+        fxs: torch.Tensor,
+        model: WavefunctionModel_GPU,
+        hamiltonian: Hamiltonian,
+        graph: Graph,
+        rank: int,
+        world_size: int,
+        config: VMCConfig,
         n_params: int,
         nsites: int,
-        on_step_end: Optional[
-            Callable[[Dict[str, Any]], None]
-        ] = None,
-    ):
+        on_step_end: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[list[float], torch.Tensor]:
         """Drive the VMC sampling/SR-solve/parameter-update loop.
 
         Args:
+            fxs: (B, N_sites) int64 initial walker configurations.
+            model: wavefunction model (float32 if
+                ``self.mixed_precision``).
+            hamiltonian: Hamiltonian for the local energies.
+            graph: lattice graph consumed by the sampler's proposals.
+            rank, world_size: from ``setup_distributed``.
             config: a ``VMCConfig``-shaped object (any object with
-                the expected attributes works).
+                the expected attributes works). ``config.learning_rate``
+                is overwritten in place every step when
+                ``config.lr_scheduler`` is set.
             n_params: total trainable parameter count of ``model``.
             nsites: number of lattice sites (for per-site energy
                 reporting).
+            on_step_end: optional callback, invoked on EVERY rank after
+                each step with a dict: ``step`` (global step, includes
+                ``config.resume_step``), ``energy_mean``, ``energy_var``,
+                ``energy_per_site``, ``error_per_site``,
+                ``total_samples``, ``sample_time``, ``phase_times``,
+                ``sr_time``, ``total_time``, ``solver_info``, ``fxs``
+                ((Ns, N_sites) walkers gathered from all ranks) and
+                ``diagnostics`` (dict from ``_compute_step_diagnostics``
+                or None). Intended for checkpointing / logging.
+
+        Returns:
+            energy_history: list of per-site energies, one per step.
+            fxs: (B, N_sites) final walker configs on this rank.
         """
         if self.mixed_precision:
             param_dtype = next(model.parameters()).dtype
@@ -1006,6 +1420,7 @@ class VMC_GPU:
         return energy_history, fxs
 
     # ==========================================================
+    # BELOW ARE ALL EXPERIMENTAL / UNVERIFIED METHODS.  USE AT YOUR OWN RISK.
     # EXPERIMENTAL: Log-variance optimization (NOT VERIFIED)
     #
     # The pathwise and REINFORCE gradient terms individually
@@ -1014,29 +1429,47 @@ class VMC_GPU:
     # residual.  As a result, logvar optimization does NOT
     # converge in practice.  These methods are kept for
     # future investigation but should not be relied upon.
-    # See test_scripts/test_logvar_grad.py for details.
+    # The gradient identity below was checked against autograd on
+    # small systems.
     # ==========================================================
 
     def _run_logvar_sampling_phase(
         self,
-        fxs,
-        model,
-        hamiltonian,
-        graph,
-        ns_per_rank,
-        burn_in=False,
-        burn_in_steps=0,
-        use_export_compile=False,
-        use_log_amp=False,
-        verbose=False,
-    ):
+        fxs: torch.Tensor,
+        model: WavefunctionModel_GPU,
+        hamiltonian: Hamiltonian,
+        graph: Graph,
+        ns_per_rank: int,
+        burn_in: bool = False,
+        burn_in_steps: int = 0,
+        use_export_compile: bool = False,
+        use_log_amp: bool = False,
+        verbose: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
         """MCMC sampling + energy eval only (no gradient).
 
+        Args:
+            fxs: (B, N_sites) int64 walker configurations.
+            model: wavefunction model.
+            hamiltonian: Hamiltonian for the local energies.
+            graph: lattice graph consumed by the sampler's proposals.
+            ns_per_rank: samples to collect on this rank (Ns).
+            burn_in: if True, run ``burn_in_steps`` sampler sweeps
+                first.
+            burn_in_steps: number of burn-in sweeps.
+            use_export_compile: forwarded to the sampler as
+                ``compile``.
+            use_log_amp: work in log-amplitude space.
+            verbose: forwarded to the sampler / energy function.
+
         Returns:
-            all_fxs: (Ns, N_sites) sampled configs.
+            all_fxs: (Ns, N_sites) sampled configs (kept for the
+                surrogate-loss forward in ``_compute_logvar_loss``).
             local_energies: (Ns,) local energies.
             fxs: (B, N_sites) updated walker configs.
             phase_times: dict with t_samp, t_locE.
+
+        Currently unreliable (see the EXPERIMENTAL note above).
         """
         B = fxs.shape[0]
         t_samp, t_locE = 0.0, 0.0
@@ -1110,13 +1543,13 @@ class VMC_GPU:
 
     @staticmethod
     def _compute_logvar_loss(
-        all_fxs,
-        hamiltonian,
-        gamma,
-        model,
-        grad_batch_size,
-        use_log_amp=True,
-    ):
+        all_fxs: torch.Tensor,
+        hamiltonian: Hamiltonian,
+        gamma: float,
+        model: WavefunctionModel_GPU,
+        grad_batch_size: int,
+        use_log_amp: bool = True,
+    ) -> tuple[float, float, float]:
         """Two-pass log-variance gradient: pathwise + REINFORCE.
 
         Pass 1 (pathwise): Forward through evaluate_energy_grad
@@ -1134,6 +1567,17 @@ class VMC_GPU:
         where:
           d(sigma^2)/dtheta = 2*Cov(O, (E_L-Ebar)^2)  [REINFORCE]
                             + 2*<(E_L-Ebar)*dE_L/dtheta> [pathwise]
+
+        Args:
+            all_fxs: (Ns, N_sites) frozen sample configurations.
+            hamiltonian: Hamiltonian for the local energies.
+            gamma: regulariser inside the log,
+                L = log(Var[E_L] + gamma).
+            model: wavefunction model; ``model.zero_grad()`` is called
+                first and both passes accumulate into ``param.grad``.
+            grad_batch_size: chunk size for both passes.
+            use_log_amp: use ``model.forward_log`` instead of raw
+                amplitudes.
 
         Returns:
             (log_var_loss, energy_mean, energy_var):
@@ -1204,27 +1648,43 @@ class VMC_GPU:
 
     def run_vmc_loop_logvar(
         self,
-        fxs,
-        model,
-        hamiltonian,
-        graph,
-        rank,
-        world_size,
-        config,
+        fxs: torch.Tensor,
+        model: WavefunctionModel_GPU,
+        hamiltonian: Hamiltonian,
+        graph: Graph,
+        rank: int,
+        world_size: int,
+        config: VMCConfig,
         n_params: int,
         nsites: int,
-        torch_optimizer,
+        torch_optimizer: torch.optim.Optimizer,
         on_step_end: Optional[
             Callable[[Dict[str, Any]], None]
         ] = None,
-    ):
+    ) -> tuple[list[float], torch.Tensor]:
         """VMC loop using log-variance loss + AdamW.
 
         Instead of SR, computes a surrogate loss whose
         gradient equals the REINFORCE estimator of
         grad log(Var[E_L] + gamma).  AdamW updates params.
+
+        Args:
+            fxs, model, hamiltonian, graph, rank, world_size,
+                n_params, nsites: as in ``run_vmc_loop``.
+            config: ``VMCConfig``-like; uses ``logvar_gamma`` for the
+                loss regulariser plus the sampling / compile fields.
+            torch_optimizer: a ``torch.optim`` optimizer (e.g. AdamW)
+                over ``model.parameters()``. ``self.preconditioner`` and
+                ``self.optimizer`` are not used by this loop.
+            on_step_end: per-step callback as in ``run_vmc_loop``
+                (``sr_time`` is 0.0, ``solver_info`` None and there is
+                no ``diagnostics`` key).
+
+        Returns:
+            energy_history: list of per-site energies, one per step.
+            fxs: (B, N_sites) final walker configs on this rank.
         """
-        Warning(
+        warnings.warn(
             "Log-variance optimization is experimental and "
             "does not currently converge in practice. Use "
             "with caution."
@@ -1382,94 +1842,117 @@ class VMC_GPU:
 
     def run_SWO_state_fitting_gpu(
         self,
-        fxs,
-        training_model,
-        target_model,
-        graph,
-        ns_per_rank,
+        fxs: torch.Tensor,
+        training_model: WavefunctionModel_GPU,
+        target_model: WavefunctionModel_GPU,
+        graph: Graph,
+        ns_per_rank: int,
         *,
         loss: str = 'fidelity',
         sample_times: int = 10,
         SWO_max_iter: int = int(1e3),
         log_fidelity_tol: float = 1e-4,
+        ess_tol: float = 0.1,
         burn_in_steps: int = 0,
         grad_batch_size: Optional[int] = None,
-        hamiltonian=None,
+        hamiltonian: Optional[Hamiltonian] = None,
         tmpdir: Optional[str] = None,
         save: bool = True,
         save_step_offset: int = 0,
-        scheduler=None,
+        scheduler: Optional[Callable[[int], float]] = None,
         verbose: bool = False,
         sr_rshift: float = 0.0,
         sr_ashift: float = 1e-4,
         sr_ratio_clip: Optional[float] = None,
-        learning_rate: float = 1e-3,
-        torch_optimizer_cls=torch.optim.SGD,
-        torch_optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        ratio: float = 0.0,
         line_search: bool = False,
         line_search_shrink: float = 0.5,
         line_search_max_backtracks: int = 8,
         line_search_min_lr: float = 1e-8,
-    ):
-        """Run SWO state fitting with a selected fitting loss.
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Fit ``training_model`` to a frozen ``target_model``.
+
+        Outer loop: MCMC-sample a fresh dataset from the training model
+        and freeze it. Inner loop: take up to ``SWO_max_iter`` steps on
+        that frozen set, importance-reweighting every estimator back to
+        the current Born measure (see `swo_utils`).
 
         Args:
-            loss: One of ``'fidelity'``, ``'sr'``, or ``'l2'``.
-                ``'fidelity'`` uses the CPU-mirrored explicit fidelity
-                gradient. ``'sr'`` uses quantax-style supervised SR/MinSR.
-                ``'l2'`` uses sample-normalized amplitude L2 with
-                autograd.
-            ratio: Fraction of each outer-loop dataset sampled from
-                target_model B instead of training_model A. This is an
-                empirical mixed-sampling knob for tiny-overlap fits; the
-                strict A-distribution estimator is recovered at ``0``.
-            line_search: If True, accept fidelity/SR updates only when
-                they reduce the fixed-sample sampled-fidelity loss.
+            fxs: (B, N_sites) int64 initial walker configurations.
+            training_model: model being fitted (updated in place).
+            target_model: frozen model whose state is the fit target.
+            graph: lattice graph consumed by the sampler's proposals.
+            ns_per_rank: dataset size per rank per outer step.
+            loss: ``'fidelity'`` (plain reweighted gradient of -log F)
+                or ``'sr'`` (weighted supervised MinSR). Both are built
+                from the same ``(O, r, p)``; they differ only in whether
+                the QGT is inverted.
+            sample_times: number of outer steps (a fresh dataset is
+                sampled for each).
+            SWO_max_iter: max inner iterations per frozen dataset.
+            log_fidelity_tol: leave the inner loop once the reweighted
+                ``-log F < log_fidelity_tol``.
+            ess_tol: leave the inner loop when the reweighting has
+                degenerated, i.e. ``ESS/N < ess_tol``. ``ESS/N`` is
+                ``exp(-D_2(p_theta || p_sample))``, so this is a trust
+                region on how far theta may drift before the frozen
+                samples stop carrying information -- the analogue of
+                PPO's early stopping on KL. Set to 0 to disable.
+            burn_in_steps: sampler burn-in sweeps before EACH dataset
+                collection (after an inner loop the walkers are still
+                equilibrated to the old theta).
+            grad_batch_size: chunk size for the gradient / refresh
+                passes; None -> the walker batch size ``fxs.shape[0]``.
+            hamiltonian: if given, the reweighted energy of
+                ``training_model`` is measured after every outer step.
+            tmpdir: checkpoint directory (rank 0 writes); None disables.
+            save: write checkpoints (requires ``tmpdir``).
+            save_step_offset: added to the outer step index for
+                checkpoint numbering and the lr ``scheduler`` (resume).
+            scheduler: optional ``outer_step -> lr`` callable, applied
+                to ``self.optimizer.lr`` at the start of every inner
+                loop.
+            verbose: rank-0 tqdm bar over the inner iterations.
+            sr_rshift, sr_ashift: Gram regularisation for
+                ``loss='sr'`` (same convention as ``VMCConfig``).
+            sr_ratio_clip: ``loss='sr'`` only -- clamp the per-sample
+                amplitude-ratio residual ``eps`` to ``[-clip, clip]``
+                (opt-in outlier control on top of the overflow drop
+                in ``swo_sr_terms``; None disables).
+            line_search: accept a step only if it decreases the
+                reweighted ``-log F`` on the frozen set.
+            line_search_shrink, line_search_max_backtracks,
+                line_search_min_lr: backtracking parameters, see
+                ``_swo_line_search_step``.
 
-        The outer loop is shared for all losses: sample from A, cache B,
-        report initial fidelity, run the selected inner fit, optionally
-        measure energy, and save the checkpoint.
+        Returns:
+            fxs: (B, N_sites) final walker configs.
+            MC_stats: dict with ``sample_size`` (global dataset size)
+                and per-outer-step lists ``-logf`` / ``fidelity`` (both
+                measured at the START of the inner loop, i.e. before
+                fitting on that dataset), ``fidelity_diagnostics``
+                (inner-loop summary dicts from ``_run_swo_inner``),
+                ``energy`` (per site, only if ``hamiltonian`` is given)
+                and, for ``loss='sr'``, ``sr_time`` / ``sr_info``.
+                Lists are populated on rank 0 only.
         """
         loss = loss.lower()
-        valid_losses = {'fidelity', 'sr', 'l2'}
-        if loss not in valid_losses:
+        if loss not in ('fidelity', 'sr'):
             raise ValueError(
-                f"Unknown SWO loss {loss!r}; expected one of "
-                f"{sorted(valid_losses)}."
+                f"Unknown SWO loss {loss!r}; expected 'fidelity' or 'sr'."
             )
-        if loss in ('fidelity', 'sr') and self.optimizer is None:
-            raise ValueError(
-                f"loss={loss!r} requires an OptimizerGPU, e.g. SGDGPU()."
-            )
-        if loss == 'sr' and self.preconditioner is None:
-            raise ValueError(
-                "loss='sr' requires a GPU SR preconditioner, "
-                "e.g. MinSRGPU()."
-            )
+        if self.optimizer is None:
+            raise ValueError("SWO requires an OptimizerGPU, e.g. SGDGPU().")
 
         rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = (
-            dist.get_world_size() if dist.is_initialized() else 1
-        )
         device = next(training_model.parameters()).device
         Np = sum(p.numel() for p in training_model.parameters())
-        B = fxs.shape[0]
         if grad_batch_size is None:
-            grad_batch_size = B
-        n_total = ns_per_rank * world_size
-
-        trainable_params = None
-        if loss == 'l2':
-            trainable_params = [
-                p for p in training_model.parameters() if p.requires_grad
-            ]
-            if not trainable_params:
-                raise ValueError("training_model has no trainable parameters")
+            grad_batch_size = fxs.shape[0]
 
         MC_stats = {
-            'sample_size': n_total,
-            'target_sample_ratio': ratio,
+            'sample_size': ns_per_rank * (
+                dist.get_world_size() if dist.is_initialized() else 1
+            ),
             '-logf': [],
             'fidelity': [],
             'fidelity_diagnostics': [],
@@ -1478,269 +1961,143 @@ class VMC_GPU:
         if loss == 'sr':
             MC_stats['sr_time'] = []
             MC_stats['sr_info'] = []
-        if loss == 'l2':
-            MC_stats['l2_loss'] = []
 
         self._sync_params(training_model)
         self._sync_params(target_model)
-
-        label = {
-            'fidelity': 'SWO',
-            'sr': 'SWO-SR',
-            'l2': 'SWO-L2',
-        }[loss]
+        label = {'fidelity': 'SWO', 'sr': 'SWO-SR'}[loss]
 
         for local_step in range(sample_times):
             t_step = save_step_offset + local_step
-            
+
+            # Burn in on EVERY outer step: after an inner loop the
+            # walkers are still equilibrated to the old theta, and the
+            # collection loop below only runs ceil(ns/batch) sweeps.
+            # An unconverged chain is not a known proposal, so no
+            # importance weight can correct for it.
             with torch.no_grad():
-                (
-                    fxs, configs, sign_B, log_abs_B,
-                    sign_A0, log_abs_A0,
-                ) = collect_swo_dataset(
+                fxs, batch = collect_swo_dataset(
                     self.sampler, fxs,
                     training_model, target_model, graph,
                     ns_per_rank,
-                    burn_in=(t_step == 0),
-                    burn_in_steps=burn_in_steps,
-                    ratio=ratio,
+                    burn_in=True, burn_in_steps=burn_in_steps,
                 )
-                
-                log_abs_B_f64 = log_abs_B.to(torch.float64)
-                sign_B_f64 = sign_B.to(torch.float64)
-                log_abs_A0_f64 = log_abs_A0.to(torch.float64)
-            
-                fid_stats = fidelity_stats_from_log_amps(
-                    sign_A0, log_abs_A0,
-                    sign_B, log_abs_B,
-                    n_total,
-                )
-                fid_init = fid_stats['fidelity']
-                logf_init = fid_stats['log_f']
+                init_stats = swo_fidelity(batch)
 
             if rank == 0:
-                MC_stats['-logf'].append(float(logf_init))
-                MC_stats['fidelity'].append(float(fid_init))
-                fid_diag = {
-                    key: float(value)
-                    for key, value in fid_stats.items()
-                    if key not in ('fidelity', 'log_f')
-                }
-                MC_stats['fidelity_diagnostics'].append(fid_diag)
                 print(
                     f"[{label} outer {t_step}] init fidelity="
-                    f"{float(fid_init):.6e}, "
-                    f"-log f={float(logf_init):.6e}, "
+                    f"{float(init_stats['fidelity']):.6e}, "
+                    f"-log f={float(init_stats['neg_log_f']):.6e}"
                 )
 
-            checkpoint_optimizer = self.optimizer
-            if loss == 'fidelity':
-                self._run_swo_fidelity_inner(
-                    configs=configs,
-                    sign_B_f64=sign_B_f64,
-                    log_abs_B_f64=log_abs_B_f64,
-                    log_abs_A0_f64=log_abs_A0_f64,
-                    training_model=training_model,
-                    grad_batch_size=grad_batch_size,
-                    Np=Np,
-                    n_total=n_total,
-                    device=device,
-                    t_step=t_step,
-                    SWO_max_iter=SWO_max_iter,
-                    log_fidelity_tol=log_fidelity_tol,
-                    scheduler=scheduler,
-                    rank=rank,
-                    verbose=verbose,
-                    line_search=line_search,
-                    line_search_shrink=line_search_shrink,
-                    line_search_max_backtracks=line_search_max_backtracks,
-                    line_search_min_lr=line_search_min_lr,
-                )
-            elif loss == 'sr':
-                sr_stats = self._run_swo_sr_inner(
-                    configs=configs,
-                    sign_B_f64=sign_B_f64,
-                    log_abs_B_f64=log_abs_B_f64,
-                    training_model=training_model,
-                    grad_batch_size=grad_batch_size,
-                    Np=Np,
-                    n_total=n_total,
-                    device=device,
-                    t_step=t_step,
-                    SWO_max_iter=SWO_max_iter,
-                    log_fidelity_tol=log_fidelity_tol,
-                    scheduler=scheduler,
-                    sr_rshift=sr_rshift,
-                    sr_ashift=sr_ashift,
-                    sr_ratio_clip=sr_ratio_clip,
-                    rank=rank,
-                    verbose=verbose,
-                    line_search=line_search,
-                    line_search_shrink=line_search_shrink,
-                    line_search_max_backtracks=line_search_max_backtracks,
-                    line_search_min_lr=line_search_min_lr,
-                )
-                if rank == 0:
-                    MC_stats['sr_time'].append(sr_stats['sr_time'])
-                    MC_stats['sr_info'].append(sr_stats['sr_info'])
-            else:
-                l2_stats = self._run_swo_l2_inner(
-                    configs=configs,
-                    sign_B=sign_B,
-                    log_abs_B=log_abs_B,
-                    training_model=training_model,
-                    trainable_params=trainable_params,
-                    batch_size=grad_batch_size,
-                    n_total=n_total,
-                    t_step=t_step,
-                    SWO_max_iter=SWO_max_iter,
-                    learning_rate=learning_rate,
-                    torch_optimizer_cls=torch_optimizer_cls,
-                    torch_optimizer_kwargs=torch_optimizer_kwargs,
-                    scheduler=scheduler,
-                    rank=rank,
-                    world_size=world_size,
-                    verbose=verbose,
-                )
-                checkpoint_optimizer = l2_stats['optimizer']
-                if rank == 0:
-                    MC_stats['l2_loss'].append(l2_stats['l2_loss'])
+            inner = self._run_swo_inner(
+                batch=batch,
+                training_model=training_model,
+                loss=loss,
+                grad_batch_size=grad_batch_size,
+                Np=Np,
+                device=device,
+                t_step=t_step,
+                SWO_max_iter=SWO_max_iter,
+                log_fidelity_tol=log_fidelity_tol,
+                ess_tol=ess_tol,
+                scheduler=scheduler,
+                sr_rshift=sr_rshift,
+                sr_ashift=sr_ashift,
+                sr_ratio_clip=sr_ratio_clip,
+                rank=rank,
+                verbose=verbose,
+                line_search=line_search,
+                line_search_shrink=line_search_shrink,
+                line_search_max_backtracks=line_search_max_backtracks,
+                line_search_min_lr=line_search_min_lr,
+            )
+
+            if rank == 0:
+                MC_stats['-logf'].append(float(init_stats['neg_log_f']))
+                MC_stats['fidelity'].append(float(init_stats['fidelity']))
+                MC_stats['fidelity_diagnostics'].append(inner['diagnostics'])
+                if loss == 'sr':
+                    MC_stats['sr_time'].append(inner['sr_time'])
+                    MC_stats['sr_info'].append(inner['sr_info'])
 
             if hamiltonian is not None:
-                local_E_sum = torch.zeros(
-                    (), device=device, dtype=torch.float64,
+                # batch is refreshed at the post-update theta, so this
+                # is <E_loc>_r and not a stale plain mean.
+                energy = swo_energy(
+                    batch, training_model, hamiltonian,
+                    self.evaluate_energy_fn, batch_size=grad_batch_size,
                 )
-                with torch.inference_mode():
-                    for start in range(0, configs.shape[0], grad_batch_size):
-                        stop = min(start + grad_batch_size, configs.shape[0])
-                        cfg_chunk = configs[start:stop]
-                        amps_out = training_model.forward_log(cfg_chunk)
-                        _, local_E = self.evaluate_energy_fn(
-                            cfg_chunk, training_model, hamiltonian, amps_out,
-                            use_log_amp=True,
-                        )
-                        local_E_sum += local_E.detach().to(
-                            torch.float64,
-                        ).sum()
-                if dist.is_initialized() and dist.get_world_size() > 1:
-                    dist.all_reduce(local_E_sum, op=dist.ReduceOp.SUM)
-                energy_mean_per_site = (
-                    local_E_sum / n_total / graph.n_nodes
-                )
+                per_site = float(energy) / graph.n_nodes
                 if rank == 0:
-                    MC_stats['energy'].append(float(energy_mean_per_site))
+                    MC_stats['energy'].append(per_site)
                     print(
                         f"[{label} outer {t_step}] "
-                        f"energy={float(energy_mean_per_site):.12e}\n"
+                        f"energy={per_site:.12e}\n"
                     )
 
             if rank == 0 and tmpdir is not None and save:
                 save_swo_checkpoint(
                     training_model, MC_stats, tmpdir, t_step,
-                    optimizer=checkpoint_optimizer,
+                    optimizer=self.optimizer,
                 )
 
         return fxs, MC_stats
 
-    def _run_swo_fidelity_inner(
+    def _run_swo_inner(
         self,
         *,
-        configs,
-        sign_B_f64,
-        log_abs_B_f64,
-        log_abs_A0_f64,
-        training_model,
-        grad_batch_size,
-        Np,
-        n_total,
-        device,
-        t_step,
-        SWO_max_iter,
-        log_fidelity_tol,
-        scheduler,
-        rank,
-        verbose,
-        line_search,
-        line_search_shrink,
-        line_search_max_backtracks,
-        line_search_min_lr,
-    ):
-        if scheduler is not None:
-            self.optimizer.lr = scheduler(t_step)
-        self.optimizer.reset()
+        batch: SWOBatch,
+        training_model: WavefunctionModel_GPU,
+        loss: str,
+        grad_batch_size: int,
+        Np: int,
+        device: torch.device,
+        t_step: int,
+        SWO_max_iter: int,
+        log_fidelity_tol: float,
+        ess_tol: float,
+        scheduler: Optional[Callable[[int], float]],
+        sr_rshift: float,
+        sr_ashift: float,
+        sr_ratio_clip: Optional[float],
+        rank: int,
+        verbose: bool,
+        line_search: bool,
+        line_search_shrink: float,
+        line_search_max_backtracks: int,
+        line_search_min_lr: float,
+    ) -> dict[str, Any]:
+        """Inner loop over the frozen dataset, shared by both losses.
 
-        pbar = tqdm(range(SWO_max_iter)) if rank == 0 and verbose else None
-        for it in range(SWO_max_iter):
-            terms = accumulate_fidelity_terms(
-                configs,
-                log_abs_A0_f64,
-                sign_B_f64, log_abs_B_f64,
-                training_model,
-                grad_batch_size=grad_batch_size,
-                Np=Np, device=device,
-            )
-            direction, log_f = compute_swo_direction(terms, n_total)
-            line_search_stats = None
-            if line_search:
-                line_search_stats = self._swo_line_search_step(
-                    configs=configs,
-                    sign_B=sign_B_f64,
-                    log_abs_B=log_abs_B_f64,
-                    training_model=training_model,
-                    direction=direction,
-                    old_log_f=log_f,
-                    grad_batch_size=grad_batch_size,
-                    n_total=n_total,
-                    max_backtracks=line_search_max_backtracks,
-                    shrink=line_search_shrink,
-                    min_lr=line_search_min_lr,
-                    rank=rank,
-                )
-            else:
-                self.optimizer.step(training_model, direction)
+        Each iteration: refresh the importance weights at the current
+        theta, build a direction, decide whether to stop, then step.
+        Both stopping tests look at the same reweighted estimator that
+        produced the direction, so the monitored quantity and the
+        optimized quantity can no longer disagree.
 
-            if rank == 0 and pbar is not None:
-                desc = f"SWO {it} -logF={float(log_f):.3e}"
-                if line_search_stats is not None:
-                    desc += (
-                        f" -> {float(line_search_stats['log_f']):.3e} "
-                        f"lr={line_search_stats['lr']:.2e} "
-                        f"bt={line_search_stats['n_backtrack']}"
-                    )
-                pbar.set_description(desc)
-                pbar.update(1)
+        Args:
+            batch: frozen ``SWOBatch``; left refreshed at the final
+                theta on return.
+            training_model: model being fitted (updated in place).
+            loss: ``'fidelity'`` or ``'sr'``.
+            grad_batch_size, Np, device: as in the caller.
+            t_step: global outer step index (fed to ``scheduler``).
+            SWO_max_iter, log_fidelity_tol, ess_tol, scheduler,
+                sr_rshift, sr_ashift, sr_ratio_clip, rank, verbose,
+                line_search, line_search_shrink,
+                line_search_max_backtracks, line_search_min_lr: see
+                ``run_SWO_state_fitting_gpu``.
 
-            if float(log_f) < log_fidelity_tol:
-                break
-
-        if pbar is not None:
-            pbar.close()
-
-    def _run_swo_sr_inner(
-        self,
-        *,
-        configs,
-        sign_B_f64,
-        log_abs_B_f64,
-        training_model,
-        grad_batch_size,
-        Np,
-        n_total,
-        device,
-        t_step,
-        SWO_max_iter,
-        log_fidelity_tol,
-        scheduler,
-        sr_rshift,
-        sr_ashift,
-        sr_ratio_clip,
-        rank,
-        verbose,
-        line_search,
-        line_search_shrink,
-        line_search_max_backtracks,
-        line_search_min_lr,
-    ):
+        Returns:
+            dict with ``sr_time`` (total seconds in the MinSR solves,
+            0.0 for ``'fidelity'``), ``sr_info`` (last solver info or
+            None) and ``diagnostics``: ``n_inner`` (iterations run),
+            ``exit`` (``'tol'`` / ``'ess'`` / ``'maxiter'``),
+            ``neg_log_f_final``, ``fidelity_final``, ``ess_frac_final``,
+            ``ess_frac_min``, ``coherence_min`` and ``n_over`` (total
+            overflow-dropped rows, ``'sr'`` only).
+        """
         if scheduler is not None:
             self.optimizer.lr = scheduler(t_step)
         self.optimizer.reset()
@@ -1748,42 +2105,85 @@ class VMC_GPU:
         pbar = tqdm(range(SWO_max_iter)) if rank == 0 and verbose else None
         total_sr_time = 0.0
         last_info = None
+        ess_min = float('inf')
+        coh_min = float('inf')
+        n_over_total = 0.0
+        stats = None
+        exit_reason = 'maxiter'
+        n_inner = 0
+
         for it in range(SWO_max_iter):
-            terms = accumulate_supervised_sr_terms(
-                configs,
-                sign_B_f64, log_abs_B_f64,
-                training_model,
-                grad_batch_size=grad_batch_size,
-                device=device,
-                n_total=n_total,
-                ratio_clip=sr_ratio_clip,
-            )
-            direction, sr_time, info = self.preconditioner.solve(
-                O_loc=terms['local_lpg'],
-                E_loc=terms['local_signal'],
-                E_mean=float(terms['signal_mean']),
-                Ns=n_total,
-                Np=Np,
-                rshift=sr_rshift,
-                ashift=sr_ashift,
-                device=device,
-            )
+            if loss == 'fidelity':
+                batch.refresh_from_model(training_model, grad_batch_size)
+                direction, stats = swo_fidelity_gradient(
+                    batch, training_model,
+                    grad_batch_size=grad_batch_size, Np=Np, device=device,
+                )
+            else:
+                # swo_sr_terms refreshes `batch` out of its own gradient
+                # pass, so the SR path pays no extra forward.
+                terms = swo_sr_terms(
+                    batch, training_model,
+                    grad_batch_size=grad_batch_size,
+                    ratio_clip=sr_ratio_clip,
+                )
+                stats = terms['stats']
+                direction, sr_time, info = weighted_minsr_step(
+                    terms['O_loc'], terms['eps'], terms['r'],
+                    batch.n_total, Np,
+                    rshift=sr_rshift, ashift=sr_ashift, device=device,
+                )
+                total_sr_time += sr_time
+                last_info = info
+                n_over_total += float(stats['n_over'])
+                del terms
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            total_sr_time += sr_time
-            last_info = info
+            n_inner = it + 1
+            neg_log_f = float(stats['neg_log_f'])
+            ess = float(stats['ess_frac'])
+            coh = float(stats['coherence'])
+            ess_min = min(ess_min, ess)
+            coh_min = min(coh_min, coh)
 
-            log_f = terms['log_f']
-            line_search_stats = None
+            if rank == 0 and pbar is not None:
+                pbar.set_description(
+                    f"{loss} {it} -logF={neg_log_f:.3e} "
+                    f"ESS/N={ess:.3f} coh={coh:.3f}"
+                )
+                pbar.update(1)
+
+            if neg_log_f < log_fidelity_tol:
+                exit_reason = 'tol'
+                break
+            if ess_tol > 0.0 and ess < ess_tol:
+                # The frozen samples no longer represent the current
+                # state; this direction is noise. Stop and resample
+                # rather than take it.
+                exit_reason = 'ess'
+                if rank == 0:
+                    print(
+                        f"[SWO inner] ESS/N={ess:.3f} < {ess_tol} at "
+                        f"iter {it}; resampling."
+                    )
+                break
+            if rank == 0 and coh < 0.05:
+                # <A|B> is a near-cancelling signed sum, so the overlap
+                # weight p -- and hence the direction -- is amplified by
+                # ~1/coherence. Report it; clamping would silently bend
+                # the direction instead.
+                print(
+                    f"[SWO inner] warning: coherence={coh:.3e} at iter "
+                    f"{it}; <A|B> is dominated by sign cancellation."
+                )
+
             if line_search:
-                line_search_stats = self._swo_line_search_step(
-                    configs=configs,
-                    sign_B=sign_B_f64,
-                    log_abs_B=log_abs_B_f64,
+                self._swo_line_search_step(
+                    batch=batch,
                     training_model=training_model,
                     direction=direction,
-                    old_log_f=log_f,
                     grad_batch_size=grad_batch_size,
-                    n_total=n_total,
                     max_backtracks=line_search_max_backtracks,
                     shrink=line_search_shrink,
                     min_lr=line_search_min_lr,
@@ -1792,189 +2192,31 @@ class VMC_GPU:
             else:
                 self.optimizer.step(training_model, direction)
 
-            # DEBUG:
-            # compare norm of direction and model parameters
-            model_params_vec = torch.nn.utils.parameters_to_vector(
-                training_model.parameters(),
-            )
-            dir_norm = torch.norm(direction).item()
-            params_norm = torch.norm(model_params_vec).item()
-            print(
-                f"  [dbg]: "
-                f"dir_norm={dir_norm:.4e} "
-                f"params_norm={params_norm:.4e} "
-                f"log_f={float(log_f):.3e} "
-                f"ESS={float(terms['ess']):.1f}/{n_total} "
-            )
-
-            if rank == 0 and pbar is not None:
-                desc = (
-                    f"SWO-SR {it} -logF={float(log_f):.3e} "
-                    f"T_SR={sr_time:.2f}s info={info}"
-                )
-                if line_search_stats is not None:
-                    desc += (
-                        f" -> {float(line_search_stats['log_f']):.3e} "
-                        f"lr={line_search_stats['lr']:.2e} "
-                        f"bt={line_search_stats['n_backtrack']}"
-                    )
-                pbar.set_description(desc)
-                pbar.update(1)
-
-            del terms
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            if float(log_f) < log_fidelity_tol:
-                break
-
         if pbar is not None:
             pbar.close()
+
+        # Leave `batch` refreshed at the final theta so the caller's
+        # energy measurement reweights against the right state.
+        batch.refresh_from_model(training_model, grad_batch_size)
+        final = swo_fidelity(batch)
 
         return {
             'sr_time': float(total_sr_time),
-            'sr_info': None if last_info is None else int(last_info)
-            if isinstance(last_info, (int, np.integer)) else str(last_info),
-        }
-
-    def _run_swo_l2_inner(
-        self,
-        *,
-        configs,
-        sign_B,
-        log_abs_B,
-        training_model,
-        trainable_params,
-        batch_size,
-        n_total,
-        t_step,
-        SWO_max_iter,
-        learning_rate,
-        torch_optimizer_cls,
-        torch_optimizer_kwargs,
-        scheduler,
-        rank,
-        world_size,
-        verbose,
-    ):
-        device = next(training_model.parameters()).device
-        amp_dtype = next(training_model.parameters()).dtype
-        target_amps = (
-            sign_B.to(device=device, dtype=amp_dtype)
-            * torch.exp(log_abs_B.to(device=device, dtype=amp_dtype))
-        ).detach()
-        local_b2_sum = (target_amps.to(torch.float64) ** 2).sum()
-        global_b2_sum = local_b2_sum.clone()
-        if dist.is_initialized() and world_size > 1:
-            dist.all_reduce(global_b2_sum, op=dist.ReduceOp.SUM)
-        target_norm = torch.sqrt(
-            (global_b2_sum / n_total).clamp(min=1e-300)
-        ).to(dtype=amp_dtype)
-
-        lr = scheduler(t_step) if scheduler is not None else learning_rate
-        opt_kwargs = dict(torch_optimizer_kwargs or {})
-        opt_kwargs['lr'] = lr
-        torch_optimizer = torch_optimizer_cls(trainable_params, **opt_kwargs)
-
-        pbar = tqdm(range(SWO_max_iter)) if rank == 0 and verbose else None
-        last_l2_loss = None
-        for it in range(SWO_max_iter):
-            torch_optimizer.zero_grad(set_to_none=True)
-
-            current_amps = torch.empty_like(target_amps)
-            local_a2_sum = torch.zeros(
-                (), device=device, dtype=torch.float64,
-            )
-
-            with torch.inference_mode():
-                for start in range(0, configs.shape[0], batch_size):
-                    stop = min(start + batch_size, configs.shape[0])
-                    amp_A = training_model(configs[start:stop])
-                    current_amps[start:stop] = amp_A.detach()
-                    local_a2_sum += (amp_A.detach().to(
-                        torch.float64,
-                    ) ** 2).sum()
-
-            global_a2_sum = local_a2_sum.clone()
-            if dist.is_initialized() and world_size > 1:
-                dist.all_reduce(global_a2_sum, op=dist.ReduceOp.SUM)
-            current_norm = torch.sqrt(
-                (global_a2_sum / n_total).clamp(min=1e-300)
-            ).to(dtype=amp_dtype)
-
-            normed_A = current_amps / current_norm
-            normed_B = target_amps / target_norm
-            residual = normed_A - normed_B
-            local_loss_sum = (residual.to(torch.float64) ** 2).sum()
-            total_loss_sum = local_loss_sum.clone()
-            if dist.is_initialized() and world_size > 1:
-                dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
-            last_l2_loss = total_loss_sum / n_total
-
-            local_y_dot_a = (
-                residual.to(torch.float64)
-                * current_amps.to(torch.float64)
-            ).sum()
-            global_y_dot_a = local_y_dot_a.clone()
-            if dist.is_initialized() and world_size > 1:
-                dist.all_reduce(global_y_dot_a, op=dist.ReduceOp.SUM)
-
-            coeffs = (2.0 / n_total) * (
-                residual.to(torch.float64) / current_norm.to(torch.float64)
-                - (
-                    current_amps.to(torch.float64)
-                    * global_y_dot_a
-                    / (
-                        n_total
-                        * current_norm.to(torch.float64) ** 3
-                    )
-                )
-            )
-
-            for start in range(0, configs.shape[0], batch_size):
-                stop = min(start + batch_size, configs.shape[0])
-                amp_A = training_model(configs[start:stop])
-                vjp = (
-                    amp_A.to(torch.float64)
-                    * coeffs[start:stop]
-                ).sum()
-                vjp.backward()
-
-            if dist.is_initialized() and world_size > 1:
-                for p in trainable_params:
-                    if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-
-            grad_rms = None
-            if rank == 0 and pbar is not None:
-                grad_sq_sum = torch.zeros(
-                    (), device=device, dtype=torch.float64,
-                )
-                grad_numel = 0
-                for p in trainable_params:
-                    if p.grad is not None:
-                        grad_sq_sum += (p.grad.detach().to(
-                            torch.float64,
-                        ) ** 2).sum()
-                        grad_numel += p.grad.numel()
-                grad_rms = torch.sqrt(grad_sq_sum / max(grad_numel, 1))
-
-            torch_optimizer.step()
-
-            if rank == 0 and pbar is not None:
-                pbar.set_description(
-                    f"SWO-L2 {it} "
-                    f"L2={float(last_l2_loss):.6e} "
-                    f"|g|rms={float(grad_rms):.3e}"
-                )
-                pbar.update(1)
-
-        if pbar is not None:
-            pbar.close()
-
-        return {
-            'l2_loss': float(last_l2_loss),
-            'optimizer': torch_optimizer,
+            'sr_info': None if last_info is None else int(last_info),
+            'diagnostics': {
+                'n_inner': n_inner,
+                'exit': exit_reason,
+                'neg_log_f_final': float(final['neg_log_f']),
+                'fidelity_final': float(final['fidelity']),
+                'ess_frac_final': float(final['ess_frac']),
+                'ess_frac_min': (
+                    None if ess_min == float('inf') else ess_min
+                ),
+                'coherence_min': (
+                    None if coh_min == float('inf') else coh_min
+                ),
+                'n_over': n_over_total,
+            },
         }
 
 

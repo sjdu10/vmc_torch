@@ -18,6 +18,7 @@ identical either way::
     from vmc_torch.GPU.tensor_network import evaluate_energy_reuse
 """
 from .utils import (  # noqa: F401
+    generate_random_spin_mps,
     generate_random_spin_peps,
     get_params_ftn,
     load_or_generate_peps,
@@ -56,5 +57,6 @@ __all__ = [
     'get_params_ftn',
     'load_or_generate_peps',
     'generate_random_spin_peps',
+    'generate_random_spin_mps',
     *_REUSE_NAMES,
 ]

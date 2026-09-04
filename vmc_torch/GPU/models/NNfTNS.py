@@ -12,6 +12,7 @@ __all__ = [
     "NNfTNS_Reuse_Model_GPU",
     "Conv2D_Geometric_fPEPS_GPU",
     "Conv2D_Geometric_fPEPS_GPU_Deep",
+    "Conv2D_Attn_Geometric_fPEPS_GPU_Deep",
     "Conv2D_Uniform_fPEPS_GPU_Deep",
     "Conv2D_Uniform_fPEPS_GPU_Deep_PBC",
     "Conv2D_Uniform_fPEPS_GPU_Deep_PBC_Direct",
@@ -57,6 +58,10 @@ class Conv2D_Geometric_fPEPS_GPU(NNfTNS_Model_GPU):
 
 
 class Conv2D_Geometric_fPEPS_GPU_Deep(NNfTNS_Model_GPU):
+    pass
+
+
+class Conv2D_Attn_Geometric_fPEPS_GPU_Deep(NNfTNS_Model_GPU):
     pass
 
 

@@ -29,9 +29,7 @@ os.environ.setdefault(
 )
 
 import torch
-
 from vmc_torch.GPU.optimizer import (
-    TrivialPreconditionerGPU,
     AdamSRIterGPU,
     AdamSRMinSRGPU,
     IterSRGPU,
@@ -40,8 +38,8 @@ from vmc_torch.GPU.optimizer import (
     MinSRGPU,
     SPRINGIterGPU,
     SPRINGMinSRGPU,
+    TrivialPreconditionerGPU,
 )
-
 
 # Valid values for ``VMCConfig.preconditioner``.
 _VALID_PRECONDITIONERS = ('sr', 'spring', 'march', 'adamsr')

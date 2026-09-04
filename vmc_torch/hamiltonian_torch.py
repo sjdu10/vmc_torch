@@ -379,6 +379,12 @@ class Chain(Graph):
         self._edges = edges
         self.n_nodes = L
 
+        # Flat structure: all bonds lie along the chain, so they all go
+        # in one "row" and there are no columns. Needed by the exchange
+        # samplers, which sweep graph.row_edges + graph.col_edges.
+        self.row_edges = {0: self._edges}
+        self.col_edges = {}
+
 
 class CompleteGraph(Graph):
     """Fully-connected graph for molecular orbital pairs.
@@ -903,6 +909,9 @@ class spinless_Fermi_Hubbard_square_lattice_torch(GPUMixin, Hamiltonian):
     def __init__(self, Lx, Ly, t=1.0, V=0.0, mu=0.0, N_f=None, pbc=False):
         """
         Implementation of spinless Fermi-Hubbard model on a square lattice using torch.
+        
+        Math:
+            H = -t * sum_{<i,j>} (c_i^† c_j + h.c.) + V * sum_{<i,j>} n_i n_j - mu * sum_i n_i
         Args:
             N_f is used to restrict the Hilbert space.
         """

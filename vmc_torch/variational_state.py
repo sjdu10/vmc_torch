@@ -7,7 +7,6 @@ import torch
 
 import vmc_torch
 import vmc_torch.model
-# import vmc_torch.experiment.tn_model
 
 from .global_var import DEBUG
 from .sampler import get_safe_ratio
@@ -119,6 +118,10 @@ class Variational_State:
         self.reset()
         amp = self.vstate_func(x, grad=True)
         if isinstance(
+            self.vstate_func, vmc_torch.model.fTNModel_reuse
+        ) or isinstance(
+            self.vstate_func, vmc_torch.model.PEPS_model_reuse
+        ) or isinstance(
             self.vstate_func, vmc_torch.model.fTNModel_reuse
         ) or isinstance(
             self.vstate_func, vmc_torch.model.PEPS_model_reuse
