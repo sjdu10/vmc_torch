@@ -420,6 +420,16 @@ class WavefunctionModel_GPU(nn.Module):
         self._exported_module = exported.module()
         self._move_exported_constants_to_device(example_x.device)
 
+        # One eager pass of the exported graph on the example input,
+        # OUTSIDE inductor's CUDA-graph memory pool. Opaque custom ops
+        # (e.g. the capture-safe Jacobi eigh) build per-(size, device)
+        # index caches on their first real call; if that first call
+        # happened inside the cudagraph-trees warmup, the cached
+        # tensors would live in the graph pool and trip "Detected N
+        # tensor(s) in the cudagraph pool not tracked as outputs".
+        with torch.no_grad():
+            self._exported_module(example_x, *params_list)
+
         self._vmapped_exported = torch.vmap(
             self._exported_module,
             in_dims=(0, *([None] * n_params)),
