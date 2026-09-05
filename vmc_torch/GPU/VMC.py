@@ -67,6 +67,10 @@ def setup_distributed(
         cpu: if True, use the gloo backend and return a CPU device
             (NCCL has no CPU support).
 
+    Side effects:
+        Initialises the default process group and, on GPU, calls
+        ``torch.cuda.set_device`` for this rank's device.
+
     Returns:
         (rank, world_size, device)
     """
@@ -92,6 +96,11 @@ def setup_distributed(
 
     if not cpu:
         device = torch.device(f"cuda:{local_rank}")
+        # Make this rank's GPU the CURRENT CUDA device. Run scripts
+        # typically only call torch.set_default_device(device), which
+        # steers tensor factories but not streams / CUDA-graph
+        # capture / NCCL, all of which follow the current device.
+        torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
     return rank, world_size, device

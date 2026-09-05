@@ -21,6 +21,20 @@ import torch
 import torch.nn as nn
 
 
+def _is_cache_writer():
+    """True if this process should write shared cache files.
+
+    Under torch.distributed only rank 0 writes; every rank still reads.
+    Without a process group (single process) always True.  Concurrent
+    writers on a shared filesystem otherwise race on the same
+    ``exported_*.pt2`` / ``compiler_artifacts.bin`` and can leave a
+    truncated or interleaved file behind for the next run to load.
+    """
+    import torch.distributed as dist
+    return not (dist.is_available() and dist.is_initialized()) \
+        or dist.get_rank() == 0
+
+
 class WavefunctionModel_GPU(nn.Module):
     """Base class for GPU wavefunction models.
 
@@ -339,13 +353,21 @@ class WavefunctionModel_GPU(nn.Module):
                 cache_dir, "compiler_artifacts.bin",
             )
             if os.path.exists(artifacts_path):
-                with open(artifacts_path, 'rb') as f:
-                    artifact_bytes = f.read()
-                torch.compiler.load_cache_artifacts(artifact_bytes)
-                print(
-                    f"Loaded compiler artifacts from "
-                    f"{artifacts_path}"
-                )
+                try:
+                    with open(artifacts_path, 'rb') as f:
+                        artifact_bytes = f.read()
+                    torch.compiler.load_cache_artifacts(artifact_bytes)
+                    print(
+                        f"Loaded compiler artifacts from "
+                        f"{artifacts_path}"
+                    )
+                except Exception as e:
+                    # A corrupt / foreign-version cache must never abort
+                    # the run; Triton simply recompiles.
+                    warnings.warn(
+                        f"compiler artifacts unusable ({e!r}); "
+                        "recompiling"
+                    )
         else:
             artifacts_path = None
         self._compiler_artifacts_path = artifacts_path
@@ -384,10 +406,15 @@ class WavefunctionModel_GPU(nn.Module):
                 )
 
             # Save before device move so constants remain on CPU
-            # (portable across devices / restarts).
-            if cache_path is not None:
+            # (portable across devices / restarts).  Every rank exports
+            # for itself (no cross-rank dependency); only rank 0 writes
+            # the shared cache, via a temp file + atomic rename so a
+            # concurrent reader never sees a half-written archive.
+            if cache_path is not None and _is_cache_writer():
                 os.makedirs(cache_dir, exist_ok=True)
-                torch.export.save(exported, cache_path)
+                tmp_path = cache_path + ".tmp"
+                torch.export.save(exported, tmp_path)
+                os.replace(tmp_path, cache_path)
                 print(f"Saved ExportedProgram to {cache_path}")
 
         self._exported_module = exported.module()
@@ -433,12 +460,20 @@ class WavefunctionModel_GPU(nn.Module):
                 "skipping."
             )
             return
+        if not _is_cache_writer():
+            return          # non-zero ranks: rank 0 writes the shared file
         try:
-            artifact_bytes, _ = (
-                torch.compiler.save_cache_artifacts()
-            )
-            with open(path, 'wb') as f:
+            result = torch.compiler.save_cache_artifacts()
+            if result is None:
+                # torch returns None when nothing was compiled yet
+                # (e.g. save called before the first compiled forward).
+                print("save_compiler_artifacts: nothing to save yet.")
+                return
+            artifact_bytes, _ = result
+            tmp_path = path + ".tmp"
+            with open(tmp_path, 'wb') as f:
                 f.write(artifact_bytes)
+            os.replace(tmp_path, path)
             print(
                 f"Saved compiler artifacts to {path} "
                 f"({len(artifact_bytes) / 1e6:.1f} MB)"

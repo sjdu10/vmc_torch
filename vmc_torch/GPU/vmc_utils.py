@@ -500,8 +500,13 @@ def compute_grads_gpu(
                 warnings.warn(
                     "CUDA-graph capture of the grad fn failed "
                     f"({type(e).__name__}: {e}); falling back to "
-                    "the uncaptured exported grad fn. chi > 0 "
-                    "graphs need capture-safe linalg hooks."
+                    "the uncaptured exported grad fn. Some op in "
+                    "the exported grad graph is not capture-safe "
+                    "(host sync such as .item()/nonzero/unique, "
+                    "pageable H2D copy, or a raw eigh/svd when "
+                    "chi > 0). To locate it, run the grad fn once "
+                    "eagerly under "
+                    "torch.cuda.set_sync_debug_mode('warn')."
                 )
                 fpeps_model._grad_graph_capture = False
     else:

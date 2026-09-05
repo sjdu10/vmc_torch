@@ -1943,7 +1943,10 @@ class GraphedGradFn:
         whatever the capture raises (e.g. for cuSOLVER kernels in
         the graph); callers should catch and fall back to ``fn``.
         ``warmup`` must be >= 1 (the warmup output is deleted after
-        the loop).
+        the loop). The side stream and the capture live on
+        ``example_x.device`` (made the current CUDA device for the
+        duration of ``__init__``), so multi-GPU ranks that never
+        called ``torch.cuda.set_device`` capture on the right device.
 
         Args:
             fn: eager callable ``fn(x, *params) -> pytree``.
@@ -1962,20 +1965,27 @@ class GraphedGradFn:
             p.detach().clone() for p in example_params
         ]
 
-        # warmup on a side stream (CUDA-graphs requirement)
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(warmup):
-                out = fn(self._static_x, *self._static_params)
-        torch.cuda.current_stream().wait_stream(side)
-        del out
+        # Streams and graph capture are bound to the CURRENT CUDA
+        # device, which torch.set_default_device() does NOT change.
+        # Pin it to the data's device: otherwise on a multi-GPU rank
+        # with tensors on cuda:k the capture runs on cuda:0's stream
+        # and dies with cudaErrorStreamCaptureInvalidated.
+        dev = self._static_x.device
+        with torch.cuda.device(dev):
+            # warmup on a side stream (CUDA-graphs requirement)
+            side = torch.cuda.Stream(device=dev)
+            side.wait_stream(torch.cuda.current_stream(dev))
+            with torch.cuda.stream(side):
+                for _ in range(warmup):
+                    out = fn(self._static_x, *self._static_params)
+            torch.cuda.current_stream(dev).wait_stream(side)
+            del out
 
-        self._graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph):
-            self._static_out = fn(
-                self._static_x, *self._static_params,
-            )
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph):
+                self._static_out = fn(
+                    self._static_x, *self._static_params,
+                )
 
     def _compatible(
         self, x: torch.Tensor, params: Sequence[torch.Tensor],
