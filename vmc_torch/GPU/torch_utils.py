@@ -1850,14 +1850,14 @@ def install_capture_safe_linalg(
 
     ar.register_function(
         'torch', 'linalg.svd',
-        lambda x: svd_via_jacobi(
+        lambda x, **kwargs: svd_via_jacobi(
             x, jitter=jitter, nonuniform_diag=nonuniform_diag,
             sweeps=sweeps,
         ),
     )
     ar.register_function(
         'torch', 'linalg.qr',
-        lambda x: qr_via_jacobi(
+        lambda x, **kwargs: qr_via_jacobi(
             x, jitter=jitter, nonuniform_diag=nonuniform_diag,
             sweeps=sweeps,
         ),
