@@ -24,11 +24,13 @@ import torch.nn as nn
 def _is_cache_writer():
     """True if this process should write shared cache files.
 
-    Under torch.distributed only rank 0 writes; every rank still reads.
-    Without a process group (single process) always True.  Concurrent
-    writers on a shared filesystem otherwise race on the same
-    ``exported_*.pt2`` / ``compiler_artifacts.bin`` and can leave a
-    truncated or interleaved file behind for the next run to load.
+    Guards the single shared ``exported_*.pt2``: under torch.distributed
+    only rank 0 writes it, every rank reads it and re-homes it onto its own
+    device.  Without a process group (single process) always True.
+    Concurrent writers on a shared filesystem would otherwise race on the
+    same file and leave a truncated or interleaved archive behind for the
+    next run to load.  The compiler artifacts are NOT covered by this --
+    they are per-device and every rank writes its own.
     """
     import torch.distributed as dist
     return not (dist.is_available() and dist.is_initialized()) \
@@ -326,6 +328,7 @@ class WavefunctionModel_GPU(nn.Module):
                 custom settings wins.
         """
         from torch.export import export
+        from torch.export.passes import move_to_device_pass
 
         if capture_safe_linalg:
             from vmc_torch.GPU.torch_utils import (
@@ -349,8 +352,19 @@ class WavefunctionModel_GPU(nn.Module):
         # Must be loaded before torch.compile so dynamo finds
         # cached Triton kernels instead of recompiling from scratch.
         if cache_dir is not None:
+            # One file per device.  Unlike the ExportedProgram these are
+            # compiled machine code with the device index baked into the
+            # generated wrapper (``_DeviceGuard(0)``, ``get_raw_stream(0)``)
+            # and into inductor's FX-graph cache key, so there is nothing
+            # to re-home: a rank on cuda:1 simply cannot use cuda:0's
+            # artifacts and would silently recompile from scratch.
+            _dev = example_x.device
+            _tag = (
+                _dev.type if _dev.index is None
+                else f"{_dev.type}{_dev.index}"
+            )
             artifacts_path = os.path.join(
-                cache_dir, "compiler_artifacts.bin",
+                cache_dir, f"compiler_artifacts_{_tag}.bin",
             )
             if os.path.exists(artifacts_path):
                 try:
@@ -417,8 +431,16 @@ class WavefunctionModel_GPU(nn.Module):
                 os.replace(tmp_path, cache_path)
                 print(f"Saved ExportedProgram to {cache_path}")
 
+        # A cached .pt2 was traced on whichever device wrote it (rank 0
+        # -> cuda:0), and torch.export bakes that device in twice over:
+        # into the lifted constants AND into node kwargs/args
+        # (aten.ones/arange/eye and aten.to.device).  Any other rank
+        # therefore has to re-home the program wholesale -- moving only
+        # the CPU constants leaves it indexing cuda:0 tensors with
+        # cuda:1 indices.  The upstream pass also covers state_dict,
+        # example_inputs and each node's meta['val'], and validates.
+        exported = move_to_device_pass(exported, example_x.device)
         self._exported_module = exported.module()
-        self._move_exported_constants_to_device(example_x.device)
 
         # One eager pass of the exported graph on the example input,
         # OUTSIDE inductor's CUDA-graph memory pool. Opaque custom ops
@@ -470,8 +492,8 @@ class WavefunctionModel_GPU(nn.Module):
                 "skipping."
             )
             return
-        if not _is_cache_writer():
-            return          # non-zero ranks: rank 0 writes the shared file
+        # No writer guard: the path is per-device (see export_and_compile),
+        # so each rank owns its file and there is nothing to race over.
         try:
             result = torch.compiler.save_cache_artifacts()
             if result is None:
